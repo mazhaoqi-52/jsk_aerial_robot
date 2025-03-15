@@ -7,14 +7,27 @@ import rospy
 from std_msgs.msg import Empty
 from aerial_robot_msgs.msg import FlightNav
 import rosgraph
+from geometry_msgs.msg import PoseStamped
 
-class DualPublisher:
-    def __init__(self, topic1, topic2, data_class, queue_size=1):
+current_pose_z = None      
+commanded_altitude = None  
+
+def pose_callback(msg):
+    global current_pose_z, commanded_altitude
+    current_pose_z = msg.pose.position.z
+    if commanded_altitude is None:
+        commanded_altitude = current_pose_z
+        rospy.loginfo("Initial commanded altitude set to current z: %.2f", commanded_altitude)
+
+class TriPublisher:
+    def __init__(self, topic1, topic2, topic3, data_class, queue_size=1):
         self.pub1 = rospy.Publisher(topic1, data_class, queue_size=queue_size)
         self.pub2 = rospy.Publisher(topic2, data_class, queue_size=queue_size)
+        self.pub3 = rospy.Publisher(topic3, data_class, queue_size=queue_size)
     def publish(self, msg):
         self.pub1.publish(msg)
         self.pub2.publish(msg)
+        self.pub3.publish(msg)
 
 
 msg = """
@@ -53,38 +66,28 @@ def printMsg(msg, msg_len = 50):
 if __name__=="__main__":
         settings = termios.tcgetattr(sys.stdin)
         rospy.init_node("keyboard_command")
-        # robot_ns = rospy.get_param("~robot_ns", "");
         robot_ns_1 = "beetle1"
         robot_ns_2 = "beetle2"
+        robot_ns_3 = "assembly"
         print(msg)
 
-        # if not robot_ns:
-        #         master = rosgraph.Master('/rostopic')
-        #         try:
-        #                 _, subs, _ = master.getSystemState()
-
-        #         except socket.error:
-        #                 raise ROSTopicIOException("Unable to communicate with master!")
-
-        #         teleop_topics = [topic[0] for topic in subs if 'teleop_command/start' in topic[0]]
-        #         if len(teleop_topics) == 1:
-        #                 robot_ns = teleop_topics[0].split('/teleop')[0]
-
+        rospy.Subscriber("/beetle1/mocap/pose", PoseStamped, pose_callback)
         ns_1 = robot_ns_1 + "/teleop_command"
         ns_2 = robot_ns_2 + "/teleop_command"
-        land_pub = DualPublisher(ns_1 + '/land',ns_2 + '/land', Empty, queue_size=1)
-        halt_pub = DualPublisher(ns_1 + '/halt',ns_2 +'/halt', Empty, queue_size=1)
-        start_pub = DualPublisher(ns_1 + '/start',ns_2 + '/start', Empty, queue_size=1)
-        takeoff_pub = DualPublisher(ns_1 + '/takeoff',ns_2 + '/takeoff', Empty, queue_size=1)
-        force_landing_pub = DualPublisher(ns_1 + '/force_landing',ns_2 + '/force_landing', Empty, queue_size=1)
-        nav_pub = DualPublisher(robot_ns_1 + '/uav/nav',robot_ns_2 + '/uav/nav', FlightNav, queue_size=1)
+        ns_3 = robot_ns_3 + "/teleop_command"
+        land_pub = TriPublisher(ns_1 + '/land', ns_2 + '/land', ns_3 + '/land', Empty, queue_size=1)
+        halt_pub = TriPublisher(ns_1 + '/halt', ns_2 +'/halt', ns_3 +'/halt', Empty, queue_size=1)
+        start_pub = TriPublisher(ns_1 + '/start', ns_2 + '/start',ns_3 + '/start', Empty, queue_size=1)
+        takeoff_pub = TriPublisher(ns_1 + '/takeoff', ns_2 + '/takeoff', ns_3 + '/takeoff', Empty, queue_size=1)
+        force_landing_pub = TriPublisher(ns_1 + '/force_landing', ns_2 + '/force_landing', ns_3 + '/force_landing', Empty, queue_size=1)
+        nav_pub = TriPublisher(robot_ns_1 + '/uav/nav', robot_ns_2 + '/uav/nav', robot_ns_3 + '/uav/nav', FlightNav, queue_size=1)
 
-        xy_vel   = rospy.get_param("xy_vel", 0.2)
-        z_vel    = rospy.get_param("z_vel", 0.2)
-        yaw_vel  = rospy.get_param("yaw_vel", 0.2)
+        xy_vel   = rospy.get_param("xy_vel", 0.1)
+        z_step  = 0.1
+        yaw_vel  = rospy.get_param("yaw_vel", 0.1)
 
-        # motion_start_pub = rospy.Publisher('task_start', Empty, queue_size=1)
-        motion_start_pub   = DualPublisher('task_start', 'task_start', Empty, queue_size=1)
+        motion_start_pub   = TriPublisher('task_start', 'task_start', 'task_start', Empty, queue_size=1)
+        current_z_vel = 0.0
         try:
                 while(True):
                         nav_msg = FlightNav()
@@ -143,16 +146,27 @@ if __name__=="__main__":
                                 nav_msg.target_omega_z = -yaw_vel
                                 msg = "send -yaw vel command"
                                 nav_pub.publish(nav_msg)
+                        if current_pose_z is None:
+                                current_pose_z = 0.0
+
                         if key == '[':
-                                nav_msg.pos_z_nav_mode = FlightNav.VEL_MODE
-                                nav_msg.target_vel_z = z_vel
-                                nav_pub.publish(nav_msg)
-                                msg = "send +z vel command"
+                                if current_pose_z is not None:
+                                        commanded_altitude = current_pose_z + z_step
+                                        msg_str = "set altitude to: {:.2f}".format(commanded_altitude)
+                                if commanded_altitude is not None:
+                                        nav_msg.pos_z_nav_mode = FlightNav.POS_MODE
+                                        nav_msg.target_pos_z = commanded_altitude
+                                        nav_pub.publish(nav_msg)
                         if key == ']':
-                                nav_msg.pos_z_nav_mode = FlightNav.VEL_MODE
-                                nav_msg.target_vel_z = -z_vel
-                                nav_pub.publish(nav_msg)
-                                msg = "send -z vel command"
+                                if current_pose_z is not None:
+                                        commanded_altitude = current_pose_z - z_step
+                                        msg_str = "set altitude to: {:.2f}".format(commanded_altitude)
+                                if commanded_altitude is not None:
+                                        nav_msg.pos_z_nav_mode = FlightNav.POS_MODE
+                                        nav_msg.target_pos_z = commanded_altitude
+                                        nav_pub.publish(nav_msg)
+
+
                         if key == '\x03':
                                 break
 
@@ -163,5 +177,3 @@ if __name__=="__main__":
                 print(repr(e))
         finally:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
-
-

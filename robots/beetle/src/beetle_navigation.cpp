@@ -260,8 +260,10 @@ void BeetleNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & 
   if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::VEL_MODE)
     {
       /* special */
-      addTargetPosZ(msg->target_pos_diff_z);
-      setTargetVelZ(0);
+      // addTargetPosZ(msg->target_pos_diff_z);
+      // setTargetVelZ(0);
+      setTargetVelZ(msg->target_vel_z);
+      teleop_reset_time_ = teleop_reset_duration_ + ros::Time::now().toSec();
     }
   else if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
     {

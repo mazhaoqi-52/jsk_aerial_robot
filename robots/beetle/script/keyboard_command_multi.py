@@ -9,15 +9,6 @@ from aerial_robot_msgs.msg import FlightNav
 import rosgraph
 from geometry_msgs.msg import PoseStamped
 
-current_pose_z = None      
-commanded_altitude = None  
-
-def pose_callback(msg):
-    global current_pose_z, commanded_altitude
-    current_pose_z = msg.pose.position.z
-    if commanded_altitude is None:
-        commanded_altitude = current_pose_z
-        rospy.loginfo("Initial commanded altitude set to current z: %.2f", commanded_altitude)
 
 class TriPublisher:
     def __init__(self, topic1, topic2, topic3, data_class, queue_size=1):
@@ -70,8 +61,6 @@ if __name__=="__main__":
         robot_ns_2 = "beetle2"
         robot_ns_3 = "assembly"
         print(msg)
-
-        rospy.Subscriber("/beetle1/mocap/pose", PoseStamped, pose_callback)
         ns_1 = robot_ns_1 + "/teleop_command"
         ns_2 = robot_ns_2 + "/teleop_command"
         ns_3 = robot_ns_3 + "/teleop_command"
@@ -83,7 +72,7 @@ if __name__=="__main__":
         nav_pub = TriPublisher(robot_ns_1 + '/uav/nav', robot_ns_2 + '/uav/nav', robot_ns_3 + '/uav/nav', FlightNav, queue_size=1)
 
         xy_vel   = rospy.get_param("xy_vel", 0.1)
-        z_step  = 0.1
+        z_vel   = rospy.get_param("z_vel", 0.1)
         yaw_vel  = rospy.get_param("yaw_vel", 0.1)
 
         motion_start_pub   = TriPublisher('task_start', 'task_start', 'task_start', Empty, queue_size=1)
@@ -146,27 +135,16 @@ if __name__=="__main__":
                                 nav_msg.target_omega_z = -yaw_vel
                                 msg = "send -yaw vel command"
                                 nav_pub.publish(nav_msg)
-                        if current_pose_z is None:
-                                current_pose_z = 0.0
-
                         if key == '[':
-                                if current_pose_z is not None:
-                                        commanded_altitude = current_pose_z + z_step
-                                        msg_str = "set altitude to: {:.2f}".format(commanded_altitude)
-                                if commanded_altitude is not None:
-                                        nav_msg.pos_z_nav_mode = FlightNav.POS_MODE
-                                        nav_msg.target_pos_z = commanded_altitude
-                                        nav_pub.publish(nav_msg)
+                                nav_msg.pos_z_nav_mode = FlightNav.VEL_MODE
+                                nav_msg.target_vel_z = z_vel
+                                nav_pub.publish(nav_msg)
+                                msg = "send +z vel command"
                         if key == ']':
-                                if current_pose_z is not None:
-                                        commanded_altitude = current_pose_z - z_step
-                                        msg_str = "set altitude to: {:.2f}".format(commanded_altitude)
-                                if commanded_altitude is not None:
-                                        nav_msg.pos_z_nav_mode = FlightNav.POS_MODE
-                                        nav_msg.target_pos_z = commanded_altitude
-                                        nav_pub.publish(nav_msg)
-
-
+                                nav_msg.pos_z_nav_mode = FlightNav.VEL_MODE
+                                nav_msg.target_vel_z = -z_vel
+                                nav_pub.publish(nav_msg)
+                                msg = "send -z vel command"
                         if key == '\x03':
                                 break
 

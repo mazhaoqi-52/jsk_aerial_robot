@@ -54,11 +54,13 @@ class SwitchState(smach.State):
         self.neighboring_id = neighboring_id
         self.female_servo_id = female_servo_id
         self.separate_dir = separate_dir
-        try:
-            link_detacher = GazeboLinkDetacher(self.robot_name, 'root', self.neighboring, 'root')
-            link_detacher.detach_links()
-        except :
-            rospy.loginfo("Failed to detach links")
+        if not self.real_machine:
+            try:
+                link_detacher = GazeboLinkDetacher(self.neighboring, 'root', self.robot_name, 'root')
+                link_detacher.detach_links()
+            except rospy.ServiceException:
+                rospy.loginfo("Dettacher failed")  
+        time.sleep(1)  
         if(separate_dir > 0):
             self.kondo_servo = KondoControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
             self.kondo_servo_neighboring = KondoControl(self.neighboring,self.neighboring_id,self.male_servo_id,self.real_machine)

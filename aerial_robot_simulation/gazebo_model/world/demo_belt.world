@@ -122,7 +122,7 @@
 
     <!-- World plugin: Link attacher -->
     <plugin name="link_attacher_plugin" filename="libgazebo_ros_link_attacher.so">
-    </plugin>s
+    </plugin>
 
   </world>
 </sdf>

@@ -33,9 +33,9 @@ class SwitchState(smach.State):
                  male_servo_id = 5,
                  real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 8300,
+                 lock_servo_angle_male = 7700,###8300###modify
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 5600,
+                 lock_servo_angle_female = 8000,###5600###
                  neighboring = 'beetle2',
                  neighboring_id = 2,
                  female_servo_id = 6,

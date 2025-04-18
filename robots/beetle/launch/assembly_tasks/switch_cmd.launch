@@ -5,7 +5,7 @@
   <arg name = "male_servo_id" default="5"/>
   <arg name = "female_servo_id" default="6" />
   <arg name = "unlock_servo_angle_male" default="7000"/>
-  <arg name = "lock_servo_angle_male" default="7700"/>
+  <arg name = "lock_servo_angle_male" default="7580"/>
   <arg name = "unlock_servo_angle_female" default="11000"/>
   <arg name = "lock_servo_angle_female" default="5800"/>
   <arg name = "left_edge_id" default="1"/>

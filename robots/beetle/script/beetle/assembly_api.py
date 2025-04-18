@@ -35,7 +35,7 @@ class StandbyState(smach.State):
                  female_servo_id = 6,
                  real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 7700,###8800###
+                 lock_servo_angle_male = 7580,###8800###
                  unlock_servo_angle_female = 11000,
                  lock_servo_angle_female = 8000,###5600###
                  leader = 'beetle2',
@@ -225,7 +225,7 @@ class ApproachState(smach.State):
                  female_servo_id = 6,
                  real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 7700,###8800###
+                 lock_servo_angle_male = 7400,###8800###
                  unlock_servo_angle_female = 11000,
                  lock_servo_angle_female = 8000,##5600##
                  leader = 'beetle2',

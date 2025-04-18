@@ -33,7 +33,7 @@ class SwitchState(smach.State):
                  male_servo_id = 5,
                  real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 7700,###8300###modify
+                 lock_servo_angle_male = 7580,###8300###modify
                  unlock_servo_angle_female = 11000,
                  lock_servo_angle_female = 8000,###5600###
                  neighboring = 'beetle2',
@@ -54,13 +54,6 @@ class SwitchState(smach.State):
         self.neighboring_id = neighboring_id
         self.female_servo_id = female_servo_id
         self.separate_dir = separate_dir
-        if not self.real_machine:
-            try:
-                link_detacher = GazeboLinkDetacher(self.neighboring, 'root', self.robot_name, 'root')
-                link_detacher.detach_links()
-            except rospy.ServiceException:
-                rospy.loginfo("Dettacher failed")  
-        time.sleep(1)  
         if(separate_dir > 0):
             self.kondo_servo = KondoControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
             self.kondo_servo_neighboring = KondoControl(self.neighboring,self.neighboring_id,self.male_servo_id,self.real_machine)
@@ -82,6 +75,13 @@ class SwitchState(smach.State):
         time.sleep(0.5)
 
     def execute(self, userdata):
+        if not self.real_machine:
+            try:
+                link_detacher = GazeboLinkDetacher(self.neighboring, 'root', self.robot_name, 'root')
+                link_detacher.detach_links()
+            except rospy.ServiceException:
+                rospy.loginfo("Dettacher failed")  
+        time.sleep(1)  
         self.flag_msg.key = str(self.robot_id)
         self.flag_msg.value = '0'
         self.flag_pub.publish(self.flag_msg)

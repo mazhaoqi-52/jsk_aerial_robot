@@ -78,6 +78,8 @@ class SwitchState(smach.State):
         if not self.real_machine:
             try:
                 link_detacher = GazeboLinkDetacher(self.neighboring, 'root', self.robot_name, 'root')
+                # link_detacher = GazeboLinkDetacher(self.robot_name, 'root', self.neighboring, 'root')
+
                 link_detacher.detach_links()
             except rospy.ServiceException:
                 rospy.loginfo("Dettacher failed")  

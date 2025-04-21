@@ -14,6 +14,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from tf.transformations import euler_from_quaternion
 from task.assembly_motion import *
+from task.disassembly_motion import *
 from valve_rotation_demo.trajectory import PolynomialTrajectory
 from valve_rotation_demo.motion_controller import MotionController
 from valve_rotation_demo.base_UAV_state import SeperatedMotionStateBase, AssemblyMotionStateBase
@@ -352,7 +353,32 @@ class AssembledLeaveState(AssemblyMotionStateBase):
         else:
             rospy.logwarn("AssembledLeaveState: Failed to leave the valve area.")
             return 'failed'
+class DisassembleState(smach.State):
+    def __init__(self):
 
+        smach.State.__init__(self, outcomes=['succeeded', 'failed'])
+
+        # Module IDs
+        modules_str = rospy.get_param("~module_ids", "")
+        real_machine = rospy.get_param("~real_machine", True)
+        modules = []
+        if modules_str:
+            modules = [int(x) for x in modules_str.split(',')]
+        else:
+            rospy.logerr("No module ID is designated!")
+
+        # disassembleDemo 
+        self.disassemble_demo = DisassemblyDemo(module_ids=modules, real_machine=real_machine)
+    
+    def execute(self, userdata):
+        rospy.loginfo("Disassembling UAVs...")
+        try:
+            self.disassemble_demo.main()
+            rospy.loginfo("Disassembly completed successfully.")
+            return 'succeeded'
+        except rospy.ROSInterruptException:
+            rospy.logerr("Disassembly process failed.")
+            return 'failed'
 
 def main():
     rospy.init_node('valve_task_state_machine')
@@ -371,6 +397,9 @@ def main():
                                  transitions={'succeeded': 'ASSEMBLED_LEAVE',
                                               'failed': 'TASK_FAILED'})
         smach.StateMachine.add('ASSEMBLED_LEAVE', AssembledLeaveState(),
+                                 transitions={'succeeded': 'TASK_COMPLETED',
+                                              'failed': 'TASK_FAILED'})
+        smach.StateMachine.add('DISASSEMBLE', DisassembleState(),
                                  transitions={'succeeded': 'TASK_COMPLETED',
                                               'failed': 'TASK_FAILED'})
     outcome = sm.execute()

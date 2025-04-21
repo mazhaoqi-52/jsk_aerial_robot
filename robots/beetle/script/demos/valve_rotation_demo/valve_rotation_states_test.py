@@ -15,6 +15,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from tf.transformations import euler_from_quaternion
 from task.assembly_motion import *
+from task.disassembly_motion import *
 from valve_rotation_demo.trajectory import PolynomialTrajectory
 from valve_rotation_demo.motion_controller import *
 # from valve_rotation_demo.base_UAV_state import AssemblyMotionStateBase
@@ -53,7 +54,7 @@ class MoveAndRotateValveState(smach.State):
                  z_offset_real = 0.21,# 0.21(when use the real valve instead of the valve_fake),0.47(when use the valve_fake)
                  z_offset_sim = 0.23,
                  yaw_offset = math.pi / 8.0,
-                 valve_rotation_angle_compenstation = 0.06,
+                 valve_rotation_angle_compenstation = math.pi / 10.0,
                  valve_rotation_angle = math.pi / 2.0,
                  avg_speed = 0.15,
                  avg_yaw_speed = 0.15,
@@ -371,6 +372,32 @@ class MoveAndRotateValveState(smach.State):
         else:
             rospy.logwarn("Failed to return to start position.")
             return 'failed'
+class DisassembleState(smach.State):
+    def __init__(self):
+
+        smach.State.__init__(self, outcomes=['succeeded', 'failed'])
+
+        # Module IDs
+        modules_str = rospy.get_param("~module_ids", "")
+        real_machine = rospy.get_param("~real_machine", True)
+        modules = []
+        if modules_str:
+            modules = [int(x) for x in modules_str.split(',')]
+        else:
+            rospy.logerr("No module ID is designated!")
+
+        # disassembleDemo 
+        self.disassemble_demo = DisassemblyDemo(module_ids=modules, real_machine=real_machine)
+    
+    def execute(self, userdata):
+        rospy.loginfo("Disassembling UAVs...")
+        try:
+            self.disassemble_demo.main()
+            rospy.loginfo("Disassembly completed successfully.")
+            return 'succeeded'
+        except rospy.ROSInterruptException:
+            rospy.logerr("Disassembly process failed.")
+            return 'failed'
 
 def main():
     rospy.init_node('valve_task_state_machine')
@@ -380,8 +407,11 @@ def main():
                                  transitions={'succeeded': 'ASSEMBLED_VALVE_TASK',
                                               'failed': 'TASK_FAILED'})
         smach.StateMachine.add('ASSEMBLED_VALVE_TASK', MoveAndRotateValveState(),
-                                 transitions={'succeeded': 'TASK_COMPLETED',
+                                 transitions={'succeeded': 'DISASSEMBLE',
                                               'failed': 'TASK_FAILED'})
+        smach.StateMachine.add('DISASSEMBLE', DisassembleState(),
+                                    transitions={'succeeded': 'TASK_COMPLETED',
+                                                'failed': 'TASK_FAILED'})
     outcome = sm.execute()
 
 if __name__ == '__main__':

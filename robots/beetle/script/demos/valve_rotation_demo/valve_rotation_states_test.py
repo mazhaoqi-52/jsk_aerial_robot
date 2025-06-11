@@ -13,6 +13,8 @@ import numpy as np
 from aerial_robot_msgs.msg import FlightNav
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import WrenchStamped
+from beetle.msg import TaggedWrench
 from tf.transformations import euler_from_quaternion
 from task.assembly_motion import *
 from task.disassembly_motion import *
@@ -74,7 +76,7 @@ class MoveAndRotateValveState(smach.State):
         self.avg_valve_rotation_speed = avg_valve_rotation_speed
         self.pos_initialization = pos_initialization
         self.exit_target = exit_target
-
+        self.comp_wrench = WrenchStamped()
         # Simulation flag
         self.is_simulation = rospy.get_param("~simulation", True)
 
@@ -84,7 +86,14 @@ class MoveAndRotateValveState(smach.State):
         self.module_ids = [int(x) for x in module_ids_str.split(',')]
         if len(self.module_ids) < 2:
             rospy.logerr("SeparatedMoveToGateState: At least 2 module IDs are required.")
-
+        #External Wrench Compasation
+        self.ff_wrench_pubs = {}
+        for mid in self.module_ids:
+            topic = f"/beetle{mid}/ff_inter_wrench"
+            self.ff_wrench_pubs[mid] = rospy.Publisher(
+                topic, TaggedWrench, queue_size=1
+            )
+        self.desired_valve_torque = 0.2
         # Subscribers
         self.beetle1_sub_topic = "/beetle{}/mocap/pose".format(self.module_ids[0])
         self.beetle2_sub_topic = "/beetle{}/mocap/pose".format(self.module_ids[1])
@@ -106,6 +115,17 @@ class MoveAndRotateValveState(smach.State):
         # Publisher
         self.pos_pub = rospy.Publisher("/assembly/uav/nav", FlightNav, queue_size=1)
         self.wait_for_initialization(timeout=10)
+    
+    def publish_feedforward_torque(self):
+        now = rospy.Time.now()
+        for mid, pub in self.ff_wrench_pubs.items():
+            tw = TaggedWrench()
+            tw.index = mid
+            ws = WrenchStamped()
+            ws.header.stamp = now
+            ws.wrench.torque.z = self.desired_valve_torque
+            tw.wrench = ws
+            pub.publish(tw)
         
     def beetle2_callback(self, msg):
         self.pos_beetle2 = msg
@@ -277,6 +297,7 @@ class MoveAndRotateValveState(smach.State):
             yaw_val = traj.evaluate()
             if yaw_val is None:
                 break
+            self.publish_feedforward_torque()
             pos_cmd = FlightNav()
             pos_cmd.target = 1
             pos_cmd.pos_xy_nav_mode = FlightNav.POS_MODE
@@ -322,6 +343,8 @@ class MoveAndRotateValveState(smach.State):
             pos_cmd.target_yaw = target_yaw  # 保持yaw角
             self.pos_pub.publish(pos_cmd)
             rate.sleep()
+            self.desired_valve_torque = 0.0
+            self.publish_feedforward_torque()
             if rospy.Time.now().to_sec() - start_correction_time > max_correction_duration:
                 rospy.logwarn("Position correction exceeded maximum duration.")
                 break

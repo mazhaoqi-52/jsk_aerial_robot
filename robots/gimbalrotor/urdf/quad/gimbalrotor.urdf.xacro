@@ -24,16 +24,16 @@
     ## link
     <link name="base_link">
       <inertial>
-        <origin xyz="0.0 0.0 0.0165" rpy="0 0 0"/>
-        <mass value="0.1753"/>
+        <origin xyz="0.0257171 0.0007358  0.0813823" rpy="0 0 0"/>
+        <mass value="2.8200834"/>
         <inertia
-            ixx="0.0004" iyy="0.0004" izz="0.0008"
-            ixy="0.00000" ixz="0.0000" iyz="0.00000"/>
+            ixx="0.0679394" iyy="0.1142367" izz="0.1213159"
+            ixy="-0.0001621" ixz="0.00612466" iyz="0.0000964"/>
       </inertial>
       <visual>
-        <origin xyz="0 0 -0.0165" rpy="0 0 0"/>
+        <origin xyz="0 0 0" rpy="0 0 3.141592"/>
         <geometry>
-          <mesh filename="package://gimbalrotor/urdf/quad/mesh/base_link.STL"/>
+          <mesh filename="package://gimbalrotor/urdf/quad/mesh/base_link_hyper.dae"/>
         </geometry>
       </visual>
       <collision>
@@ -76,7 +76,7 @@
       <visual>
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.STL"/>
+          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.dae"/>
         </geometry>
       </visual>
       <collision>
@@ -105,7 +105,7 @@
       <visual>
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.STL"/>
+          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.dae"/>
         </geometry>
       </visual>
       <collision>
@@ -134,7 +134,7 @@
       <visual>
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.STL"/>
+          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.dae"/>
         </geometry>
       </visual>
       <collision>
@@ -163,7 +163,7 @@
       <visual>
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.STL"/>
+          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_arm.dae"/>
         </geometry>
       </visual>
       <collision>
@@ -203,7 +203,7 @@
       <visual>
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_module.STL"/>
+          <mesh filename="package://gimbalrotor/urdf/quad/mesh/rotor_module.dae"/>
         </geometry>
       </visual>
     </link>

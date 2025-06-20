@@ -96,7 +96,7 @@ private:
 
   void startCallback(const std_msgs::EmptyConstPtr & msg)
   {
-    std::string file_name  = std::string("motor_test_") + std::to_string((int)ros::Time::now().toSec()) + std::string(".txt");
+    std::string file_name  = std::string("/home/ma/ros/jsk_aerial_robot_ws/src/jsk_aerial_robot/aerial_robot_nerve/motor_test/src/data/") + std::to_string((int)ros::Time::now().toSec()) + std::string("22.2.txt");
     ofs_.open(file_name, std::ios::out);
 
     pwm_value_ = min_pwm_value_;

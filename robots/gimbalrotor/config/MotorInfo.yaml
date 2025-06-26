@@ -1,6 +1,6 @@
 motor_info:
-        min_pwm: 0.58 # = 1800 [ms]
-        max_pwm: 0.92 #0.92 # = 1840 [ms]             
+        min_pwm: 0.50 # = 1000 [ms]
+        max_pwm: 0.98 #0.92 # = 1950 [ms]             
         min_thrust: 0 #[N]
         force_landing_thrust: 7 #[N]
         m_f_rate: 0 # should be zero, because of the dual rotor

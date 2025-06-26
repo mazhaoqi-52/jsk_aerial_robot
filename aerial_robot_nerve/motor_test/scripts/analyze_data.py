@@ -201,9 +201,9 @@ if __name__ == '__main__':
     parser.add_argument('file_name', help='file name')
     parser.add_argument('has_telemetry', help='has telemetry, 0 or 1')
     parser.add_argument("--set_voltage", "-s", help="the voltage set in the test, float", default=0.0)
-    parser.add_argument("--order", "-o", help="fitting order of fz vs PWM_ratio", default=2)
+    parser.add_argument("--order", "-o", help="fitting order of fz vs PWM_ratio", default=4)
     parser.add_argument('--folder_path', "-f", help='path to folder', default='~/.ros/')
-    parser.add_argument('--if_reverse', "-r", help='if the force sensor is reversed,0 or 1', default='0')
+    parser.add_argument('--if_reverse', "-r", help='if the force sensor is reversed,0 or 1', default='1')
     args = parser.parse_args()
 
     analyze_data(args.folder_path, args.file_name, int(args.has_telemetry), float(args.set_voltage), int(args.order), int(args.if_reverse))

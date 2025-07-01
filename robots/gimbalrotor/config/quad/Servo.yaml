@@ -2,7 +2,7 @@ servo_controller:
   gimbals:
     angle_sgn: -1
     angle_scale: 0.001534
-    zero_point_offset: 2047
+    zero_point_offset: 2048
 
     controller1:
       id: 1

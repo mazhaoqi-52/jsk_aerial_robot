@@ -64,3 +64,20 @@ class PolynomialTrajectory:
                 np.dot(self.coeffs_y, T),
                 np.dot(self.coeffs_z, T)
             )
+
+class ValveRotationTrajectory:
+    def __init__(self, duration):
+        self.trajectory = PolynomialTrajectory(duration)
+        self.start_pos = None
+        self.target_pos = None
+
+    def set_start_target(self, start_pos, target_pos):
+        self.start_pos = start_pos
+        self.target_pos = target_pos
+        self.trajectory.generate_trajectory(start_pos, target_pos)
+
+    def get_next_position(self):
+        return self.trajectory.evaluate()
+
+    def is_complete(self):
+        return self.get_next_position() is None

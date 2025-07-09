@@ -38,7 +38,7 @@
     </include>
 
     <!-- A paltform for drone with manipulator to take off -->
-    <model name="take off platorm">
+    <!-- <model name="take off platorm">
       <static>true</static>
       <link name="link">
         <collision name="collision">
@@ -57,7 +57,7 @@
         </visual>
       </link>
       <pose>0 0 0 0 0 0</pose>
-    </model>
+    </model> -->
 
 
     <!-- World plugin: Link attacher -->

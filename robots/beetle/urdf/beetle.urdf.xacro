@@ -36,10 +36,32 @@
           <mesh filename="package://beetle/urdf/mesh/base_link.dae"/>
         </geometry>
       </visual>
+      <!-- decompse the collison part for manipulator -->
       <collision>
-        <origin xyz="0 0 0.1205" rpy="0 0 0"/>
+        <origin xyz="-0.042 0 0.1205" rpy="0 0 0"/>
         <geometry>
-          <box size="0.52 0.52 0.241"/>
+          <box size="0.436 0.52 0.241"/>
+        </geometry>
+      </collision>
+
+      <collision>
+        <origin xyz="0.218 0 0.14256" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.084 0.52 0.19688"/>
+        </geometry>
+      </collision>
+
+      <collision>
+        <origin xyz="0.218 0.24 0.02206" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.084 0.040 0.04412"/>
+        </geometry>
+      </collision>
+
+      <collision>
+        <origin xyz="0.218 -0.24 0.02206" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.084 0.040 0.04412"/>
         </geometry>
       </collision>
     </link>
@@ -79,16 +101,22 @@
         </geometry>
       </visual>
       <collision>
-        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <origin xyz="0.01 0.06255 -0.0522683" rpy="0 0 0"/>
         <geometry>
-          <box size="0.519 0.08411 0.04412"/>
+          <box size="0.012 0.012 0.04412"/>
+        </geometry>
+      </collision>
+      <collision>
+        <origin xyz="0.01 -0.06255 -0.0522683" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.012 0.012 0.04412"/>
         </geometry>
       </collision>
     </link>
     <joint name="beetle_fang_joint" type="fixed">
       <parent link="base_link"/>
       <child link="beetle_fang_link"/>
-      <origin xyz="0.244 0 0.007" rpy="0 0 0"/>
+      <origin xyz="0.244 0 0.0743823" rpy="0 0 0"/>
     </joint> 
 
     ## rotor arm macro

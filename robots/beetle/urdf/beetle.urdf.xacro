@@ -101,7 +101,7 @@
         </geometry>
       </visual>
       <collision>
-        <origin xyz="0.00772 0.08438 -0.0522683" rpy="0 0 0"/>
+        <origin xyz="0.0072 0.08438 -0.0522683" rpy="0 0 0"/>
         <geometry>
           <cylinder radius="0.006" length="0.04412"/>
         </geometry>
@@ -116,7 +116,7 @@
     <joint name="beetle_fang_joint" type="fixed">
       <parent link="base_link"/>
       <child link="beetle_fang_link"/>
-      <origin xyz="0.244 0 0.0743823" rpy="0 0 0"/>
+      <origin xyz="0.246 0 0.0743823" rpy="0 0 0"/>
     </joint> 
 
     ## rotor arm macro

@@ -113,39 +113,6 @@
   <xacro:mount_model parent = "sub_pipe1" />
   <xacro:mount_model parent = "sub_pipe2" />
 
-<!-- Rod for manipulation -->
-<link name="i_beam">
-  <visual>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry>
-      <box size="${i_beam_length} ${i_beam_width} ${i_beam_height}"/>
-    </geometry>
-    <material name="grey"/>
-  </visual>
-  <collision>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry>
-      <box size="${i_beam_length} ${i_beam_width} ${i_beam_height}"/>
-    </geometry>
-  </collision>
-  <inertial>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <mass value="${i_beam_mass}"/>
-    <inertia
-        ixx="${1/12.0 * i_beam_mass * (i_beam_width**2 + i_beam_height**2)}"
-        iyy="${1/12.0 * i_beam_mass * (i_beam_length**2 + i_beam_height**2)}"
-        izz="${1/12.0 * i_beam_mass * (i_beam_length**2 + i_beam_width**2)}"
-        ixy="0.0" ixz="0.0" iyz="0.0"/>
-  </inertial>
-</link>
-
-<joint name="valve_to_i_beam_joint" type="fixed">
-  <parent link="handle"/>
-  <child link="i_beam"/>
-  <origin xyz="0 0 ${valve_height - i_beam_height / 2 - 0.262}" rpy="0 0 0"/>
-  <axis xyz="0 0 1"/>
-</joint>
-
 <gazebo>
   <plugin name="joint_motor" filename="libgazebo_ros_joint_motor.so">
     <jointName>valve_to_i_beam_joint</jointName>

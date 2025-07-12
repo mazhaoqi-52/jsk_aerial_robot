@@ -131,7 +131,7 @@ class AlignToGraspTrajectory:
         end_effector_center_z = self.grasp_height
         
         # Calculate end-effector orientation
-        # Method 1: point towards valve center
+        # point towards valve center
         dx_to_center = center_x - end_effector_center_x
         dy_to_center = center_y - end_effector_center_y
         end_effector_yaw = atan2(dy_to_center, dx_to_center)
@@ -156,11 +156,6 @@ class AlignToGraspTrajectory:
         claw1_target_y += insertion_offset_y
         claw2_target_x += insertion_offset_x
         claw2_target_y += insertion_offset_y
-        
-        # Method 2: based on claw connection line (optional)
-        # dx_claws = claw2_target_x - claw1_target_x
-        # dy_claws = claw2_target_y - claw1_target_y
-        # perpendicular_yaw = atan2(-dx_claws, dy_claws)  # perpendicular to claw line
         
         # Verify claw positions in end-effector coordinate system
         cos_yaw = cos(end_effector_yaw)
@@ -321,7 +316,7 @@ class ValveRotationTrajectory:
                  end_effector_offset_x=0.246, end_effector_offset_y=0.0, end_effector_offset_z=0.0743823):
         """
         Args:
-            rotation_direction: 1 for anticlockwise (default, typical valve operation), -1 for clockwise
+            rotation_direction: 1 for anticlockwise, -1 for clockwise
         """
         self.rotation_duration = rotation_duration
         self.valve_center = valve_center
@@ -403,78 +398,17 @@ class ValveRotationTrajectory:
         """Check if trajectory is complete"""
         return self.get_next_position() is None
     
-    @staticmethod
-    def create_from_mocap_data(rotation_duration, valve_center, body_cog_position, body_yaw,
-                              rotation_angle=2*pi, grasp_height=None, rotation_direction=1,
-                              end_effector_offset_x=0.246, end_effector_offset_y=0.0, end_effector_offset_z=0.0743823):
-        """
-        Create rotation trajectory from mocap data
-        
-        Args:
-            rotation_duration: Rotation duration
-            valve_center: Valve center position (x, y, z)
-            body_cog_position: Body COG current position (x, y, z)
-            body_yaw: Body current yaw angle (radians)
-            rotation_angle: Rotation angle, default 2π (full circle)
-            grasp_height: Grasp height, if None use valve center height
-            rotation_direction: 1 for anticlockwise (default, typical valve operation), -1 for clockwise
-            end_effector_offset_x/y/z: End-effector offset (from urdf)
-        """
-        # Calculate current end-effector position
-        cos_yaw = cos(body_yaw)
-        sin_yaw = sin(body_yaw)
-        
-        global_offset_x = (cos_yaw * end_effector_offset_x - 
-                          sin_yaw * end_effector_offset_y)
-        global_offset_y = (sin_yaw * end_effector_offset_x + 
-                          cos_yaw * end_effector_offset_y)
-        global_offset_z = end_effector_offset_z
-        
-        # Current end-effector position
-        current_end_effector_x = body_cog_position[0] + global_offset_x
-        current_end_effector_y = body_cog_position[1] + global_offset_y
-        current_end_effector_z = body_cog_position[2] + global_offset_z
-        
-        # Calculate rotation radius and start angle
-        dx = current_end_effector_x - valve_center[0]
-        dy = current_end_effector_y - valve_center[1]
-        radius = (dx**2 + dy**2)**0.5
-        start_angle = atan2(dy, dx)
-        
-        if grasp_height is None:
-            grasp_height = current_end_effector_z
-            
-        rospy.loginfo(f"Create rotation trajectory from mocap data:")
-        rospy.loginfo(f"  Body COG position: {body_cog_position}")
-        rospy.loginfo(f"  Body yaw: {body_yaw:.3f} rad ({body_yaw*180/pi:.1f} deg)")
-        rospy.loginfo(f"  Current end-effector position: [{current_end_effector_x:.3f}, {current_end_effector_y:.3f}, {current_end_effector_z:.3f}]")
-        rospy.loginfo(f"  Calculated radius: {radius:.3f}m, start angle: {start_angle:.3f} rad")
-            
-        return ValveRotationTrajectory(
-            rotation_duration=rotation_duration,
-            valve_center=valve_center,
-            rotation_radius=radius,
-            start_angle=start_angle,
-            rotation_angle=rotation_angle,
-            grasp_height=grasp_height,
-            rotation_direction=rotation_direction,
-            end_effector_offset_x=end_effector_offset_x,
-            end_effector_offset_y=end_effector_offset_y,
-            end_effector_offset_z=end_effector_offset_z
-        )
-
-
 if __name__ == "__main__":
     rospy.init_node("valve_manipulation_trajectory_demo")
     rate = rospy.Rate(50)
     
-    # Example parameters
+    # Parameters
     valve_center = (0.5, 0.3, 0.2)
     valve_pose_yaw = 0.0  # Valve orientation
     start_pos = (0.2, 0.1, 0.2)  # Start position
-    rotation_direction = 1  # 1 for anticlockwise (typical valve operation), -1 for clockwise
-    insertion_offset = 0.02  # 2cm offset for smooth insertion
-    
+    rotation_direction = 1  # 1 for anticlockwise, -1 for clockwise
+    insertion_offset = 0.02  # offset for smooth insertion
+
     # End-effector offset parameters (from urdf file)
     end_effector_offset_x = 0.246    # End-effector 24.6cm in front of body
     end_effector_offset_y = 0.0      # No Y offset
@@ -525,12 +459,31 @@ if __name__ == "__main__":
     # Stage 2: Rotate around valve center
     rospy.loginfo("Stage 2: Rotate around valve center")
     
-    # Method 1: Create rotation trajectory from mocap data
-    rotation_traj = ValveRotationTrajectory.create_from_mocap_data(
+    # Calculate current end-effector position from aligned body position
+    cos_yaw = cos(final_body_yaw)
+    sin_yaw = sin(final_body_yaw)
+    
+    global_offset_x = (cos_yaw * end_effector_offset_x - 
+                      sin_yaw * end_effector_offset_y)
+    global_offset_y = (sin_yaw * end_effector_offset_x + 
+                      cos_yaw * end_effector_offset_y)
+    
+    current_end_effector_x = final_body_pos[0] + global_offset_x
+    current_end_effector_y = final_body_pos[1] + global_offset_y
+    current_end_effector_z = final_body_pos[2] + end_effector_offset_z
+    
+    # Calculate rotation radius and start angle
+    dx = current_end_effector_x - valve_center[0]
+    dy = current_end_effector_y - valve_center[1]
+    radius = (dx**2 + dy**2)**0.5
+    start_angle = atan2(dy, dx)
+    
+    # Create rotation trajectory directly
+    rotation_traj = ValveRotationTrajectory(
         rotation_duration=8.0,
         valve_center=valve_center,
-        body_cog_position=final_body_pos,  # Use aligned position
-        body_yaw=final_body_yaw,  # Use aligned yaw
+        rotation_radius=radius,
+        start_angle=start_angle,
         rotation_angle=2*pi,  # Full circle
         grasp_height=0.2,
         rotation_direction=rotation_direction,

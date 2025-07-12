@@ -22,6 +22,7 @@
       <group unless="$(arg real_machine)">
         <param name="robot_description"
           command="$(find xacro)/xacro $(find beetle)/urdf/valve.urdf no_collision:=false" />
+        <!-- Spawn valve directly, ignore if it already exists -->
         <node pkg="gazebo_ros" type="spawn_model" name="spawn_valve" respawn="false" output="screen"
           args="-urdf -model valve -x $(arg valve_x) -y $(arg valve_y) -z $(arg valve_z) -Y $(arg valve_yaw) -param robot_description" />
       </group>

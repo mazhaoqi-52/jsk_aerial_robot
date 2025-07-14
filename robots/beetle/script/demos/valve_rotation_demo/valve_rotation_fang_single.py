@@ -326,13 +326,13 @@ class InitializeStartPositionState(SingleUAVStateBase):
         return 'succeeded'
 
 class MoveToValveState(SingleUAVStateBase):
-    """Move to position above valve"""
+    """Move to position above valve center (simple approach)"""
     def __init__(self, module_id=1, approach_height=0.5):
         SingleUAVStateBase.__init__(self, outcomes=['succeeded', 'failed'], module_id=module_id)
         self.approach_height = approach_height
     
     def execute(self, userdata):
-        rospy.loginfo("Moving to valve position...")
+        rospy.loginfo("Moving to valve position (above valve center)...")
         
         if not self.wait_for_positions():
             return 'failed'
@@ -348,10 +348,12 @@ class MoveToValveState(SingleUAVStateBase):
         
         rospy.loginfo(f"Moving from {start_pos} to valve at {self.valve_pos}")
         
+        # Simple approach: move to position above valve center
+        # Let the AlignToGraspTrajectory handle the precise positioning
         target_pos = (self.valve_pos[0], self.valve_pos[1], 
                      self.valve_pos[2] + self.approach_height)
         
-        rospy.loginfo(f"Target position: {target_pos}")
+        rospy.loginfo(f"Target position (above valve center): {target_pos}")
         
         # Calculate distance and adjust speed/timeout for long moves
         distance = math.sqrt((target_pos[0]-start_pos[0])**2 + 
@@ -376,7 +378,7 @@ class MoveToValveState(SingleUAVStateBase):
             return 'failed'
 
 class DescendAndContactState(SingleUAVStateBase):
-    """Descend and establish contact with valve"""
+    """Align to grasp position, then descend to establish contact"""
     def __init__(self, module_id=1, contact_force_threshold=2.0, descent_speed=0.05):
         SingleUAVStateBase.__init__(self, outcomes=['succeeded', 'failed'], module_id=module_id)
         self.contact_force_threshold = contact_force_threshold
@@ -386,7 +388,7 @@ class DescendAndContactState(SingleUAVStateBase):
         self._output_keys = ['start_position']
     
     def execute(self, userdata):
-        rospy.loginfo("Starting descent and contact phase...")
+        rospy.loginfo("Phase 1: Align to grasp position, Phase 2: Descend to contact...")
         
         if not self.wait_for_positions():
             return 'failed'
@@ -405,12 +407,29 @@ class DescendAndContactState(SingleUAVStateBase):
         # Store start position for emergency return
         userdata.start_position = start_pos
         
-        # Align to grasp position
+        # Phase 1: Align to grasp position (at current height)
+        rospy.loginfo("Phase 1: Aligning to grasp position...")
+        if not self.align_to_grasp_position(start_pos):
+            rospy.logerr("Failed to align to grasp position")
+            return 'failed'
+        
+        # Phase 2: Descend to contact
+        rospy.loginfo("Phase 2: Descending to establish contact...")
+        if not self.descend_to_contact():
+            rospy.logerr("Failed to descend to contact")
+            return 'failed'
+        
+        rospy.loginfo("Successfully aligned and established contact")
+        return 'succeeded'
+    
+    def align_to_grasp_position(self, start_pos):
+        """Align to grasp position at current height"""
+        # Use AlignToGraspTrajectory but keep at current height
         align_traj = AlignToGraspTrajectory(
-            approach_duration=20.0,
+            approach_duration=15.0,  # Reduced duration for alignment only
             valve_center=self.valve_pos,
             valve_pose_yaw=self.valve_yaw,
-            grasp_height=self.valve_pos[2] + self.z_offset,
+            grasp_height=start_pos[2],  # Stay at current height
             valve_radius=0.1225,
             valve_beam_width=0.0185,
             rotation_direction=1,
@@ -419,8 +438,10 @@ class DescendAndContactState(SingleUAVStateBase):
         
         align_traj.set_start_position(start_pos)
         
-        # Execute alignment
+        # Execute alignment trajectory
         rate = rospy.Rate(50)
+        rospy.loginfo("Executing grasp alignment trajectory...")
+        
         while not rospy.is_shutdown() and not align_traj.is_complete():
             result = align_traj.get_next_position_and_yaw()
             if result is None:
@@ -429,38 +450,130 @@ class DescendAndContactState(SingleUAVStateBase):
             MotionController.send_trajectory_point(self.pub, pos, yaw)
             rate.sleep()
         
-        # Descend until contact
+        rospy.loginfo("Grasp alignment completed")
+        return True
+    
+    def descend_to_contact(self):
+        """Descend using polynomial trajectory until contact"""
         current_pos = self.get_current_position()
         if current_pos is None:
-            return 'failed'
+            return False
         
-        target_z = self.valve_pos[2] + self.z_offset - 0.01
+        # Calculate target descent position
+        target_z = self.valve_pos[2] + self.z_offset
+        target_pos = (current_pos[0], current_pos[1], target_z)
         
-        while not rospy.is_shutdown() and current_pos[2] > target_z:
+        rospy.loginfo(f"Descending from {current_pos[2]:.3f}m to {target_z:.3f}m")
+        
+        # Calculate descent parameters
+        descent_distance = abs(current_pos[2] - target_z)
+        descent_duration = descent_distance / self.descent_speed
+        
+        rospy.loginfo(f"Descent: {descent_distance:.3f}m in {descent_duration:.1f}s at {self.descent_speed}m/s")
+        
+        # Execute descent with contact detection
+        return self.execute_descent_with_contact_detection(current_pos, target_pos, descent_duration)
+    
+    def execute_descent_with_contact_detection(self, start_pos, target_pos, duration):
+        """Execute descent using polynomial trajectory with contact detection"""
+        from trajectory import PolynomialTrajectory
+        
+        # Create polynomial trajectory for descent
+        traj = PolynomialTrajectory(duration)
+        traj.generate_trajectory(start_pos, target_pos)
+        
+        rate = rospy.Rate(50)  # 50Hz control rate
+        start_time = time.time()
+        
+        rospy.loginfo("Starting descent with contact detection...")
+        
+        while not rospy.is_shutdown() and (time.time() - start_time) < duration + 5.0:
+            # Check for contact force
             force_mag = self.get_contact_force_magnitude()
             if force_mag > self.contact_force_threshold:
-                rospy.loginfo(f"Contact established, force: {force_mag:.2f}N")
-                return 'succeeded'
+                rospy.loginfo(f"Contact established during descent, force: {force_mag:.2f}N")
+                return True
             
+            # Get next trajectory point
+            pt = traj.evaluate()
+            if pt is None:
+                # Trajectory completed, check if we need to continue descent for contact
+                rospy.loginfo("Descent trajectory completed, checking for contact...")
+                current_pos = self.get_current_position()
+                if current_pos is None:
+                    return False
+                
+                # Continue slow descent until contact or minimum height reached
+                return self.continue_descent_until_contact(current_pos)
+            
+            # Send trajectory command (preserve current yaw)
             current_pos = self.get_current_position()
             if current_pos is None:
-                return 'failed'
-            
-            descent_pos = (current_pos[0], current_pos[1], 
-                          current_pos[2] - self.descent_speed * 0.02)
-            
+                return False
+                
             msg = FlightNav()
             msg.target = 1
             msg.pos_xy_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_x = descent_pos[0]
-            msg.target_pos_y = descent_pos[1]
+            msg.target_pos_x = pt[0]
+            msg.target_pos_y = pt[1]
             msg.pos_z_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_z = descent_pos[2]
+            msg.target_pos_z = pt[2]
+            msg.yaw_nav_mode = FlightNav.POS_MODE
+            msg.target_yaw = self.current_yaw  # Preserve current yaw
             self.pub.publish(msg)
             
-            time.sleep(0.02)
+            rate.sleep()
         
-        return 'succeeded'
+        rospy.logwarn("Descent timed out without establishing contact")
+        return False
+    
+    def continue_descent_until_contact(self, current_pos):
+        """Continue slow descent until contact is established"""
+        rospy.loginfo("Continuing slow descent until contact...")
+        
+        min_z = self.valve_pos[2] + self.z_offset - 0.02  # 2cm below target
+        max_descent_time = 10.0  # Maximum time for final descent
+        
+        start_time = time.time()
+        rate = rospy.Rate(50)
+        
+        while not rospy.is_shutdown() and (time.time() - start_time) < max_descent_time:
+            # Check for contact
+            force_mag = self.get_contact_force_magnitude()
+            if force_mag > self.contact_force_threshold:
+                rospy.loginfo(f"Contact established, force: {force_mag:.2f}N")
+                return True
+            
+            # Get current position
+            current_pos = self.get_current_position()
+            if current_pos is None:
+                return False
+            
+            # Check if we've reached minimum height
+            if current_pos[2] <= min_z:
+                rospy.loginfo("Reached minimum descent height")
+                return True
+            
+            # Calculate next descent position
+            descent_step = self.descent_speed * 0.02  # 20ms step
+            next_z = current_pos[2] - descent_step
+            
+            # Send descent command (preserve yaw)
+            msg = FlightNav()
+            msg.target = 1
+            msg.pos_xy_nav_mode = FlightNav.POS_MODE
+            msg.target_pos_x = current_pos[0]
+            msg.target_pos_y = current_pos[1]
+            msg.pos_z_nav_mode = FlightNav.POS_MODE
+            msg.target_pos_z = next_z
+            msg.yaw_nav_mode = FlightNav.POS_MODE
+            msg.target_yaw = self.current_yaw  # Preserve current yaw
+            self.pub.publish(msg)
+            
+            rate.sleep()
+        
+        rospy.logwarn("Final descent completed without strong contact detection")
+        return True  # Continue with task even if contact force is not strong
 
 class RotateValveState(SingleUAVStateBase):
     """Rotate valve while maintaining contact"""
@@ -691,6 +804,7 @@ def main():
     rospy.loginfo("Start position will be recorded from current mocap position")
     rospy.loginfo("Valve position fallback: If valve spawn fails, using default position (3.0, 0.0, 0.0)")
     rospy.loginfo("This addresses valve spawn conflicts and duplicate spawn issues")
+    rospy.loginfo("Corrected logic: 1) Move above valve center, 2) Align to grasp at safe height, 3) Descend to contact")
     
     # Create state machine
     sm = smach.StateMachine(outcomes=['TASK_COMPLETED', 'TASK_FAILED', 'EMERGENCY_COMPLETED'])
@@ -709,10 +823,10 @@ def main():
         smach.StateMachine.add('MOVE_TO_VALVE', 
                                MoveToValveState(module_id=module_id, 
                                                approach_height=approach_height),
-                               transitions={'succeeded': 'DESCEND_AND_CONTACT',
+                               transitions={'succeeded': 'ALIGN_AND_DESCEND',
                                           'failed': 'TASK_FAILED'})
         
-        smach.StateMachine.add('DESCEND_AND_CONTACT', 
+        smach.StateMachine.add('ALIGN_AND_DESCEND', 
                                DescendAndContactState(module_id=module_id),
                                transitions={'succeeded': 'ROTATE_VALVE',
                                           'failed': 'TASK_FAILED'},

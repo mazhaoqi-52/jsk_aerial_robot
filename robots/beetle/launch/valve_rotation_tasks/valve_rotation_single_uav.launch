@@ -6,7 +6,8 @@
   <!-- UAV parameters -->
   <arg name="module_id" default="1" />
   <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
-  <arg name="approach_height" default="0.5" />
+  <arg name="approach_height" default="0.5" /><!-- need to be fixed -->
+  
   <arg name="hover_duration" default="2.0" /> <!-- seconds to hover for initialization -->
   
   <!-- Valve parameters -->

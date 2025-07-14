@@ -360,7 +360,15 @@ class ValveRotationTrajectory:
         center_x, center_y, center_z = self.valve_center
         end_effector_x = center_x + self.rotation_radius * cos(current_angle)
         end_effector_y = center_y + self.rotation_radius * sin(current_angle)
-        end_effector_z = self.grasp_height if self.grasp_height is not None else center_z
+        
+        # CRITICAL FIX: grasp_height should be the body height, not end-effector height
+        # If grasp_height is provided, use it as body height directly
+        if self.grasp_height is not None:
+            body_z = self.grasp_height  # Use grasp_height as body height directly
+            end_effector_z = body_z + self.end_effector_offset_z  # Add offset to get end-effector height
+        else:
+            end_effector_z = center_z  # Fallback to valve center height
+            body_z = end_effector_z - self.end_effector_offset_z
         
         # Calculate end-effector orientation (always facing valve center)
         dx_to_center = center_x - end_effector_x
@@ -383,7 +391,7 @@ class ValveRotationTrajectory:
         # Calculate body COG position
         body_x = end_effector_x - global_offset_x
         body_y = end_effector_y - global_offset_y
-        body_z = end_effector_z - global_offset_z
+        # body_z is already calculated above based on grasp_height
         
         return ((body_x, body_y, body_z), body_yaw)
     

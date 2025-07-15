@@ -191,7 +191,7 @@ class AlignToGraspTrajectory:
         claw2_target_x += insertion_offset_x
         claw2_target_y += insertion_offset_y
         
-        # 计算body CoG目标位置
+        # Calculate body CoG target position
         body_yaw = end_effector_yaw
         cos_yaw = cos(body_yaw)
         sin_yaw = sin(body_yaw)
@@ -206,13 +206,13 @@ class AlignToGraspTrajectory:
         body_target_y = end_effector_center_y - global_offset_y
         body_target_z = end_effector_center_z - global_offset_z
         
-        # 验证：确保机体大部分处于阀门外侧
+        # Verification: ensure body is mostly outside valve
         body_to_center_distance = ((body_target_x - center_x)**2 + (body_target_y - center_y)**2)**0.5
         if body_to_center_distance < self.valve_radius:
-            rospy.logwarn(f"机体距离阀门中心过近: {body_to_center_distance:.3f}m < {self.valve_radius:.3f}m")
-            rospy.logwarn("可能需要调整end_effector_offset参数")
+            rospy.logwarn(f"Body too close to valve center: {body_to_center_distance:.3f}m < {self.valve_radius:.3f}m")
+            rospy.logwarn("May need to adjust end_effector_offset parameters")
         
-        # 存储claw位置信息
+        # Store claw position information
         self._claw_positions = {
             'claw1_target': (claw1_target_x, claw1_target_y, self.grasp_height),
             'claw2_target': (claw2_target_x, claw2_target_y, self.grasp_height),
@@ -225,17 +225,17 @@ class AlignToGraspTrajectory:
             'gap12_angle': gap12_angle,
         }
         
-        rospy.loginfo(f"符合用户描述的开阀门方式:")
-        rospy.loginfo(f"  Beam0 (X轴正方向): [{beam0_x:.3f}, {beam0_y:.3f}] @ {beam0_angle*180/pi:.1f}°")
+        rospy.loginfo(f"Valve opening method according to description:")
+        rospy.loginfo(f"  Beam0 (positive X-axis): [{beam0_x:.3f}, {beam0_y:.3f}] @ {beam0_angle*180/pi:.1f}°")
         rospy.loginfo(f"  Beam1 (120°): [{beam1_x:.3f}, {beam1_y:.3f}] @ {beam1_angle*180/pi:.1f}°")
         rospy.loginfo(f"  Beam2 (240°): [{beam2_x:.3f}, {beam2_y:.3f}] @ {beam2_angle*180/pi:.1f}°")
-        rospy.loginfo(f"  左侧manipulator (claw1): [{claw1_target_x:.3f}, {claw1_target_y:.3f}] @ {claw1_angle*180/pi:.1f}°")
-        rospy.loginfo(f"  右侧manipulator (claw2): [{claw2_target_x:.3f}, {claw2_target_y:.3f}] @ {claw2_angle*180/pi:.1f}°")
+        rospy.loginfo(f"  Left manipulator (claw1): [{claw1_target_x:.3f}, {claw1_target_y:.3f}] @ {claw1_angle*180/pi:.1f}°")
+        rospy.loginfo(f"  Right manipulator (claw2): [{claw2_target_x:.3f}, {claw2_target_y:.3f}] @ {claw2_angle*180/pi:.1f}°")
         rospy.loginfo(f"  End-effector center: [{end_effector_center_x:.3f}, {end_effector_center_y:.3f}, {end_effector_center_z:.3f}]")
         rospy.loginfo(f"  Body target: [{body_target_x:.3f}, {body_target_y:.3f}, {body_target_z:.3f}]")
         rospy.loginfo(f"  Body yaw: {body_yaw:.3f} rad ({body_yaw*180/pi:.1f}°)")
-        rospy.loginfo(f"  机体到阀门中心距离: {body_to_center_distance:.3f}m (应该 > {self.valve_radius:.3f}m)")
-        rospy.loginfo(f"  旋转方向: {'逆时针' if self.rotation_direction > 0 else '顺时针'}")
+        rospy.loginfo(f"  Body to valve center distance: {body_to_center_distance:.3f}m (should be > {self.valve_radius:.3f}m)")
+        rospy.loginfo(f"  Rotation direction: {'counterclockwise' if self.rotation_direction > 0 else 'clockwise'}")
         
         return ((body_target_x, body_target_y, body_target_z), 
                 body_yaw, 
@@ -338,26 +338,26 @@ class ValveRotationTrajectory:
     """
     Trajectory generator for rotating around valve center
     
-    CRITICAL FIX: 实现末端执行器保持与阀门中心恒定距离的轨迹生成
-    无人机中心轨迹确保末端执行器围绕阀门中心做圆周运动
+    CRITICAL FIX: Implement trajectory generation that maintains constant distance between end-effector and valve center
+    UAV center trajectory ensures end-effector performs circular motion around valve center
     """
     def __init__(self, rotation_duration, valve_center, end_effector_rotation_radius, start_angle, 
                  rotation_angle=2*pi, grasp_height=None, rotation_direction=1,
                  end_effector_offset_x=0.246, end_effector_offset_y=0.0, end_effector_offset_z=0.0743823):
         """
         Args:
-            rotation_duration: 旋转持续时间
-            valve_center: 阀门中心位置
-            end_effector_rotation_radius: 末端执行器围绕阀门中心的旋转半径
-            start_angle: 起始角度
-            rotation_angle: 旋转角度
-            grasp_height: 抓取高度
+            rotation_duration: Rotation duration
+            valve_center: Valve center position
+            end_effector_rotation_radius: End-effector rotation radius around valve center
+            start_angle: Starting angle
+            rotation_angle: Rotation angle
+            grasp_height: Grasp height
             rotation_direction: 1 for anticlockwise, -1 for clockwise
-            end_effector_offset_x/y/z: 末端执行器相对于无人机中心的偏移
+            end_effector_offset_x/y/z: End-effector offset relative to UAV center
         """
         self.rotation_duration = rotation_duration
         self.valve_center = valve_center
-        self.end_effector_rotation_radius = end_effector_rotation_radius  # 末端执行器的旋转半径
+        self.end_effector_rotation_radius = end_effector_rotation_radius  # End-effector rotation radius
         self.start_angle = start_angle
         self.rotation_angle = rotation_angle * rotation_direction
         self.grasp_height = grasp_height
@@ -368,49 +368,49 @@ class ValveRotationTrajectory:
         self.end_effector_offset_y = end_effector_offset_y
         self.end_effector_offset_z = end_effector_offset_z
         
-        # 兼容性：支持新的命名方式
+        # Compatibility: support new naming convention
         self.end_effector_distance = end_effector_rotation_radius
         
         self._angle_trajectory = None
         
-        rospy.loginfo("=== 固定末端执行器-阀门距离的轨迹生成 ===")
-        rospy.loginfo(f"末端执行器旋转半径: {self.end_effector_rotation_radius:.3f}m")
-        rospy.loginfo(f"末端执行器偏移: [{end_effector_offset_x:.3f}, {end_effector_offset_y:.3f}, {end_effector_offset_z:.3f}]")
-        rospy.loginfo("无人机中心轨迹将确保末端执行器保持与阀门中心恒定距离")
+        rospy.loginfo("=== Fixed End-Effector-Valve Distance Trajectory Generation ===")
+        rospy.loginfo(f"End-effector rotation radius: {self.end_effector_rotation_radius:.3f}m")
+        rospy.loginfo(f"End-effector offset: [{end_effector_offset_x:.3f}, {end_effector_offset_y:.3f}, {end_effector_offset_z:.3f}]")
+        rospy.loginfo("UAV center trajectory will ensure end-effector maintains constant distance from valve center")
         
     def start_rotation(self):
         """Start rotation trajectory"""
         self.start_trajectory()
     
     def start_trajectory(self):
-        """启动轨迹生成"""
+        """Start trajectory generation"""
         end_angle = self.start_angle + self.rotation_angle
         self._angle_trajectory = PolynomialTrajectory(self.rotation_duration)
         self._angle_trajectory.generate_trajectory(self.start_angle, end_angle)
         
-        rospy.loginfo(f"末端执行器固定距离旋转轨迹启动:")
-        rospy.loginfo(f"  阀门中心: {self.valve_center}")
-        rospy.loginfo(f"  末端执行器旋转半径: {self.end_effector_rotation_radius:.3f}m")
-        rospy.loginfo(f"  起始角度: {self.start_angle:.3f} rad")
-        rospy.loginfo(f"  旋转角度: {self.rotation_angle:.3f} rad")
-        rospy.loginfo(f"  旋转方向: {'逆时针' if self.rotation_direction > 0 else '顺时针'}")
-        rospy.loginfo(f"  持续时间: {self.rotation_duration:.1f}s")
+        rospy.loginfo(f"End-effector fixed distance rotation trajectory started:")
+        rospy.loginfo(f"  Valve center: {self.valve_center}")
+        rospy.loginfo(f"  End-effector rotation radius: {self.end_effector_rotation_radius:.3f}m")
+        rospy.loginfo(f"  Starting angle: {self.start_angle:.3f} rad")
+        rospy.loginfo(f"  Rotation angle: {self.rotation_angle:.3f} rad")
+        rospy.loginfo(f"  Rotation direction: {'counterclockwise' if self.rotation_direction > 0 else 'clockwise'}")
+        rospy.loginfo(f"  Duration: {self.rotation_duration:.1f}s")
         
     def get_next_position_and_yaw(self):
         """
         Get next body position and yaw angle
         
-        CRITICAL FIX: 确保末端执行器保持与阀门中心的恒定距离
-        无人机中心位置根据末端执行器的目标位置反向计算
+        CRITICAL FIX: Ensure end-effector maintains constant distance from valve center
+        UAV center position is calculated inversely from end-effector target position
         """
         return self.get_next_uav_position_and_yaw()
     
     def get_next_uav_position_and_yaw(self):
         """
-        获取下一个无人机位置和朝向
+        Get next UAV position and orientation
         
         Returns:
-            tuple: ((x, y, z), yaw) 或 None（如果轨迹结束）
+            tuple: ((x, y, z), yaw) or None (if trajectory ends)
         """
         if self._angle_trajectory is None:
             return None
@@ -421,64 +421,64 @@ class ValveRotationTrajectory:
             
         center_x, center_y, center_z = self.valve_center
         
-        # 1. 计算末端执行器的目标位置（围绕阀门中心的圆周运动）
+        # 1. Calculate end-effector target position (circular motion around valve center)
         end_effector_target_x = center_x + self.end_effector_rotation_radius * cos(current_angle)
         end_effector_target_y = center_y + self.end_effector_rotation_radius * sin(current_angle)
         
-        # 2. 计算末端执行器的目标高度
+        # 2. Calculate end-effector target height
         if self.grasp_height is not None:
-            # 如果指定了抓取高度，使用它作为无人机高度
+            # If grasp height is specified, use it as UAV height
             uav_target_z = self.grasp_height
             end_effector_target_z = uav_target_z + self.end_effector_offset_z
         else:
-            # 否则使用阀门高度作为末端执行器高度
+            # Otherwise use valve height as end-effector height
             end_effector_target_z = center_z
             uav_target_z = end_effector_target_z - self.end_effector_offset_z
         
-        # 3. 计算末端执行器的目标朝向（始终指向阀门中心）
+        # 3. Calculate end-effector target orientation (always pointing toward valve center)
         dx_to_center = center_x - end_effector_target_x
         dy_to_center = center_y - end_effector_target_y
         end_effector_target_yaw = atan2(dy_to_center, dx_to_center)
         
-        # 4. 无人机朝向与末端执行器朝向相同
+        # 4. UAV orientation is same as end-effector orientation
         uav_target_yaw = end_effector_target_yaw
         
-        # 5. 根据末端执行器目标位置反向计算无人机中心位置
-        # 末端执行器位置 = 无人机位置 + 旋转后的偏移向量
+        # 5. Calculate UAV center position inversely from end-effector target position
+        # End-effector position = UAV position + rotated offset vector
         cos_yaw = cos(uav_target_yaw)
         sin_yaw = sin(uav_target_yaw)
         
-        # 将末端执行器偏移从机体坐标系转换到世界坐标系
+        # Transform end-effector offset from body coordinate system to world coordinate system
         world_offset_x = (cos_yaw * self.end_effector_offset_x - 
                          sin_yaw * self.end_effector_offset_y)
         world_offset_y = (sin_yaw * self.end_effector_offset_x + 
                          cos_yaw * self.end_effector_offset_y)
         world_offset_z = self.end_effector_offset_z
         
-        # 反向计算无人机中心位置
+        # Calculate UAV center position inversely
         uav_target_x = end_effector_target_x - world_offset_x
         uav_target_y = end_effector_target_y - world_offset_y
-        # uav_target_z 已经在步骤2中计算
+        # uav_target_z already calculated in step 2
         
-        # 6. 验证计算结果
-        # 正向验证：从计算的无人机位置推导末端执行器位置
+        # 6. Verify calculation results
+        # Forward verification: derive end-effector position from calculated UAV position
         verify_ee_x = uav_target_x + world_offset_x
         verify_ee_y = uav_target_y + world_offset_y
         verify_ee_z = uav_target_z + world_offset_z
         
-        # 检查末端执行器到阀门中心的距离是否保持恒定
+        # Check if end-effector to valve center distance remains constant
         verify_distance = math.sqrt((verify_ee_x - center_x)**2 + 
                                   (verify_ee_y - center_y)**2)
         
         distance_error = abs(verify_distance - self.end_effector_rotation_radius)
-        if distance_error > 0.001:  # 1mm 误差阈值
-            rospy.logwarn(f"末端执行器距离误差: {distance_error:.4f}m")
-            rospy.logwarn(f"目标距离: {self.end_effector_rotation_radius:.3f}m, 实际距离: {verify_distance:.3f}m")
+        if distance_error > 0.001:  # 1mm error threshold
+            rospy.logwarn(f"End-effector distance error: {distance_error:.4f}m")
+            rospy.logwarn(f"Target distance: {self.end_effector_rotation_radius:.3f}m, actual distance: {verify_distance:.3f}m")
         
         return ((uav_target_x, uav_target_y, uav_target_z), uav_target_yaw)
         
     def get_current_angle(self):
-        """获取当前角度"""
+        """Get current angle"""
         if self._angle_trajectory is None:
             return None
         return self._angle_trajectory.evaluate()
@@ -496,10 +496,10 @@ class ValveRotationTrajectory:
         
     def get_trajectory_info(self):
         """
-        获取轨迹信息
+        Get trajectory information
         
         Returns:
-            dict: 轨迹参数信息
+            dict: Trajectory parameter information
         """
         return {
             'valve_center': self.valve_center,
@@ -511,17 +511,16 @@ class ValveRotationTrajectory:
             'grasp_height': self.grasp_height
         }
     
-    def check_trajectory_continuity(self, previous_uav_pos, current_uav_pos, max_step_size=0.05):
-        """
-        检查轨迹连续性，确保无人机运动平滑
+    def check_trajectory_continuity(self, previous_uav_pos, current_uav_pos, max_step_size=0.05):        """
+        Check trajectory continuity to ensure smooth UAV motion
         
         Args:
-            previous_uav_pos: 上一个无人机位置
-            current_uav_pos: 当前无人机位置
-            max_step_size: 最大允许步长（米）
-        
+            previous_uav_pos: Previous UAV position
+            current_uav_pos: Current UAV position
+            max_step_size: Maximum allowed step size (meters)
+            
         Returns:
-            bool: 轨迹是否连续
+            bool: Whether trajectory is continuous
         """
         if previous_uav_pos is None or current_uav_pos is None:
             return True
@@ -630,7 +629,7 @@ def create_constant_distance_trajectory(current_uav_pos, current_uav_yaw, valve_
                                       end_effector_offset_x=0.246, end_effector_offset_y=0.0, 
                                       end_effector_offset_z=0.0743823, rotation_direction=1):
     """
-    创建恒定距离旋转轨迹的便捷函数
+    Convenience function to create constant distance rotation trajectory
     
     Args:
         current_uav_pos: 当前无人机位置 (x, y, z)
@@ -659,17 +658,17 @@ def create_constant_distance_trajectory(current_uav_pos, current_uav_yaw, valve_
     valve_x, valve_y, _ = valve_center
     end_effector_distance = math.sqrt((current_ee_x - valve_x)**2 + (current_ee_y - valve_y)**2)
     
-    # 计算起始角度
+    # Calculate starting angle
     start_angle = atan2(current_ee_y - valve_y, current_ee_x - valve_x)
     
-    rospy.loginfo("=== 创建恒定距离旋转轨迹 ===")
-    rospy.loginfo(f"当前无人机位置: {current_uav_pos}")
-    rospy.loginfo(f"当前末端执行器位置: [{current_ee_x:.3f}, {current_ee_y:.3f}]")
-    rospy.loginfo(f"阀门中心: {valve_center}")
-    rospy.loginfo(f"计算得到的末端执行器距离: {end_effector_distance:.3f}m")
-    rospy.loginfo(f"起始角度: {start_angle:.3f}rad ({start_angle*180/pi:.1f}°)")
+    rospy.loginfo("=== Creating Constant Distance Rotation Trajectory ===")
+    rospy.loginfo(f"Current UAV position: {current_uav_pos}")
+    rospy.loginfo(f"Current end-effector position: [{current_ee_x:.3f}, {current_ee_y:.3f}]")
+    rospy.loginfo(f"Valve center: {valve_center}")
+    rospy.loginfo(f"Calculated end-effector distance: {end_effector_distance:.3f}m")
+    rospy.loginfo(f"Starting angle: {start_angle:.3f}rad ({start_angle*180/pi:.1f}°)")
     
-    # 创建轨迹生成器
+    # Create trajectory generator
     trajectory = ValveRotationTrajectory(
         rotation_duration=rotation_duration,
         valve_center=valve_center,

@@ -2024,19 +2024,19 @@ class RotateValveState(SingleUAVStateBase):
         rospy.loginfo("=== PHASE 2: ALIGNMENT-CONTROLLED ROTATION ===")
         
         # Calculate rotation parameters from current position
-        # CRITICAL FIX: 计算末端执行器到阀门中心的距离作为旋转半径
-        # 这样可以确保末端执行器保持与阀门中心的恒定距离
+        # CRITICAL FIX: Calculate end-effector to valve center distance as rotation radius
+        # This ensures the end-effector maintains constant distance from valve center
         
-        # 1. 计算当前末端执行器位置
+        # 1. Calculate current end-effector position
         current_end_effector_pos = self.calculate_end_effector_position(current_pos, self.current_yaw)
         
-        # 2. 计算末端执行器到阀门中心的距离（这是真正的旋转半径）
+        # 2. Calculate end-effector to valve center distance (this is the true rotation radius)
         end_effector_rotation_radius = math.sqrt(
             (current_end_effector_pos[0] - self.valve_pos[0])**2 + 
             (current_end_effector_pos[1] - self.valve_pos[1])**2
         )
         
-        # 3. 计算起始角度（末端执行器相对于阀门中心的角度）
+        # 3. Calculate starting angle (end-effector angle relative to valve center)
         start_angle = math.atan2(
             current_end_effector_pos[1] - self.valve_pos[1],
             current_end_effector_pos[0] - self.valve_pos[0]
@@ -2046,14 +2046,14 @@ class RotateValveState(SingleUAVStateBase):
         # The UAV should maintain the same height throughout rotation
         current_height = current_pos[2]
         
-        rospy.loginfo(f"末端执行器固定距离旋转参数:")
-        rospy.loginfo(f"  - 无人机位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
-        rospy.loginfo(f"  - 末端执行器位置: [{current_end_effector_pos[0]:.3f}, {current_end_effector_pos[1]:.3f}, {current_end_effector_pos[2]:.3f}]")
-        rospy.loginfo(f"  - 阀门中心: [{self.valve_pos[0]:.3f}, {self.valve_pos[1]:.3f}, {self.valve_pos[2]:.3f}]")
-        rospy.loginfo(f"  - 末端执行器旋转半径: {end_effector_rotation_radius:.3f}m")
-        rospy.loginfo(f"  - 起始角度: {start_angle:.3f}rad ({start_angle*180/math.pi:.1f}°)")
-        rospy.loginfo(f"  - 当前高度: {current_height:.3f}m (将被维持)")
-        rospy.loginfo(f"  - 旋转角度: {self.rotation_angle:.3f}rad ({self.rotation_angle*180/math.pi:.1f}°)")
+        rospy.loginfo(f"End-effector constant distance rotation parameters:")
+        rospy.loginfo(f"  - UAV position: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
+        rospy.loginfo(f"  - End-effector position: [{current_end_effector_pos[0]:.3f}, {current_end_effector_pos[1]:.3f}, {current_end_effector_pos[2]:.3f}]")
+        rospy.loginfo(f"  - Valve center: [{self.valve_pos[0]:.3f}, {self.valve_pos[1]:.3f}, {self.valve_pos[2]:.3f}]")
+        rospy.loginfo(f"  - End-effector rotation radius: {end_effector_rotation_radius:.3f}m")
+        rospy.loginfo(f"  - Starting angle: {start_angle:.3f}rad ({start_angle*180/math.pi:.1f}°)")
+        rospy.loginfo(f"  - Current height: {current_height:.3f}m (will be maintained)")
+        rospy.loginfo(f"  - Rotation angle: {self.rotation_angle:.3f}rad ({self.rotation_angle*180/math.pi:.1f}°)")
         
         # Calculate correct rotation height - should be at valve level
         # The UAV body should be at valve height + end_effector_offset for proper engagement
@@ -2061,16 +2061,16 @@ class RotateValveState(SingleUAVStateBase):
         end_effector_offset_z = 0.0743823  # From trajectory.py
         correct_rotation_height = valve_height + end_effector_offset_z
         
-        rospy.loginfo(f"旋转高度计算:")
-        rospy.loginfo(f"  - 阀门高度: {valve_height:.3f}m")
-        rospy.loginfo(f"  - 末端执行器偏移Z: {end_effector_offset_z:.3f}m")
-        rospy.loginfo(f"  - 正确旋转高度: {correct_rotation_height:.3f}m")
-        rospy.loginfo(f"  - 当前高度: {current_height:.3f}m")
-        rospy.loginfo(f"  - 高度调整: {correct_rotation_height - current_height:.3f}m")
+        rospy.loginfo(f"Rotation height calculation:")
+        rospy.loginfo(f"  - Valve height: {valve_height:.3f}m")
+        rospy.loginfo(f"  - End-effector offset Z: {end_effector_offset_z:.3f}m")
+        rospy.loginfo(f"  - Correct rotation height: {correct_rotation_height:.3f}m")
+        rospy.loginfo(f"  - Current height: {current_height:.3f}m")
+        rospy.loginfo(f"  - Height adjustment: {correct_rotation_height - current_height:.3f}m")
         
         # Create rotation trajectory with correct height
-        # CRITICAL FIX: 使用新的恒定距离旋转轨迹生成器
-        # 确保末端执行器保持与阀门中心的恒定距离
+        # CRITICAL FIX: Use new constant distance rotation trajectory generator
+        # Ensure end-effector maintains constant distance from valve center
         rotation_traj = create_constant_distance_trajectory(
             current_uav_pos=current_pos,
             current_uav_yaw=self.current_yaw,
@@ -2080,10 +2080,10 @@ class RotateValveState(SingleUAVStateBase):
             end_effector_offset_x=0.246,
             end_effector_offset_y=0.0,
             end_effector_offset_z=0.0743823,
-            rotation_direction=1  # 逆时针旋转
+            rotation_direction=1  # counterclockwise rotation
         )
         
-        # 启动轨迹
+        # Start trajectory
         rotation_traj.start_trajectory()
         
         # PHASE 2.5: SLOW DESCENT TO ROTATION HEIGHT
@@ -2153,18 +2153,18 @@ class RotateValveState(SingleUAVStateBase):
                     return 'failed'
             
             # Log rotation statistics
-            rospy.loginfo("=== 恒定距离旋转统计信息 ===")
-            rospy.loginfo(f"执行时间: {rotation_stats.get('execution_time', 0):.1f}s")
-            rospy.loginfo(f"距离偏差违规次数: {rotation_stats.get('alignment_violations', 0)}")
-            rospy.loginfo(f"纠正应用次数: {rotation_stats.get('corrections_applied', 0)}")
-            rospy.loginfo(f"最大位置误差: {rotation_stats.get('max_position_error', 0):.3f}m")
-            rospy.loginfo(f"最大朝向误差: {rotation_stats.get('max_yaw_error', 0):.3f}rad")
-            rospy.loginfo("=== 恒定距离旋转理念验证 ===")
-            rospy.loginfo("✓ 末端执行器保持与阀门中心恒定距离")
-            rospy.loginfo("✓ 无人机中心轨迹根据末端执行器圆周运动计算")
-            rospy.loginfo("✓ 避免了强制三点共线的控制困难")
+            rospy.loginfo("=== Constant Distance Rotation Statistics ===")
+            rospy.loginfo(f"Execution time: {rotation_stats.get('execution_time', 0):.1f}s")
+            rospy.loginfo(f"Distance deviation violations: {rotation_stats.get('alignment_violations', 0)}")
+            rospy.loginfo(f"Corrections applied: {rotation_stats.get('corrections_applied', 0)}")
+            rospy.loginfo(f"Max position error: {rotation_stats.get('max_position_error', 0):.3f}m")
+            rospy.loginfo(f"Maximum yaw error: {rotation_stats.get('max_yaw_error', 0):.3f}rad")
+            rospy.loginfo("=== Constant Distance Rotation Concept Verification ===")
+            rospy.loginfo("✓ End effector maintains constant distance to valve center")
+            rospy.loginfo("✓ UAV center trajectory calculated based on end-effector circular motion")
+            rospy.loginfo("✓ Avoided difficult control of forced three-point collinearity")
             
-            rospy.loginfo("恒定距离阀门旋转完成")
+            rospy.loginfo("Constant distance valve rotation completed")
             return 'succeeded'
             
         except Exception as e:
@@ -2196,7 +2196,7 @@ class RotateValveState(SingleUAVStateBase):
         feedback_frequency = rospy.get_param('~feedback_frequency', 50)
         alignment_check_interval = rospy.get_param('~alignment_check_interval', 0.1)
         
-        rospy.loginfo(f"执行反馈控制旋转: 反馈频率={feedback_frequency}Hz, 对齐检查间隔={alignment_check_interval}s")
+        rospy.loginfo(f"Executing feedback control rotation: feedback frequency={feedback_frequency}Hz, alignment check interval={alignment_check_interval}s")
         
         try:
             stats = feedback_controller.execute_constant_distance_rotation(
@@ -2206,13 +2206,13 @@ class RotateValveState(SingleUAVStateBase):
                 alignment_check_interval=alignment_check_interval
             )
             
-            rospy.loginfo("反馈控制旋转执行完成")
+            rospy.loginfo("Feedback control rotation execution completed")
             return stats
             
         except Exception as e:
-            rospy.logerr(f"反馈控制旋转失败: {e}")
+            rospy.logerr(f"Feedback control rotation failed: {e}")
             # Fallback to original implementation
-            rospy.loginfo("回退到原始轨迹执行方法")
+            rospy.loginfo("Falling back to original trajectory execution method")
             return self.execute_rotation_trajectory_fallback(rotation_traj)
     
     def execute_rotation_trajectory_fallback(self, rotation_traj):
@@ -2240,10 +2240,10 @@ class RotateValveState(SingleUAVStateBase):
         previous_target_pos = None
         while not rospy.is_shutdown() and not self.emergency_stop.is_set():
             # Get next trajectory point
-            # CRITICAL FIX: 使用新的恒定距离轨迹生成器方法
+            # CRITICAL FIX: Use new constant distance trajectory generator method
             result = rotation_traj.get_next_uav_position_and_yaw()
             if result is None:
-                rospy.loginfo("恒定距离旋转轨迹完成")
+                rospy.loginfo("Constant distance rotation trajectory completed")
                 break
             
             target_pos, target_yaw = result
@@ -2251,16 +2251,16 @@ class RotateValveState(SingleUAVStateBase):
             # Check trajectory continuity for smooth motion
             if previous_target_pos is not None:
                 if not rotation_traj.check_trajectory_continuity(previous_target_pos, target_pos):
-                    rospy.logwarn("轨迹不连续，可能影响运动平滑性")
+                    rospy.logwarn("Trajectory discontinuity detected, may affect motion smoothness")
             previous_target_pos = target_pos
             
             # Debug: Log trajectory points occasionally
             if point_count % 50 == 0:  # Every 1 second at 50Hz
                 current_angle = rotation_traj.get_current_angle()
                 if current_angle is not None:
-                    rospy.loginfo(f"轨迹点 {point_count}: pos=[{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}], yaw={target_yaw:.3f}, angle={current_angle*180/math.pi:.1f}°")
+                    rospy.loginfo(f"Trajectory point {point_count}: pos=[{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}], yaw={target_yaw:.3f}, angle={current_angle*180/math.pi:.1f}°")
                 else:
-                    rospy.loginfo(f"轨迹点 {point_count}: pos=[{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}], yaw={target_yaw:.3f}")
+                    rospy.loginfo(f"Trajectory point {point_count}: pos=[{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}], yaw={target_yaw:.3f}")
                 
                 current_pos = self.get_current_position()
                 if current_pos is not None:
@@ -2286,7 +2286,7 @@ class RotateValveState(SingleUAVStateBase):
                     distance_status = rotation_traj.monitor_end_effector_distance(
                         current_pos, self.current_yaw, tolerance=0.02)
                     if distance_status['status'] == 'warning':
-                        rospy.logwarn(f"末端执行器距离监控警告: {distance_status['distance_error']:.3f}m")
+                        rospy.logwarn(f"End-effector distance monitoring warning: {distance_status['distance_error']:.3f}m")
                         stats['alignment_violations'] += 1
             
             point_count += 1

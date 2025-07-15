@@ -35,7 +35,7 @@ class EnhancedRotateValveState(RotateValveState):
         """
         Execute valve rotation with constant distance feedback control
         """
-        rospy.loginfo("开始增强型阀门旋转（恒定距离反馈控制）")
+        rospy.loginfo("Starting enhanced valve rotation (constant distance feedback control)")
         
         # Initialize unified motion controller if not already done
         if self.feedback_controller is None:
@@ -75,7 +75,7 @@ class EnhancedRotateValveState(RotateValveState):
             feedback_frequency = rospy.get_param('~feedback_frequency', 50)
             alignment_check_interval = rospy.get_param('~alignment_check_interval', 0.1)
             
-            rospy.loginfo(f"执行反馈控制旋转: 角度={rotation_angle}°, 步数={rotation_steps}, 距离={end_effector_distance}m")
+            rospy.loginfo(f"Executing feedback control rotation: angle={rotation_angle}°, steps={rotation_steps}, distance={end_effector_distance}m")
             
             stats = self.feedback_controller.execute_constant_distance_rotation(
                 trajectory=trajectory,

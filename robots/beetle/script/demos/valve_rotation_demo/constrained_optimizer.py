@@ -77,7 +77,7 @@ class ConstrainedInsertionOptimizer:
     
     def _objective_function(self, x, current_pos, current_yaw):
         """
-        径向配置优化目标函数
+        Radial configuration optimization objective function
         
         Args:
             x: [body_x, body_y, body_yaw] - optimization variables
@@ -94,36 +94,34 @@ class ConstrainedInsertionOptimizer:
         end_eff_x = body_x + self.end_effector_length * math.cos(body_yaw)
         end_eff_y = body_y + self.end_effector_length * math.sin(body_yaw)
         
-        # 主要目标：优化径向配置的几何质量
-        # 1. 末端执行器到阀门中心的距离（应该接近但小于阀门半径）
+        # Primary objective: optimize radial configuration geometric quality
+        # 1. End-effector to valve center distance (should be close but less than valve radius)
         end_eff_valve_distance = math.sqrt((end_eff_x - valve_center_x)**2 + 
                                           (end_eff_y - valve_center_y)**2)
         
-        # 理想的末端执行器距离：接近阀门半径但留有小间隙
-        ideal_end_eff_distance = self.valve_radius - 0.02  # 2cm间隙
+        # Ideal end-effector distance: close to valve radius but with small gap
+        ideal_end_eff_distance = self.valve_radius - 0.02  # 2cm gap
         distance_error = abs(end_eff_valve_distance - ideal_end_eff_distance)
         
-        # 2. 径向对齐质量：机体-末端执行器-阀门中心的共线性
+        # 2. Body safety distance (no longer enforces three-point collinearity)
         body_valve_distance = math.sqrt((body_x - valve_center_x)**2 + 
                                        (body_y - valve_center_y)**2)
         
-        # 计算角度偏差
-        body_angle = math.atan2(body_y - valve_center_y, body_x - valve_center_x)
-        end_eff_angle = math.atan2(end_eff_y - valve_center_y, end_eff_x - valve_center_x)
+        # Ensure body maintains safe distance outside end-effector
+        min_body_distance = self.valve_radius + 0.05  # Valve radius + 5cm safety margin
+        body_safety_error = max(0, min_body_distance - body_valve_distance)
         
-        angle_diff = abs(self._normalize_angle(body_angle - end_eff_angle))
-        angle_diff = min(angle_diff, 2*math.pi - angle_diff)
-        
-        # 3. 次要目标：最小化移动距离和角度变化
+        # 3. Secondary objective: minimize movement distance and angle change
         approach_distance = math.sqrt((body_x - current_pos[0])**2 + 
                                      (body_y - current_pos[1])**2)
         yaw_change = abs(self._normalize_angle(body_yaw - current_yaw))
         
-        # 综合目标函数（权重化）
-        objective = (5.0 * distance_error +      # 主要：末端执行器距离优化
-                    10.0 * angle_diff +          # 主要：径向对齐质量
-                    1.0 * approach_distance +    # 次要：移动距离
-                    1.0 * yaw_change)           # 次要：角度变化
+        # Comprehensive objective function (weighted)
+        # Removed radial alignment quality (three-point collinearity) constraint
+        objective = (5.0 * distance_error +      # Primary: end-effector distance optimization
+                    3.0 * body_safety_error +    # Primary: body safety distance
+                    1.0 * approach_distance +    # Secondary: movement distance
+                    1.0 * yaw_change)           # Secondary: angle change
         
         return objective
     
@@ -193,24 +191,26 @@ class ConstrainedInsertionOptimizer:
         body_angle = math.atan2(body_y - valve_center_y, body_x - valve_center_x)
         end_eff_angle = math.atan2(end_eff_y - valve_center_y, end_eff_x - valve_center_x)
         
-        # 角度差异约束：机体和末端执行器应该在同一径向方向（角度差异小于30°）
-        angle_diff = abs(self._normalize_angle(body_angle - end_eff_angle))
-        angle_diff = min(angle_diff, 2*math.pi - angle_diff)  # 取较小角度
-        max_angle_deviation = math.pi/6  # 30°最大偏差
-        radial_alignment_constraint = max_angle_deviation - angle_diff
-        constraints.append(radial_alignment_constraint)
+        # REMOVED: 三点共线约束 (机体COG - 末端执行器 - 阀门中心)
+        # 之前的角度差异约束已被移除，允许更灵活的插入配置
+        # angle_diff = abs(self._normalize_angle(body_angle - end_eff_angle))
+        # angle_diff = min(angle_diff, 2*math.pi - angle_diff)  # 取较小角度
+        # max_angle_deviation = math.pi/6  # 30°最大偏差
+        # radial_alignment_constraint = max_angle_deviation - angle_diff
+        # constraints.append(radial_alignment_constraint)
         
-        # 距离约束：机体必须在末端执行器外侧
-        # 确保 body_valve_distance > end_eff_valve_distance
-        radial_distance_constraint = body_valve_distance - end_eff_valve_distance - 0.05  # 5cm缓冲
-        constraints.append(radial_distance_constraint)
+        # NEW CONSTRAINT: Valve center to body center distance must be greater than 
+        # end-effector center to valve center distance
+        # This ensures the body stays outside the end-effector working area
+        valve_body_distance_constraint = body_valve_distance - end_eff_valve_distance - 0.02  # 2cm buffer
+        constraints.append(valve_body_distance_constraint)
         
-        # 末端执行器必须在阀门半径内才能抓取
+        # End-effector must be within valve radius to grasp
         end_eff_reach_constraint = self.valve_radius - end_eff_valve_distance
         constraints.append(end_eff_reach_constraint)
         
-        # 机体最小安全距离约束
-        min_body_distance = self.valve_radius + 0.05  # 阀门半径 + 5cm安全间隙
+        # Body minimum safety distance constraint
+        min_body_distance = self.valve_radius + 0.05  # Valve radius + 5cm safety margin
         body_safety_constraint = body_valve_distance - min_body_distance
         constraints.append(body_safety_constraint)
         
@@ -318,46 +318,46 @@ class ConstrainedInsertionOptimizer:
                 else:
                     selected_gap = 'beam2_beam0'
                 
-                rospy.loginfo("=== 径向配置优化结果 ===")
+                rospy.loginfo("=== Radial Configuration Optimization Results ===")
                 rospy.loginfo(f"Optimization successful: {result.success}")
                 rospy.loginfo(f"Objective value: {result.fun:.4f}")
                 rospy.loginfo(f"Selected gap: {selected_gap}")
                 
-                # 计算径向配置的几何关系
+                # Calculate radial configuration geometric relationships
                 valve_center_x, valve_center_y, _ = self.valve_pos
                 
-                # 机体到阀门中心的距离和角度
+                # Body to valve center distance and angle
                 body_valve_distance = math.sqrt((optimal_body_x - valve_center_x)**2 + 
                                                (optimal_body_y - valve_center_y)**2)
                 body_angle = math.atan2(optimal_body_y - valve_center_y, optimal_body_x - valve_center_x)
                 
-                # 末端执行器到阀门中心的距离和角度
+                # End-effector to valve center distance and angle
                 end_eff_valve_distance = math.sqrt((optimal_end_eff_x - valve_center_x)**2 + 
                                                   (optimal_end_eff_y - valve_center_y)**2)
                 end_eff_angle = math.atan2(optimal_end_eff_y - valve_center_y, optimal_end_eff_x - valve_center_x)
                 
-                # 径向对齐质量
+                # Radial alignment quality
                 angle_diff = abs(self._normalize_angle(body_angle - end_eff_angle))
                 angle_diff = min(angle_diff, 2*math.pi - angle_diff)
                 
-                rospy.loginfo("=== 径向配置几何关系 ===")
-                rospy.loginfo(f"阀门中心: [{valve_center_x:.3f}, {valve_center_y:.3f}]")
-                rospy.loginfo(f"机体位置: [{optimal_body_x:.3f}, {optimal_body_y:.3f}] (距离阀门中心: {body_valve_distance:.3f}m)")
-                rospy.loginfo(f"末端执行器位置: [{optimal_end_eff_x:.3f}, {optimal_end_eff_y:.3f}] (距离阀门中心: {end_eff_valve_distance:.3f}m)")
-                rospy.loginfo(f"机体角度: {body_angle*180/math.pi:.1f}°")
-                rospy.loginfo(f"末端执行器角度: {end_eff_angle*180/math.pi:.1f}°")
-                rospy.loginfo(f"径向对齐偏差: {angle_diff*180/math.pi:.1f}°")
-                rospy.loginfo(f"径向配置质量: {'优秀' if angle_diff < 0.1 else '良好' if angle_diff < 0.2 else '需要改进'}")
+                rospy.loginfo("=== Radial Configuration Geometric Relationships ===")
+                rospy.loginfo(f"Valve center: [{valve_center_x:.3f}, {valve_center_y:.3f}]")
+                rospy.loginfo(f"Body position: [{optimal_body_x:.3f}, {optimal_body_y:.3f}] (distance to valve center: {body_valve_distance:.3f}m)")
+                rospy.loginfo(f"End-effector position: [{optimal_end_eff_x:.3f}, {optimal_end_eff_y:.3f}] (distance to valve center: {end_eff_valve_distance:.3f}m)")
+                rospy.loginfo(f"Body angle: {body_angle*180/math.pi:.1f}°")
+                rospy.loginfo(f"End-effector angle: {end_eff_angle*180/math.pi:.1f}°")
+                rospy.loginfo(f"Radial alignment deviation: {angle_diff*180/math.pi:.1f}°")
+                rospy.loginfo(f"Radial configuration quality: {'Excellent' if angle_diff < 0.1 else 'Good' if angle_diff < 0.2 else 'Needs improvement'}")
                 
-                # 验证理想的径向扩张配置
+                # Verify ideal radial expansion configuration
                 theoretical_body_distance = end_eff_valve_distance + self.end_effector_length
                 distance_accuracy = abs(body_valve_distance - theoretical_body_distance)
                 
-                rospy.loginfo("=== 径向扩张配置验证 ===")
-                rospy.loginfo(f"理论机体距离: {theoretical_body_distance:.3f}m")
-                rospy.loginfo(f"实际机体距离: {body_valve_distance:.3f}m")
-                rospy.loginfo(f"距离精度: {distance_accuracy:.3f}m")
-                rospy.loginfo(f"配置类型: {'理想径向扩张' if distance_accuracy < 0.05 and angle_diff < 0.1 else '约束优化结果'}")
+                rospy.loginfo("=== Radial Expansion Configuration Verification ===")
+                rospy.loginfo(f"Theoretical body distance: {theoretical_body_distance:.3f}m")
+                rospy.loginfo(f"Actual body distance: {body_valve_distance:.3f}m")
+                rospy.loginfo(f"Distance accuracy: {distance_accuracy:.3f}m")
+                rospy.loginfo(f"Configuration type: {'Ideal radial expansion' if distance_accuracy < 0.05 and angle_diff < 0.1 else 'Constrained optimization result'}")
                 
                 rospy.loginfo(f"Optimal body yaw: {optimal_body_yaw:.3f} rad ({optimal_body_yaw*180/math.pi:.1f}°)")
                 rospy.loginfo(f"End-effector angle in valve frame: {normalized_angle*180/math.pi:.1f}°")

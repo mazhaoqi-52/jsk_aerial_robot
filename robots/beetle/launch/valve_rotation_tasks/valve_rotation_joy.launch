@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 手动插入后自动对齐和旋转阀门 Launch文件 -->
+    
+    <!-- 参数配置 -->
+    <arg name="module_id" default="1" />
+    <arg name="rotation_angle" default="1.5708" />  <!-- π/2 = 90度 -->
+    <arg name="rotation_duration" default="8.0" />
+    <arg name="ascent_height" default="0.5" />
+    
+    <!-- 阀门位置参数 -->
+    <arg name="valve_x" default="3.0" />
+    <arg name="valve_y" default="0.0" />
+    <arg name="valve_z" default="0.55" />
+    <arg name="valve_yaw" default="0.0" />
+    
+    <!-- 对齐控制参数 -->
+    <arg name="alignment_position_tolerance" default="0.01" />
+    <arg name="alignment_yaw_tolerance" default="0.05" />
+    <arg name="alignment_timeout" default="15.0" />
+    
+    <!-- 增强控制器参数 -->
+    <arg name="strict_alignment_enabled" default="true" />
+    <arg name="alignment_correction_enabled" default="true" />
+    <arg name="alignment_control_gain" default="0.8" />
+    <arg name="alignment_check_frequency" default="25" />
+    
+    <!-- 手柄控制参数 -->
+    <arg name="joy_deadzone" default="0.1" />
+    
+    <!-- 启动简化版手动插入后自动旋转程序 -->
+    <node pkg="beetle" type="valve_rotation_fang_single_joy.py" name="valve_rotation_joy" output="screen">
+        <!-- 基本参数 -->
+        <param name="module_id" value="$(arg module_id)" />
+        <param name="auto_start" value="false" />
+        
+        <!-- 阀门位置参数（由原始状态机处理） -->
+        <rosparam param="valve_pos">[$(arg valve_x), $(arg valve_y), $(arg valve_z)]</rosparam>
+        <param name="valve_yaw" value="$(arg valve_yaw)" />
+        
+        <!-- 旋转参数（由原始状态机处理） -->
+        <param name="rotation_angle" value="$(arg rotation_angle)" />
+        <param name="rotation_duration" value="$(arg rotation_duration)" />
+        <param name="alignment_correction_enabled" value="$(arg alignment_correction_enabled)" />
+        <param name="alignment_control_gain" value="$(arg alignment_control_gain)" />
+        <param name="alignment_check_frequency" value="$(arg alignment_check_frequency)" />
+        
+        <!-- 末端执行器参数 -->
+        <rosparam param="end_effector_offset">[0.0, 0.0, -0.246]</rosparam>
+        <param name="end_effector_length" value="0.246" />
+        
+        <!-- 旋转轨迹稳定性参数 -->
+        <param name="rotation_radius_tolerance" value="0.005" />
+        <param name="rotation_height_tolerance" value="0.01" />
+        
+        <!-- 手柄控制参数 -->
+        <param name="joy_deadzone" value="$(arg joy_deadzone)" />
+        
+        <!-- 紧急检测参数 -->
+        <param name="stuck_threshold" value="25.0" />
+        <param name="movement_threshold" value="0.02" />
+        <param name="yaw_threshold" value="0.1" />
+    </node>
+    
+    <!-- 启动手柄节点 -->
+    <node pkg="joy" type="joy_node" name="joy_node" output="screen">
+        <param name="dev" value="/dev/input/js0" />
+        <param name="deadzone" value="$(arg joy_deadzone)" />
+        <param name="autorepeat_rate" value="10.0" />
+    </node>
+    
+    <!-- 启动必要的服务节点 -->
+    <node pkg="gazebo_ros_link_attacher" type="gazebo_ros_link_attacher" name="link_attacher_node" output="screen" />
+    
+    <!-- 信息显示 -->
+    <node pkg="rostopic" type="rostopic" name="status_monitor" 
+          args="echo /valve_rotation_status" output="screen" />
+    
+    <!-- 调试信息 -->
+    <group if="$(eval arg('module_id') == 1)">
+        <node pkg="rostopic" type="rostopic" name="uav_pos_monitor" 
+              args="echo /uav1/nav --filter=/uav1/nav/pos_x,/uav1/nav/pos_y,/uav1/nav/pos_z,/uav1/nav/yaw -r 2" output="screen" />
+    </group>
+    
+    <!-- 参数信息打印 -->
+    <node pkg="rospy" type="rospy" name="param_info" output="screen" 
+          args="$(find beetle)/script/demos/valve_rotation_demo/print_launch_params.py" />
+
+</launch>

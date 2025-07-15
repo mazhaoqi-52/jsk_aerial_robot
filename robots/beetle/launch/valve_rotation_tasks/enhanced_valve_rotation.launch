@@ -1,0 +1,102 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Enhanced Valve Rotation with Strict Alignment Control -->
+  
+  <!-- Robot Configuration -->
+  <arg name="real_machine" default="true" />
+  <arg name="simulation" default="false" />
+  <arg name="module_id" default="1" />
+  
+  <!-- Basic Parameters -->
+  <arg name="rotation_angle" default="1.5708" />  <!-- π/2 radians = 90 degrees -->
+  <arg name="hover_duration" default="2.0" />
+  <arg name="approach_height" default="0.5" />
+  
+  <!-- === ENHANCED STRICT ALIGNMENT CONTROL === -->
+  <!-- Enable strict alignment monitoring and correction -->
+  <arg name="strict_alignment_enabled" default="true" />
+  <arg name="alignment_correction_enabled" default="true" />
+  
+  <!-- End-effector parameters -->
+  <arg name="end_effector_offset_x" default="0.0" />
+  <arg name="end_effector_offset_y" default="0.0" />
+  <arg name="end_effector_offset_z" default="-0.246" />  <!-- 24.6cm below COG -->
+  
+  <!-- Alignment tolerances -->
+  <arg name="alignment_position_tolerance" default="0.01" />    <!-- 1cm -->
+  <arg name="alignment_yaw_tolerance" default="0.05" />         <!-- ~2.9 degrees -->
+  
+  <!-- Rotation trajectory stability -->
+  <arg name="rotation_radius_tolerance" default="0.005" />      <!-- 0.5cm -->
+  <arg name="rotation_height_tolerance" default="0.01" />       <!-- 1cm -->
+  
+  <!-- Control parameters -->
+  <arg name="alignment_control_gain" default="0.8" />
+  <arg name="alignment_check_frequency" default="25" />         <!-- Hz -->
+  
+  <!-- Angular insertion parameters -->
+  <arg name="angular_insertion_enabled" default="false" />
+  
+  <!-- Debug parameters -->
+  <arg name="debug_alignment" default="false" />
+  <arg name="debug_trajectory" default="false" />
+  
+  <!-- Start valve position node -->
+  <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
+    <arg name="real_machine" value="$(arg real_machine)" />
+    <arg name="simulation" value="$(arg simulation)" />
+  </include>
+  
+  <!-- Start enhanced valve rotation node -->
+  <group ns="beetle$(arg module_id)">
+    <node pkg="beetle" type="valve_rotation_fang_single.py" name="enhanced_valve_rotation"
+          output="screen" required="true">
+      
+      <!-- Basic parameters -->
+      <param name="module_id" value="$(arg module_id)" />
+      <param name="rotation_angle" value="$(arg rotation_angle)" />
+      <param name="hover_duration" value="$(arg hover_duration)" />
+      <param name="approach_height" value="$(arg approach_height)" />
+      <param name="real_machine" value="$(arg real_machine)" />
+      <param name="simulation" value="$(arg simulation)" />
+      
+      <!-- === ENHANCED STRICT ALIGNMENT CONTROL === -->
+      <param name="strict_alignment_enabled" value="$(arg strict_alignment_enabled)" />
+      <param name="alignment_correction_enabled" value="$(arg alignment_correction_enabled)" />
+      
+      <!-- End-effector parameters -->
+      <rosparam param="end_effector_offset">[$(arg end_effector_offset_x), $(arg end_effector_offset_y), $(arg end_effector_offset_z)]</rosparam>
+      
+      <!-- Alignment tolerances -->
+      <param name="alignment_position_tolerance" value="$(arg alignment_position_tolerance)" />
+      <param name="alignment_yaw_tolerance" value="$(arg alignment_yaw_tolerance)" />
+      
+      <!-- Rotation trajectory stability -->
+      <param name="rotation_radius_tolerance" value="$(arg rotation_radius_tolerance)" />
+      <param name="rotation_height_tolerance" value="$(arg rotation_height_tolerance)" />
+      
+      <!-- Control parameters -->
+      <param name="alignment_control_gain" value="$(arg alignment_control_gain)" />
+      <param name="alignment_check_frequency" value="$(arg alignment_check_frequency)" />
+      
+      <!-- Angular insertion parameters -->
+      <param name="angular_insertion_enabled" value="$(arg angular_insertion_enabled)" />
+      
+      <!-- Debug parameters -->
+      <param name="debug_alignment" value="$(arg debug_alignment)" />
+      <param name="debug_trajectory" value="$(arg debug_trajectory)" />
+      
+      <!-- Emergency detection parameters -->
+      <param name="stuck_threshold" value="25.0" />
+      <param name="movement_threshold" value="0.02" />
+      <param name="yaw_threshold" value="0.1" />
+      
+    </node>
+  </group>
+  
+  <!-- Information display -->
+  <node pkg="rostopic" type="rostopic" name="alignment_info" 
+        args="echo /beetle$(arg module_id)/alignment_status" output="screen" 
+        if="$(arg debug_alignment)" />
+  
+</launch>

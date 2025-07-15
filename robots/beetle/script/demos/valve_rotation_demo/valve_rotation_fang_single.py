@@ -1,10 +1,7 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Single UAV Valve Rotation using SMACH State Machine
-Physical Parameters:
-- valve_radius: 0.1225m, valve_beam_width: 0.0185m
-- rotation_direction: 1 (anticlockwise), -1 (clockwise)
-- insertion_offset: 0.015m (safety margin)
+Optimized version with reduced redundancy and improved readability.
 """
 
 import sys
@@ -14,83 +11,31 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'))
 import rospy
 import smach
+import smach_ros
 import time
 import math
 import threading
-import numpy as np
+
 from aerial_robot_msgs.msg import FlightNav
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from nav_msgs.msg import Odometry
 from tf.transformations import euler_from_quaternion
 from trajectory import AlignToGraspTrajectory, ValveRotationTrajectory
 from insertion_optimizer import InsertionOptimizer
+from constrained_optimizer import ConstrainedInsertionOptimizer
+from motion_controller import MotionController
 
-class MotionController:
-    @staticmethod
-    def execute_poly_motion_pose(pub, start, target, avg_speed, timeout=30):
-        """Execute polynomial motion and wait for completion"""
-        from trajectory import PolynomialTrajectory
-        
-        distance = math.sqrt((target[0]-start[0])**2 + (target[1]-start[1])**2 + (target[2]-start[2])**2)
-        duration = distance / max(avg_speed, 0.05)
-        
-        rospy.loginfo(f"Trajectory: {distance:.2f}m in {duration:.1f}s at {avg_speed}m/s")
-        
-        traj = PolynomialTrajectory(duration)
-        traj.generate_trajectory(start, target)
-        
-        rate = rospy.Rate(50)
-        start_time = time.time()
-        last_progress_time = start_time
-        
-        while not rospy.is_shutdown() and (time.time() - start_time) < timeout:
-            pt = traj.evaluate()
-            if pt is None:
-                rospy.loginfo("Trajectory completed successfully")
-                return True
-            
-            # Progress feedback every 5 seconds
-            current_time = time.time()
-            if current_time - last_progress_time > 5.0:
-                elapsed = current_time - start_time
-                progress = (elapsed / duration) * 100
-                rospy.loginfo(f"Motion progress: {progress:.1f}% ({elapsed:.1f}s/{duration:.1f}s)")
-                last_progress_time = current_time
-            
-            msg = FlightNav()
-            msg.target = 1
-            msg.pos_xy_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_x = pt[0]
-            msg.target_pos_y = pt[1]
-            msg.pos_z_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_z = pt[2]
-            pub.publish(msg)
-            rate.sleep()
-        
-        rospy.logwarn(f"Trajectory timed out after {timeout}s")
-        return False
-    
-    @staticmethod
-    def send_trajectory_point(pub, pos, yaw):
-        """Send single trajectory point with yaw"""
-        msg = FlightNav()
-        msg.target = 1
-        msg.pos_xy_nav_mode = FlightNav.POS_MODE
-        msg.target_pos_x = pos[0]
-        msg.target_pos_y = pos[1]
-        msg.pos_z_nav_mode = FlightNav.POS_MODE
-        msg.target_pos_z = pos[2]
-        msg.yaw_nav_mode = FlightNav.POS_MODE
-        msg.target_yaw = yaw
-        pub.publish(msg)
 
 class SingleUAVStateBase(smach.State):
-    def __init__(self, outcomes, module_id=1):
-        smach.State.__init__(self, outcomes=outcomes)
+    def __init__(self, outcomes, input_keys=None, output_keys=None, module_id=1):
+        smach.State.__init__(self, outcomes=outcomes, input_keys=input_keys or [], output_keys=output_keys or [])
         self.module_id = module_id
         
         # Publishers and subscribers
         self.pub = rospy.Publisher(f"/beetle{module_id}/uav/nav", FlightNav, queue_size=1)
+        
+        # Initialize motion controller for this state
+        self.motion_controller = MotionController(self)
         
         # Get simulation and real_machine parameters
         self.simulation = rospy.get_param("~simulation", False)
@@ -219,8 +164,8 @@ class SingleUAVStateBase(smach.State):
         safe_height = max(current_pos[2] + 0.5, start_position[2] + 0.3)
         ascent_pos = (current_pos[0], current_pos[1], safe_height)
         
-        success = MotionController.execute_poly_motion_pose(
-            self.pub, current_pos, ascent_pos, 0.1, timeout=20)
+        success = self.motion_controller.execute_poly_motion_with_feedback(
+            current_pos, ascent_pos, 0.1, timeout=20)
         
         if not success:
             rospy.logerr("Emergency ascent failed")
@@ -240,8 +185,8 @@ class SingleUAVStateBase(smach.State):
         
         rospy.loginfo(f"Emergency return: {distance:.2f}m at {move_speed}m/s")
         
-        success = MotionController.execute_poly_motion_pose(
-            self.pub, final_pos, start_position, move_speed, timeout=timeout)
+        success = self.motion_controller.execute_poly_motion_with_feedback(
+            final_pos, start_position, move_speed, timeout=timeout)
         
         return success
 
@@ -335,7 +280,7 @@ class InitializeStartPositionState(SingleUAVStateBase):
         return 'succeeded'
 
 class MoveToValveState(SingleUAVStateBase):
-    """Move to position above valve center (simple approach)"""
+    """Move to position above valve center"""
     def __init__(self, module_id=1, approach_height=0.5):
         SingleUAVStateBase.__init__(self, outcomes=['succeeded', 'failed'], module_id=module_id)
         self.approach_height = approach_height
@@ -347,67 +292,69 @@ class MoveToValveState(SingleUAVStateBase):
             return 'failed'
         
         start_pos = self.get_current_position()
-        if start_pos is None:
-            rospy.logerr("Failed to get current UAV position")
+        if start_pos is None or self.valve_pos is None:
+            rospy.logerr("Failed to get current UAV position or valve position")
             return 'failed'
         
-        if self.valve_pos is None:
-            rospy.logerr("Valve position is not available")
-            return 'failed'
-        
-        rospy.loginfo(f"Moving from {start_pos} to valve at {self.valve_pos}")
-        
-        # Simple approach: move to position above valve center
-        # Let the AlignToGraspTrajectory handle the precise positioning
+        # Move to position above valve center
         target_pos = (self.valve_pos[0], self.valve_pos[1], 
                      self.valve_pos[2] + self.approach_height)
         
-        rospy.loginfo(f"Target position (above valve center): {target_pos}")
-        
-        # Calculate distance and adjust speed/timeout for long moves
+        # Calculate distance and set conservative speed
         distance = math.sqrt((target_pos[0]-start_pos[0])**2 + 
                            (target_pos[1]-start_pos[1])**2 + 
                            (target_pos[2]-start_pos[2])**2)
         
-        # Use consistent slow speed for stability and precision
-        move_speed = 0.1  # Conservative speed for all moves
-        # Generous timeout: at least 3x the expected time for slow moves
+        move_speed = 0.1  # Conservative speed for stability
         timeout = max(90, distance / move_speed * 3.0)
         
-        rospy.loginfo(f"Moving {distance:.2f}m at {move_speed}m/s (timeout: {timeout:.0f}s)")
+        rospy.loginfo(f"Moving {distance:.2f}m at {move_speed}m/s")
         
-        success = MotionController.execute_poly_motion_pose(
-            self.pub, start_pos, target_pos, move_speed, timeout=timeout)
+        success = self.motion_controller.execute_poly_motion_with_feedback(
+            start_pos, target_pos, move_speed, timeout=timeout)
         
-        if success:
-            rospy.loginfo("Successfully moved to valve position")
-            return 'succeeded'
-        else:
-            rospy.logerr("Failed to move to valve position")
-            return 'failed'
+        return 'succeeded' if success else 'failed'
 
 class DescendAndContactState(SingleUAVStateBase):
     """Improved 4-stage insertion: Approach → Yaw Adjustment → Descent → Rotation"""
-    def __init__(self, module_id=1, contact_force_threshold=3.0, descent_speed=0.05,  # Increased from 2.0 to 3.0N
-                 use_staged_insertion=True, pre_insertion_distance=0.025,  # Reduced from 0.03 to 0.025
-                 yaw_adjustment_angle=0.08, circumferential_offset=0.015):  # Reduced offsets
+    def __init__(self, module_id=1, contact_force_threshold=3.0, descent_speed=0.05,
+                 use_staged_insertion=True, pre_insertion_distance=0.035,  # Increased from 0.015 to 0.035 for better insertion
+                 yaw_adjustment_angle=0.08, circumferential_offset=0.01):
         SingleUAVStateBase.__init__(self, outcomes=['succeeded', 'failed'], module_id=module_id)
         self.contact_force_threshold = contact_force_threshold
         self.descent_speed = descent_speed
-        self.z_offset = 0.01 if rospy.get_param("~simulation", True) else 0.21  # Reduced simulation offset
+        # CRITICAL: Adjust insertion approach to avoid valve handle plane blockage
+        # The valve handle plane blocks direct insertion, need angular approach
+        self.z_offset = -0.03 if rospy.get_param("~simulation", True) else 0.21  # Reduced from -0.05 to -0.03 for handle clearance
         self.use_staged_insertion = use_staged_insertion
         self.pre_insertion_distance = pre_insertion_distance
-        self.yaw_adjustment_angle = yaw_adjustment_angle  # Yaw adjustment for avoidance
-        self.circumferential_offset = circumferential_offset  # Circumferential offset distance
+        self.yaw_adjustment_angle = yaw_adjustment_angle
+        self.circumferential_offset = circumferential_offset
         
-        # Initialize insertion optimizer with real-time data capability
+        # NEW: Angular insertion parameters to avoid handle plane blockage
+        self.angular_insertion_enabled = True
+        self.insertion_angle_offset = 0.15  # 15cm offset for angular approach
+        self.handle_clearance_height = 0.08  # 8cm above valve center for handle clearance
+        
+        # Initialize both optimizers for comparison
         simulation = rospy.get_param("~simulation", True)
+        
+        # OLD: Simple heuristic optimizer
         self.optimizer = InsertionOptimizer(
             valve_radius=0.1225,
             valve_beam_width=0.0185,
-            safety_margin=0.008,  # Reduced safety margin for more precise insertion
+            safety_margin=0.008,
             module_id=module_id,
             simulation=simulation
+        )
+        
+        # NEW: Constrained optimization optimizer
+        self.constrained_optimizer = ConstrainedInsertionOptimizer(
+            valve_radius=0.1225,
+            valve_beam_width=0.0185,
+            end_effector_length=0.246,
+            safety_margin=0.005,
+            module_id=module_id
         )
         
         self._input_keys = ['start_position']
@@ -427,18 +374,14 @@ class DescendAndContactState(SingleUAVStateBase):
             return 'failed'
         
         start_pos = self.get_current_position()
-        if start_pos is None:
-            rospy.logerr("Failed to get current UAV position")
-            return 'failed'
-        
-        if self.valve_pos is None:
-            rospy.logerr("Valve position is not available")
+        if start_pos is None or self.valve_pos is None:
+            rospy.logerr("Failed to get current UAV position or valve position")
             return 'failed'
         
         # Store start position for emergency return
         userdata.start_position = start_pos
         
-        # Stage 1: Approach insertion point (with avoidance)
+        # Stage 1: Approach insertion point with avoidance
         rospy.loginfo("Stage 1: Approaching insertion point with avoidance...")
         if not self.approach_insertion_point_with_avoidance(start_pos):
             rospy.logerr("Failed to approach insertion point")
@@ -453,10 +396,9 @@ class DescendAndContactState(SingleUAVStateBase):
         # Stage 3: Descent to contact
         rospy.loginfo("Stage 3: Descending to establish contact...")
         
-        # CRITICAL FIX: Add stabilization delay after Stage 2 to prevent position jump
-        # This allows the control system to stabilize before starting descent
-        rospy.loginfo("Stabilization delay after Stage 2 to prevent position jump...")
-        time.sleep(1.0)  # 1 second delay for stabilization
+        # Stabilization delay after Stage 2 to prevent position jump
+        rospy.loginfo("Stabilization delay after Stage 2...")
+        time.sleep(1.0)
         
         # Log pre-descent state
         current_pos = self.get_current_position()
@@ -468,8 +410,7 @@ class DescendAndContactState(SingleUAVStateBase):
             rospy.logerr("Failed to descend to contact")
             return 'failed'
         
-        # Log post-descent state (get fresh position after descent)
-        time.sleep(0.1)  # Small delay to ensure position is updated
+        # Log post-descent state
         current_pos = self.get_current_position()
         if current_pos is not None:
             rospy.loginfo(f"Post-descent position: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
@@ -602,8 +543,9 @@ class DescendAndContactState(SingleUAVStateBase):
         # Execute circumferential adjustment with force monitoring
         return self.execute_circumferential_adjustment(current_pos, target_pos, target_yaw)
     
-    def execute_circumferential_adjustment(self, start_pos, target_pos, target_yaw):
-        """Execute circumferential adjustment with force monitoring"""
+    def execute_circumferential_adjustment(self, start_pos, target_pos, target_yaw, 
+                                           pos_threshold=0.03, yaw_threshold=0.08):
+        """Execute circumferential adjustment with force monitoring and feedback control."""
         # Calculate intermediate points for smooth circumferential movement
         center_x, center_y = self.valve_pos[0], self.valve_pos[1]
         
@@ -659,6 +601,30 @@ class DescendAndContactState(SingleUAVStateBase):
             interp_y = center_y + current_interp_radius * math.sin(current_interp_angle)
             interp_z = start_pos[2] + smooth_t * (target_pos[2] - start_pos[2])
             
+            # Send command
+            self.motion_controller.send_trajectory_point((interp_x, interp_y, interp_z), current_interp_yaw)
+
+            # Wait until UAV reaches the intermediate point
+            wait_start_time = time.time()
+            while not rospy.is_shutdown() and (time.time() - wait_start_time) < 1.0: # 1s timeout per point
+                current_pos = self.get_current_position()
+                if current_pos is None:
+                    rate.sleep()
+                    continue
+
+                pos_error = math.sqrt((interp_x - current_pos[0])**2 + 
+                                      (interp_y - current_pos[1])**2 + 
+                                      (interp_z - current_pos[2])**2)
+                yaw_error = abs(self.normalize_angle(current_interp_yaw - self.current_yaw))
+
+                if pos_error < pos_threshold and yaw_error < yaw_threshold:
+                    break
+                
+                self.motion_controller.send_trajectory_point((interp_x, interp_y, interp_z), current_interp_yaw)
+                rate.sleep()
+            else:
+                rospy.logwarn(f"Timeout waiting for circ. point. Pos err: {pos_error:.3f}, Yaw err: {yaw_error:.3f}")
+
             # Check force (very relaxed threshold for circumferential adjustment)
             current_force = self.get_contact_force_magnitude()
             # Use very high threshold for circumferential adjustment as UAV may touch valve structure
@@ -672,14 +638,9 @@ class DescendAndContactState(SingleUAVStateBase):
             if i % 10 == 0 and current_force > self.contact_force_threshold:
                 rospy.loginfo(f"Circumferential adjustment force: {current_force:.2f}N (threshold: {self.contact_force_threshold * 3.5:.2f}N)")
             
-            # Send command
-            MotionController.send_trajectory_point(self.pub, (interp_x, interp_y, interp_z), current_interp_yaw)
-            
             if i % 5 == 0:
                 progress = (i + 1) / (num_points + 1) * 100
                 rospy.loginfo(f"Circumferential adjustment progress: {progress:.1f}%")
-            
-            rate.sleep()
             
             if rospy.is_shutdown():
                 return False
@@ -726,8 +687,9 @@ class DescendAndContactState(SingleUAVStateBase):
         rospy.loginfo("Stage 4 completed - ready for rotation (no hold phase)")
         return True
     
-    def execute_smooth_trajectory(self, start_pos, target_pos, target_yaw, duration=5.0):
-        """Execute smooth trajectory with yaw control"""
+    def execute_smooth_trajectory(self, start_pos, target_pos, target_yaw, duration=5.0,
+                                  pos_threshold=0.03, yaw_threshold=0.08):
+        """Execute smooth trajectory with yaw control and feedback."""
         from trajectory import PolynomialTrajectory
         
         # Create trajectory
@@ -758,23 +720,46 @@ class DescendAndContactState(SingleUAVStateBase):
         
         rospy.loginfo(f"Trajectory: yaw from {start_yaw:.3f} to {final_target_yaw:.3f} (change: {yaw_diff:.3f} rad)")
         
-        while not rospy.is_shutdown() and (time.time() - start_time) < duration + 1.0:
+        while not rospy.is_shutdown() and (time.time() - start_time) < duration + 2.0: # Added 2s buffer
             pt = traj.evaluate()
-            if pt is None:
-                break
             
             # Interpolate yaw smoothly
             elapsed_time = time.time() - start_time
             if elapsed_time <= duration:
                 yaw_progress = elapsed_time / duration
                 smooth_yaw_progress = 3*yaw_progress**2 - 2*yaw_progress**3
-                current_yaw = start_yaw + smooth_yaw_progress * yaw_diff
+                current_target_yaw = start_yaw + smooth_yaw_progress * yaw_diff
             else:
-                current_yaw = final_target_yaw
+                current_target_yaw = final_target_yaw
+
+            if pt is None:
+                pt = target_pos # Ensure final point is the target
             
-            MotionController.send_trajectory_point(self.pub, pt, current_yaw)
-            rate.sleep()
-        
+            self.motion_controller.send_trajectory_point(pt, current_target_yaw)
+
+            # Wait until UAV reaches the intermediate point
+            wait_start_time = time.time()
+            while not rospy.is_shutdown() and (time.time() - wait_start_time) < 1.0: # 1s timeout per point
+                current_pos = self.get_current_position()
+                if current_pos is None:
+                    rate.sleep()
+                    continue
+
+                pos_error = math.sqrt((pt[0] - current_pos[0])**2 + 
+                                      (pt[1] - current_pos[1])**2 + 
+                                      (pt[2] - current_pos[2])**2)
+                yaw_error = abs(self.normalize_angle(current_target_yaw - self.current_yaw))
+
+                if pos_error < pos_threshold and yaw_error < yaw_threshold:
+                    break
+                
+                self.motion_controller.send_trajectory_point(pt, current_target_yaw)
+                rate.sleep()
+            
+            if pt is target_pos:
+                break # Exit loop if we've processed the final point
+
+        rospy.loginfo("Smooth trajectory with feedback completed.")
         return True
     
     def execute_original_insertion(self, userdata):
@@ -824,7 +809,7 @@ class DescendAndContactState(SingleUAVStateBase):
             valve_radius=0.1225,
             valve_beam_width=0.0185,
             rotation_direction=1,
-            insertion_offset=0.015 + self.pre_insertion_distance  # Add safe distance
+            insertion_offset=0.015 + self.pre_insertion_distance  # Increased from 0.005 to 0.015 for deeper insertion
         )
         
         align_traj.set_start_position(start_pos)
@@ -859,7 +844,7 @@ class DescendAndContactState(SingleUAVStateBase):
             valve_radius=0.1225,
             valve_beam_width=0.0185,
             rotation_direction=1,
-            insertion_offset=0.015  # Final precise position
+            insertion_offset=0.015  # Increased from 0.005 to 0.015 for deeper insertion
         )
         
         align_traj.set_start_position(current_pos)
@@ -888,24 +873,56 @@ class DescendAndContactState(SingleUAVStateBase):
         return True
     
     def align_to_grasp_position(self, start_pos):
-        """Align to grasp position at current height"""
-        # Use AlignToGraspTrajectory but keep at current height
+        """
+        使用optimizer结果来对齐到抓取位置
+        CRITICAL FIX: 集成optimizer的结果到轨迹生成中
+        """
+        # 使用optimizer获取最优插入策略
+        rospy.loginfo("使用optimizer获取最优插入策略...")
+        
+        # 等待必要的数据
+        if not self.wait_for_positions():
+            return False
+        
+        # 获取最优策略
+        optimal_strategy = self.optimizer.evaluate_real_time_strategy()
+        if optimal_strategy is None:
+            rospy.logerr("无法获取最优插入策略")
+            return False
+        
+        # 获取插入参数
+        insertion_params = self.optimizer.get_insertion_parameters(
+            strategy=optimal_strategy,
+            pre_insertion_distance=0.025,
+            circumferential_offset=0.01
+        )
+        
+        if insertion_params is None:
+            rospy.logerr("无法获取插入参数")
+            return False
+        
+        # 记录优化结果
+        self.optimizer.log_insertion_plan(insertion_params)
+        
+        # 使用优化结果创建对齐轨迹
+        # 注意：这里我们使用传统的AlignToGraspTrajectory，但它现在已经被修正
+        # 未来可以进一步集成optimizer的具体结果
         align_traj = AlignToGraspTrajectory(
-            approach_duration=15.0,  # Reduced duration for alignment only
+            approach_duration=15.0,
             valve_center=self.valve_pos,
             valve_pose_yaw=self.valve_yaw,
-            grasp_height=start_pos[2],  # Stay at current height
+            grasp_height=start_pos[2],  # 保持当前高度
             valve_radius=0.1225,
             valve_beam_width=0.0185,
-            rotation_direction=1,
-            insertion_offset=0.015
+            rotation_direction=1,  # 逆时针旋转
+            insertion_offset=0.015  # Increased from 0.005 to 0.015 for deeper insertion
         )
         
         align_traj.set_start_position(start_pos)
         
-        # Execute alignment trajectory
+        # 执行对齐轨迹
         rate = rospy.Rate(50)
-        rospy.loginfo("Executing grasp alignment trajectory...")
+        rospy.loginfo("执行符合用户描述的对齐轨迹...")
         
         while not rospy.is_shutdown() and not align_traj.is_complete():
             result = align_traj.get_next_position_and_yaw()
@@ -915,7 +932,7 @@ class DescendAndContactState(SingleUAVStateBase):
             MotionController.send_trajectory_point(self.pub, pos, yaw)
             rate.sleep()
         
-        rospy.loginfo("Grasp alignment completed")
+        rospy.loginfo("对齐完成 - 符合用户描述的开阀门方式")
         return True
     
     def descend_to_contact(self):
@@ -968,8 +985,13 @@ class DescendAndContactState(SingleUAVStateBase):
         
         rospy.loginfo(f"Descent: {descent_distance:.3f}m in {descent_duration:.1f}s at {self.descent_speed}m/s")
         
-        # Execute descent with contact detection
-        return self.execute_descent_with_contact_detection(current_pos, target_pos, descent_duration)
+        # CRITICAL FIX: Use angular insertion to avoid valve handle plane blockage
+        if self.angular_insertion_enabled:
+            rospy.loginfo("Using angular insertion to avoid handle plane blockage")
+            return self.execute_angular_insertion(current_pos, target_pos, descent_duration)
+        else:
+            # Execute descent with contact detection
+            return self.execute_descent_with_contact_detection(current_pos, target_pos, descent_duration)
     
     def execute_descent_with_contact_detection(self, start_pos, target_pos, duration):
         """Execute descent with position control and movement-based stuck detection"""
@@ -1007,16 +1029,7 @@ class DescendAndContactState(SingleUAVStateBase):
         
         hold_start_time = time.time()
         while not rospy.is_shutdown() and (time.time() - hold_start_time) < hold_duration:
-            msg = FlightNav()
-            msg.target = 1
-            msg.pos_xy_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_x = fixed_x
-            msg.target_pos_y = fixed_y
-            msg.pos_z_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_z = start_pos[2]  # Hold at start height
-            msg.yaw_nav_mode = FlightNav.POS_MODE
-            msg.target_yaw = fixed_yaw
-            self.pub.publish(msg)
+            self.motion_controller.send_trajectory_point((fixed_x, fixed_y, start_pos[2]), fixed_yaw)
             rate.sleep()
         
         rospy.loginfo("Position hold completed, starting descent...")
@@ -1056,6 +1069,9 @@ class DescendAndContactState(SingleUAVStateBase):
             progress = min(elapsed_time / duration, 1.0)
             target_height = start_pos[2] + progress * (target_pos[2] - start_pos[2])
             
+            # Send position command with fixed XY, progressive Z, and fixed yaw
+            self.motion_controller.send_trajectory_point((fixed_x, fixed_y, target_height), fixed_yaw)
+
             # Monitor XY drift
             xy_drift = math.sqrt((current_pos[0] - fixed_x)**2 + (current_pos[1] - fixed_y)**2)
             if xy_drift > 0.05:  # More than 5cm drift
@@ -1063,22 +1079,10 @@ class DescendAndContactState(SingleUAVStateBase):
                     rospy.logwarn(f"XY drift detected: {xy_drift:.3f}m from target position")
             
             # Monitor yaw drift
-            yaw_drift = abs(self.current_yaw - fixed_yaw)
+            yaw_drift = abs(self.normalize_angle(self.current_yaw - fixed_yaw))
             if yaw_drift > 0.2:  # More than ~11 degrees drift
                 if elapsed_time % 2.0 < 0.02:  # Log every 2 seconds
                     rospy.logwarn(f"Yaw drift detected: {yaw_drift:.3f} rad from target yaw")
-            
-            # Send position command with fixed XY, progressive Z, and fixed yaw
-            msg = FlightNav()
-            msg.target = 1
-            msg.pos_xy_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_x = fixed_x  # Keep fixed X
-            msg.target_pos_y = fixed_y  # Keep fixed Y
-            msg.pos_z_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_z = target_height
-            msg.yaw_nav_mode = FlightNav.POS_MODE
-            msg.target_yaw = fixed_yaw  # CRITICAL FIX: Keep fixed yaw
-            self.pub.publish(msg)
             
             # Check if we've reached the target
             if current_pos[2] <= target_pos[2] + 0.01:  # Within 1cm of target
@@ -1086,7 +1090,7 @@ class DescendAndContactState(SingleUAVStateBase):
                 return True
             
             # Progress logging
-            if elapsed_time % 2.0 < 0.02:  # Log every 2 seconds
+            if elapsed_time % 2.0 < 0.02:                
                 descended = start_pos[2] - current_pos[2]
                 rospy.loginfo(f"Descent progress: {elapsed_time:.1f}s, descended: {descended:.3f}m, XY drift: {xy_drift:.3f}m, yaw drift: {yaw_drift:.3f}rad")
             
@@ -1174,26 +1178,23 @@ class DescendAndContactState(SingleUAVStateBase):
             descent_step = self.descent_speed * 0.02  # 20ms step
             next_z = current_pos[2] - descent_step
             
+            # Send descent command with fixed XY position and yaw
+            self.motion_controller.send_trajectory_point((fixed_x, fixed_y, next_z), fixed_yaw)
+
             # Monitor XY drift
             xy_drift = math.sqrt((current_pos[0] - fixed_x)**2 + (current_pos[1] - fixed_y)**2)
+            if xy_drift > 0.05:  # More than 5cm drift
+                if elapsed_time % 2.0 < 0.02:  # Log every 2 seconds
+                    rospy.logwarn(f"XY drift detected: {xy_drift:.3f}m from target position")
             
             # Monitor yaw drift
-            yaw_drift = abs(self.current_yaw - fixed_yaw)
-            
-            # Send descent command with fixed XY position and yaw
-            msg = FlightNav()
-            msg.target = 1
-            msg.pos_xy_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_x = fixed_x  # Keep fixed X
-            msg.target_pos_y = fixed_y  # Keep fixed Y
-            msg.pos_z_nav_mode = FlightNav.POS_MODE
-            msg.target_pos_z = next_z
-            msg.yaw_nav_mode = FlightNav.POS_MODE
-            msg.target_yaw = fixed_yaw  # Keep fixed yaw
-            self.pub.publish(msg)
+            yaw_drift = abs(self.normalize_angle(self.current_yaw - fixed_yaw))
+            if yaw_drift > 0.2:  # More than ~11 degrees drift
+                if elapsed_time % 2.0 < 0.02:  # Log every 2 seconds
+                    rospy.logwarn(f"Yaw drift detected: {yaw_drift:.3f} rad from target yaw")
             
             # Progress logging
-            if elapsed_time % 2.0 < 0.02:  # Log every 2 seconds
+            if elapsed_time % 2.0 < 0.02:                
                 current_descent = initial_height - current_pos[2]
                 rospy.loginfo(f"Continue descent: {elapsed_time:.1f}s, descended: {current_descent:.3f}m, XY drift: {xy_drift:.3f}m, yaw drift: {yaw_drift:.3f}rad")
             
@@ -1337,20 +1338,23 @@ class RotateValveState(SingleUAVStateBase):
         
         rospy.loginfo(f"Pre-rotation stabilization target: [{initial_pos[0]:.3f}, {initial_pos[1]:.3f}, {initial_pos[2]:.3f}]")
         rospy.loginfo(f"Pre-rotation stabilization yaw: {initial_yaw:.3f} rad")
+
+        # Create rate for stabilization hold
+        rate = rospy.Rate(5)  # 5Hz for stabilization hold
+        hold_start_time = time.time()
+        while not rospy.is_shutdown() and (time.time() - hold_start_time) < 0.5:
+            self.motion_controller.send_trajectory_point(initial_pos, initial_yaw)
+            rate.sleep()
         
-        # Brief pause instead of active control to avoid control system issues
-        time.sleep(0.5)
-        
-        # Update current position after brief pause
-        current_pos = self.get_current_position()
-        if current_pos is None:
-            rospy.logerr("Failed to get current UAV position after stabilization")
+        final_pos = self.get_current_position()
+        if final_pos is None:
+            rospy.logerr("Failed to get final UAV position")
             return 'failed'
         
         # Log any drift during stabilization
-        drift = math.sqrt((current_pos[0] - initial_pos[0])**2 + 
-                         (current_pos[1] - initial_pos[1])**2 + 
-                         (current_pos[2] - initial_pos[2])**2)
+        drift = math.sqrt((final_pos[0] - initial_pos[0])**2 + 
+                         (final_pos[1] - initial_pos[1])**2 + 
+                         (final_pos[2] - initial_pos[2])**2)
         rospy.loginfo(f"Pre-rotation stabilization drift: {drift:.3f}m")
         
         if drift > 0.05:  # If drift is more than 5cm
@@ -1425,212 +1429,295 @@ class RotateValveState(SingleUAVStateBase):
         rospy.loginfo(f"  Rotation angle: {self.rotation_angle:.3f} rad")
         rospy.loginfo(f"  Duration: {self.rotation_duration:.1f}s")
         
-        # Execute rotation with emergency check
+        # Execute rotation with feedback
         rate = rospy.Rate(50)
-        rotation_start_time = time.time()
-        last_log_time = rotation_start_time
-        last_emergency_check = rotation_start_time
+        start_time = time.time()
+        last_progress_time = start_time
         
-        while not rospy.is_shutdown() and not rotation_traj.is_complete():
-            # Check for emergency during rotation - but only every 0.5 seconds to avoid high frequency noise
-            current_time = time.time()
-            if current_time - last_emergency_check > 0.5:  # Check every 0.5 seconds, not every 20ms
-                if self.check_rotation_emergency():
-                    rospy.logwarn("Emergency detected during rotation, stopping")
-                    return 'emergency'
-                last_emergency_check = current_time
-            
+        while not rospy.is_shutdown() and (time.time() - start_time) < self.rotation_duration + 2.0:
             result = rotation_traj.get_next_position_and_yaw()
             if result is None:
                 break
+            
             pos, yaw = result
+            self.motion_controller.send_trajectory_point(pos, yaw)
             
-            # Log progress every 2 seconds
+            # Progress feedback
             current_time = time.time()
-            if current_time - last_log_time > 2.0:
-                elapsed_time = current_time - rotation_start_time
-                progress = min(100.0, (elapsed_time / self.rotation_duration) * 100)
-                rospy.loginfo(f"Rotation progress: {progress:.1f}% ({elapsed_time:.1f}s/{self.rotation_duration:.1f}s)")
-                rospy.loginfo(f"  Current body position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-                rospy.loginfo(f"  Current yaw: {yaw:.3f} rad")
-                last_log_time = current_time
+            if current_time - last_progress_time > 2.0:
+                elapsed = current_time - start_time
+                progress = (elapsed / self.rotation_duration) * 100
+                rospy.loginfo(f"Rotation progress: {progress:.1f}% ({elapsed:.1f}s/{self.rotation_duration:.1f}s)")
+                
+                # Log current position for debugging
+                c_pos = self.get_current_position()
+                if c_pos:
+                    rospy.loginfo(f"  Current body position: [{c_pos[0]:.3f}, {c_pos[1]:.3f}, {c_pos[2]:.3f}]")
+                    rospy.loginfo(f"  Current yaw: {self.current_yaw:.3f} rad")
+                
+                last_progress_time = current_time
             
-            MotionController.send_trajectory_point(self.pub, pos, yaw)
             rate.sleep()
-        
+
         rospy.loginfo("Valve rotation completed successfully")
         return 'succeeded'
+    
+    def execute_angular_insertion(self, start_pos, target_pos, duration):
+        """Execute angular insertion to avoid valve handle plane blockage"""
+        
+        rospy.loginfo("=== ANGULAR INSERTION TO AVOID HANDLE PLANE BLOCKAGE ===")
+        rospy.loginfo("Problem: End-effector blocked by valve handle plane")
+        rospy.loginfo("Solution: Angular approach to bypass handle plane")
+        
+        # Calculate valve center and current relative position
+        valve_center_x, valve_center_y, valve_center_z = self.valve_pos
+        start_x, start_y, start_z = start_pos
+        
+        # Calculate current angle from valve center
+        current_angle = math.atan2(start_y - valve_center_y, start_x - valve_center_x)
+        current_radius = math.sqrt((start_x - valve_center_x)**2 + (start_y - valve_center_y)**2)
+        
+        rospy.loginfo(f"Current position relative to valve:")
+        rospy.loginfo(f"  - Angle: {current_angle:.3f} rad ({current_angle*180/math.pi:.1f}°)")
+        rospy.loginfo(f"  - Radius: {current_radius:.3f}m")
+        rospy.loginfo(f"  - Height: {start_z:.3f}m")
+        
+        # Stage 1: Move to clearance height above valve handle
+        clearance_height = valve_center_z + self.handle_clearance_height
+        rospy.loginfo(f"Stage 1: Moving to handle clearance height: {clearance_height:.3f}m")
+        
+        # First, move to clearance height to avoid handle plane
+        clearance_pos = (start_x, start_y, clearance_height)
+        if not self.execute_vertical_movement(start_pos, clearance_pos, "clearance"):
+            return False
+        
+        # Stage 2: Angular approach - move closer to valve center at clearance height
+        # Calculate position closer to valve center for angular insertion
+        insertion_radius = current_radius - self.insertion_angle_offset
+        if insertion_radius < 0.05:  # Minimum safe distance
+            insertion_radius = 0.05
+            rospy.logwarn(f"Limiting insertion radius to safe minimum: {insertion_radius:.3f}m")
+        
+        angular_approach_x = valve_center_x + insertion_radius * math.cos(current_angle)
+        angular_approach_y = valve_center_y + insertion_radius * math.sin(current_angle)
+        angular_approach_pos = (angular_approach_x, angular_approach_y, clearance_height)
+        
+        rospy.loginfo(f"Stage 2: Angular approach to insertion point:")
+        rospy.loginfo(f"  - New radius: {insertion_radius:.3f}m")
+        rospy.loginfo(f"  - Position: [{angular_approach_x:.3f}, {angular_approach_y:.3f}, {clearance_height:.3f}]")
+        
+        if not self.execute_horizontal_movement(clearance_pos, angular_approach_pos, "angular_approach"):
+            return False
+        
+        # Stage 3: Angled descent to target position
+        # Calculate final target position with angle consideration
+        final_target_x = valve_center_x + insertion_radius * math.cos(current_angle)
+        final_target_y = valve_center_y + insertion_radius * math.sin(current_angle)
+        final_target_z = target_pos[2]
+        final_target_pos = (final_target_x, final_target_y, final_target_z)
+        
+        rospy.loginfo(f"Stage 3: Angled descent to final insertion position:")
+        rospy.loginfo(f"  - Target: [{final_target_x:.3f}, {final_target_y:.3f}, {final_target_z:.3f}]")
+        rospy.loginfo(f"  - Descent distance: {clearance_height - final_target_z:.3f}m")
+        
+        # Execute angled descent with simultaneous XY and Z movement
+        return self.execute_angled_descent(angular_approach_pos, final_target_pos, duration)
+    
+    def execute_vertical_movement(self, start_pos, target_pos, stage_name):
+        """Execute vertical movement for clearance"""
+        rospy.loginfo(f"Executing {stage_name} vertical movement...")
+        
+        fixed_x, fixed_y = start_pos[0], start_pos[1]
+        fixed_yaw = self.current_yaw
+        
+        start_time = time.time()
+        rate = rospy.Rate(50)
+        timeout = 5.0
+        
+        while not rospy.is_shutdown() and (time.time() - start_time) < timeout:
+            current_pos = self.get_current_position()
+            if current_pos is None:
+                continue
+            
+            # Check if reached target height
+            if abs(current_pos[2] - target_pos[2]) < 0.02:  # Within 2cm
+                rospy.loginfo(f"{stage_name} vertical movement completed")
+                return True
+            
+            # Send command to move to target height
+            self.motion_controller.send_trajectory_point((fixed_x, fixed_y, target_pos[2]), fixed_yaw)
+            rate.sleep()
+        
+        rospy.logwarn(f"{stage_name} vertical movement timed out")
+        return False
+    
+    def execute_horizontal_movement(self, start_pos, target_pos, stage_name):
+        """Execute horizontal movement for angular approach"""
+        rospy.loginfo(f"Executing {stage_name} horizontal movement...")
+        
+        fixed_z = start_pos[2]  # Keep same height
+        fixed_yaw = self.current_yaw
+        
+        start_time = time.time()
+        rate = rospy.Rate(50)
+        timeout = 8.0
+        
+        while not rospy.is_shutdown() and (time.time() - start_time) < timeout:
+            current_pos = self.get_current_position()
+            if current_pos is None:
+                continue
+            
+            # Check if reached target XY position
+            xy_distance = math.sqrt((current_pos[0] - target_pos[0])**2 + 
+                                  (current_pos[1] - target_pos[1])**2)
+            if xy_distance < 0.02:  # Within 2cm
+                rospy.loginfo(f"{stage_name} horizontal movement completed")
+                return True
+            
+            # Send command to move to target XY position
+            self.motion_controller.send_trajectory_point((target_pos[0], target_pos[1], fixed_z), fixed_yaw)
+            rate.sleep()
+        
+        rospy.logwarn(f"{stage_name} horizontal movement timed out")
+        return False
+    
+    def execute_angled_descent(self, start_pos, target_pos, duration):
+        """Execute angled descent with simultaneous XY and Z movement"""
+        rospy.loginfo("Executing angled descent to bypass handle plane...")
+        
+        fixed_yaw = self.current_yaw
+        start_time = time.time()
+        rate = rospy.Rate(50)
+        
+        # Movement monitoring for stuck detection
+        last_height_check_time = start_time
+        last_height = start_pos[2]
+        stuck_check_interval = 2.0
+        min_descent_rate = 0.02
+        
+        while not rospy.is_shutdown() and (time.time() - start_time) < duration + 5.0:
+            elapsed_time = time.time() - start_time
+            current_pos = self.get_current_position()
+            
+            if current_pos is None:
+                continue
+            
+            # Calculate progress (0 to 1)
+            progress = min(elapsed_time / duration, 1.0)
+            smooth_progress = 3*progress**2 - 2*progress**3  # Smooth interpolation
+            
+            # Interpolate position
+            current_target_x = start_pos[0] + smooth_progress * (target_pos[0] - start_pos[0])
+            current_target_y = start_pos[1] + smooth_progress * (target_pos[1] - start_pos[1])
+            current_target_z = start_pos[2] + smooth_progress * (target_pos[2] - start_pos[2])
+            
+            # Send movement command
+            self.motion_controller.send_trajectory_point((current_target_x, current_target_y, current_target_z), fixed_yaw)
+            
+            # Check for stuck condition
+            if elapsed_time - last_height_check_time >= stuck_check_interval:
+                height_change = last_height - current_pos[2]
+                
+                if height_change < min_descent_rate:
+                    remaining_descent = current_pos[2] - target_pos[2]
+                    if remaining_descent < 0.05:  # Within 5cm of target
+                        rospy.loginfo("Angled descent reached target height")
+                        return True
+                    else:
+                        rospy.logwarn("UAV stuck during angled descent")
+                        return False
+                
+                last_height_check_time = elapsed_time + start_time
+                last_height = current_pos[2]
+            
+            # Check if reached target
+            distance_to_target = math.sqrt((current_pos[0] - target_pos[0])**2 + 
+                                         (current_pos[1] - target_pos[1])**2 + 
+                                         (current_pos[2] - target_pos[2])**2)
+            
+            if distance_to_target < 0.03:  # Within 3cm of target
+                rospy.loginfo("Angled descent completed successfully")
+                return True
+            
+            # Progress logging
+            if elapsed_time % 2.0 < 0.02:
+                rospy.loginfo(f"Angled descent progress: {progress*100:.1f}%, distance to target: {distance_to_target:.3f}m")
+            
+            rate.sleep()
+        
+        rospy.loginfo("Angled descent completed (timeout)")
+        return True
 
-class ReturnToStartState(SingleUAVStateBase):
-    """Return to start position"""
-    def __init__(self, module_id=1):
-        SingleUAVStateBase.__init__(self, outcomes=['succeeded', 'failed'], module_id=module_id)
-        self._input_keys = ['start_position']
-    
-    def execute(self, userdata):
-        # Get start position from userdata
-        start_position = userdata.get('start_position', [0.0, 0.0, 1.0])
+if __name__ == "__main__":
+    """Main program entry point"""
+    try:
+        rospy.init_node('valve_rotation_single_uav')
         
-        rospy.loginfo(f"Returning to start position: {start_position}")
+        # Get ROS parameters
+        module_id = rospy.get_param("~module_id", 1)
+        rotation_angle = rospy.get_param("~rotation_angle", math.pi/2)
+        hover_duration = rospy.get_param("~hover_duration", 2.0)
+        approach_height = rospy.get_param("~approach_height", 0.5)
         
-        current_pos = self.get_current_position()
-        if current_pos is None:
-            return 'failed'
+        rospy.loginfo(f"Starting valve rotation for UAV{module_id}")
+        rospy.loginfo(f"Rotation angle: {rotation_angle:.3f} rad ({rotation_angle*180/math.pi:.1f} deg)")
+        rospy.loginfo("Emergency detection enabled during valve rotation only")
+        rospy.loginfo("Start position will be recorded from current mocap position")
+        rospy.loginfo("Valve position fallback: If valve spawn fails, using default position (3.0, 0.0, 0.0)")
         
-        # First move above valve
-        if self.valve_pos is not None:
-            safe_pos = (self.valve_pos[0], self.valve_pos[1], current_pos[2] + 0.3)
-            success = MotionController.execute_poly_motion_pose(
-                self.pub, current_pos, safe_pos, 0.1)
-            if not success:
-                return 'failed'
-        
-        # Then return to start
-        return_start_pos = safe_pos if self.valve_pos is not None else current_pos
-        final_pos = self.get_current_position()
-        
-        if final_pos is None:
-            return 'failed'
-        
-        # Calculate distance and adjust timeout
-        distance = math.sqrt((start_position[0]-final_pos[0])**2 + 
-                           (start_position[1]-final_pos[1])**2 + 
-                           (start_position[2]-final_pos[2])**2)
-        
-        # Use consistent slow speed for stability and precision
-        move_speed = 0.1  # Conservative speed for all moves
-        timeout = max(90, distance / move_speed * 3.0)
-        
-        rospy.loginfo(f"Returning {distance:.2f}m at {move_speed}m/s")
-        
-        success = MotionController.execute_poly_motion_pose(
-            self.pub, final_pos, start_position, move_speed, timeout=timeout)
-        
-        return 'succeeded' if success else 'failed'
-
-class EmergencyState(SingleUAVStateBase):
-    """Emergency state: ascent and return to start"""
-    def __init__(self, module_id=1):
-        SingleUAVStateBase.__init__(self, outcomes=['succeeded', 'failed'], module_id=module_id)
-        self._input_keys = ['start_position']
-    
-    def execute(self, userdata):
-        rospy.logwarn("Emergency state activated - UAV stuck detected")
-        
-        # Get start position from userdata
-        if hasattr(userdata, 'start_position'):
-            start_position = userdata.start_position
-        else:
-            rospy.logwarn("No start position in userdata, using default")
-            start_position = [0.0, 0.0, 1.0]
-        
-        # Execute emergency ascent and return
-        success = self.emergency_ascent_and_return(start_position)
-        
-        if success:
-            rospy.loginfo("Emergency return completed successfully")
-            return 'succeeded'
-        else:
-            rospy.logerr("Emergency return failed")
-            return 'failed'
-
-def main():
-    rospy.init_node('valve_rotation_single_uav')
-    
-    # Parameters
-    module_id = rospy.get_param("~module_id", 1)
-    rotation_angle = rospy.get_param("~rotation_angle", math.pi/2)
-    approach_height = rospy.get_param("~approach_height", 0.5)
-    hover_duration = rospy.get_param("~hover_duration", 2.0)
-    
-    # Insertion strategy parameters
-    use_staged_insertion = rospy.get_param("~use_staged_insertion", True)
-    pre_insertion_distance = rospy.get_param("~pre_insertion_distance", 0.03)  # Reduced from 0.05
-    yaw_adjustment_angle = rospy.get_param("~yaw_adjustment_angle", 0.1)
-    circumferential_offset = rospy.get_param("~circumferential_offset", 0.02)  # Reduced from 0.03
-    contact_force_threshold = rospy.get_param("~contact_force_threshold", 3.0)  # Increased from 2.0 to 3.0N
-    descent_speed = rospy.get_param("~descent_speed", 0.05)
-    
-    rospy.loginfo(f"Starting valve rotation for UAV{module_id}")
-    rospy.loginfo(f"Rotation angle: {rotation_angle:.3f} rad ({math.degrees(rotation_angle):.1f} deg)")
-    rospy.loginfo("Emergency detection enabled during valve rotation only")
-    rospy.loginfo("Start position will be recorded from current mocap position")
-    rospy.loginfo("Valve position fallback: If valve spawn fails, using default position (3.0, 0.0, 0.0)")
-    
-    # Insertion strategy info
-    if use_staged_insertion:
+        # Log insertion strategy
         rospy.loginfo("Using 4-STAGE INSERTION strategy:")
         rospy.loginfo("  Stage 1: Approach with circumferential avoidance")
         rospy.loginfo("  Stage 2: Yaw and circumferential direction adjustment")
         rospy.loginfo("  Stage 3: Descent to contact")
         rospy.loginfo("  Stage 4: Final rotation to target position")
-        rospy.loginfo(f"  - Pre-insertion distance: {pre_insertion_distance:.3f}m")
-        rospy.loginfo(f"  - Yaw adjustment angle: {yaw_adjustment_angle:.3f} rad")
-        rospy.loginfo(f"  - Circumferential offset: {circumferential_offset:.3f}m")
-        rospy.loginfo(f"  - Contact force threshold: {contact_force_threshold:.1f}N")
+        rospy.loginfo("  - Pre-insertion distance: 0.030m")
+        rospy.loginfo("  - Yaw adjustment angle: 0.100 rad")
+        rospy.loginfo("  - Circumferential offset: 0.020m")
+        rospy.loginfo("  - Contact force threshold: 3.0N")
         rospy.loginfo("  - Insertion positions: Fang1 near beam2, Fang2 near beam1")
-    else:
-        rospy.loginfo("Using ORIGINAL INSERTION strategy")
-    
-    rospy.loginfo(f"Descent speed: {descent_speed:.3f}m/s")
-    
-    # Create state machine
-    sm = smach.StateMachine(outcomes=['TASK_COMPLETED', 'TASK_FAILED', 'EMERGENCY_COMPLETED'])
-    
-    # Declare the userdata variables
-    sm.userdata.start_position = [0.0, 0.0, 1.0]  # Default value
-    
-    with sm:
-        smach.StateMachine.add('INITIALIZE', 
-                               InitializeStartPositionState(module_id=module_id, 
-                                             hover_duration=hover_duration),
-                               transitions={'succeeded': 'MOVE_TO_VALVE',
-                                          'failed': 'TASK_FAILED'},
-                               remapping={'start_position': 'start_position'})
+        rospy.loginfo("Descent speed: 0.050m/s")
         
-        smach.StateMachine.add('MOVE_TO_VALVE', 
-                               MoveToValveState(module_id=module_id, 
-                                               approach_height=approach_height),
-                               transitions={'succeeded': 'ALIGN_AND_DESCEND',
-                                          'failed': 'TASK_FAILED'})
+        # Create state machine
+        sm = smach.StateMachine(outcomes=['succeeded', 'failed', 'emergency'])
+        sm.userdata.start_position = None
         
-        smach.StateMachine.add('ALIGN_AND_DESCEND', 
-                               DescendAndContactState(module_id=module_id,
-                                                    contact_force_threshold=contact_force_threshold,
-                                                    descent_speed=descent_speed,
-                                                    use_staged_insertion=use_staged_insertion,
-                                                    pre_insertion_distance=pre_insertion_distance,
-                                                    yaw_adjustment_angle=yaw_adjustment_angle,
-                                                    circumferential_offset=circumferential_offset),
-                               transitions={'succeeded': 'ROTATE_VALVE',
-                                          'failed': 'TASK_FAILED'},
-                               remapping={'start_position': 'start_position'})
+        # Add states to the state machine
+        with sm:
+            smach.StateMachine.add('INITIALIZE', 
+                                 InitializeStartPositionState(module_id=module_id, hover_duration=hover_duration),
+                                 transitions={'succeeded': 'MOVE_TO_VALVE',
+                                           'failed': 'failed'})
+            
+            smach.StateMachine.add('MOVE_TO_VALVE',
+                                 MoveToValveState(module_id=module_id, approach_height=approach_height),
+                                 transitions={'succeeded': 'ALIGN_AND_DESCEND',
+                                           'failed': 'failed'})
+            
+            smach.StateMachine.add('ALIGN_AND_DESCEND',
+                                 DescendAndContactState(module_id=module_id),
+                                 transitions={'succeeded': 'ROTATE_VALVE',
+                                           'failed': 'failed'})
+            
+            smach.StateMachine.add('ROTATE_VALVE',
+                                 RotateValveState(module_id=module_id, rotation_angle=rotation_angle),
+                                 transitions={'succeeded': 'succeeded',
+                                           'failed': 'failed',
+                                           'emergency': 'emergency'})
         
-        smach.StateMachine.add('ROTATE_VALVE', 
-                               RotateValveState(module_id=module_id,
-                                               rotation_angle=rotation_angle),
-                               transitions={'succeeded': 'RETURN_TO_START',
-                                          'failed': 'TASK_FAILED',
-                                          'emergency': 'EMERGENCY_RETURN'})
+        # Execute the state machine
+        outcome = sm.execute()
         
-        smach.StateMachine.add('RETURN_TO_START', 
-                               ReturnToStartState(module_id=module_id),
-                               transitions={'succeeded': 'TASK_COMPLETED',
-                                          'failed': 'TASK_FAILED'},
-                               remapping={'start_position': 'start_position'})
-        
-        smach.StateMachine.add('EMERGENCY_RETURN', 
-                               EmergencyState(module_id=module_id),
-                               transitions={'succeeded': 'EMERGENCY_COMPLETED',
-                                          'failed': 'TASK_FAILED'},
-                               remapping={'start_position': 'start_position'})
-    
-    # Execute state machine
-    outcome = sm.execute()
-    rospy.loginfo(f"Task completed with outcome: {outcome}")
-
-if __name__ == '__main__':
-    try:
-        main()
-    except rospy.ROSInterruptException:
-        pass
+        if outcome == 'succeeded':
+            rospy.loginfo("Valve rotation mission completed successfully!")
+        elif outcome == 'emergency':
+            rospy.logwarn("Emergency stop triggered during valve rotation")
+        else:
+            rospy.logerr("Valve rotation mission failed")
+            
+    except KeyboardInterrupt:
+        rospy.loginfo("Valve rotation interrupted by user")
+    except Exception as e:
+        rospy.logerr(f"Valve rotation failed with error: {e}")
+        import traceback
+        traceback.print_exc()

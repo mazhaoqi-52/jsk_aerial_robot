@@ -2,7 +2,6 @@
 import rospy
 import numpy as np
 from tf.transformations import euler_from_quaternion
-from task.assembly_motion import *
 from math import pi, atan2, cos, sin
 class PolynomialTrajectory:
     def __init__(self, duration):
@@ -90,127 +89,152 @@ class AlignToGraspTrajectory:
         self._target_end_effector_pos = None
         self._claw_positions = None
         
+        # CRITICAL FIX: 根据您的描述，无人机应该沿X轴正方向飞向阀门
+        # beam0与X轴正方向重合，左侧manipulator卡在beam0与beam1之间靠近beam1
+        # 右侧manipulator卡在beam1与beam2之间靠近beam2
+        rospy.loginfo("AlignToGraspTrajectory: 初始化符合用户描述的开阀门方式")
+        rospy.loginfo("  - 无人机沿X轴正方向飞向阀门")
+        rospy.loginfo("  - 左侧manipulator: beam0与beam1之间靠近beam1")
+        rospy.loginfo("  - 右侧manipulator: beam1与beam2之间靠近beam2")
+        rospy.loginfo("  - 逆时针旋转，机体大部分处于阀门外侧")
+        
     def calculate_grasp_position_and_yaw(self):
+        """
+        CRITICAL FIX: 重新实现符合用户描述的开阀门方式
+        - 无人机沿X轴正方向飞向阀门（beam0与X轴正方向重合）
+        - 左侧manipulator卡在beam0与beam1之间靠近beam1的一侧
+        - 右侧manipulator卡在beam1与beam2之间靠近beam2的一侧
+        - 逆时针旋转，机体大部分处于阀门外侧
+        """
         center_x, center_y, center_z = self.valve_center
         
+        # 计算beam角度：beam0(0°), beam1(120°), beam2(240°)
         beam_angles = [self.valve_pose_yaw + i * 2*pi/3 for i in range(3)]
+        beam0_angle = beam_angles[0]  # 0° - 与X轴正方向重合
+        beam1_angle = beam_angles[1]  # 120°
+        beam2_angle = beam_angles[2]  # 240°
         
-        # Select 2nd and 3rd beams for grasping
-        beam2_angle = beam_angles[1]  
-        beam3_angle = beam_angles[2]  
+        rospy.loginfo(f"Beam angles: beam0={beam0_angle*180/pi:.1f}°, beam1={beam1_angle*180/pi:.1f}°, beam2={beam2_angle*180/pi:.1f}°")
         
-        # Calculate beam positions on valve circumference
+        # 计算beam在阀门圆周上的位置
+        beam0_x = center_x + self.valve_radius * cos(beam0_angle)
+        beam0_y = center_y + self.valve_radius * sin(beam0_angle)
+        beam1_x = center_x + self.valve_radius * cos(beam1_angle)
+        beam1_y = center_y + self.valve_radius * sin(beam1_angle)
         beam2_x = center_x + self.valve_radius * cos(beam2_angle)
         beam2_y = center_y + self.valve_radius * sin(beam2_angle)
         
-        beam3_x = center_x + self.valve_radius * cos(beam3_angle)
-        beam3_y = center_y + self.valve_radius * sin(beam3_angle)
+        # 根据您的描述，计算manipulator目标位置
+        # 左侧manipulator (claw1): beam0与beam1之间，靠近beam1
+        # 右侧manipulator (claw2): beam1与beam2之间，靠近beam2
         
-        # Calculate beam normal vectors (perpendicular to radius)
-        normal2_x = -sin(beam2_angle)
-        normal2_y = cos(beam2_angle)
+        # 计算gap中心角度
+        # 对于beam0(0°)和beam1(120°)之间的gap，中心角度是60°
+        # 对于beam1(120°)和beam2(240°)之间的gap，中心角度是180°
+        gap01_angle = beam0_angle + pi/3  # 60° = π/3
+        gap12_angle = beam1_angle + pi/3  # 180° = beam1_angle + π/3
         
-        normal3_x = -sin(beam3_angle)
-        normal3_y = cos(beam3_angle)
+        # 确保角度在[0, 2π]范围内
+        gap01_angle = gap01_angle % (2*pi)
+        gap12_angle = gap12_angle % (2*pi)
         
-        # Beam offset
-        beam_offset = self.valve_beam_width / 2.0
+        # 靠近beam1和beam2的偏移因子（0.4表示40%靠近目标beam，保持在gap内）
+        beam_bias = 0.4
         
-        # Calculate claw insertion positions
-        # Claw1: on one side of 2nd beam
-        claw1_target_x = beam2_x + beam_offset * normal2_x
-        claw1_target_y = beam2_y + beam_offset * normal2_y
+        # 左侧manipulator角度：beam0与beam1之间靠近beam1
+        # 从gap01_angle向beam1_angle方向偏移
+        angle_diff_01 = ((beam1_angle - gap01_angle + pi) % (2*pi)) - pi
+        claw1_angle = gap01_angle + beam_bias * angle_diff_01
         
-        # Claw2: on other side of 3rd beam
-        claw2_target_x = beam3_x - beam_offset * normal3_x
-        claw2_target_y = beam3_y - beam_offset * normal3_y
+        # 右侧manipulator角度：beam1与beam2之间靠近beam2
+        # 从gap12_angle向beam2_angle方向偏移
+        angle_diff_12 = ((beam2_angle - gap12_angle + pi) % (2*pi)) - pi
+        claw2_angle = gap12_angle + beam_bias * angle_diff_12
         
-        # End-effector center position (midpoint of two claws)
+        # 处理角度归一化
+        claw1_angle = claw1_angle % (2*pi)
+        claw2_angle = claw2_angle % (2*pi)
+        
+        rospy.loginfo(f"Claw target angles: claw1={claw1_angle*180/pi:.1f}° (beam0-beam1, near beam1)")
+        rospy.loginfo(f"                   claw2={claw2_angle*180/pi:.1f}° (beam1-beam2, near beam2)")
+        
+        # 计算claw目标位置（在阀门圆周上）
+        claw1_target_x = center_x + self.valve_radius * cos(claw1_angle)
+        claw1_target_y = center_y + self.valve_radius * sin(claw1_angle)
+        claw2_target_x = center_x + self.valve_radius * cos(claw2_angle)
+        claw2_target_y = center_y + self.valve_radius * sin(claw2_angle)
+        
+        # 计算end-effector中心位置（两个claw的中点）
         end_effector_center_x = (claw1_target_x + claw2_target_x) / 2.0
         end_effector_center_y = (claw1_target_y + claw2_target_y) / 2.0
         end_effector_center_z = self.grasp_height
         
-        # Calculate end-effector orientation
-        # point towards valve center
+        # 计算end-effector方向：指向阀门中心
         dx_to_center = center_x - end_effector_center_x
         dy_to_center = center_y - end_effector_center_y
         end_effector_yaw = atan2(dy_to_center, dx_to_center)
         
-        # Apply insertion offset based on rotation direction for smooth insertion
-        # For anticlockwise rotation (1): offset in direction perpendicular to approach (leading edge)
-        # For clockwise rotation (-1): offset in opposite direction
-        # This accounts for the valve vector direction and ensures smooth claw insertion
-        tangent_x = -sin(end_effector_yaw)  # Perpendicular to approach direction
+        # 应用insertion_offset以实现平滑插入
+        # 对于逆时针旋转，offset方向应该是切线方向
+        tangent_x = -sin(end_effector_yaw)
         tangent_y = cos(end_effector_yaw)
         
-        # Apply offset based on rotation direction (anticlockwise = 1 is typical for valve operation)
         insertion_offset_x = self.rotation_direction * self.insertion_offset * tangent_x
         insertion_offset_y = self.rotation_direction * self.insertion_offset * tangent_y
         
-        # Adjust end-effector center position for smooth insertion
+        # 调整end-effector和claw位置
         end_effector_center_x += insertion_offset_x
         end_effector_center_y += insertion_offset_y
-        
-        # Recalculate claw positions after applying insertion offset
         claw1_target_x += insertion_offset_x
         claw1_target_y += insertion_offset_y
         claw2_target_x += insertion_offset_x
         claw2_target_y += insertion_offset_y
         
-        # Verify claw positions in end-effector coordinate system
-        cos_yaw = cos(end_effector_yaw)
-        sin_yaw = sin(end_effector_yaw)
-        
-        # Convert claw target positions to end-effector coordinate system for verification
-        # Claw1 position in end-effector coordinate system
-        rel_claw1_x = claw1_target_x - end_effector_center_x
-        rel_claw1_y = claw1_target_y - end_effector_center_y
-        local_claw1_x = cos_yaw * rel_claw1_x + sin_yaw * rel_claw1_y
-        local_claw1_y = -sin_yaw * rel_claw1_x + cos_yaw * rel_claw1_y
-        
-        # Claw2 position in end-effector coordinate system
-        rel_claw2_x = claw2_target_x - end_effector_center_x
-        rel_claw2_y = claw2_target_y - end_effector_center_y
-        local_claw2_x = cos_yaw * rel_claw2_x + sin_yaw * rel_claw2_y
-        local_claw2_y = -sin_yaw * rel_claw2_x + cos_yaw * rel_claw2_y
-        
-        # Body yaw same as end-effector yaw
+        # 计算body CoG目标位置
         body_yaw = end_effector_yaw
+        cos_yaw = cos(body_yaw)
+        sin_yaw = sin(body_yaw)
         
-        # Transform end-effector offset to global coordinate system
         global_offset_x = (cos_yaw * self.end_effector_offset_x - 
                           sin_yaw * self.end_effector_offset_y)
         global_offset_y = (sin_yaw * self.end_effector_offset_x + 
                           cos_yaw * self.end_effector_offset_y)
         global_offset_z = self.end_effector_offset_z
         
-        # Body CoG target position = end-effector center position - end-effector offset
         body_target_x = end_effector_center_x - global_offset_x
         body_target_y = end_effector_center_y - global_offset_y
         body_target_z = end_effector_center_z - global_offset_z
         
-        # Store claw position information
+        # 验证：确保机体大部分处于阀门外侧
+        body_to_center_distance = ((body_target_x - center_x)**2 + (body_target_y - center_y)**2)**0.5
+        if body_to_center_distance < self.valve_radius:
+            rospy.logwarn(f"机体距离阀门中心过近: {body_to_center_distance:.3f}m < {self.valve_radius:.3f}m")
+            rospy.logwarn("可能需要调整end_effector_offset参数")
+        
+        # 存储claw位置信息
         self._claw_positions = {
             'claw1_target': (claw1_target_x, claw1_target_y, self.grasp_height),
             'claw2_target': (claw2_target_x, claw2_target_y, self.grasp_height),
-            'claw1_local': (local_claw1_x, local_claw1_y, 0),
-            'claw2_local': (local_claw2_x, local_claw2_y, 0),
+            'claw1_angle': claw1_angle,
+            'claw2_angle': claw2_angle,
+            'beam0_position': (beam0_x, beam0_y, center_z),
+            'beam1_position': (beam1_x, beam1_y, center_z),
             'beam2_position': (beam2_x, beam2_y, center_z),
-            'beam3_position': (beam3_x, beam3_y, center_z)
+            'gap01_angle': gap01_angle,
+            'gap12_angle': gap12_angle,
         }
         
-        rospy.loginfo(f"Align-to-grasp trajectory (beams 2&3):")
-        rospy.loginfo(f"  Rotation direction: {'anticlockwise' if self.rotation_direction > 0 else 'clockwise'}")
-        rospy.loginfo(f"  Insertion offset: {self.insertion_offset:.3f}m")
-        rospy.loginfo(f"  Beam2 pos: [{beam2_x:.3f}, {beam2_y:.3f}]")
-        rospy.loginfo(f"  Beam3 pos: [{beam3_x:.3f}, {beam3_y:.3f}]")
-        rospy.loginfo(f"  Claw1 target: [{claw1_target_x:.3f}, {claw1_target_y:.3f}]")
-        rospy.loginfo(f"  Claw2 target: [{claw2_target_x:.3f}, {claw2_target_y:.3f}]")
-        rospy.loginfo(f"  Claw1 local: [{local_claw1_x:.3f}, {local_claw1_y:.3f}]")
-        rospy.loginfo(f"  Claw2 local: [{local_claw2_x:.3f}, {local_claw2_y:.3f}]")
+        rospy.loginfo(f"符合用户描述的开阀门方式:")
+        rospy.loginfo(f"  Beam0 (X轴正方向): [{beam0_x:.3f}, {beam0_y:.3f}] @ {beam0_angle*180/pi:.1f}°")
+        rospy.loginfo(f"  Beam1 (120°): [{beam1_x:.3f}, {beam1_y:.3f}] @ {beam1_angle*180/pi:.1f}°")
+        rospy.loginfo(f"  Beam2 (240°): [{beam2_x:.3f}, {beam2_y:.3f}] @ {beam2_angle*180/pi:.1f}°")
+        rospy.loginfo(f"  左侧manipulator (claw1): [{claw1_target_x:.3f}, {claw1_target_y:.3f}] @ {claw1_angle*180/pi:.1f}°")
+        rospy.loginfo(f"  右侧manipulator (claw2): [{claw2_target_x:.3f}, {claw2_target_y:.3f}] @ {claw2_angle*180/pi:.1f}°")
         rospy.loginfo(f"  End-effector center: [{end_effector_center_x:.3f}, {end_effector_center_y:.3f}, {end_effector_center_z:.3f}]")
-        rospy.loginfo(f"  Body target pos: [{body_target_x:.3f}, {body_target_y:.3f}, {body_target_z:.3f}]")
-        rospy.loginfo(f"  Body target yaw: {body_yaw:.3f} rad ({body_yaw*180/pi:.1f} deg)")
+        rospy.loginfo(f"  Body target: [{body_target_x:.3f}, {body_target_y:.3f}, {body_target_z:.3f}]")
+        rospy.loginfo(f"  Body yaw: {body_yaw:.3f} rad ({body_yaw*180/pi:.1f}°)")
+        rospy.loginfo(f"  机体到阀门中心距离: {body_to_center_distance:.3f}m (应该 > {self.valve_radius:.3f}m)")
+        rospy.loginfo(f"  旋转方向: {'逆时针' if self.rotation_direction > 0 else '顺时针'}")
         
         return ((body_target_x, body_target_y, body_target_z), 
                 body_yaw, 

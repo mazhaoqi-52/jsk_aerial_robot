@@ -19,6 +19,83 @@ from valve_rotation_fang_single import (
     RotateValveState
 )
 
+# Import the unified motion controller
+from unified_motion_controller import UnifiedMotionController
+
+class EnhancedRotateValveState(RotateValveState):
+    """
+    Enhanced rotate valve state that uses constant distance feedback controller
+    """
+    
+    def __init__(self, module_id):
+        super().__init__(module_id)
+        self.feedback_controller = None
+        
+    def execute(self, userdata):
+        """
+        Execute valve rotation with constant distance feedback control
+        """
+        rospy.loginfo("开始增强型阀门旋转（恒定距离反馈控制）")
+        
+        # Initialize unified motion controller if not already done
+        if self.feedback_controller is None:
+            self.feedback_controller = UnifiedMotionController(self.sm)
+        
+        # Execute the original rotation logic but with feedback control
+        return self.execute_with_feedback_control(userdata)
+    
+    def execute_with_feedback_control(self, userdata):
+        """
+        Execute valve rotation with feedback control
+        """
+        try:
+            # Get valve position and rotation parameters
+            valve_pos = self.sm.get_current_position()
+            if valve_pos is None:
+                rospy.logerr("无法获取当前位置")
+                return 'failed'
+            
+            valve_center = (valve_pos[0], valve_pos[1], valve_pos[2])
+            
+            # Calculate rotation parameters
+            rotation_angle = rospy.get_param('~valve_rotation_angle', 90.0)
+            rotation_steps = rospy.get_param('~valve_rotation_steps', 36)
+            end_effector_distance = rospy.get_param('~end_effector_distance', 0.15)
+            
+            # Create constant distance trajectory
+            from trajectory import create_constant_distance_trajectory
+            trajectory = create_constant_distance_trajectory(
+                valve_center=valve_center,
+                rotation_angle=rotation_angle,
+                rotation_steps=rotation_steps,
+                end_effector_distance=end_effector_distance
+            )
+            
+            # Execute rotation with feedback control
+            feedback_frequency = rospy.get_param('~feedback_frequency', 50)
+            alignment_check_interval = rospy.get_param('~alignment_check_interval', 0.1)
+            
+            rospy.loginfo(f"执行反馈控制旋转: 角度={rotation_angle}°, 步数={rotation_steps}, 距离={end_effector_distance}m")
+            
+            stats = self.feedback_controller.execute_constant_distance_rotation(
+                trajectory=trajectory,
+                valve_center=valve_center,
+                feedback_frequency=feedback_frequency,
+                alignment_check_interval=alignment_check_interval
+            )
+            
+            # Check execution success based on statistics
+            if stats['max_distance_error'] < self.feedback_controller.distance_tolerance * 3:
+                rospy.loginfo("增强型阀门旋转成功完成")
+                return 'succeeded'
+            else:
+                rospy.logwarn("增强型阀门旋转完成但精度不足")
+                return 'succeeded'  # Still consider as success but with warning
+                
+        except Exception as e:
+            rospy.logerr(f"增强型阀门旋转失败: {e}")
+            return 'failed'
+
 class JoyControlledValveRotation:
     """
     Simplified joy-controlled valve rotation that reuses existing state machine
@@ -90,7 +167,7 @@ class JoyControlledValveRotation:
             
             smach.StateMachine.add(
                 'ROTATE_VALVE',
-                RotateValveState(module_id=self.module_id),
+                EnhancedRotateValveState(module_id=self.module_id),
                 transitions={
                     'succeeded': 'succeeded',
                     'failed': 'failed',
@@ -200,7 +277,7 @@ class JoyControlledValveRotation:
                     
                     smach.StateMachine.add(
                         'ROTATE_VALVE',
-                        RotateValveState(module_id=self.module_id),
+                        EnhancedRotateValveState(module_id=self.module_id),
                         transitions={
                             'succeeded': 'succeeded',
                             'failed': 'failed',

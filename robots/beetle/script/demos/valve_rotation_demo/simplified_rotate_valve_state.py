@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 """
-Simplified RotateValveState that uses EnhancedMotionController for alignment control
+Simplified RotateValveState that uses UnifiedMotionController for alignment control
 """
 import math
 import time
 import threading
 import rospy
-from enhanced_motion_controller import EnhancedMotionController
+from unified_motion_controller import UnifiedMotionController
 from trajectory import ValveRotationTrajectory
 
 
 class SimplifiedRotateValveState:
-    """Simplified valve rotation state that delegates alignment control to EnhancedMotionController"""
+    """Simplified valve rotation state that delegates alignment control to UnifiedMotionController"""
     
     def __init__(self, state_machine, rotation_angle=math.pi/2, rotation_duration=8.0):
         """
@@ -27,7 +27,7 @@ class SimplifiedRotateValveState:
         self.rotation_duration = rotation_duration
         
         # Initialize enhanced motion controller
-        self.motion_controller = EnhancedMotionController(state_machine)
+        self.motion_controller = UnifiedMotionController(state_machine)
         
         # Emergency detection variables
         self.emergency_stop = threading.Event()
@@ -41,7 +41,7 @@ class SimplifiedRotateValveState:
         self.yaw_threshold = rospy.get_param("~yaw_threshold", 0.1)
         
         rospy.loginfo("=== SIMPLIFIED VALVE ROTATION STATE ===")
-        rospy.loginfo("Using EnhancedMotionController for alignment control")
+        rospy.loginfo("Using UnifiedMotionController for alignment control")
         rospy.loginfo(f"Rotation angle: {self.rotation_angle:.3f}rad ({self.rotation_angle*180/math.pi:.1f}°)")
         rospy.loginfo(f"Rotation duration: {self.rotation_duration:.1f}s")
     

@@ -1,10 +1,4 @@
 #!/usr/bin/env python
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'))
-
 import rospy
 import numpy as np
 import math
@@ -177,18 +171,15 @@ def validate_uav_position(uav_pos, uav_yaw, valve_center,
     
     # Validation criteria
     valve_radius = 0.1225
-    # OPTIMIZED: Practical safe distance for post-insertion rotation start
-    # Based on actual insertion results, UAV should be positioned optimally for rotation
-    min_safe_uav_distance = valve_radius + end_effector_offset_x * 0.4  # Further reduced from 50% to 40%
+    min_safe_uav_distance = valve_radius + end_effector_offset_x * 0.5
     
     errors = []
     
     if uav_to_valve_distance < min_safe_uav_distance:
         errors.append(f"UAV too close to valve center: {uav_to_valve_distance:.3f}m < {min_safe_uav_distance:.3f}m")
     
-    # Very lenient end-effector clearance check - 25% of valve radius for successful insertion
-    if ee_to_valve_distance < valve_radius * 0.25:
-        errors.append(f"End-effector inside valve: {ee_to_valve_distance:.3f}m < {valve_radius * 0.25:.3f}m")
+    if ee_to_valve_distance < valve_radius * 0.8:
+        errors.append(f"End-effector inside valve: {ee_to_valve_distance:.3f}m < {valve_radius:.3f}m")
     
     return len(errors) == 0, errors
 

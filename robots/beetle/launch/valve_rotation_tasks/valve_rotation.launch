@@ -20,7 +20,7 @@
   </include>
 
   <!-- <node pkg="beetle" type="valve_rotation_smach_test.py" name="valve_rotation_smach_test" output="screen"> -->
-  <node pkg="beetle" type="valve_rotation_two_states_test.py" name="valve_rotation_states_test" output="screen">
+  <node pkg="beetle" type="valve_rotation_states_test.py" name="valve_rotation_states_test" output="screen">
     <param name="simulation" value="$(arg simulation)"/>
     <param name="module_ids" value="$(arg module_ids)"/>
     <param name="real_machine" value="$(arg real_machine)"/>

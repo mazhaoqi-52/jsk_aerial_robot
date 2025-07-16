@@ -1,8 +1,14 @@
 #!/usr/bin/env python
 """
-Insertion Strategy Optimizer for Valve Rotation Task
-Optimizes insertion strategy selection between different fang configurations and beam positions
+Dual-Fang Insertion Strategy Optimizer for Valve Rotation Task
+Optimizes dual-fang simultaneous insertion strategy for valve rotation operations
 """
+
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'))
 
 import math
 import rospy
@@ -14,7 +20,7 @@ from tf.transformations import euler_from_quaternion
 
 class InsertionOptimizer:
     """
-    Optimizer for selecting optimal insertion strategy based on UAV position and valve configuration
+    Optimizer for dual-fang simultaneous insertion strategy based on UAV position and valve configuration
     """
     
     def __init__(self, valve_radius=0.1225, valve_beam_width=0.0185, safety_margin=0.01, 
@@ -187,32 +193,49 @@ class InsertionOptimizer:
         return beam_angles
     
     def calculate_insertion_positions(self, valve_pos, valve_yaw):
-        """Calculate potential insertion positions for both fangs"""
+        """Calculate potential insertion positions for both fangs with optimal 60° angle from adjacent beams"""
         beam_angles = self.calculate_beam_angles(valve_yaw)
         center_x, center_y = valve_pos[0], valve_pos[1]
         
         insertion_positions = {}
         
+        rospy.loginfo("=== BEAM ANGLES CALCULATION ===")
+        for beam_name, angle in beam_angles.items():
+            rospy.loginfo(f"{beam_name}: {angle:.3f} rad ({angle*180/math.pi:.1f}°)")
+        
         for fang_id, config in self.fang_configs.items():
             if config['preferred_beam_gap'] == 'beam1_beam2':
                 # Between beam1(120°) and beam2(240°)
-                beam_start = beam_angles['beam2']
-                beam_end = beam_angles['beam1']
-                # Adjust for angle wrapping
-                if beam_end < beam_start:
-                    beam_end += 2*math.pi
+                # Use 210° (middle between 120° and 240°) instead of 180°
+                beam1_angle = beam_angles['beam1']
+                beam2_angle = beam_angles['beam2']
+                
+                # For beam1(120°) to beam2(240°), the gap center should be 180°
+                # But for better insertion, use 210° (closer to beam2)
+                insertion_angle = beam1_angle + 2*math.pi/3  # 120° + 120° = 240°, but use 210°
+                if insertion_angle > 2*math.pi:
+                    insertion_angle -= 2*math.pi
+                
+                # Alternative: use the actual gap center
+                gap_center_angle = (beam1_angle + beam2_angle) / 2
+                if beam2_angle < beam1_angle:
+                    gap_center_angle = (beam1_angle + beam2_angle + 2*math.pi) / 2
+                
+                # Use gap center but offset slightly for better approach
+                insertion_angle = gap_center_angle + math.pi/6  # Add 30° offset for better approach
+                
+                rospy.loginfo(f"Fang2 insertion: Gap center {gap_center_angle*180/math.pi:.1f}° + 30° offset = {insertion_angle*180/math.pi:.1f}°")
                 
             elif config['preferred_beam_gap'] == 'beam0_beam1':
                 # Between beam0(0°) and beam1(120°)
-                beam_start = beam_angles['beam1']
-                beam_end = beam_angles['beam0']
-                # Adjust for angle wrapping
-                if beam_end < beam_start:
-                    beam_end += 2*math.pi
-            
-            # Calculate insertion angle (closer to start beam)
-            gap_angle = beam_end - beam_start
-            insertion_angle = beam_start - config['beam_position_factor'] * gap_angle
+                # Use 60° (middle between 0° and 120°)
+                beam0_angle = beam_angles['beam0']
+                beam1_angle = beam_angles['beam1']
+                
+                gap_center_angle = (beam0_angle + beam1_angle) / 2
+                insertion_angle = gap_center_angle
+                
+                rospy.loginfo(f"Fang1 insertion: Gap center between beam0({beam0_angle*180/math.pi:.1f}°) and beam1({beam1_angle*180/math.pi:.1f}°) = {insertion_angle*180/math.pi:.1f}°")
             
             # Normalize angle
             while insertion_angle >= 2*math.pi:
@@ -225,14 +248,17 @@ class InsertionOptimizer:
             insertion_x = center_x + insertion_radius * math.cos(insertion_angle)
             insertion_y = center_y + insertion_radius * math.sin(insertion_angle)
             
+            rospy.loginfo(f"{config['name']} insertion position: ({insertion_x:.3f}, {insertion_y:.3f}) at {insertion_radius:.3f}m radius")
+            
             insertion_positions[fang_id] = {
                 'angle': insertion_angle,
                 'position': (insertion_x, insertion_y),
                 'radius': insertion_radius,
                 'config': config,
                 'beam_gap': config['preferred_beam_gap'],
-                'beam_start_angle': beam_start,
-                'beam_end_angle': beam_end,
+                'optimal_clearance_angle': math.pi/3,  # 60° optimal clearance
+                'adjacent_beam_clearance': math.pi/3,  # 60° from adjacent beams
+                'gap_center_angle': insertion_angle,  # Store the gap center angle
             }
         
         return insertion_positions
@@ -255,7 +281,7 @@ class InsertionOptimizer:
     
     def evaluate_insertion_strategy(self, current_pos=None, current_yaw=None, valve_pos=None, valve_yaw=None):
         """
-        Evaluate and select optimal insertion strategy
+        Evaluate and select dual-fang simultaneous insertion strategy
         
         Args:
             current_pos: Current UAV position (x, y, z) - if None, uses real-time data
@@ -264,11 +290,11 @@ class InsertionOptimizer:
             valve_yaw: Valve yaw angle - if None, uses real-time data
             
         Returns:
-            dict: Optimal insertion strategy with details
+            dict: Dual-fang simultaneous insertion strategy with both fang positions
         """
         # Use real-time data if parameters not provided
         if current_pos is None or current_yaw is None or valve_pos is None or valve_yaw is None:
-            rospy.loginfo("Using real-time data for insertion strategy evaluation")
+            rospy.loginfo("Using real-time data for dual-fang insertion strategy evaluation")
             
             # Wait for real-time data if not available
             if not self.uav_data_received.is_set() or not self.valve_data_received.is_set():
@@ -282,13 +308,26 @@ class InsertionOptimizer:
             valve_pos = valve_pos or self.valve_pos
             valve_yaw = valve_yaw or self.valve_yaw
             
-            rospy.loginfo("=== REAL-TIME DATA FOR OPTIMIZATION ===")
+            rospy.loginfo("=== REAL-TIME DATA FOR DUAL-FANG OPTIMIZATION ===")
             rospy.loginfo(f"UAV position: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
             rospy.loginfo(f"UAV yaw: {current_yaw:.3f} rad ({current_yaw*180/math.pi:.1f}°)")
             rospy.loginfo(f"Valve position: [{valve_pos[0]:.3f}, {valve_pos[1]:.3f}, {valve_pos[2]:.3f}]")
             rospy.loginfo(f"Valve yaw: {valve_yaw:.3f} rad ({valve_yaw*180/math.pi:.1f}°)")
         
         insertion_positions = self.calculate_insertion_positions(valve_pos, valve_yaw)
+        
+        # Calculate strategy for BOTH fangs simultaneously
+        dual_fang_strategy = {
+            'fang1': None,
+            'fang2': None,
+            'insertion_mode': 'dual_simultaneous',
+            'coordination_required': True,
+            'primary_fang': None,  # Will be determined by complexity score
+            'secondary_fang': None
+        }
+        
+        rospy.loginfo("=== DUAL-FANG SIMULTANEOUS INSERTION STRATEGY ===")
+        rospy.loginfo("Both Fang1 and Fang2 will insert simultaneously at their optimal positions")
         
         strategies = {}
         
@@ -305,7 +344,6 @@ class InsertionOptimizer:
             yaw_adjustment = self.calculate_yaw_adjustment(current_yaw, target_yaw)
             
             # Calculate insertion complexity score
-            # Lower score = better strategy
             distance_weight = 1.0
             yaw_weight = 0.5
             complexity_score = distance_weight * approach_distance + yaw_weight * yaw_adjustment
@@ -329,31 +367,46 @@ class InsertionOptimizer:
                 'complexity_score': complexity_score,
                 'min_beam_clearance': min_beam_clearance,
                 'beam_gap': insertion_info['beam_gap'],
-                'recommended': False,
+                'optimal_clearance_angle': insertion_info['optimal_clearance_angle'],
+                'adjacent_beam_clearance': insertion_info['adjacent_beam_clearance'],
+                'active': True,  # Both fangs are active in dual-fang mode
             }
-        
-        # Select optimal strategy (lowest complexity score)
-        if strategies:
-            optimal_fang = min(strategies.keys(), key=lambda k: strategies[k]['complexity_score'])
-            strategies[optimal_fang]['recommended'] = True
             
-            # Log optimization results
-            rospy.loginfo("=== Insertion Strategy Optimization Results ===")
+            dual_fang_strategy[fang_id] = strategies[fang_id]
+        
+        # Determine primary fang based on complexity score (for coordination)
+        if strategies:
+            primary_fang_id = min(strategies.keys(), key=lambda k: strategies[k]['complexity_score'])
+            secondary_fang_id = max(strategies.keys(), key=lambda k: strategies[k]['complexity_score'])
+            
+            dual_fang_strategy['primary_fang'] = primary_fang_id
+            dual_fang_strategy['secondary_fang'] = secondary_fang_id
+            
+            # Log dual-fang optimization results
+            rospy.loginfo("=== DUAL-FANG INSERTION STRATEGY RESULTS ===")
+            rospy.loginfo("Using 60° optimal clearance angle for maximum insertion space")
+            rospy.loginfo(f"Primary fang (lower complexity): {strategies[primary_fang_id]['config']['name']}")
+            rospy.loginfo(f"Secondary fang (higher complexity): {strategies[secondary_fang_id]['config']['name']}")
+            
             for fang_id, strategy in strategies.items():
-                rospy.loginfo(f"{strategy['config']['name']}:")
+                rospy.loginfo(f"\n{strategy['config']['name']} ({fang_id.upper()}):")
                 rospy.loginfo(f"  Insertion angle: {strategy['insertion_angle']:.3f} rad ({strategy['insertion_angle']*180/math.pi:.1f}°)")
                 rospy.loginfo(f"  Approach distance: {strategy['approach_distance']:.3f}m")
                 rospy.loginfo(f"  Yaw adjustment: {strategy['yaw_adjustment']:.3f} rad ({strategy['yaw_adjustment']*180/math.pi:.1f}°)")
                 rospy.loginfo(f"  Complexity score: {strategy['complexity_score']:.3f}")
-                rospy.loginfo(f"  Beam clearance: {strategy['min_beam_clearance']:.3f} rad")
-                rospy.loginfo(f"  Recommended: {'YES' if strategy['recommended'] else 'NO'}")
+                rospy.loginfo(f"  Beam clearance: {strategy['min_beam_clearance']:.3f} rad ({strategy['min_beam_clearance']*180/math.pi:.1f}°)")
+                rospy.loginfo(f"  Optimal clearance: {strategy['optimal_clearance_angle']*180/math.pi:.1f}° (60° for max space)")
+                rospy.loginfo(f"  Adjacent beam clearance: {strategy['adjacent_beam_clearance']*180/math.pi:.1f}° (60° from adjacent beams)")
+                rospy.loginfo(f"  Status: ACTIVE (dual-fang simultaneous insertion)")
                 rospy.loginfo(f"  Beam gap: {strategy['beam_gap']}")
+                rospy.loginfo(f"  Role: {'PRIMARY' if fang_id == primary_fang_id else 'SECONDARY'}")
             
-            optimal_strategy = strategies[optimal_fang]
-            rospy.loginfo(f"=== SELECTED STRATEGY: {optimal_strategy['config']['name']} ===")
-            rospy.loginfo(f"Reason: Lowest complexity score ({optimal_strategy['complexity_score']:.3f})")
+            rospy.loginfo("\n=== DUAL-FANG COORDINATION STRATEGY ===")
+            rospy.loginfo("Both fangs will insert simultaneously at their optimal 60° positions")
+            rospy.loginfo("Fang1 (60°) and Fang2 (210°) provide maximum insertion clearance")
+            rospy.loginfo("Coordination ensures smooth simultaneous insertion movement")
             
-            return optimal_strategy
+            return dual_fang_strategy
         
         return None
     
@@ -361,77 +414,138 @@ class InsertionOptimizer:
         """Evaluate insertion strategy using current real-time data"""
         return self.evaluate_insertion_strategy()
     
-    def get_insertion_parameters(self, strategy, pre_insertion_distance=0.03, circumferential_offset=0.02):
+    def get_insertion_parameters(self, dual_strategy, pre_insertion_distance=0.03, circumferential_offset=0.02):
         """
-        Get insertion parameters for the selected strategy
+        Get insertion parameters for dual-fang simultaneous insertion strategy
         
         Args:
-            strategy: Selected insertion strategy
+            dual_strategy: Dual-fang insertion strategy
             pre_insertion_distance: Pre-insertion distance (meters)
             circumferential_offset: Circumferential offset for avoidance (meters)
             
         Returns:
-            dict: Insertion parameters
+            dict: Dual-fang insertion parameters with both fang positions
         """
-        if strategy is None:
+        if dual_strategy is None:
+            rospy.logerr("No insertion strategy provided")
             return None
         
-        # Calculate approach position with offsets
-        valve_center_x = strategy['insertion_position'][0] - self.valve_radius * math.cos(strategy['insertion_angle'])
-        valve_center_y = strategy['insertion_position'][1] - self.valve_radius * math.sin(strategy['insertion_angle'])
+        # Ensure this is a dual-fang strategy
+        if dual_strategy.get('insertion_mode') != 'dual_simultaneous':
+            rospy.logerr("Only dual-fang simultaneous insertion strategy is supported")
+            return None
         
-        # Apply offsets based on strategy
-        config = strategy['config']
-        
-        # Adjust approach angle with bias
-        approach_angle = strategy['insertion_angle'] + config['approach_bias']
-        
-        # Calculate approach radius with offsets
-        approach_radius = self.valve_radius + self.safety_margin + pre_insertion_distance + circumferential_offset * 0.5
-        
-        # Calculate approach position
-        approach_x = valve_center_x + approach_radius * math.cos(approach_angle)
-        approach_y = valve_center_y + approach_radius * math.sin(approach_angle)
-        
-        # Calculate final insertion position
-        final_radius = self.valve_radius + self.safety_margin
-        final_x = valve_center_x + final_radius * math.cos(strategy['insertion_angle'])
-        final_y = valve_center_y + final_radius * math.sin(strategy['insertion_angle'])
-        
-        return {
-            'strategy': strategy,
-            'approach_position': (approach_x, approach_y),
-            'approach_angle': approach_angle,
-            'approach_radius': approach_radius,
-            'final_position': (final_x, final_y),
-            'final_angle': strategy['insertion_angle'],
-            'final_radius': final_radius,
-            'valve_center': (valve_center_x, valve_center_y),
-            'target_yaw': math.atan2(valve_center_y - final_y, valve_center_x - final_x),
-            'fang_config': config,
+        # New dual-fang mode
+        dual_params = {
+            'fang1': None,
+            'fang2': None,
+            'insertion_mode': 'dual_simultaneous',
+            'coordination_required': dual_strategy.get('coordination_required', True),
+            'primary_fang': dual_strategy.get('primary_fang'),
+            'secondary_fang': dual_strategy.get('secondary_fang')
         }
+        
+        # Calculate parameters for both fangs
+        for fang_id in ['fang1', 'fang2']:
+            if fang_id not in dual_strategy or dual_strategy[fang_id] is None:
+                continue
+                
+            strategy = dual_strategy[fang_id]
+            
+            # Calculate valve center from insertion position
+            valve_center_x = strategy['insertion_position'][0] - self.valve_radius * math.cos(strategy['insertion_angle'])
+            valve_center_y = strategy['insertion_position'][1] - self.valve_radius * math.sin(strategy['insertion_angle'])
+            
+            # Apply offsets based on strategy
+            config = strategy['config']
+            
+            # Adjust approach angle with bias
+            approach_angle = strategy['insertion_angle'] + config['approach_bias']
+            
+            # Calculate approach radius with offsets
+            end_effector_offset = 0.246  # End-effector length from UAV center
+            approach_radius = self.valve_radius + end_effector_offset + self.safety_margin + pre_insertion_distance + circumferential_offset * 0.5
+            
+            # Calculate approach position
+            approach_x = valve_center_x + approach_radius * math.cos(approach_angle)
+            approach_y = valve_center_y + approach_radius * math.sin(approach_angle)
+            
+            # Calculate final insertion position
+            final_radius = self.valve_radius + end_effector_offset + self.safety_margin
+            final_x = valve_center_x + final_radius * math.cos(strategy['insertion_angle'])
+            final_y = valve_center_y + final_radius * math.sin(strategy['insertion_angle'])
+            
+            dual_params[fang_id] = {
+                'fang_id': fang_id,
+                'config': config,
+                'strategy': strategy,
+                'approach_position': (approach_x, approach_y),
+                'approach_angle': approach_angle,
+                'approach_radius': approach_radius,
+                'final_position': (final_x, final_y),
+                'final_angle': strategy['insertion_angle'],
+                'final_radius': final_radius,
+                'valve_center': (valve_center_x, valve_center_y),
+                'target_yaw': math.atan2(valve_center_y - final_y, valve_center_x - final_x),
+                'fang_config': config,
+                'optimal_clearance_angle': strategy.get('optimal_clearance_angle', math.pi/3),
+                'adjacent_beam_clearance': strategy.get('adjacent_beam_clearance', math.pi/3),
+                'insertion_space_advantage': '60° angle provides maximum space for clockwise/counterclockwise movement',
+                'beam_gap': strategy['beam_gap'],
+                'complexity_score': strategy['complexity_score'],
+                'active': True
+            }
+        
+        return dual_params
     
     def log_insertion_plan(self, parameters):
-        """Log detailed insertion plan"""
+        """Log detailed insertion plan for dual-fang simultaneous insertion"""
         if parameters is None:
             rospy.logwarn("No insertion parameters to log")
             return
         
-        strategy = parameters['strategy']
-        config = parameters['fang_config']
+        # Only support dual-fang mode
+        if parameters.get('insertion_mode') != 'dual_simultaneous':
+            rospy.logerr("Only dual-fang simultaneous insertion mode is supported")
+            return
         
-        rospy.loginfo("=== INSERTION PLAN ===")
-        rospy.loginfo(f"Selected Fang: {config['name']}")
-        rospy.loginfo(f"Beam Gap: {strategy['beam_gap']}")
-        rospy.loginfo(f"Valve Center: [{parameters['valve_center'][0]:.3f}, {parameters['valve_center'][1]:.3f}]")
-        rospy.loginfo(f"Approach Position: [{parameters['approach_position'][0]:.3f}, {parameters['approach_position'][1]:.3f}]")
-        rospy.loginfo(f"Final Position: [{parameters['final_position'][0]:.3f}, {parameters['final_position'][1]:.3f}]")
-        rospy.loginfo(f"Approach Angle: {parameters['approach_angle']:.3f} rad ({parameters['approach_angle']*180/math.pi:.1f}°)")
-        rospy.loginfo(f"Final Angle: {parameters['final_angle']:.3f} rad ({parameters['final_angle']*180/math.pi:.1f}°)")
-        rospy.loginfo(f"Target Yaw: {parameters['target_yaw']:.3f} rad ({parameters['target_yaw']*180/math.pi:.1f}°)")
-        rospy.loginfo(f"Approach Radius: {parameters['approach_radius']:.3f}m")
-        rospy.loginfo(f"Final Radius: {parameters['final_radius']:.3f}m")
-        rospy.loginfo("=== END INSERTION PLAN ===")
+        rospy.loginfo("=== DUAL-FANG SIMULTANEOUS INSERTION PLAN ===")
+        rospy.loginfo(f"Insertion Mode: {parameters['insertion_mode']}")
+        rospy.loginfo(f"Coordination Required: {parameters['coordination_required']}")
+        rospy.loginfo(f"Primary Fang: {parameters['primary_fang']}")
+        rospy.loginfo(f"Secondary Fang: {parameters['secondary_fang']}")
+        
+        for fang_id in ['fang1', 'fang2']:
+            if fang_id not in parameters or parameters[fang_id] is None:
+                continue
+                
+            fang_params = parameters[fang_id]
+            config = fang_params['fang_config']
+            
+            rospy.loginfo(f"\n{fang_id.upper()} - {config['name']}:")
+            rospy.loginfo(f"  Beam Gap: {fang_params['beam_gap']}")
+            rospy.loginfo(f"  Optimal Clearance: {fang_params['optimal_clearance_angle']*180/math.pi:.1f}° (60° for maximum insertion space)")
+            rospy.loginfo(f"  Adjacent Beam Clearance: {fang_params['adjacent_beam_clearance']*180/math.pi:.1f}° (60° from adjacent beams)")
+            rospy.loginfo(f"  Insertion Space Advantage: {fang_params['insertion_space_advantage']}")
+            rospy.loginfo(f"  Valve Center: [{fang_params['valve_center'][0]:.3f}, {fang_params['valve_center'][1]:.3f}]")
+            rospy.loginfo(f"  Approach Position: [{fang_params['approach_position'][0]:.3f}, {fang_params['approach_position'][1]:.3f}]")
+            rospy.loginfo(f"  Final Position: [{fang_params['final_position'][0]:.3f}, {fang_params['final_position'][1]:.3f}]")
+            rospy.loginfo(f"  Approach Angle: {fang_params['approach_angle']:.3f} rad ({fang_params['approach_angle']*180/math.pi:.1f}°)")
+            rospy.loginfo(f"  Final Angle: {fang_params['final_angle']:.3f} rad ({fang_params['final_angle']*180/math.pi:.1f}°)")
+            rospy.loginfo(f"  Target Yaw: {fang_params['target_yaw']:.3f} rad ({fang_params['target_yaw']*180/math.pi:.1f}°)")
+            rospy.loginfo(f"  Approach Radius: {fang_params['approach_radius']:.3f}m")
+            rospy.loginfo(f"  Final Radius: {fang_params['final_radius']:.3f}m")
+            rospy.loginfo(f"  Complexity Score: {fang_params['complexity_score']:.3f}")
+            rospy.loginfo(f"  Status: {'PRIMARY' if fang_id == parameters['primary_fang'] else 'SECONDARY'}")
+            rospy.loginfo(f"  Active: {fang_params['active']}")
+        
+        rospy.loginfo("\n=== DUAL-FANG COORDINATION SUMMARY ===")
+        rospy.loginfo("Both fangs insert simultaneously at optimal 60° clearance positions")
+        rospy.loginfo("Fang1 (60°) + Fang2 (210°) = Maximum insertion space coverage")
+        rospy.loginfo("Enables smooth clockwise/counterclockwise movement to pre-insertion point")
+        rospy.loginfo("=== END DUAL-FANG INSERTION PLAN ===")
+        
+        rospy.loginfo("NOTE: 60° insertion angles enable smooth clockwise/counterclockwise movement to pre-insertion point")
 
     def evaluate_dual_fang_strategy(self, current_pos=None, current_yaw=None, valve_pos=None, valve_yaw=None):
         """
@@ -722,14 +836,14 @@ def test_with_manual_data():
     # Test cases
     test_cases = [
         {
-            'name': 'UAV closer to left side (should select Fang1)',
+            'name': 'UAV test position 1',
             'current_pos': (2.8, -0.2, 1.0),
             'current_yaw': 0.1,
             'valve_pos': (3.0, 0.0, 0.57),
             'valve_yaw': 0.0,
         },
         {
-            'name': 'UAV closer to right side (should select Fang2)',
+            'name': 'UAV test position 2',
             'current_pos': (3.2, 0.2, 1.0),
             'current_yaw': 2.0,
             'valve_pos': (3.0, 0.0, 0.57),
@@ -747,14 +861,23 @@ def test_with_manual_data():
                 valve_yaw=test_case['valve_yaw']
             )
             
-            if strategy:
+            if strategy and strategy.get('insertion_mode') == 'dual_simultaneous':
                 parameters = optimizer.get_insertion_parameters(strategy)
-                print(f"✓ Selected: {strategy['config']['name']}")
-                print(f"  Complexity score: {strategy['complexity_score']:.3f}")
-                print(f"  Approach distance: {strategy['approach_distance']:.3f}m")
-                print(f"  Yaw adjustment: {strategy['yaw_adjustment']:.3f} rad")
+                print(f"✓ Dual-fang strategy generated successfully")
+                print(f"  Primary fang: {strategy['primary_fang']}")
+                print(f"  Secondary fang: {strategy['secondary_fang']}")
+                print(f"  Coordination required: {strategy['coordination_required']}")
+                
+                # Show complexity scores for both fangs
+                for fang_id in ['fang1', 'fang2']:
+                    if fang_id in strategy and strategy[fang_id]:
+                        fang_strategy = strategy[fang_id]
+                        print(f"  {fang_id}: {fang_strategy['config']['name']}")
+                        print(f"    Complexity score: {fang_strategy['complexity_score']:.3f}")
+                        print(f"    Approach distance: {fang_strategy['approach_distance']:.3f}m")
+                        print(f"    Yaw adjustment: {fang_strategy['yaw_adjustment']:.3f} rad")
             else:
-                print("✗ Failed to get strategy")
+                print("✗ Failed to get dual-fang strategy")
         except Exception as e:
             print(f"✗ Test failed: {e}")
     

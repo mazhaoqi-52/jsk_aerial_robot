@@ -71,10 +71,10 @@ if __name__=="__main__":
         force_landing_pub = TriPublisher(ns_1 + '/force_landing', ns_2 + '/force_landing', ns_3 + '/force_landing', Empty, queue_size=1)
         nav_pub = TriPublisher(robot_ns_1 + '/uav/nav', robot_ns_2 + '/uav/nav', robot_ns_3 + '/uav/nav', FlightNav, queue_size=1)
 
-        xy_vel   = rospy.get_param("xy_vel", 0.1)
+        xy_vel   = rospy.get_param("xy_vel", 0.05)
         z_step  = 0.1
-        yaw_vel  = rospy.get_param("yaw_vel", 0.1)
-        z_vel = rospy.get_param("z_vel", 0.1)
+        yaw_vel  = rospy.get_param("yaw_vel", 0.05)
+        z_vel = rospy.get_param("z_vel", 0.05)
 
         motion_start_pub   = TriPublisher('task_start', 'task_start', 'task_start', Empty, queue_size=1)
         current_z_vel = 0.0

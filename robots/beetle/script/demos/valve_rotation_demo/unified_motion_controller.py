@@ -5,6 +5,12 @@ Unified Motion Controller
 Integrates basic motion control, enhanced alignment control, and constant distance feedback control functionality
 """
 
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'))
+
 import rospy
 import time
 import math

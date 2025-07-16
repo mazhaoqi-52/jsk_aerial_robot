@@ -1,8 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 Joy-controlled valve rotation using existing state machine
 Simplified version that directly imports and reuses original components
 """
+
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'))
 
 import rospy
 import smach

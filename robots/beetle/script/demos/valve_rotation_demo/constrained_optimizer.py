@@ -40,6 +40,21 @@ class ConstrainedInsertionOptimizer:
         self.max_yaw_change = math.pi / 2  # 90 degrees max
         self.max_approach_distance = 2.0  # 2m max approach
         self.min_beam_clearance = 0.01  # 1cm minimum clearance
+        self.beam_clearance = 0.01  # 1cm minimum beam clearance
+        
+        # URDF-based fang geometry (from beetle.urdf.xacro)
+        self.fang_to_base_x = 0.246        # Fang连接到base_link的X偏移
+        self.fang_to_base_y = 0.0          # Fang连接到base_link的Y偏移
+        self.fang_to_base_z = 0.0743823    # Fang连接到base_link的Z偏移
+        
+        # 两个fang的collision位置 (相对于beetle_fang_link)
+        self.left_fang_y = 0.08438         # 左fang的Y偏移
+        self.right_fang_y = -0.08438       # 右fang的Y偏移
+        self.fang_collision_x = 0.0072     # 两个fang的X偏移 (近似相同)
+        self.fang_collision_z = -0.0522683 # 两个fang的Z偏移
+        
+        # 两个fang之间的固定距离
+        self.fixed_inter_fang_distance = 0.16876  # 168.76mm (固定值)
         
         # Current state
         self.current_uav_pos = None
@@ -54,6 +69,7 @@ class ConstrainedInsertionOptimizer:
         rospy.loginfo(f"Valve radius: {valve_radius:.4f}m")
         rospy.loginfo(f"End-effector length: {end_effector_length:.4f}m")
         rospy.loginfo(f"Safety margin: {safety_margin:.4f}m")
+        rospy.loginfo(f"Fixed inter-fang distance: {self.fixed_inter_fang_distance:.4f}m")
     
     def _setup_subscribers(self):
         """Setup ROS subscribers"""
@@ -108,7 +124,9 @@ class ConstrainedInsertionOptimizer:
                                        (body_y - valve_center_y)**2)
         
         # Ensure body maintains safe distance outside end-effector
-        min_body_distance = self.valve_radius + 0.05  # Valve radius + 5cm safety margin
+        # CRITICAL FIX: Consider end-effector length (0.246m) in safety calculation
+        end_effector_length = 0.246  # Distance from UAV center to end-effector
+        min_body_distance = self.valve_radius + end_effector_length + 0.01  # Additional 1cm safety margin
         body_safety_error = max(0, min_body_distance - body_valve_distance)
         
         # 3. Secondary objective: minimize movement distance and angle change
@@ -210,7 +228,9 @@ class ConstrainedInsertionOptimizer:
         constraints.append(end_eff_reach_constraint)
         
         # Body minimum safety distance constraint
-        min_body_distance = self.valve_radius + 0.05  # Valve radius + 5cm safety margin
+        # CRITICAL FIX: Consider end-effector length (0.246m) in safety calculation
+        end_effector_length = 0.246  # Distance from UAV center to end-effector
+        min_body_distance = self.valve_radius + end_effector_length + 0.01  # Additional 1cm safety margin
         body_safety_constraint = body_valve_distance - min_body_distance
         constraints.append(body_safety_constraint)
         
@@ -379,6 +399,402 @@ class ConstrainedInsertionOptimizer:
             rospy.logerr(f"Optimization error: {e}")
             return {'success': False, 'message': str(e)}
 
+    def optimize_dual_insertion_position(self):
+        """
+        Optimize dual end-effector simultaneous insertion position using constrained optimization
+        Both left and right end-effectors insert simultaneously
+        
+        Returns:
+            dict: Dual insertion optimization result
+        """
+        if self.current_uav_pos is None or self.valve_pos is None:
+            rospy.logerr("Missing UAV or valve position data")
+            return None
+        
+        rospy.loginfo("Starting dual end-effector constrained optimization...")
+        rospy.loginfo(f"Current UAV: [{self.current_uav_pos[0]:.3f}, {self.current_uav_pos[1]:.3f}]")
+        rospy.loginfo(f"Valve center: [{self.valve_pos[0]:.3f}, {self.valve_pos[1]:.3f}]")
+        
+        # Calculate geometrically optimal positions for both end-effectors
+        valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
+        
+        # Left end-effector (fang1): beam0_beam1 gap (closer to beam1 at 120°)
+        left_target_angle = 90 * math.pi / 180  # 90° (closer to beam1 at 120°)
+        left_global_angle = left_target_angle + self.valve_yaw
+        
+        # Right end-effector (fang2): beam1_beam2 gap (closer to beam2 at 240°)
+        right_target_angle = 190 * math.pi / 180  # 190° (closer to beam2 at 240°)
+        right_global_angle = right_target_angle + self.valve_yaw
+        
+        # Calculate end-effector positions on valve circumference
+        left_end_eff_x = valve_center_x + self.valve_radius * math.cos(left_global_angle)
+        left_end_eff_y = valve_center_y + self.valve_radius * math.sin(left_global_angle)
+        
+        right_end_eff_x = valve_center_x + self.valve_radius * math.cos(right_global_angle)
+        right_end_eff_y = valve_center_y + self.valve_radius * math.sin(right_global_angle)
+        
+        # Calculate body position based on dual end-effector configuration
+        # Body is positioned to balance between both end-effectors
+        center_end_eff_x = (left_end_eff_x + right_end_eff_x) / 2
+        center_end_eff_y = (left_end_eff_y + right_end_eff_y) / 2
+        
+        # Body yaw points toward valve center
+        body_yaw = math.atan2(valve_center_y - center_end_eff_y, valve_center_x - center_end_eff_x)
+        
+        # Body position: extended back from center of end-effectors
+        body_x = center_end_eff_x - self.end_effector_length * math.cos(body_yaw)
+        body_y = center_end_eff_y - self.end_effector_length * math.sin(body_yaw)
+        
+        x0 = [body_x, body_y, body_yaw]
+        
+        rospy.loginfo(f"Initial guess: body[{body_x:.3f}, {body_y:.3f}], yaw={body_yaw:.3f}")
+        rospy.loginfo(f"Left end-effector: [{left_end_eff_x:.3f}, {left_end_eff_y:.3f}]")
+        rospy.loginfo(f"Right end-effector: [{right_end_eff_x:.3f}, {right_end_eff_y:.3f}]")
+        
+        # Bounds for optimization variables
+        bounds = [
+            (self.current_uav_pos[0] - 1.0, self.current_uav_pos[0] + 1.0),  # body_x
+            (self.current_uav_pos[1] - 1.0, self.current_uav_pos[1] + 1.0),  # body_y
+            (self.current_uav_yaw - self.max_yaw_change, 
+             self.current_uav_yaw + self.max_yaw_change)  # body_yaw
+        ]
+        
+        # Constraint function for dual end-effector
+        def dual_constraint_func(x):
+            return self._dual_constraints(x)
+        
+        constraint_dict = {
+            'type': 'ineq',
+            'fun': dual_constraint_func
+        }
+        
+        # Optimize
+        try:
+            result = minimize(
+                fun=lambda x: self._dual_objective_function(x, self.current_uav_pos, self.current_uav_yaw),
+                x0=x0,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraint_dict,
+                options={'maxiter': 100, 'ftol': 1e-6}
+            )
+            
+            if result.success:
+                optimal_body_x, optimal_body_y, optimal_body_yaw = result.x
+                
+                # Calculate dual fang positions using URDF geometry
+                (left_fang_x, left_fang_y, left_fang_z), (right_fang_x, right_fang_y, right_fang_z) = \
+                    self._calculate_fang_positions(optimal_body_x, optimal_body_y, optimal_body_yaw)
+                
+                # Calculate inter-fang distance (should be fixed)
+                inter_fang_distance = math.sqrt((left_fang_x - right_fang_x)**2 + 
+                                               (left_fang_y - right_fang_y)**2)
+                
+                # Calculate angular separation
+                valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
+                left_fang_angle = math.atan2(left_fang_y - valve_center_y, left_fang_x - valve_center_x)
+                right_fang_angle = math.atan2(right_fang_y - valve_center_y, right_fang_x - valve_center_x)
+                
+                angular_separation = abs(self._normalize_angle(left_fang_angle - right_fang_angle))
+                angular_separation = min(angular_separation, 2*math.pi - angular_separation)
+                
+                rospy.loginfo("=== Dual End-Effector Optimization Results ===")
+                rospy.loginfo(f"Optimization successful: {result.success}")
+                rospy.loginfo(f"Objective value: {result.fun:.4f}")
+                rospy.loginfo(f"Body position: [{optimal_body_x:.3f}, {optimal_body_y:.3f}]")
+                rospy.loginfo(f"Body yaw: {optimal_body_yaw:.3f} rad ({optimal_body_yaw*180/math.pi:.1f}°)")
+                rospy.loginfo(f"Left fang: [{left_fang_x:.3f}, {left_fang_y:.3f}]")
+                rospy.loginfo(f"Right fang: [{right_fang_x:.3f}, {right_fang_y:.3f}]")
+                rospy.loginfo(f"Inter-fang distance: {inter_fang_distance:.5f}m (Fixed: {self.fixed_inter_fang_distance:.5f}m)")
+                rospy.loginfo(f"Angular separation: {angular_separation:.3f} rad ({angular_separation*180/math.pi:.1f}°)")
+                
+                # Evaluate constraint satisfaction
+                constraint_values = self._dual_constraints(result.x)
+                constraints_satisfied = all(c >= -1e-6 for c in constraint_values)
+                
+                rospy.loginfo("=== Constraint Satisfaction Status ===")
+                rospy.loginfo(f"All constraints satisfied: {constraints_satisfied}")
+                rospy.loginfo(f"Number of constraints: {len(constraint_values)}")
+                
+                # Detailed constraint analysis
+                constraint_names = [
+                    "Left fang at valve radius",
+                    "Right fang at valve radius", 
+                    "Left fang in beam0_beam1 gap",
+                    "Right fang in beam1_beam2 gap",
+                    "Body safety distance",
+                    "Left fang beam clearance",
+                    "Right fang beam clearance",
+                    "Workspace constraint",
+                    "Inter-fang distance constraint"
+                ]
+                
+                for i, (name, value) in enumerate(zip(constraint_names, constraint_values)):
+                    status = "✓" if value >= -1e-6 else "✗"
+                    rospy.loginfo(f"  {status} {name}: {value:.4f}")
+                
+                return {
+                    'success': True,
+                    'body_position': (optimal_body_x, optimal_body_y, self.current_uav_pos[2]),
+                    'body_yaw': optimal_body_yaw,
+                    'left_end_effector_position': (left_fang_x, left_fang_y, left_fang_z),
+                    'right_end_effector_position': (right_fang_x, right_fang_y, right_fang_z),
+                    'inter_fang_distance': inter_fang_distance,
+                    'angular_separation': angular_separation,
+                    'insertion_type': 'dual_simultaneous',
+                    'objective_value': result.fun,
+                    'constraints_satisfied': constraints_satisfied,
+                    'constraint_values': constraint_values
+                }
+            else:
+                rospy.logerr(f"Dual optimization failed: {result.message}")
+                return {'success': False, 'message': result.message}
+                
+        except Exception as e:
+            rospy.logerr(f"Dual optimization error: {e}")
+            return {'success': False, 'message': str(e)}
+
+    def _dual_objective_function(self, x, current_pos, current_yaw):
+        """
+        Dual end-effector optimization objective function (corrected for fixed fang geometry)
+        
+        Args:
+            x: [body_x, body_y, body_yaw] - optimization variables
+            current_pos: Current UAV position
+            current_yaw: Current UAV yaw
+            
+        Returns:
+            float: Objective value (to minimize)
+        """
+        body_x, body_y, body_yaw = x
+        valve_center_x, valve_center_y, _ = self.valve_pos
+        
+        # Calculate actual fang positions based on URDF geometry
+        (left_fang_x, left_fang_y, left_fang_z), (right_fang_x, right_fang_y, right_fang_z) = \
+            self._calculate_fang_positions(body_x, body_y, body_yaw)
+        
+        # Primary objective: optimize both fangs to valve radius
+        left_valve_distance = math.sqrt((left_fang_x - valve_center_x)**2 + 
+                                       (left_fang_y - valve_center_y)**2)
+        right_valve_distance = math.sqrt((right_fang_x - valve_center_x)**2 + 
+                                        (right_fang_y - valve_center_y)**2)
+        
+        # Ideal distance: close to valve radius
+        ideal_distance = self.valve_radius - 0.01  # 1cm gap
+        left_distance_error = abs(left_valve_distance - ideal_distance)
+        right_distance_error = abs(right_valve_distance - ideal_distance)
+        
+        # Body safety distance
+        body_valve_distance = math.sqrt((body_x - valve_center_x)**2 + 
+                                       (body_y - valve_center_y)**2)
+        # CRITICAL FIX: Consider end-effector length (0.246m) in safety calculation
+        end_effector_length = 0.246  # Distance from UAV center to end-effector
+        min_body_distance = self.valve_radius + end_effector_length + 0.01  # Additional 1cm safety margin
+        body_safety_error = max(0, min_body_distance - body_valve_distance)
+        
+        # Movement minimization
+        approach_distance = math.sqrt((body_x - current_pos[0])**2 + 
+                                     (body_y - current_pos[1])**2)
+        yaw_change = abs(self._normalize_angle(body_yaw - current_yaw))
+        
+        # Symmetry objective: both fangs should be equidistant from valve center
+        symmetry_error = abs(left_valve_distance - right_valve_distance)
+        
+        # Calculate angular separation between fangs (relative to valve center)
+        left_fang_angle = math.atan2(left_fang_y - valve_center_y, left_fang_x - valve_center_x)
+        right_fang_angle = math.atan2(right_fang_y - valve_center_y, right_fang_x - valve_center_x)
+        
+        angular_separation = abs(self._normalize_angle(left_fang_angle - right_fang_angle))
+        angular_separation = min(angular_separation, 2*math.pi - angular_separation)
+        
+        # Optimal angular separation: around 120° (2π/3) for effective valve gripping
+        optimal_angular_separation = 2*math.pi/3  # 120°
+        angular_error = abs(angular_separation - optimal_angular_separation)
+        
+        # Comprehensive objective function (removed inter-fang distance error since it's fixed)
+        objective = (5.0 * left_distance_error +      # Left fang distance
+                    5.0 * right_distance_error +      # Right fang distance
+                    3.0 * body_safety_error +         # Body safety
+                    2.0 * symmetry_error +            # Dual symmetry
+                    1.5 * angular_error +             # Angular separation optimization
+                    1.0 * approach_distance +         # Movement minimization
+                    1.0 * yaw_change)                 # Yaw change minimization
+        
+        return objective
+
+    def _dual_constraints(self, x):
+        """
+        Dual end-effector optimization constraints (corrected for fixed fang geometry)
+        
+        Args:
+            x: [body_x, body_y, body_yaw] - optimization variables
+            
+        Returns:
+            list: Constraint violations (should be >= 0)
+        """
+        body_x, body_y, body_yaw = x
+        constraints = []
+        
+        # Calculate actual fang positions based on URDF geometry
+        (left_fang_x, left_fang_y, left_fang_z), (right_fang_x, right_fang_y, right_fang_z) = \
+            self._calculate_fang_positions(body_x, body_y, body_yaw)
+        
+        valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
+        
+        # Constraint 1: Left fang should be at valve radius
+        left_valve_distance = math.sqrt((left_fang_x - valve_center_x)**2 + 
+                                       (left_fang_y - valve_center_y)**2)
+        left_radius_constraint = self.safety_margin - abs(left_valve_distance - self.valve_radius)
+        constraints.append(left_radius_constraint)
+        
+        # Constraint 2: Right fang should be at valve radius
+        right_valve_distance = math.sqrt((right_fang_x - valve_center_x)**2 + 
+                                        (right_fang_y - valve_center_y)**2)
+        right_radius_constraint = self.safety_margin - abs(right_valve_distance - self.valve_radius)
+        constraints.append(right_radius_constraint)
+        
+        # Constraint 3: Left fang should be in beam0_beam1 gap
+        left_angle = math.atan2(left_fang_y - valve_center_y, left_fang_x - valve_center_x)
+        left_normalized = self._normalize_angle(left_angle - self.valve_yaw)
+        left_in_gap = (left_normalized >= 0 and left_normalized <= 2*math.pi/3)
+        constraints.append(0.1 if left_in_gap else -1.0)
+        
+        # Constraint 4: Right fang should be in beam1_beam2 gap
+        right_angle = math.atan2(right_fang_y - valve_center_y, right_fang_x - valve_center_x)
+        right_normalized = self._normalize_angle(right_angle - self.valve_yaw)
+        right_in_gap = (right_normalized >= 2*math.pi/3 and right_normalized <= 4*math.pi/3)
+        constraints.append(0.1 if right_in_gap else -1.0)
+        
+        # Constraint 5: Body safety distance
+        body_valve_distance = math.sqrt((body_x - valve_center_x)**2 + 
+                                       (body_y - valve_center_y)**2)
+        # CRITICAL FIX: Consider end-effector length (0.246m) in safety calculation
+        end_effector_length = 0.246  # Distance from UAV center to end-effector
+        min_body_distance = self.valve_radius + end_effector_length + 0.01  # Additional 1cm safety margin
+        body_safety_constraint = body_valve_distance - min_body_distance
+        constraints.append(body_safety_constraint)
+        
+        # Constraint 6: Minimum clearance from beams for both fangs
+        beam_angles = [0, 2*math.pi/3, 4*math.pi/3]  # 0°, 120°, 240°
+        
+        # Left fang beam clearance
+        left_clearances = []
+        for beam_angle in beam_angles:
+            clearance = abs(self._normalize_angle(left_normalized - beam_angle))
+            clearance = min(clearance, 2*math.pi - clearance)
+            left_clearances.append(clearance)
+        
+        min_left_clearance = min(left_clearances)
+        left_clearance_constraint = min_left_clearance - self.beam_clearance
+        constraints.append(left_clearance_constraint)
+        
+        # Right fang beam clearance
+        right_clearances = []
+        for beam_angle in beam_angles:
+            clearance = abs(self._normalize_angle(right_normalized - beam_angle))
+            clearance = min(clearance, 2*math.pi - clearance)
+            right_clearances.append(clearance)
+        
+        min_right_clearance = min(right_clearances)
+        right_clearance_constraint = min_right_clearance - self.beam_clearance
+        constraints.append(right_clearance_constraint)
+        
+        # Constraint 7: Workspace boundary
+        workspace_radius = 1.0  # meters
+        workspace_constraint = workspace_radius - math.sqrt(body_x**2 + body_y**2)
+        constraints.append(workspace_constraint)
+        
+        # Constraint 8: Fixed inter-fang distance validation (not for optimization)
+        # This verifies the URDF geometry is correctly maintained
+        expected_inter_fang_distance = 0.16876  # From URDF analysis
+        actual_inter_fang_distance = math.sqrt((left_fang_x - right_fang_x)**2 + 
+                                              (left_fang_y - right_fang_y)**2)
+        distance_tolerance = 0.001  # 1mm tolerance for numerical precision
+        inter_fang_constraint = distance_tolerance - abs(actual_inter_fang_distance - expected_inter_fang_distance)
+        constraints.append(inter_fang_constraint)
+        
+        return constraints
+        # Both end-effectors should be roughly equidistant from valve center
+        distance_balance = abs(left_valve_distance - right_valve_distance)
+        max_distance_imbalance = 0.02  # 2cm maximum imbalance
+        balance_constraint = max_distance_imbalance - distance_balance
+        constraints.append(balance_constraint)
+        
+        # Constraint 8: Inter-fang distance constraint
+        # Distance between two fangs should be within acceptable range
+        inter_fang_distance = math.sqrt((left_end_eff_x - right_end_eff_x)**2 + 
+                                       (left_end_eff_y - right_end_eff_y)**2)
+        
+        # Physical constraints based on actual fang configuration
+        min_inter_fang_distance = 0.05  # 5cm minimum separation (avoid collision)
+        max_inter_fang_distance = 0.35  # 35cm maximum separation (maintain coordination)
+        
+        # Two-sided constraint: distance should be within [min, max] range
+        min_distance_constraint = inter_fang_distance - min_inter_fang_distance
+        max_distance_constraint = max_inter_fang_distance - inter_fang_distance
+        
+        constraints.append(min_distance_constraint)  # >= min_distance
+        constraints.append(max_distance_constraint)  # <= max_distance
+        
+        # Constraint 9: Fang angular separation constraint
+        # Angular separation between fangs should be reasonable for valve operation
+        left_fang_angle = math.atan2(left_end_eff_y - valve_center_y, left_end_eff_x - valve_center_x)
+        right_fang_angle = math.atan2(right_end_eff_y - valve_center_y, right_end_eff_x - valve_center_x)
+        
+        # Calculate angular separation (always positive)
+        angular_separation = abs(self._normalize_angle(left_fang_angle - right_fang_angle))
+        angular_separation = min(angular_separation, 2*math.pi - angular_separation)
+        
+        # Optimal angular separation: around 90° to 180° for effective valve rotation
+        min_angular_separation = math.pi/3      # 60° minimum
+        max_angular_separation = 5*math.pi/6    # 150° maximum
+        
+        min_angular_constraint = angular_separation - min_angular_separation
+        max_angular_constraint = max_angular_separation - angular_separation
+        
+        constraints.append(min_angular_constraint)  # >= 60°
+        constraints.append(max_angular_constraint)  # <= 150°
+        
+        return constraints
+
+    def _calculate_fang_positions(self, body_x, body_y, body_yaw, body_z=None):
+        """
+        Calculate world positions of both fangs based on URDF geometry
+        
+        Args:
+            body_x: Body X position
+            body_y: Body Y position  
+            body_yaw: Body yaw angle
+            body_z: Body Z position (optional, defaults to valve height)
+            
+        Returns:
+            tuple: (left_fang_pos, right_fang_pos) each as (x, y, z)
+        """
+        # Use valve height if body_z not provided
+        if body_z is None:
+            body_z = self.valve_pos[2] if self.valve_pos else 0.5
+        
+        # Transform from body frame to world frame
+        cos_yaw = math.cos(body_yaw)
+        sin_yaw = math.sin(body_yaw)
+        
+        # Fang link position in world frame
+        fang_link_x = body_x + self.fang_to_base_x * cos_yaw - self.fang_to_base_y * sin_yaw
+        fang_link_y = body_y + self.fang_to_base_x * sin_yaw + self.fang_to_base_y * cos_yaw
+        fang_link_z = body_z + self.fang_to_base_z
+        
+        # Left fang position in world frame
+        left_fang_x = fang_link_x + self.fang_collision_x * cos_yaw - self.left_fang_y * sin_yaw
+        left_fang_y = fang_link_y + self.fang_collision_x * sin_yaw + self.left_fang_y * cos_yaw
+        left_fang_z = fang_link_z + self.fang_collision_z
+        
+        # Right fang position in world frame
+        right_fang_x = fang_link_x + self.fang_collision_x * cos_yaw - self.right_fang_y * sin_yaw
+        right_fang_y = fang_link_y + self.fang_collision_x * sin_yaw + self.right_fang_y * cos_yaw
+        right_fang_z = fang_link_z + self.fang_collision_z
+        
+        return ((left_fang_x, left_fang_y, left_fang_z), 
+                (right_fang_x, right_fang_y, right_fang_z))
 
 def test_constrained_optimizer():
     """Test the constrained optimizer"""
@@ -398,15 +814,40 @@ def test_constrained_optimizer():
     optimizer.valve_pos = (3.0, 0.0, 0.57)
     optimizer.valve_yaw = 0.0
     
-    # Run optimization
+    # Test 1: Single end-effector optimization
+    rospy.loginfo("=== Test 1: Single End-Effector Optimization ===")
     result = optimizer.optimize_insertion_position()
     
     if result and result['success']:
-        rospy.loginfo("✓ Constrained optimization successful!")
+        rospy.loginfo("✓ Single end-effector optimization successful!")
         rospy.loginfo(f"Selected gap: {result['selected_gap']}")
         rospy.loginfo(f"Constraints satisfied: {result['constraints_satisfied']}")
     else:
-        rospy.logerr("✗ Constrained optimization failed!")
+        rospy.logerr("✗ Single end-effector optimization failed!")
+    
+    # Test 2: Dual end-effector optimization
+    rospy.loginfo("\n=== Test 2: Dual End-Effector Optimization ===")
+    dual_result = optimizer.optimize_dual_insertion_position()
+    
+    if dual_result and dual_result['success']:
+        rospy.loginfo("✓ Dual end-effector optimization successful!")
+        rospy.loginfo(f"Insertion type: {dual_result['insertion_type']}")
+        rospy.loginfo(f"Constraints satisfied: {dual_result['constraints_satisfied']}")
+        rospy.loginfo(f"Body position: {dual_result['body_position']}")
+        rospy.loginfo(f"Left end-effector: {dual_result['left_end_effector_position']}")
+        rospy.loginfo(f"Right end-effector: {dual_result['right_end_effector_position']}")
+    else:
+        rospy.logerr("✗ Dual end-effector optimization failed!")
+    
+    # Test 3: Comparison
+    rospy.loginfo("\n=== Test 3: Comparison ===")
+    if result and result['success'] and dual_result and dual_result['success']:
+        rospy.loginfo(f"Single objective: {result['objective_value']:.4f}")
+        rospy.loginfo(f"Dual objective: {dual_result['objective_value']:.4f}")
+        rospy.loginfo(f"Recommendation: {'Dual' if dual_result['objective_value'] < result['objective_value'] else 'Single'} end-effector approach")
+    
+    rospy.loginfo("=== Constrained Optimizer Test Complete ===")
+    rospy.loginfo("Both single and dual end-effector optimization modes are now available!")
 
 
 if __name__ == '__main__':

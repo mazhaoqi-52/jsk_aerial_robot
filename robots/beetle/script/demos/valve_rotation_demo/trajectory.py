@@ -76,6 +76,7 @@ class ValveRotationTrajectory:
         self.rotation_duration = rotation_duration
         self.valve_center = valve_center
         self.end_effector_rotation_radius = end_effector_rotation_radius
+        self.end_effector_distance = end_effector_rotation_radius  # Alias for compatibility
         self.start_angle = start_angle
         self.rotation_angle = rotation_angle * rotation_direction
         self.grasp_height = grasp_height
@@ -145,6 +146,10 @@ class ValveRotationTrajectory:
         
         return ((uav_target_x, uav_target_y, uav_target_z), uav_target_yaw)
         
+    def get_next_uav_position_and_yaw(self):
+        """Get next UAV position and orientation (compatibility interface)"""
+        return self.get_next_position_and_yaw()
+    
     def get_next_position(self):
         """Get next position (compatibility interface)"""
         result = self.get_next_position_and_yaw()
@@ -179,7 +184,7 @@ def validate_uav_position(uav_pos, uav_yaw, valve_center,
     valve_radius = 0.1225
     # OPTIMIZED: Practical safe distance for post-insertion rotation start
     # Based on actual insertion results, UAV should be positioned optimally for rotation
-    min_safe_uav_distance = valve_radius + end_effector_offset_x * 0.4  # Further reduced from 50% to 40%
+    min_safe_uav_distance = valve_radius + end_effector_offset_x * 0.2  # Further reduced from 50% to 40%
     
     errors = []
     

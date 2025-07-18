@@ -58,23 +58,25 @@ if __name__=="__main__":
         rospy.init_node("keyboard_command")
         robot_ns_1 = "beetle1"
         robot_ns_2 = "beetle2"
-        robot_ns_3 = "assembly"
+        robot_ns_3 = "beetle3"
+        robot_ns_assemble = "assembly"
         print(msg)
 
         ns_1 = robot_ns_1 + "/teleop_command"
         ns_2 = robot_ns_2 + "/teleop_command"
         ns_3 = robot_ns_3 + "/teleop_command"
-        land_pub = TriPublisher(ns_1 + '/land', ns_2 + '/land', ns_3 + '/land', Empty, queue_size=1)
-        halt_pub = TriPublisher(ns_1 + '/halt', ns_2 +'/halt', ns_3 +'/halt', Empty, queue_size=1)
-        start_pub = TriPublisher(ns_1 + '/start', ns_2 + '/start',ns_3 + '/start', Empty, queue_size=1)
-        takeoff_pub = TriPublisher(ns_1 + '/takeoff', ns_2 + '/takeoff', ns_3 + '/takeoff', Empty, queue_size=1)
-        force_landing_pub = TriPublisher(ns_1 + '/force_landing', ns_2 + '/force_landing', ns_3 + '/force_landing', Empty, queue_size=1)
-        nav_pub = TriPublisher(robot_ns_1 + '/uav/nav', robot_ns_2 + '/uav/nav', robot_ns_3 + '/uav/nav', FlightNav, queue_size=1)
+        ns_assemble = robot_ns_assemble + "/teleop_command"
+        land_pub = TriPublisher(ns_1 + '/land', ns_2 + '/land', ns_3 + '/land', ns_assemble + '/land', Empty, queue_size=1)
+        halt_pub = TriPublisher(ns_1 + '/halt', ns_2 +'/halt', ns_3 +'/halt', ns_assemble +'/halt', Empty, queue_size=1)
+        start_pub = TriPublisher(ns_1 + '/start', ns_2 + '/start',ns_3 + '/start', ns_assemble + '/start', Empty, queue_size=1)
+        takeoff_pub = TriPublisher(ns_1 + '/takeoff', ns_2 + '/takeoff', ns_3 + '/takeoff', ns_assemble + '/takeoff', Empty, queue_size=1)
+        force_landing_pub = TriPublisher(ns_1 + '/force_landing', ns_2 + '/force_landing', ns_3 + '/force_landing', ns_assemble + '/force_landing', Empty, queue_size=1)
+        nav_pub = TriPublisher(robot_ns_1 + '/uav/nav', robot_ns_2 + '/uav/nav', robot_ns_3 + '/uav/nav', robot_ns_assemble + '/uav/nav', FlightNav, queue_size=1)
 
-        xy_vel   = rospy.get_param("xy_vel", 0.05)
+        xy_vel   = rospy.get_param("xy_vel", 0.02)
         z_step  = 0.1
-        yaw_vel  = rospy.get_param("yaw_vel", 0.05)
-        z_vel = rospy.get_param("z_vel", 0.05)
+        yaw_vel  = rospy.get_param("yaw_vel", 0.02)
+        z_vel = rospy.get_param("z_vel", 0.02)
 
         motion_start_pub   = TriPublisher('task_start', 'task_start', 'task_start', Empty, queue_size=1)
         current_z_vel = 0.0

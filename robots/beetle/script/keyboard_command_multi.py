@@ -10,14 +10,16 @@ import rosgraph
 from geometry_msgs.msg import PoseStamped
 
 class TriPublisher:
-    def __init__(self, topic1, topic2, topic3, data_class, queue_size=1):
+    def __init__(self, topic1, topic2, topic3, topic4, data_class, queue_size=1):
         self.pub1 = rospy.Publisher(topic1, data_class, queue_size=queue_size)
         self.pub2 = rospy.Publisher(topic2, data_class, queue_size=queue_size)
         self.pub3 = rospy.Publisher(topic3, data_class, queue_size=queue_size)
+        self.pub4 = rospy.Publisher(topic4, data_class, queue_size=queue_size)
     def publish(self, msg):
         self.pub1.publish(msg)
         self.pub2.publish(msg)
         self.pub3.publish(msg)
+        self.pub4.publish(msg)
 
 
 msg = """
@@ -73,12 +75,11 @@ if __name__=="__main__":
         force_landing_pub = TriPublisher(ns_1 + '/force_landing', ns_2 + '/force_landing', ns_3 + '/force_landing', ns_assemble + '/force_landing', Empty, queue_size=1)
         nav_pub = TriPublisher(robot_ns_1 + '/uav/nav', robot_ns_2 + '/uav/nav', robot_ns_3 + '/uav/nav', robot_ns_assemble + '/uav/nav', FlightNav, queue_size=1)
 
-        xy_vel   = rospy.get_param("xy_vel", 0.02)
-        z_step  = 0.1
+        xy_vel   = rospy.get_param("xy_vel", 0.04)
         yaw_vel  = rospy.get_param("yaw_vel", 0.02)
-        z_vel = rospy.get_param("z_vel", 0.02)
+        z_vel = rospy.get_param("z_vel", 0.04)
 
-        motion_start_pub   = TriPublisher('task_start', 'task_start', 'task_start', Empty, queue_size=1)
+        motion_start_pub   = TriPublisher('task_start', 'task_start', 'task_start', 'task_start', Empty, queue_size=1)
         current_z_vel = 0.0
         try:
                 while(True):

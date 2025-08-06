@@ -66,6 +66,31 @@ class PolynomialTrajectory:
                 np.dot(self.coeffs_z, T)
             )
 
+    def get_next_position(self):
+        """Get next position from trajectory (compatibility method)"""
+        return self.evaluate()
+    
+    def get_velocity(self):
+        """Get current velocity from trajectory"""
+        if self.start_time is None:
+            return None
+        elapsed_time = rospy.Time.now().to_sec() - self.start_time
+        if elapsed_time > self.duration:
+            return None
+        
+        # Velocity coefficients (derivative of position)
+        T_vel = np.array([5*elapsed_time**4, 4*elapsed_time**3, 3*elapsed_time**2, 
+                         2*elapsed_time, 1, 0])
+        
+        if self.is_scalar:
+            return np.dot(self.coeffs_scalar, T_vel)
+        else:
+            return (
+                np.dot(self.coeffs_x, T_vel),
+                np.dot(self.coeffs_y, T_vel),
+                np.dot(self.coeffs_z, T_vel)
+            )
+
 class ValveRotationTrajectory:
     """
     Core trajectory generator for rotating around valve center with constant end-effector distance

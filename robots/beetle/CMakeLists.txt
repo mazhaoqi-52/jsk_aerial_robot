@@ -79,7 +79,7 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 catkin_install_python(PROGRAMS
-  script/demos/valve_rotation_demo/valve_rotation_fang_single.py
+  script/valve_rotation_fang_single.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

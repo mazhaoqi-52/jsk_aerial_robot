@@ -46,13 +46,15 @@ class SingleUAVStateBase(smach.State):
         self.uav_received = threading.Event()
         self.valve_received = threading.Event()
         
+        # Check simulation mode
+        self.is_simulation = rospy.get_param("~simulation", True)
+        
         # Setup subscribers
         self.uav_sub = rospy.Subscriber(f"/beetle{module_id}/mocap/pose", PoseStamped, self.uav_callback, queue_size=1)
         self.wrench_sub = rospy.Subscriber(f"/beetle{module_id}/estimated_external_wrench", WrenchStamped, self.wrench_callback, queue_size=1)
         
         # Subscribe to valve position based on simulation mode
-        is_simulation = rospy.get_param("~simulation", True)
-        if is_simulation:
+        if self.is_simulation:
             self.valve_sub = rospy.Subscriber("/valve/odom", Odometry, self.valve_sim_callback, queue_size=1)
         else:
             self.valve_sub = rospy.Subscriber("/valve/mocap/pose", PoseStamped, self.valve_callback, queue_size=1)
@@ -78,7 +80,6 @@ class SingleUAVStateBase(smach.State):
         self.uav_received.set()
     
     def valve_callback(self, msg):
-        """处理真机模式阀门位置数据"""
         position = msg.pose.position
         orientation = msg.pose.orientation
         self.valve_pos = (position.x, position.y, position.z)
@@ -90,7 +91,7 @@ class SingleUAVStateBase(smach.State):
         self.valve_received.set()
     
     def valve_sim_callback(self, msg):
-        """处理仿真模式阀门位置数据"""
+        """Callback for valve position updates in simulation mode (Odometry)"""
         position = msg.pose.pose.position
         orientation = msg.pose.pose.orientation
         self.valve_pos = (position.x, position.y, position.z)

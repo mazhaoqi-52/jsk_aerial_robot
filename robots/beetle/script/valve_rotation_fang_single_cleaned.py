@@ -100,6 +100,9 @@ class SingleUAVStateBase(smach.State):
         self.valve_yaw = yaw
         
         self.valve_received.set()
+        self.valve_yaw = yaw
+        
+        self.valve_received.set()
     
     def wrench_callback(self, msg):
         self.external_wrench = msg.wrench

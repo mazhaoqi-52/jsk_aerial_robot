@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """
 Joy-controlled valve rotation for manual insertion scenario
-专为手动插入后的阀门旋转任务设计
 """
 
 import sys
@@ -25,6 +24,8 @@ from tf.transformations import euler_from_quaternion
 import tf2_ros
 import tf2_geometry_msgs
 import numpy as np
+# Import GazeboLinkAttacher for simulation UAV-valve handle attachment
+from beetle.gazebo_link_attacher import GazeboLinkAttacher
 
 # Import trajectory generation and control components
 from trajectory import create_constant_distance_trajectory, ValveRotationTrajectory
@@ -59,6 +60,22 @@ class UAVStateBase(smach.State):
         
         # Get simulation and real_machine parameters
         self.simulation = rospy.get_param("~simulation", False)
+
+        # In simulation mode, automatically attach UAV to valve handle using GazeboLinkAttacher
+        if self.simulation:
+            try:
+                from beetle.gazebo_link_attacher import GazeboLinkAttacher
+                attacher = GazeboLinkAttacher()
+                # UAV模型名和link名需根据实际仿真模型调整
+                uav_model = f"beetle{module_id}"  # 假定无人机模型名
+                uav_link = "beetle_fang_link"     # 假定无人机主link
+                valve_model = "valve"              # 阀门模型名
+                valve_link = "handle"              # 阀门handle link
+                rospy.loginfo(f"Attaching {uav_model}:{uav_link} to {valve_model}:{valve_link} via GazeboLinkAttacher...")
+                attacher.attach(uav_model, uav_link, valve_model, valve_link)
+                rospy.loginfo("Gazebo link attacher: UAV and valve handle attached.")
+            except Exception as e:
+                rospy.logwarn(f"Gazebo link attacher failed: {e}")
         
         # Setup subscribers
         rospy.loginfo(f"Subscribing to UAV pose: /beetle{module_id}/mocap/pose")
@@ -299,7 +316,6 @@ class UAVStateBase(smach.State):
 class TrajectoryPreviewState(UAVStateBase):
     """
     Trajectory preview state - only shows trajectory visualization without actual control
-    轨迹预览状态 - 仅显示轨迹可视化，不执行实际控制
     """
     
     def __init__(self, module_id=1):
@@ -450,7 +466,7 @@ class TrajectoryPreviewState(UAVStateBase):
 class SlowValveRotationState(UAVStateBase):
     """
     Slow valve rotation state for precise control
-    无人机绕阀门中心"公转"同时保持朝向阀门中心"自转"
+    UAV revolves around valve center while maintaining orientation towards valve center
     """
     
     def __init__(self, module_id=1):
@@ -562,74 +578,107 @@ class SlowValveRotationState(UAVStateBase):
             return 'failed'
     
     def execute_strict_rotation(self, trajectory):
-        """Execute rotation with strict feedback control"""
+        """Execute rotation with real-time trajectory adjustment, relaxing yaw error threshold for initial steps"""
         rate = rospy.Rate(self.feedback_frequency)
         start_time = time.time()
         point_counter = 0
-        
-        rospy.loginfo("Starting strict rotation trajectory execution...")
-        
+        rospy.loginfo("Starting strict rotation trajectory execution with real-time adjustment...")
+
+        # Calculate the angle for each rotation step
+        total_steps = int(self.rotation_duration * self.feedback_frequency)
+        if total_steps < 1:
+            total_steps = 1
+        angle_step = self.rotation_angle / total_steps
+        duration_step = self.rotation_duration / total_steps
+        step_count = 0
+
+        # Relax yaw error threshold for initial steps
+        initial_relax_steps = max(20, int(0.05 * total_steps))  # Relax for first 5 steps or 5% of total
+        relaxed_yaw_error = max(0.5, self.max_yaw_error * 2)   # Use a larger threshold for initial alignment
+        strict_yaw_error = self.max_yaw_error
+
         while not rospy.is_shutdown() and not self.emergency_stop.is_set():
-            # Get next trajectory point
-            result = trajectory.get_next_position_and_yaw()
-            if result is None:
-                rospy.loginfo("Trajectory completed")
-                break
-            
-            target_pos, target_yaw = result
-            
-            # Store trajectory point for visualization
-            self.trajectory_points.append((target_pos, target_yaw))
-            if len(self.trajectory_points) > self.max_trajectory_points:
-                self.trajectory_points.pop(0)  # Remove oldest point
-            
-            # Publish trajectory visualization periodically
-            if point_counter % self.publish_trajectory_interval == 0:
-                self.publish_trajectory_visualization()
-            
-            # Publish current point marker
-            current_marker = self.create_current_point_marker(target_pos, target_yaw)
-            self.current_point_pub.publish(current_marker)
-            
-            # Get current position
+            # Get current UAV position and yaw
             current_pos = self.get_current_position()
+            current_yaw = self.current_yaw
             if current_pos is None:
                 rospy.logwarn("Unable to get current position")
                 rate.sleep()
                 continue
-            
-            # Calculate errors
+
+            # Dynamically generate the next target point (rotate by angle_step each time)
+            temp_traj = create_constant_distance_trajectory(
+                current_uav_pos=current_pos,
+                current_uav_yaw=current_yaw,
+                valve_center=self.valve_pos,
+                rotation_angle=angle_step,
+                rotation_duration=duration_step,
+                end_effector_offset_x=0.246,
+                end_effector_offset_y=0.0,
+                end_effector_offset_z=0.0743823,
+                rotation_direction=1
+            )
+            if temp_traj is None:
+                rospy.logerr("Failed to create real-time trajectory step")
+                self.emergency_stop.set()
+                break
+            temp_traj.start_trajectory()
+            result = temp_traj.get_next_position_and_yaw()
+            if result is None:
+                rospy.loginfo("Trajectory completed")
+                break
+            target_pos, target_yaw = result
+
+            # Store trajectory point for visualization
+            self.trajectory_points.append((target_pos, target_yaw))
+            if len(self.trajectory_points) > self.max_trajectory_points:
+                self.trajectory_points.pop(0)
+
+            # Visualization
+            if point_counter % self.publish_trajectory_interval == 0:
+                self.publish_trajectory_visualization()
+            current_marker = self.create_current_point_marker(target_pos, target_yaw)
+            self.current_point_pub.publish(current_marker)
+
+            # Error checking
             pos_error = math.sqrt(
-                (target_pos[0] - current_pos[0])**2 + 
-                (target_pos[1] - current_pos[1])**2 + 
+                (target_pos[0] - current_pos[0])**2 +
+                (target_pos[1] - current_pos[1])**2 +
                 (target_pos[2] - current_pos[2])**2
             )
             yaw_error = abs(self.normalize_angle(target_yaw - self.current_yaw))
-            
-            # Check for large errors that indicate problems
+
+            # Use relaxed yaw error for initial steps, strict for later
+            if step_count < initial_relax_steps:
+                yaw_error_threshold = relaxed_yaw_error
+            else:
+                yaw_error_threshold = strict_yaw_error
+
             if pos_error > self.max_position_error:
                 rospy.logerr(f"Position error too large: {pos_error:.3f}m > {self.max_position_error:.3f}m")
                 self.emergency_stop.set()
                 break
-            
-            if yaw_error > self.max_yaw_error:
-                rospy.logerr(f"Yaw error too large: {yaw_error:.3f}rad > {self.max_yaw_error:.3f}rad")
+            if yaw_error > yaw_error_threshold:
+                rospy.logerr(f"Yaw error too large: {yaw_error:.3f}rad > {yaw_error_threshold:.3f}rad (step {step_count})")
                 self.emergency_stop.set()
                 break
-            
-            # Send trajectory point with feedback control
+
+            # Command UAV to track the target point
             self.motion_controller.send_trajectory_point(target_pos, target_yaw)
-            
-            # Log progress periodically
-            if int(time.time() - start_time) % 2 == 0:  # Every 2 seconds
-                rospy.loginfo(f"Rotation progress: pos_error={pos_error:.3f}m, yaw_error={yaw_error:.3f}rad, points={len(self.trajectory_points)}")
-            
+
+            # Logging
+            if int(time.time() - start_time) % 2 == 0:
+                rospy.loginfo(f"Rotation progress: pos_error={pos_error:.3f}m, yaw_error={yaw_error:.3f}rad, points={len(self.trajectory_points)}, step={step_count}")
+
             point_counter += 1
+            step_count += 1
+            if step_count >= total_steps:
+                rospy.loginfo("All rotation steps completed")
+                break
             rate.sleep()
-        
-        # Publish final trajectory visualization
+
+        # Publish final trajectory visualization at the end
         self.publish_trajectory_visualization()
-        
         return True
     
     def _emergency_monitor(self):
@@ -664,8 +713,8 @@ class SlowValveRotationState(UAVStateBase):
 class ValveRotationController:
     """
     Simplified valve rotation controller for manual insertion scenario
-    专为手动插入后的阀门旋转任务设计，移除了手柄控制，专注于核心旋转功能
-    支持预览模式：preview_only=true时只显示轨迹，不执行实际控制
+    Designed for post-insertion valve rotation, joystick control removed, focused on core rotation functionality
+    Supports preview mode: preview_only=true only shows trajectory visualization, no actual control
     """
     
     def __init__(self):

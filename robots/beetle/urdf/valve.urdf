@@ -156,15 +156,15 @@
 
   <link name="handle">
     <visual>
-      <origin xyz="0 0 -0.04" rpy="0 0 ${-pi/2}"/>
+      <origin xyz="0 0 -0.04" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="package://beetle/urdf/mesh/200mm_valve.STL" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://beetle/urdf/mesh/beetle_valve.STL" scale="0.001 0.001 0.001"/>
       </geometry>
       <material name="black"/>
     </visual>
     <xacro:unless value="$(arg no_collision)">
       <collision>
-        <origin xyz="0 0 -0.04" rpy="0 0 ${-pi/2}"/>
+        <origin xyz="0 0 -0.04" rpy="0 0 0"/>
         <geometry>
           <mesh filename="package://beetle/urdf/mesh/200mm_valve.STL" scale="0.001 0.001 0.001"/>
         </geometry>

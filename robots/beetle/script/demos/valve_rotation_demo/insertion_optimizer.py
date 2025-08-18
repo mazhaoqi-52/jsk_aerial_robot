@@ -54,23 +54,11 @@ class InsertionOptimizer:
         # Setup subscribers for real-time data
         self._setup_subscribers()
         
-        # Corrected Fang configurations for dual simultaneous insertion
-        self.fang_configs = {
-            'fang1': {
-                'name': 'Left Fang (Fang 1)',
-                'description': 'Left side fang insertion',
-                'preferred_beam_gap': 'beam1_beam2',  # Between beam1(120°) and beam2(240°)
-                'beam_position_factor': 0.8,  # Closer to beam1 (120°)
-                'approach_bias': 0.3,  # Approach bias factor
-            },
-            'fang2': {
-                'name': 'Right Fang (Fang 2)', 
-                'description': 'Right side fang insertion',
-                'preferred_beam_gap': 'beam0_beam2',  # Between beam0(0°) and beam2(240°)
-                'beam_position_factor': 0.2,  # Closer to beam2 (240°)
-                'approach_bias': 0.3,  # Approach bias factor
-            }
-        }
+        # Rotation direction for insertion strategy
+        self.rotation_direction = 1  # Default clockwise
+        
+        # Initialize with default clockwise configurations
+        self._setup_fang_configs_for_rotation(1)
         
         rospy.loginfo("Insertion optimizer initialized with real-time data")
         rospy.loginfo(f"Module ID: {module_id}")
@@ -78,6 +66,57 @@ class InsertionOptimizer:
         rospy.loginfo(f"Valve radius: {valve_radius:.4f}m")
         rospy.loginfo(f"Valve beam width: {valve_beam_width:.4f}m")
         rospy.loginfo(f"Safety margin: {safety_margin:.4f}m")
+    
+    def _setup_fang_configs_for_rotation(self, rotation_direction):
+        """Setup fang configurations based on rotation direction"""
+        self.rotation_direction = rotation_direction
+        
+        if rotation_direction == 1:  # Clockwise rotation
+            self.fang_configs = {
+                'fang1': {
+                    'name': 'Left Fang (Fang 1)',
+                    'description': 'Leading edge for clockwise rotation',
+                    'preferred_beam_gap': 'beam1_beam2',  # Between beam1(120°) and beam2(240°)
+                    'beam_position_factor': 0.8,  # Closer to beam1 (leading edge)
+                    'approach_bias': 0.3,
+                },
+                'fang2': {
+                    'name': 'Right Fang (Fang 2)', 
+                    'description': 'Trailing edge for clockwise rotation',
+                    'preferred_beam_gap': 'beam0_beam2',  # Between beam0(0°) and beam2(240°)
+                    'beam_position_factor': 0.2,  # Closer to beam2 (trailing edge)
+                    'approach_bias': 0.3,
+                }
+            }
+            rospy.loginfo("Configured for CLOCKWISE rotation:")
+            rospy.loginfo("  - Fang1: beam1_beam2 gap, closer to beam1 (leading)")
+            rospy.loginfo("  - Fang2: beam0_beam2 gap, closer to beam2 (trailing)")
+            
+        else:  # Counter-clockwise rotation (rotation_direction == -1)
+            self.fang_configs = {
+                'fang1': {
+                    'name': 'Left Fang (Fang 1)',
+                    'description': 'Leading edge for counter-clockwise rotation',
+                    'preferred_beam_gap': 'beam0_beam1',  # Between beam0(0°) and beam1(120°)
+                    'beam_position_factor': 0.2,  # Closer to beam1 (leading edge for CCW)
+                    'approach_bias': 0.3,
+                },
+                'fang2': {
+                    'name': 'Right Fang (Fang 2)', 
+                    'description': 'Trailing edge for counter-clockwise rotation',
+                    'preferred_beam_gap': 'beam1_beam2',  # Between beam1(120°) and beam2(240°)
+                    'beam_position_factor': 0.2,  # Closer to beam2 (trailing edge for CCW)
+                    'approach_bias': 0.3,
+                }
+            }
+            rospy.loginfo("Configured for COUNTER-CLOCKWISE rotation:")
+            rospy.loginfo("  - Fang1: beam0_beam1 gap, closer to beam1 (leading)")
+            rospy.loginfo("  - Fang2: beam1_beam2 gap, closer to beam2 (trailing)")
+    
+    def set_rotation_direction(self, rotation_direction):
+        """Set rotation direction and reconfigure fang positions"""
+        rospy.loginfo(f"Setting rotation direction: {'Clockwise' if rotation_direction == 1 else 'Counter-clockwise'}")
+        self._setup_fang_configs_for_rotation(rotation_direction)
     
     def _setup_subscribers(self):
         """Setup ROS subscribers for real-time position data"""
@@ -205,52 +244,55 @@ class InsertionOptimizer:
         
         for fang_id, config in self.fang_configs.items():
             if config['preferred_beam_gap'] == 'beam1_beam2':
-                # Left Fang: Between beam1(120°) and beam2(240°), closer to beam1
+                # Between beam1(120°) and beam2(240°)
                 beam1_angle = beam_angles['beam1']
                 beam2_angle = beam_angles['beam2']
                 
-                # Calculate gap center between beam1 and beam2
-                # beam2_angle (240°) > beam1_angle (120°), so gap spans 120°
-                # Gap center would be at 180°, but position closer to beam1
+                # Calculate gap center between beam1 and beam2 (180°)
                 gap_center_angle = (beam1_angle + beam2_angle) / 2
                 if beam2_angle < beam1_angle:
                     gap_center_angle = (beam1_angle + beam2_angle + 2*math.pi) / 2
                 
-                # Position closer to beam1 using beam_position_factor
-                # factor 0.8 means 80% toward beam1, 20% toward beam2
-                insertion_angle = beam1_angle + config['beam_position_factor'] * (gap_center_angle - beam1_angle)
+                # INSERT AT GAP CENTER for maximum reliability
+                insertion_angle = gap_center_angle
                 
-                rospy.loginfo(f"Fang1 (Left): Gap beam1_beam2, closer to beam1")
+                rospy.loginfo(f"Fang (beam1_beam2): Inserting at gap center")
                 rospy.loginfo(f"  beam1: {beam1_angle*180/math.pi:.1f}°, beam2: {beam2_angle*180/math.pi:.1f}°")
-                rospy.loginfo(f"  Gap center: {gap_center_angle*180/math.pi:.1f}°, positioned at: {insertion_angle*180/math.pi:.1f}°")
+                rospy.loginfo(f"  Gap center (insertion point): {insertion_angle*180/math.pi:.1f}°")
                 
             elif config['preferred_beam_gap'] == 'beam0_beam2':
-                # Right Fang: Between beam0(0°) and beam2(240°), closer to beam2
+                # Between beam0(0°) and beam2(240°)
                 beam0_angle = beam_angles['beam0']
                 beam2_angle = beam_angles['beam2']
                 
-                # This gap spans across 0°, so handle angle wrapping
-                # From beam0(0°) to beam2(240°) going clockwise = 240°
-                # From beam0(0°) to beam2(240°) going counter-clockwise = 120°
-                # We want the shorter gap (120°), so gap center is at 300° (or -60°)
-                
-                # Calculate the shorter arc between beam0 and beam2
-                # beam2(240°) to beam0(0°) counter-clockwise = 120°
-                # So gap center is at 300° (beam2 + 60°)
-                gap_center_angle = beam2_angle + math.pi/3  # 240° + 60° = 300°
+                # Calculate gap center for the shorter arc (120° gap)
+                # From beam2(240°) to beam0(0°/360°) = 120° gap
+                # Gap center is at 300° (240° + 60°)
+                gap_center_angle = beam2_angle + math.pi/3  # 300°
                 if gap_center_angle >= 2*math.pi:
                     gap_center_angle -= 2*math.pi
                 
-                # Position closer to beam2 using beam_position_factor
-                # factor 0.2 means 20% toward beam0, 80% toward beam2
-                angle_diff = gap_center_angle - beam2_angle
-                if angle_diff < 0:
-                    angle_diff += 2*math.pi
-                insertion_angle = beam2_angle + config['beam_position_factor'] * angle_diff
+                # INSERT AT GAP CENTER for maximum reliability
+                insertion_angle = gap_center_angle
                 
-                rospy.loginfo(f"Fang2 (Right): Gap beam0_beam2, closer to beam2")
+                rospy.loginfo(f"Fang (beam0_beam2): Inserting at gap center")
                 rospy.loginfo(f"  beam0: {beam0_angle*180/math.pi:.1f}°, beam2: {beam2_angle*180/math.pi:.1f}°")
-                rospy.loginfo(f"  Gap center: {gap_center_angle*180/math.pi:.1f}°, positioned at: {insertion_angle*180/math.pi:.1f}°")
+                rospy.loginfo(f"  Gap center (insertion point): {insertion_angle*180/math.pi:.1f}°")
+                
+            elif config['preferred_beam_gap'] == 'beam0_beam1':
+                # Between beam0(0°) and beam1(120°)
+                beam0_angle = beam_angles['beam0']
+                beam1_angle = beam_angles['beam1']
+                
+                # Gap center between beam0(0°) and beam1(120°) is at 60°
+                gap_center_angle = (beam0_angle + beam1_angle) / 2  # 60°
+                
+                # INSERT AT GAP CENTER for maximum reliability
+                insertion_angle = gap_center_angle
+                
+                rospy.loginfo(f"Fang (beam0_beam1): Inserting at gap center")
+                rospy.loginfo(f"  beam0: {beam0_angle*180/math.pi:.1f}°, beam1: {beam1_angle*180/math.pi:.1f}°")
+                rospy.loginfo(f"  Gap center (insertion point): {insertion_angle*180/math.pi:.1f}°")
             
             # Normalize angle
             while insertion_angle >= 2*math.pi:
@@ -476,8 +518,10 @@ class InsertionOptimizer:
             approach_x = valve_center_x + approach_radius * math.cos(approach_angle)
             approach_y = valve_center_y + approach_radius * math.sin(approach_angle)
             
-            # Calculate final insertion position
-            final_radius = self.valve_radius + end_effector_offset + self.safety_margin
+            # Calculate final insertion position - end-effector should be AT valve inner edge
+            # The final_position represents where the END-EFFECTOR should be positioned
+            # This should be at the valve inner radius (valve edge) for proper gripping
+            final_radius = self.valve_radius  # End-effector at valve inner edge
             final_x = valve_center_x + final_radius * math.cos(fang_strategy['insertion_angle'])
             final_y = valve_center_y + final_radius * math.sin(fang_strategy['insertion_angle'])
             

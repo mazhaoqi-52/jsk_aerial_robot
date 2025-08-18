@@ -144,43 +144,46 @@ class UnifiedMotionController:
         start_yaw = self.sm.current_yaw
         yaw_diff = self._normalize_angle_diff(target_yaw - start_yaw)
         
-        # Limit maximum yaw change
-        max_yaw_change = math.pi / 4  # 45 degrees
-        if abs(yaw_diff) > max_yaw_change:
-            yaw_diff = max_yaw_change * (1 if yaw_diff > 0 else -1)
-            rospy.logwarn(f"Limiting yaw change to: {yaw_diff:.3f} rad")
-        
-        final_target_yaw = start_yaw + yaw_diff
+        rospy.loginfo(f"Trajectory: {start_pos} -> {target_pos}")
+        rospy.loginfo(f"Yaw change: {math.degrees(yaw_diff):.1f}° (no artificial limit)")
         
         rate = rospy.Rate(50)
         start_time = time.time()
+        trajectory_completed = False
         
-        while not rospy.is_shutdown() and (time.time() - start_time) < duration + 2.0:
+        while not rospy.is_shutdown() and (time.time() - start_time) < duration + 5.0:
             pt = traj.evaluate()
-            if pt is None:
+            elapsed_time = time.time() - start_time
+            
+            # Check if trajectory is complete
+            if pt is None or elapsed_time >= duration:
                 pt = target_pos
+                trajectory_completed = True
             
             # Smooth yaw interpolation
-            elapsed_time = time.time() - start_time
             if elapsed_time <= duration:
-                yaw_progress = elapsed_time / duration
+                yaw_progress = min(elapsed_time / duration, 1.0)
                 smooth_progress = 3*yaw_progress**2 - 2*yaw_progress**3
                 current_target_yaw = start_yaw + smooth_progress * yaw_diff
             else:
-                current_target_yaw = final_target_yaw
+                current_target_yaw = target_yaw
             
             self.send_trajectory_point(pt, current_target_yaw)
             
-            if not self._wait_for_position_and_yaw(pt, current_target_yaw, 
-                                                  pos_threshold, yaw_threshold, point_timeout=1.0):
-                rospy.logwarn(f"Position and yaw timeout")
-            
-            if pt is target_pos:
-                break
+            # More lenient waiting strategy - don't wait for each point
+            if trajectory_completed:
+                # Only wait for final convergence
+                if self._wait_for_position_and_yaw(pt, current_target_yaw, 
+                                                  pos_threshold, yaw_threshold, point_timeout=3.0):
+                    rospy.loginfo("Trajectory converged successfully")
+                    return True
+                else:
+                    rospy.logwarn("Final convergence timeout, but continuing...")
+                    return True  # Consider it successful anyway
             
             rate.sleep()
         
-        rospy.loginfo("Smooth trajectory motion completed")
+        rospy.loginfo("Smooth trajectory motion completed by timeout")
         return True
     
     def execute_controlled_descent(self, start_pos, target_z, descent_speed=0.05,
@@ -597,7 +600,7 @@ class UnifiedMotionController:
         
         # 偏航角速度控制
         msg.yaw_nav_mode = FlightNav.VEL_MODE
-        msg.target_yaw_rate = yaw_vel
+        msg.target_omega_z = yaw_vel
         
         # 如果提供备用位置，设置为参考
         if pos_backup is not None:

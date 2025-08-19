@@ -165,7 +165,7 @@ class AssemblyMotionStateBase(smach.State):
 
     def rotate_to_target_poly(self, target_yaw, avg_yaw_speed=None, fixed_pos=None):
         if avg_yaw_speed is None or avg_yaw_speed <= 0:
-            avg_yaw_speed = 0.15
+            avg_yaw_speed = 0.10
         current_yaw = self.get_uav_yaw()
         yaw_diff = (target_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
         duration = abs(yaw_diff) / avg_yaw_speed

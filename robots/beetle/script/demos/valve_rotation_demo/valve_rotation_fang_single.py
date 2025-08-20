@@ -6,9 +6,14 @@ Cleaned version with redundant code removed.
 
 import sys
 import os
+
+# Add current directory FIRST to ensure local imports work correctly
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)  # Insert at beginning for priority
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'))
 
 import rospy
 import smach
@@ -23,14 +28,8 @@ from nav_msgs.msg import Odometry
 from tf.transformations import euler_from_quaternion
 from trajectory import create_constant_distance_trajectory
 from unified_motion_controller import UnifiedMotionController
-import os
-import sys
 
-# Add current directory to Python path to ensure we import the local insertion_optimizer
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-
+# Import the local insertion optimizer
 from insertion_optimizer import InsertionOptimizer
 
 
@@ -548,11 +547,12 @@ class DescendAndContactState(SingleUAVStateBase):
         """
         Enhanced 4-step valve engagement strategy:
         1. Determine optimal contact point for valve rotation
-        2. Rotate UAV and insert into beam gap for maximum control margin  
+        2. Descend to valve height and insert into beam gap for maximum control margin  
         3. Move along valve circumference from insertion point to contact point
         4. Begin valve rotation
         """
         rospy.loginfo("=== ENHANCED 4-STEP VALVE ENGAGEMENT STRATEGY ===")
+        rospy.loginfo("This includes DESCENT to valve height for proper insertion")
         
         # Initialize and wait for required positions
         if not self.wait_for_positions():
@@ -562,9 +562,18 @@ class DescendAndContactState(SingleUAVStateBase):
         if start_pos is None:
             return 'failed'
         
-        # CRITICAL: Lock Z coordinate for entire process to prevent oscillation
-        self.locked_z = start_pos[2]
-        rospy.loginfo(f"Z-axis LOCKED at {self.locked_z:.6f}m for entire process")
+        # CRITICAL: Calculate correct Z position for end-effector insertion at valve height
+        # End-effector should be at valve height, so UAV should be offset accordingly
+        end_effector_offset_z = 0.0221140  # Z offset of dual-fang center from UAV base_link
+        valve_z = self.valve_pos[2]
+        required_uav_z = valve_z - end_effector_offset_z  # UAV position to place end-effector at valve height
+        
+        self.locked_z = required_uav_z
+        rospy.loginfo(f"=== INSERTION HEIGHT CALCULATION ===")
+        rospy.loginfo(f"Valve height: {valve_z:.6f}m")
+        rospy.loginfo(f"End-effector Z offset: {end_effector_offset_z:.6f}m")
+        rospy.loginfo(f"Required UAV Z for insertion: {required_uav_z:.6f}m")
+        rospy.loginfo(f"Z-axis LOCKED at {self.locked_z:.6f}m for valve insertion")
         
         # Set rotation direction in optimizer
         self.optimizer.set_rotation_direction(self.rotation_direction)
@@ -598,83 +607,84 @@ class DescendAndContactState(SingleUAVStateBase):
     
     def determine_optimal_contact_point(self):
         """
-        Step 1: Determine optimal contact point for valve rotation based on:
-        - Rotation direction (clockwise/counter-clockwise)
-        - Beam gap analysis for maximum mechanical advantage
-        - Available beam gaps and their accessibility
+        Step 1: Determine optimal contact point using SIMPLE DISTANCE-BASED approach
+        - Calculate all beam gap positions
+        - Select the closest gap to current UAV position  
+        - Much simpler than complex dual-fang coordination
         """
-        rospy.loginfo("--- Step 1: Determining optimal contact point ---")
+        rospy.loginfo("--- Step 1: Determining optimal contact point (DISTANCE-BASED) ---")
         
-        # Get optimal strategy with current rotation direction
-        optimal_strategy = self.optimizer.evaluate_real_time_strategy()
-        if optimal_strategy is None:
-            rospy.logerr("Failed to evaluate optimal strategy")
+        # Use the existing optimizer for simple distance-based selection
+        if not self.optimizer:
+            rospy.logerr("Optimizer not initialized")
             return None
         
-        # Extract contact point information from strategy
-        contact_point = {}
+        # Get current UAV and valve positions
+        current_pos = self.get_current_position()
+        if current_pos is None:
+            rospy.logerr("Cannot get current UAV position")
+            return None
         
-        # For dual-fang mode, use gap center as optimal contact point
-        if optimal_strategy.get('insertion_mode') == 'dual_simultaneous':
-            fang1_strategy = optimal_strategy.get('fang1')
-            fang2_strategy = optimal_strategy.get('fang2')
-            
-            if fang1_strategy and fang2_strategy:
-                # Calculate optimal contact point from gap center
-                gap_center_x = (fang1_strategy['insertion_position'][0] + fang2_strategy['insertion_position'][0]) / 2
-                gap_center_y = (fang1_strategy['insertion_position'][1] + fang2_strategy['insertion_position'][1]) / 2
-                gap_center_angle = math.atan2(gap_center_y - self.valve_pos[1], gap_center_x - self.valve_pos[0])
-                
-                contact_point = {
-                    'position': (gap_center_x, gap_center_y, self.valve_pos[2]),
-                    'angle': gap_center_angle,
-                    'rotation_direction': self.rotation_direction,
-                    'beam_gap': fang1_strategy.get('beam_gap', {}),
-                    'mechanical_advantage': 'High - dual fang engagement',
-                    'strategy': optimal_strategy
-                }
-                
-                rospy.loginfo(f"Optimal contact point determined:")
-                rospy.loginfo(f"  Position: ({gap_center_x:.3f}, {gap_center_y:.3f}, {self.valve_pos[2]:.3f})")
-                rospy.loginfo(f"  Angle: {math.degrees(gap_center_angle):.1f}°")
-                rospy.loginfo(f"  Rotation direction: {'clockwise' if self.rotation_direction == 1 else 'counter-clockwise'}")
-                
-                return contact_point
+        # Find closest beam gap using simple distance-based approach
+        strategy = self.optimizer.find_closest_beam_gap(
+            uav_pos=current_pos,
+            valve_pos=self.valve_pos,
+            valve_yaw=self.valve_yaw
+        )
         
-        rospy.logerr("Failed to determine optimal contact point from strategy")
-        return None
+        if strategy is None:
+            rospy.logerr("Failed to find closest beam gap")
+            return None
+        
+        # Store strategy for use in insertion phase
+        self.current_insertion_params = {
+            'simple_strategy': strategy,
+            'selected_gap': strategy['selected_gap'],
+            'gap_center_angle': strategy['gap_center_angle'],
+            'target_position': strategy['target_position'],
+            'approach_distance': strategy['approach_distance'],
+            'approach_angle': strategy['gap_center_angle']  # Use gap_center_angle as approach_angle
+        }
+        
+        # Create contact point information for compatibility
+        contact_point = {
+            'position': strategy['target_position'],
+            'angle': strategy['gap_center_angle'],
+            'distance': strategy['approach_distance'],
+            'strategy': 'simple_closest_gap'
+        }
+        
+        rospy.loginfo("=== SIMPLE DISTANCE-BASED STRATEGY SELECTED ===")
+        rospy.loginfo(f"Optimal contact point determined:")
+        rospy.loginfo(f"  Position: ({contact_point['position'][0]:.3f}, {contact_point['position'][1]:.3f}, {contact_point['position'][2]:.3f})")
+        rospy.loginfo(f"  Angle: {math.degrees(contact_point['angle']):.1f}°")
+        rospy.loginfo(f"  Selected gap: {strategy['selected_gap']}")
+        rospy.loginfo(f"  Distance: {contact_point['distance']:.3f}m")
+        
+        return contact_point
     
     def rotate_and_insert_to_beam_gap(self, contact_point):
         """
-        Step 2: Rotate UAV and insert into beam gap for maximum control margin
-        - Position UAV for optimal insertion angle
-        - Insert end-effector into beam gap with maximum clearance
-        - Ensure stable grip before circumferential movement
+        Step 2: Insert into the closest beam gap (SIMPLIFIED)
+        - Use the simple strategy determined in step 1
+        - Direct insertion without complex dual-fang coordination
         """
-        rospy.loginfo("--- Step 2: Rotating UAV and inserting into beam gap ---")
+        rospy.loginfo("--- Step 2: Inserting into closest beam gap (SIMPLIFIED) ---")
         
         if contact_point is None:
             rospy.logerr("No contact point provided for insertion")
             return False
         
-        strategy = contact_point['strategy']
-        
-        # Get insertion parameters from strategy
-        insertion_params = self.optimizer.get_insertion_parameters(
-            strategy=strategy,
-            pre_insertion_distance=self.pre_insertion_distance,
-            circumferential_offset=self.circumferential_offset
-        )
-        
-        if insertion_params is None:
-            rospy.logerr("Failed to get insertion parameters")
+        # Use simple strategy from step 1
+        if not hasattr(self, 'current_insertion_params'):
+            rospy.logerr("No insertion parameters available from step 1")
             return False
         
-        # Execute enhanced insertion using existing optimized logic
-        success = self.execute_enhanced_insertion(insertion_params)
+        # Execute simplified insertion
+        success = self.execute_simple_insertion()
         
         if success:
-            rospy.loginfo("Successfully inserted into beam gap with maximum control margin")
+            rospy.loginfo("Successfully inserted into closest beam gap")
             return True
         else:
             rospy.logerr("Failed to insert into beam gap")
@@ -756,6 +766,94 @@ class DescendAndContactState(SingleUAVStateBase):
         
         return True
     
+    def execute_simple_insertion(self):
+        """Execute simplified insertion strategy using distance-based approach"""
+        if not hasattr(self, 'current_insertion_params'):
+            rospy.logerr("No insertion parameters available")
+            return False
+        
+        params = self.current_insertion_params
+        target_position = params['target_position']
+        approach_angle = params['approach_angle']  # This is in radians
+        
+        rospy.loginfo(f"Executing simple insertion at position: {target_position}")
+        rospy.loginfo(f"Approach angle: {approach_angle:.3f} rad ({approach_angle*180/3.14159:.1f} degrees)")
+        
+        try:
+            # Phase 1: Move to pre-insertion position
+            pre_insertion_pos = list(target_position)  # Convert tuple to list
+            pre_insertion_pos[2] += self.pre_insertion_distance  # Hover above target
+            
+            rospy.loginfo("Moving to pre-insertion position...")
+            current_pos = self.uav_pos
+            if not current_pos:
+                rospy.logerr("No UAV position available")
+                return False
+            
+            # Step 1a: Move to position with current yaw (avoid sudden yaw changes)
+            current_yaw = self.current_yaw
+            success = self.motion_controller.execute_smooth_trajectory_with_yaw(
+                start_pos=current_pos,
+                target_pos=pre_insertion_pos,
+                target_yaw=current_yaw,  # Keep current yaw during movement
+                duration=12.0,  # Much slower movement for better stability
+                pos_threshold=0.05,
+                yaw_threshold=0.2
+            )
+            
+            if not success:
+                rospy.logerr("Failed to reach pre-insertion position")
+                return False
+            
+            # Step 1b: Adjust yaw orientation to approach angle
+            final_pos = self.get_current_position()
+            if final_pos is None:
+                final_pos = pre_insertion_pos
+            
+            rospy.loginfo("Adjusting yaw for insertion approach...")
+            self.motion_controller.send_trajectory_point(final_pos, approach_angle)
+            
+            # Wait for yaw convergence
+            yaw_adjustment_start = time.time()
+            rate = rospy.Rate(10)
+            
+            while (time.time() - yaw_adjustment_start) < 8.0 and not rospy.is_shutdown():  # More time for yaw adjustment
+                yaw_error = abs(self.normalize_angle(self.current_yaw - approach_angle))
+                if yaw_error < 0.2:  # yaw_threshold
+                    rospy.loginfo(f"Yaw adjustment completed. Error: {yaw_error:.3f} rad")
+                    break
+                
+                self.motion_controller.send_trajectory_point(final_pos, approach_angle)
+                rate.sleep()
+            
+            time.sleep(2.0)  # Longer pause for better stabilization
+            
+            # Phase 2: Descend to insertion position
+            rospy.loginfo("Descending to insertion position...")
+            current_pos = self.uav_pos  # Update current position
+            
+            success = self.motion_controller.execute_smooth_trajectory_with_yaw(
+                start_pos=current_pos,
+                target_pos=target_position,
+                target_yaw=approach_angle,  # Maintain approach angle during descent
+                duration=6.0,  # Slower descent for higher accuracy
+                pos_threshold=0.05,
+                yaw_threshold=0.2
+            )
+            
+            if not success:
+                rospy.logerr("Failed to reach insertion position")
+                return False
+            
+            time.sleep(1.0)  # Brief pause for stabilization
+            
+            rospy.loginfo("Simple insertion completed successfully")
+            return True
+            
+        except Exception as e:
+            rospy.logerr(f"Error during simple insertion: {e}")
+            return False
+
     def execute_enhanced_insertion(self, insertion_params):
         """
         Execute enhanced insertion using optimized dual-fang parameters
@@ -789,38 +887,175 @@ class DescendAndContactState(SingleUAVStateBase):
         
         rospy.loginfo(f"Selected {selected_fang_id} for insertion (complexity: {selected_fang_params['complexity_score']:.3f})")
         
-        # Extract target position and orientation
-        target_x = selected_fang_params['final_position'][0]
-        target_y = selected_fang_params['final_position'][1]
-        target_z = self.locked_z  # Use locked Z to prevent oscillation
-        target_yaw = selected_fang_params['target_yaw']
+        # Debug: Print full structure of selected fang parameters
+        rospy.loginfo(f"=== DEBUG: Selected fang parameters structure ===")
+        rospy.loginfo(f"Selected fang params keys: {list(selected_fang_params.keys())}")
         
-        # Calculate UAV position to place end-effector at target
-        end_effector_offset_x = 0.25346  # Dual-fang center X offset from UAV
-        end_effector_offset_y = 0.0      # Dual-fang center Y offset
-        end_effector_offset_z = 0.0221140  # Dual-fang center Z offset
+        # Get the beam gap strategy for this fang
+        fang_strategy = selected_fang_params['strategy']
         
-        # Compensate for end-effector offset
-        uav_x = target_x - end_effector_offset_x * math.cos(target_yaw)
-        uav_y = target_y - end_effector_offset_x * math.sin(target_yaw)
-        uav_z = target_z - end_effector_offset_z
+        # Debug: Print strategy structure for troubleshooting
+        rospy.loginfo(f"Fang strategy keys: {list(fang_strategy.keys())}")
+        rospy.loginfo(f"Fang strategy type: {type(fang_strategy)}")
+        if 'gap_center_angle' in fang_strategy:
+            rospy.loginfo(f"gap_center_angle found: {fang_strategy['gap_center_angle']}")
+        if 'insertion_angle' in fang_strategy:
+            rospy.loginfo(f"insertion_angle found: {fang_strategy['insertion_angle']}")
+        
+        # Get gap center angle directly from strategy (not from beam_gap sub-dict)
+        if 'gap_center_angle' not in fang_strategy:
+            rospy.logerr("No gap_center_angle found in fang strategy")
+            rospy.logerr(f"Available keys in fang_strategy: {list(fang_strategy.keys())}")
+            # Fallback: try to get insertion_angle or angle
+            if 'insertion_angle' in fang_strategy:
+                gap_center_angle = fang_strategy['insertion_angle']
+                rospy.logwarn("Using insertion_angle as gap_center_angle")
+            elif 'angle' in fang_strategy:
+                gap_center_angle = fang_strategy['angle']
+                rospy.logwarn("Using angle as gap_center_angle")
+            else:
+                rospy.logerr("No angle information found in strategy")
+                return False
+        else:
+            gap_center_angle = fang_strategy['gap_center_angle']
+        
+        # CRITICAL: Calculate beam gap center position (INSIDE the valve)
+        # For beam gap insertion, the fang should reach the CENTER of the gap between beams
+        # This position is INSIDE the valve, not at the valve edge
+        valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
+        
+        # Beam gap center should be at valve inner radius minus safety margin for beam thickness
+        beam_gap_radius = self.optimizer.valve_radius - 0.012  # 12mm inside for beam gap center
+        fang_target_x = valve_center_x + beam_gap_radius * math.cos(gap_center_angle)
+        fang_target_y = valve_center_y + beam_gap_radius * math.sin(gap_center_angle)
+        fang_target_z = self.valve_pos[2]  # End-effector should be at valve height
+        
+        # Calculate target yaw - UAV should face towards valve center for optimal insertion
+        target_yaw = math.atan2(valve_center_y - fang_target_y, valve_center_x - fang_target_x)
+        
+        rospy.loginfo(f"Target fang position (beam gap): ({fang_target_x:.3f}, {fang_target_y:.3f}, {fang_target_z:.3f})")
+        rospy.loginfo(f"Target UAV yaw: {math.degrees(target_yaw):.1f}°")
+        
+        # CRITICAL: Calculate UAV position to place end-effector INTO the valve
+        # End-effector offset from UAV base_link (dual-fang center)
+        end_effector_offset_x = 0.25346   # X offset of dual-fang center from UAV
+        end_effector_offset_y = 0.0       # Y offset (centered)
+        end_effector_offset_z = 0.0221140 # Z offset of dual-fang center from UAV
+        
+        # Transform end-effector offset to world frame based on UAV yaw
+        offset_world_x = end_effector_offset_x * math.cos(target_yaw) - end_effector_offset_y * math.sin(target_yaw)
+        offset_world_y = end_effector_offset_x * math.sin(target_yaw) + end_effector_offset_y * math.cos(target_yaw)
+        offset_world_z = end_effector_offset_z
+        
+        # Calculate UAV position: fang_target - offset = uav_position
+        uav_x = fang_target_x - offset_world_x
+        uav_y = fang_target_y - offset_world_y
+        uav_z = fang_target_z - offset_world_z
+        
+        # Use locked Z for UAV to prevent oscillation
+        uav_z = self.locked_z
         
         target_pos = (uav_x, uav_y, uav_z)
         
+        # Verification: Calculate expected end-effector position from UAV position
+        expected_fang_x = uav_x + offset_world_x
+        expected_fang_y = uav_y + offset_world_y
+        expected_fang_z = uav_z + offset_world_z
+        
+        position_error = math.sqrt((expected_fang_x - fang_target_x)**2 + 
+                                 (expected_fang_y - fang_target_y)**2 + 
+                                 (expected_fang_z - fang_target_z)**2)
+        
+        rospy.loginfo(f"=== INSERTION POSITION CALCULATION ===")
+        rospy.loginfo(f"Target fang position: ({fang_target_x:.3f}, {fang_target_y:.3f}, {fang_target_z:.3f})")
+        rospy.loginfo(f"Calculated UAV position: ({uav_x:.3f}, {uav_y:.3f}, {uav_z:.3f})")
+        rospy.loginfo(f"Expected fang position: ({expected_fang_x:.3f}, {expected_fang_y:.3f}, {expected_fang_z:.3f})")
+        rospy.loginfo(f"Position calculation error: {position_error:.6f}m")
+        
+        # Check if target is inside valve (should be closer to center than valve radius)
+        valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
+        target_distance_from_center = math.sqrt((fang_target_x - valve_center_x)**2 + 
+                                              (fang_target_y - valve_center_y)**2)
+        valve_radius = self.optimizer.valve_radius
+        
+        if target_distance_from_center > valve_radius:
+            rospy.logwarn(f"⚠ Target fang position is OUTSIDE valve! Distance: {target_distance_from_center:.3f}m > {valve_radius:.3f}m")
+        else:
+            rospy.loginfo(f"✓ Target fang position is INSIDE valve. Distance: {target_distance_from_center:.3f}m < {valve_radius:.3f}m")
+        
         rospy.loginfo(f"Enhanced insertion target: {target_pos}, yaw: {math.degrees(target_yaw):.1f}°")
         
-        # Execute trajectory to target position
-        return self.execute_smooth_trajectory(current_pos, target_pos, target_yaw, duration=6.0)
+        # === TWO-PHASE INSERTION STRATEGY ===
+        # Phase 1: Move horizontally to insertion point (maintain current height)
+        # Phase 2: Descend to insertion height at correct XY position
+        
+        current_pos = self.get_current_position()
+        if current_pos is None:
+            rospy.logerr("Cannot get current position for insertion")
+            return False
+        
+        rospy.loginfo("=== PHASE 1: HORIZONTAL POSITIONING ===")
+        rospy.loginfo("Moving horizontally to insertion point (maintaining height)")
+        
+        # Phase 1: Horizontal movement to insertion XY position at current height
+        phase1_target = (uav_x, uav_y, current_pos[2])  # Keep current Z
+        
+        rospy.loginfo(f"Phase 1 trajectory:")
+        rospy.loginfo(f"  From: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
+        rospy.loginfo(f"  To:   ({phase1_target[0]:.3f}, {phase1_target[1]:.3f}, {phase1_target[2]:.3f})")
+        rospy.loginfo(f"  Movement: XY positioning, Z unchanged")
+        
+        # Execute phase 1: horizontal positioning
+        phase1_success = self.execute_smooth_trajectory(
+            current_pos, phase1_target, target_yaw, duration=4.0, use_z_lock=False
+        )
+        
+        if not phase1_success:
+            rospy.logerr("Phase 1 (horizontal positioning) failed")
+            return False
+        
+        rospy.loginfo("✓ Phase 1 completed: UAV positioned above insertion point")
+        
+        # Update current position for phase 2
+        current_pos = self.get_current_position()
+        if current_pos is None:
+            rospy.logerr("Cannot get position after phase 1")
+            return False
+        
+        rospy.loginfo("=== PHASE 2: VERTICAL DESCENT ===")
+        rospy.loginfo("Descending to insertion height at correct XY position")
+        
+        # Phase 2: Vertical descent to insertion height
+        phase2_target = (uav_x, uav_y, uav_z)  # Final insertion position
+        
+        rospy.loginfo(f"Phase 2 trajectory:")
+        rospy.loginfo(f"  From: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
+        rospy.loginfo(f"  To:   ({phase2_target[0]:.3f}, {phase2_target[1]:.3f}, {phase2_target[2]:.3f})")
+        rospy.loginfo(f"  Movement: Descent {current_pos[2]-uav_z:.3f}m to insertion height")
+        
+        # Execute phase 2: vertical descent with Z-lock
+        phase2_success = self.execute_smooth_trajectory(
+            current_pos, phase2_target, target_yaw, duration=3.0, use_z_lock=True
+        )
+        
+        if not phase2_success:
+            rospy.logerr("Phase 2 (vertical descent) failed")
+            return False
+        
+        rospy.loginfo("✓ Phase 2 completed: UAV descended to insertion height")
+        rospy.loginfo("✓ TWO-PHASE INSERTION COMPLETED SUCCESSFULLY")
+        
+        return True
     
 
 class RotateValveState(SingleUAVStateBase):
-    def __init__(self, module_id=1, rotation_angle=math.pi/2, rotation_duration=12.0, rotation_direction=1):
+    def __init__(self, module_id=1, rotation_angle=math.pi/2, rotation_duration=18.0, rotation_direction=1):
         super().__init__(outcomes=['succeeded', 'failed', 'emergency'], 
                         input_keys=['start_position'], 
                         module_id=module_id)
         
         self.rotation_angle = rotation_angle
-        self.rotation_duration = rotation_duration  # Increased from 8.0s to 12.0s for smoother rotation
+        self.rotation_duration = rotation_duration  # Increased from 12.0s to 18.0s for much smoother rotation
         self.rotation_direction = rotation_direction  # 1 for clockwise, -1 for counter-clockwise
         
         # Emergency detection - made much less sensitive for rotation tasks
@@ -896,7 +1131,7 @@ class RotateValveState(SingleUAVStateBase):
             return 'failed'
     
     def execute_rotation_trajectory(self, rotation_traj):
-        rate = rospy.Rate(50)
+        rate = rospy.Rate(20)  # Reduced from 50Hz to 20Hz for smoother control
         start_time = time.time()
         
         while not rospy.is_shutdown() and not self.emergency_stop.is_set():
@@ -908,6 +1143,8 @@ class RotateValveState(SingleUAVStateBase):
             self.motion_controller.send_trajectory_point(target_pos, target_yaw)
             rate.sleep()
         
+        rospy.loginfo("Rotation trajectory completed - allowing stabilization time")
+        time.sleep(3.0)  # Extra stabilization time after rotation
         return True
 
 
@@ -944,7 +1181,7 @@ def main():
         
         smach.StateMachine.add(
             'ROTATE_VALVE',
-            RotateValveState(module_id=module_id, rotation_angle=math.pi/2, rotation_duration=12.0, rotation_direction=rotation_direction),
+            RotateValveState(module_id=module_id, rotation_angle=math.pi/2, rotation_duration=18.0, rotation_direction=rotation_direction),
             transitions={
                 'succeeded': 'succeeded',
                 'failed': 'failed',

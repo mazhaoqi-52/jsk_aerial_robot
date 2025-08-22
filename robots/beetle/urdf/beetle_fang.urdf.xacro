@@ -36,10 +36,32 @@
           <mesh filename="package://beetle/urdf/mesh/base_link.dae"/>
         </geometry>
       </visual>
+      <!-- decompse the collison part for manipulator -->
       <collision>
-        <origin xyz="0 0 0.1205" rpy="0 0 0"/>
+        <origin xyz="-0.042 0 0.1205" rpy="0 0 0"/>
         <geometry>
-          <box size="0.52 0.52 0.241"/>
+          <box size="0.436 0.52 0.241"/>
+        </geometry>
+      </collision>
+
+      <collision>
+        <origin xyz="0.218 0 0.14256" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.084 0.52 0.19688"/>
+        </geometry>
+      </collision>
+
+      <collision>
+        <origin xyz="0.218 0.24 0.02206" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.084 0.040 0.04412"/>
+        </geometry>
+      </collision>
+
+      <collision>
+        <origin xyz="0.218 -0.24 0.02206" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.084 0.040 0.04412"/>
         </geometry>
       </collision>
     </link>
@@ -62,6 +84,40 @@
       <origin rpy="0 0 0" xyz="0 0 0.12947"/>
       <axis xyz="0 0 1"/>
     </joint>
+
+<!-- add link for Beetle_fang -->
+     <link name="beetle_fang_link">
+      <inertial>
+        <origin xyz="0.00659 0 -0.01082" rpy="0 0 0"/>
+        <mass value="0.17123"/>
+        <inertia
+            ixx="0.0033" iyy="0.0" izz="0.00329"
+            ixy="0.0" ixz="-0.000013" iyz="0.0"/>
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://beetle/urdf/mesh/end_effector_fang.dae"/>
+        </geometry>
+      </visual>
+      <collision>
+        <origin xyz="0.0072 0.08438 -0.0522683" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="0.006" length="0.04412"/>
+        </geometry>
+      </collision>
+      <collision>
+        <origin xyz="0.00772 -0.08438 -0.0522683" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="0.006" length="0.04412"/>
+        </geometry>
+      </collision>
+    </link>
+    <joint name="beetle_fang_joint" type="fixed">
+      <parent link="base_link"/>
+      <child link="beetle_fang_link"/>
+      <origin xyz="0.246 0 0.0743823" rpy="0 0 0"/>
+    </joint> 
 
     ## rotor arm macro
     <xacro:macro name="dummy_rotor_arm" params="id x y z yaw">

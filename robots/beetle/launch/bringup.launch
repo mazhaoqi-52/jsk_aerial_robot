@@ -7,7 +7,6 @@
   <arg name="estimate_mode"  default= "1" />
   <arg name="sim_estimate_mode"  default= "2" />
   <arg name="headless" default="True" />
-  <!-- <arg name="worldtype" default="$(find aerial_robot_simulation)/gazebo_model/world/demo_belt.world" /> -->
   <arg name="worldtype" default="$(find aerial_robot_simulation)/gazebo_model/world/empty_swarm.world" />
   <arg name="launch_gazebo" default="True" />
   <arg name="direct_model" default="False" />
@@ -57,7 +56,6 @@
   </group>
 
   ###########  Base Platform  ###########
-  <!-- <node pkg="aerial_robot_base" type="aerial_robot_base_node" name="aerial_robot_base_node" ns="$(arg robot_ns)" output="screen" launch-prefix="gdb -ex run -\-args"> -->
     <node pkg="aerial_robot_base" type="aerial_robot_base_node" name="aerial_robot_base_node" ns="$(arg robot_ns)" output="screen">
     <param name="tf_prefix" value="$(arg robot_ns)"/>
     <param name="param_verbose" value="false"/>
@@ -67,9 +65,11 @@
   ###########  Robot Model  ###########
   <arg name="description_mode" value="urdf" unless="$(arg simulation)" />
   <arg name="description_mode" value="gazebo" if="$(arg simulation)" />
+  <arg name="leader_fang" default="false" />
   <include file="$(find aerial_robot_model)/launch/aerial_robot_model.launch" >
     <arg name="headless" value="$(arg headless)" />
-    <arg name="robot_model" value="$(find beetle)/robots/beetle.$(arg description_mode).xacro"/>
+    <arg name="robot_model" value="$(find beetle)/robots/beetle_fang.$(arg description_mode).xacro" if="$(arg leader_fang)"/>
+    <arg name="robot_model" value="$(find beetle)/robots/beetle.$(arg description_mode).xacro" if="$(eval not arg('leader_fang'))"/>
     <arg name="robot_ns" value="$(arg robot_ns)" />
     <arg name="rviz_config" value="$(arg config_dir)/rviz_config" />
     <arg name="rviz_init_pose" value="$(arg config_dir)/RvizInit.yaml" />

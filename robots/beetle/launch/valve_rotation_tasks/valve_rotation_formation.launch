@@ -1,23 +1,17 @@
 <?xml version="1.0"?>
 <launch>
   <!-- Dual UAV Formation Valve Rotation Launch File -->
-  
-  <!-- Arguments -->
   <arg name="simulation" default="true" />
   <arg name="real_machine" default="false" />
   <arg name="verbose" default="false" />
   
-  <!-- Set global parameters -->
   <param name="simulation" value="$(arg simulation)" />
   <param name="real_machine" value="$(arg real_machine)" />
   
-  <!-- Load unified control configuration -->
   <rosparam file="$(find beetle)/config/UnifiedControlConfig.yaml" command="load" />
   
-  <!-- Enable unified control mode for formation -->
-  <param name="controller/unified_control_mode" value="false" />  <!-- Will be enabled by state machine -->
+  <param name="controller/unified_control_mode" value="false" />  
   
-  <!-- Valve rotation feedforward parameters -->
   <param name="controller/valve_rotation_feedforward/enabled" value="false" />
   <param name="controller/valve_rotation_feedforward/force_x" value="0.0" />
   <param name="controller/valve_rotation_feedforward/force_y" value="0.0" />
@@ -26,11 +20,9 @@
   <param name="controller/valve_rotation_feedforward/torque_y" value="0.0" />
   <param name="controller/valve_rotation_feedforward/torque_z" value="4.0" />
   
-  <!-- Formation geometry parameters -->
   <param name="controller/formation_geometry/module_spacing" value="0.4" />
   <param name="controller/formation_geometry/rotor_arm_length" value="0.25" />
   
-  <!-- Advanced unified control parameters -->
   <param name="controller/unified_control_advanced/dynamic_tilt_optimization" value="true" />
   <param name="controller/unified_control_advanced/max_rotor_tilt_angle" value="0.3" />
   <param name="controller/unified_control_advanced/attitude_stability_weight" value="8.0" />
@@ -52,14 +44,5 @@
         type="smach_viewer.py" 
         output="screen"
         if="$(arg verbose)" />
-  
-  <!-- Optional: Launch RViz for visualization -->
-  <group if="$(arg verbose)">
-    <node name="rviz" 
-          pkg="rviz" 
-          type="rviz" 
-          args="-d $(find beetle)/config/valve_rotation_visualization.rviz"
-          output="screen" />
-  </group>
 
 </launch>

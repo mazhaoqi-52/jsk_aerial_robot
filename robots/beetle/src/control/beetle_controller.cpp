@@ -8,7 +8,9 @@ namespace aerial_robot_control
     GimbalrotorController(),
     pd_wrench_comp_mode_(false),
     pre_module_state_(SEPARATED),
-    des_wrench_pub_flag_(false)
+    des_wrench_pub_flag_(false),
+    valve_rotation_ff_enabled_(false),
+    external_force_feedforward_(Eigen::VectorXd::Zero(6))
   {
   }
 
@@ -57,6 +59,8 @@ namespace aerial_robot_control
     internal_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("internal_wrench", 1);
     wrench_comp_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("debug/wrench_comp/pid", 1);
     des_inter_wrench_pub_ = nh_.advertise<beetle::TaggedWrenches>("des_inter_wnrech", 1);
+    formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("formation_wrench_debug", 1);
+    feedforward_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("feedforward_wrench", 1);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
@@ -91,7 +95,17 @@ namespace aerial_robot_control
     int module_state = beetle_navigator_-> getModuleState();
     bool comp_update_flag = false;
     double comp_update_interval = 1  / comp_term_update_freq_;
-    if(beetle_navigator_->getControlFlag() &&
+    
+    // Check if unified control mode is enabled for multi-rotor formation
+    bool unified_control_mode = false;
+    ros::param::get("controller/unified_control_mode", unified_control_mode);
+    
+    if(unified_control_mode && module_state != SEPARATED && module_state == LEADER){
+      // Unified 4n-rotor control mode for formation
+      calcUnifiedRotorControl();
+      comp_update_flag = true;
+    }
+    else if(beetle_navigator_->getControlFlag() &&
        module_state != SEPARATED){
       calcInteractionWrench();
       comp_update_flag = true;
@@ -135,6 +149,14 @@ namespace aerial_robot_control
       Eigen::VectorXd I_reconfig_acc_cog_term = Eigen::VectorXd::Zero(6);
       I_reconfig_acc_cog_term.head(3) = mass_inv * wrench_comp_term.head(3);
       I_reconfig_acc_cog_term.tail(3) = inertia_inv * wrench_comp_term.tail(3); //inavailable
+      
+      // Add feedforward compensation for external forces (e.g., valve rotation)
+      if(valve_rotation_ff_enabled_) {
+        Eigen::VectorXd ff_acc_term = Eigen::VectorXd::Zero(6);
+        ff_acc_term.head(3) = mass_inv * external_force_feedforward_.head(3);
+        ff_acc_term.tail(3) = inertia_inv * external_force_feedforward_.tail(3);
+        I_reconfig_acc_cog_term += ff_acc_term;
+      }
 
       double IGain_Fx = pid_controllers_.at(X).getIGain();
       double IGain_Fy = pid_controllers_.at(Y).getIGain();
@@ -486,6 +508,214 @@ namespace aerial_robot_control
     wrench(4) =  wrench_msg.torque.y;
     wrench(5) =  wrench_msg.torque.z;
     ff_inter_wrench_list_[id] = wrench;
+  }
+
+  void BeetleController::setExternalForceFeedforward(const Eigen::VectorXd& ff_wrench)
+  {
+    external_force_feedforward_ = ff_wrench;
+    
+    // Publish feedforward wrench for debugging
+    geometry_msgs::WrenchStamped ff_wrench_msg;
+    ff_wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
+    ff_wrench_msg.wrench.force.x = ff_wrench(0);
+    ff_wrench_msg.wrench.force.y = ff_wrench(1);
+    ff_wrench_msg.wrench.force.z = ff_wrench(2);
+    ff_wrench_msg.wrench.torque.x = ff_wrench(3);
+    ff_wrench_msg.wrench.torque.y = ff_wrench(4);
+    ff_wrench_msg.wrench.torque.z = ff_wrench(5);
+    
+    if(feedforward_wrench_pub_.getNumSubscribers() > 0) {
+      feedforward_wrench_pub_.publish(ff_wrench_msg);
+    }
+  }
+
+  void BeetleController::calcUnifiedRotorControl()
+  {
+    /* Unified 4n-rotor control for assembled formation */
+    int my_id = beetle_navigator_->getMyID();
+    int max_modules_num = beetle_navigator_->getMaxModuleNum();
+    std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
+    std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
+    
+    if(assembled_ids.empty()) return;
+    
+    // Calculate total force/torque requirements for the formation
+    Eigen::VectorXd total_wrench_demand = Eigen::VectorXd::Zero(6);
+    
+    // Get formation center of mass dynamics
+    double formation_mass = beetle_robot_model_->getMass() * assembled_ids.size();
+    Eigen::Matrix3d formation_inertia = beetle_robot_model_->getInertia<Eigen::Matrix3d>() * assembled_ids.size();
+    
+    // Calculate required wrench for formation control
+    // This should come from the high-level trajectory controller
+    const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
+    if(target_wrench_acc_cog.size() > 0) {
+      total_wrench_demand.head(3) = formation_mass * target_wrench_acc_cog.head(3);
+      total_wrench_demand.tail(3) = formation_inertia * target_wrench_acc_cog.tail(3);
+    }
+    
+    // Add feedforward compensation for valve rotation if enabled
+    if(valve_rotation_ff_enabled_) {
+      total_wrench_demand += external_force_feedforward_;
+    }
+    
+    // Distribute wrench among all rotors in the formation
+    int total_rotors = assembled_ids.size() * 4; // Assuming 4 rotors per module
+    
+    // Calculate optimal rotor command distribution
+    Eigen::VectorXd rotor_commands = distributeWrenchToRotors(total_wrench_demand, assembled_ids);
+    
+    // Send commands to individual modules
+    publishUnifiedRotorCommands(rotor_commands, assembled_ids);
+    
+    // Publish formation control debug info
+    publishFormationControlDebug(total_wrench_demand, assembled_ids);
+  }
+
+  Eigen::VectorXd BeetleController::distributeWrenchToRotors(const Eigen::VectorXd& target_wrench, 
+                                                           const std::vector<int>& assembled_ids)
+  {
+    int total_rotors = assembled_ids.size() * 4;
+    Eigen::VectorXd rotor_commands = Eigen::VectorXd::Zero(total_rotors);
+    
+    // Formation geometry matrix (maps rotor forces to formation wrench)
+    // This needs to be calculated based on relative positions of modules
+    Eigen::MatrixXd G = buildFormationGeometryMatrix(assembled_ids);
+    
+    // Solve for optimal rotor forces: G * f = target_wrench
+    // Using weighted least squares for force distribution
+    Eigen::MatrixXd W = Eigen::MatrixXd::Identity(total_rotors, total_rotors); // Weight matrix
+    
+    // Weighted least squares solution: f = (G^T * W * G)^(-1) * G^T * W * target_wrench
+    Eigen::MatrixXd GtWG = G.transpose() * W * G;
+    
+    if(GtWG.determinant() > 1e-6) {
+      rotor_commands = GtWG.inverse() * G.transpose() * W * target_wrench;
+    } else {
+      // Use Moore-Penrose pseudoinverse if matrix is singular
+      rotor_commands = G.completeOrthogonalDecomposition().pseudoInverse() * target_wrench;
+    }
+    
+    return rotor_commands;
+  }
+
+  Eigen::MatrixXd BeetleController::buildFormationGeometryMatrix(const std::vector<int>& assembled_ids)
+  {
+    int total_rotors = assembled_ids.size() * 4;
+    Eigen::MatrixXd G = Eigen::MatrixXd::Zero(6, total_rotors);
+    
+    // Build geometry matrix based on rotor positions relative to formation center
+    for(size_t i = 0; i < assembled_ids.size(); i++) {
+      int module_id = assembled_ids[i];
+      
+      // Get module position relative to formation center
+      // This should come from the navigation system
+      Eigen::Vector3d module_pos = getModulePosition(module_id);
+      
+      // For each rotor in this module
+      for(int rotor = 0; rotor < 4; rotor++) {
+        int rotor_index = i * 4 + rotor;
+        
+        // Get rotor position relative to module center
+        Eigen::Vector3d rotor_pos = getRotorPosition(rotor);
+        Eigen::Vector3d total_pos = module_pos + rotor_pos;
+        
+        // Force mapping (rotor thrust contributes to formation force)
+        G(0, rotor_index) = 0;  // X force (depends on rotor tilt)
+        G(1, rotor_index) = 0;  // Y force (depends on rotor tilt) 
+        G(2, rotor_index) = 1;  // Z force (thrust direction)
+        
+        // Torque mapping (moment arm × force)
+        G(3, rotor_index) = total_pos(1);  // Roll torque
+        G(4, rotor_index) = -total_pos(0); // Pitch torque
+        G(5, rotor_index) = getRotorTorqueDirection(rotor); // Yaw torque
+      }
+    }
+    
+    return G;
+  }
+
+  void BeetleController::publishUnifiedRotorCommands(const Eigen::VectorXd& rotor_commands, 
+                                                    const std::vector<int>& assembled_ids)
+  {
+    // Distribute rotor commands to individual modules
+    for(size_t i = 0; i < assembled_ids.size(); i++) {
+      int module_id = assembled_ids[i];
+      
+      // Extract commands for this module's 4 rotors
+      Eigen::Vector4d module_commands = rotor_commands.segment(i*4, 4);
+      
+      // Convert to appropriate message type and publish
+      // This would interface with the existing gimbalrotor control system
+      publishModuleRotorCommands(module_id, module_commands);
+    }
+  }
+
+  void BeetleController::publishFormationControlDebug(const Eigen::VectorXd& total_wrench_demand, 
+                                                     const std::vector<int>& assembled_ids)
+  {
+    // Publish debug information for formation control
+    geometry_msgs::WrenchStamped formation_wrench_msg;
+    formation_wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
+    formation_wrench_msg.wrench.force.x = total_wrench_demand(0);
+    formation_wrench_msg.wrench.force.y = total_wrench_demand(1);
+    formation_wrench_msg.wrench.force.z = total_wrench_demand(2);
+    formation_wrench_msg.wrench.torque.x = total_wrench_demand(3);
+    formation_wrench_msg.wrench.torque.y = total_wrench_demand(4);
+    formation_wrench_msg.wrench.torque.z = total_wrench_demand(5);
+    
+    // Publish formation control wrench
+    if(formation_wrench_pub_.getNumSubscribers() > 0) {
+      formation_wrench_pub_.publish(formation_wrench_msg);
+    }
+  }
+
+  // Helper method implementations - these need to be customized based on your robot geometry
+  Eigen::Vector3d BeetleController::getModulePosition(int module_id)
+  {
+    // Get module position relative to formation center from navigation
+    // For now, return a simple linear arrangement
+    double module_spacing = 0.5; // meters between modules
+    int my_id = beetle_navigator_->getMyID();
+    double x_offset = (module_id - my_id) * module_spacing;
+    
+    return Eigen::Vector3d(x_offset, 0, 0);
+  }
+
+  Eigen::Vector3d BeetleController::getRotorPosition(int rotor_index)
+  {
+    // Return rotor position relative to module center
+    // This should match your robot's actual geometry
+    double rotor_arm_length = 0.25; // meters
+    
+    switch(rotor_index) {
+      case 0: return Eigen::Vector3d(rotor_arm_length, 0, 0);           // Front
+      case 1: return Eigen::Vector3d(0, rotor_arm_length, 0);          // Right  
+      case 2: return Eigen::Vector3d(-rotor_arm_length, 0, 0);         // Back
+      case 3: return Eigen::Vector3d(0, -rotor_arm_length, 0);         // Left
+      default: return Eigen::Vector3d::Zero();
+    }
+  }
+
+  double BeetleController::getRotorTorqueDirection(int rotor_index)
+  {
+    // Return +1 for CCW rotors, -1 for CW rotors
+    // This depends on your specific rotor configuration
+    return (rotor_index % 2 == 0) ? 1.0 : -1.0;
+  }
+
+  void BeetleController::publishModuleRotorCommands(int module_id, const Eigen::Vector4d& commands)
+  {
+    // This method should interface with the existing gimbalrotor control system
+    // to send individual rotor commands to each module
+    // Implementation depends on your existing rotor command interface
+    
+    ROS_DEBUG_STREAM("Publishing rotor commands for module " << module_id << 
+                     ": [" << commands.transpose() << "]");
+    
+    // TODO: Implement actual rotor command publishing
+    // This might involve calling methods from the parent GimbalrotorController class
+    // or publishing to specific topics for each module
   }
 
 } //namespace aerial_robot_controller

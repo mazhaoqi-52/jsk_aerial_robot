@@ -1,0 +1,67 @@
+<launch>
+  <!-- Environment settings -->
+  <arg name="real_machine" default="true"/>
+  <arg name="simulation" default="true"/>
+  
+  <!-- Formation UAV parameters -->
+  <arg name="module_ids" default="1,2" />
+  <arg name="leader_id" default="1" />
+  <arg name="follower_id" default="2" />
+  <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
+  <arg name="approach_height" default="0.5" />
+  
+  <arg name="hover_duration" default="2.0" /> <!-- seconds to hover for initialization -->
+  
+  <!-- Valve parameters -->
+  <arg name="valve_ns" default="valve"/>
+  <arg name="valve_id" default="85"/>
+  <arg name="valve_x" default="3"/>
+  <arg name="valve_y" default="0"/>
+  <arg name="valve_z" default="0"/>
+  <arg name="valve_yaw" default="0"/>
+  
+  <!-- Debug mode -->
+  <arg name="debug" default="false" />
+  
+  <!-- Formation control parameters -->
+  <arg name="formation_distance" default="1.0" />
+  <arg name="unified_control_gain" default="1.0" />
+  <arg name="feedforward_gain" default="0.5" />
+  
+  <!-- Emergency detection parameters -->
+  <arg name="stuck_threshold" default="3.0" /> 
+  <arg name="movement_threshold" default="0.01" /> 
+  <arg name="yaw_threshold" default="0.05" /> 
+  
+  <!-- Include valve position setup -->
+  <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
+    <arg name="real_machine" value="$(arg real_machine)" />
+    <arg name="simulation" value="$(arg simulation)" />
+    <arg name="robot_ns" value="$(arg valve_ns)" />
+    <arg name="robot_id" value="$(arg valve_id)"/>
+    <arg name="valve_x" value="$(arg valve_x)" />
+    <arg name="valve_y" value="$(arg valve_y)" />
+    <arg name="valve_z" value="$(arg valve_z)" />
+    <arg name="valve_yaw" value="$(arg valve_yaw)" />
+  </include>
+  
+  <!-- Dual UAV Formation Valve Rotation Node -->
+  <node name="valve_rotation_formation" pkg="beetle" type="valve_rotation_formation.py"
+        output="screen">
+    <param name="module_ids" value="$(arg module_ids)" />
+    <param name="leader_id" value="$(arg leader_id)" />
+    <param name="follower_id" value="$(arg follower_id)" />
+    <param name="rotation_angle" value="$(arg rotation_angle)" />
+    <param name="approach_height" value="$(arg approach_height)" />
+    <param name="hover_duration" value="$(arg hover_duration)" />
+    <param name="formation_distance" value="$(arg formation_distance)" />
+    <param name="unified_control_gain" value="$(arg unified_control_gain)" />
+    <param name="feedforward_gain" value="$(arg feedforward_gain)" />
+    <param name="simulation" value="$(arg simulation)" />
+    <param name="real_machine" value="$(arg real_machine)" />
+    <param name="stuck_threshold" value="$(arg stuck_threshold)" />
+    <param name="movement_threshold" value="$(arg movement_threshold)" />
+    <param name="yaw_threshold" value="$(arg yaw_threshold)" />
+    <param name="debug" value="$(arg debug)" />
+  </node>
+</launch>

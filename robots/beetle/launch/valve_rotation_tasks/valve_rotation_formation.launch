@@ -7,7 +7,8 @@
   
   <param name="simulation" value="$(arg simulation)" />
   <param name="real_machine" value="$(arg real_machine)" />
-  
+  <param name="module_ids" value="$(arg module_ids)" />
+
   <rosparam file="$(find beetle)/config/UnifiedControlConfig.yaml" command="load" />
   
   <param name="controller/unified_control_mode" value="false" />  
@@ -29,20 +30,15 @@
   <param name="controller/unified_control_advanced/torque_optimization_weight" value="3.0" />
   
   <!-- Launch the formation valve rotation state machine -->
-  <node name="formation_valve_rotation_smach" 
-        pkg="beetle" 
-        type="valve_rotation_formation.py" 
-        output="screen"
-        required="true">
-    <param name="simulation" value="$(arg simulation)" />
-    <param name="real_machine" value="$(arg real_machine)" />
-  </node>
-  
+  <node pkg="beetle" type="valve_rotation_formation.py" name="formation_valve_rotation_smach" output="screen" required="true">
+    <param name="simulation" value="$(arg simulation)"/>
+    <param name="module_ids" value="$(arg module_ids)"/>
+    <param name="real_machine" value="$(arg real_machine)"/>
+  </node>  
   <!-- Launch SMACH viewer for state machine visualization -->
   <node name="smach_viewer" 
         pkg="smach_viewer" 
         type="smach_viewer.py" 
         output="screen"
         if="$(arg verbose)" />
-
 </launch>

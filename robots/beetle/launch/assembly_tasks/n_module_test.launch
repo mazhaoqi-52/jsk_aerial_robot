@@ -9,9 +9,10 @@
   <arg name="headless" default="true" />
   <arg name="launch_gazebo_for_first" default="true" />
 
+  <!-- Load swarm configuration -->
   <rosparam command="load" file="$(find beetle)/config/swarm.yaml"/>
   
-  <!-- for 1st Beetle -->
+  <!-- for 1st Beetle (leftmost) -->
   <group if="$(eval len(arg('module_ids').split(',')) > 0)">
     <include file="$(find beetle)/launch/bringup.launch">
       <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[0])"/>
@@ -20,14 +21,14 @@
       <arg name="headless"      value="$(arg headless)"/>
       <arg name="launch_gazebo" value="$(arg launch_gazebo_for_first)"/>
       <arg name="estimate_mode" value="1"/>
-      <arg name="spawn_x"       value="$(eval ( ((len(arg('module_ids').split(','))-1)/2.0 - 0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - 0*float(arg('dx')) ))"/>
+      <arg name="spawn_x"       value="$(eval ( (0 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) + 0*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="true"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 1)"/>
     </include>
   </group>
 
-  <!-- for 2nd Beetle -->
+  <!-- for 2nd Beetle (middle) -->
   <group if="$(eval len(arg('module_ids').split(',')) > 1)">
     <include file="$(find beetle)/launch/bringup.launch">
       <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[1])"/>
@@ -36,14 +37,14 @@
       <arg name="headless"      value="$(arg headless)"/>
       <arg name="launch_gazebo" value="false"/>
       <arg name="estimate_mode" value="1"/>
-      <arg name="spawn_x"       value="$(eval ( ((len(arg('module_ids').split(','))-1)/2.0 - 1) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - 1*float(arg('dx')) ))"/>
+      <arg name="spawn_x"       value="$(eval ( (1 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) + 1*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="false"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 2)"/>
     </include>
   </group>
 
-  <!-- for 3rd Beetle -->
+  <!-- for 3rd Beetle (rightmost) -->
   <group if="$(eval len(arg('module_ids').split(',')) > 2)">
     <include file="$(find beetle)/launch/bringup.launch">
       <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[2])"/>
@@ -52,12 +53,44 @@
       <arg name="headless"      value="$(arg headless)"/>
       <arg name="launch_gazebo" value="false"/>
       <arg name="estimate_mode" value="1"/>
-      <arg name="spawn_x"       value="$(eval ( ((len(arg('module_ids').split(','))-1)/2.0 - 2) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - 2*float(arg('dx')) ))"/>
+      <arg name="spawn_x"       value="$(eval ( (2 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) + 2*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="false"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 3)"/>
     </include>
   </group>
 
-<!-- just copy __x3/__x4/__x5 groups as needed -->
+  <!-- for 4th Beetle -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 3)">
+    <include file="$(find beetle)/launch/bringup.launch">
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[3])"/>
+      <arg name="real_machine"  value="false"/>
+      <arg name="simulation"    value="true"/>
+      <arg name="headless"      value="$(arg headless)"/>
+      <arg name="launch_gazebo" value="false"/>
+      <arg name="estimate_mode" value="1"/>
+      <arg name="spawn_x"       value="$(eval ( (3 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) + 3*float(arg('dx')) ))"/>
+      <arg name="spawn_y"       value="$(arg spawn_y)"/>
+      <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 4)"/>
+    </include>
+  </group>
+
+  <!-- for 5th Beetle -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 4)">
+    <include file="$(find beetle)/launch/bringup.launch">
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[4])"/>
+      <arg name="real_machine"  value="false"/>
+      <arg name="simulation"    value="true"/>
+      <arg name="headless"      value="$(arg headless)"/>
+      <arg name="launch_gazebo" value="false"/>
+      <arg name="estimate_mode" value="1"/>
+      <arg name="spawn_x"       value="$(eval ( (4 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) + 4*float(arg('dx')) ))"/>
+      <arg name="spawn_y"       value="$(arg spawn_y)"/>
+      <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 5)"/>
+    </include>
+  </group>
+
+<!-- just copy more Beetle as needed -->
 </launch>

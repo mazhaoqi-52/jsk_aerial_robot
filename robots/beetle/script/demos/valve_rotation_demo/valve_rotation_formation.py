@@ -61,27 +61,33 @@ except ImportError as e:
 class FormationValveRotationController:
     """Unified control and feedforward control manager"""
     
-    def __init__(self):
+    def __init__(self, module_ids=[1, 2], leader_id=None):
+        self.module_ids = module_ids
+        self.leader_id = leader_id if leader_id is not None else module_ids[-1]  # Last module is leader
+        
+        # Dynamic topic naming based on module IDs
         self.feedforward_pub_1 = rospy.Publisher(
-            '/beetle1/controller/feedforward_wrench', 
+            f'/beetle{self.module_ids[0]}/controller/feedforward_wrench', 
             WrenchStamped, 
             queue_size=1
         )
         self.feedforward_pub_2 = rospy.Publisher(
-            '/beetle2/controller/feedforward_wrench', 
+            f'/beetle{self.module_ids[1]}/controller/feedforward_wrench', 
             WrenchStamped, 
             queue_size=1
         )
         
-        # Monitor formation control status
+        # Monitor formation control status - use leader for monitoring
         self.formation_wrench_sub = rospy.Subscriber(
-            '/beetle1/controller/formation_wrench_debug',
+            f'/beetle{self.leader_id}/controller/formation_wrench_debug',
             WrenchStamped,
             self.formation_wrench_callback
         )
         
         self.unified_control_enabled = False
         self.feedforward_enabled = False
+        
+        rospy.loginfo(f"FormationController initialized with modules {self.module_ids}, leader: beetle{self.leader_id}")
         
     def enable_unified_control(self):
         """Enable unified 4n-rotor control mode"""
@@ -243,15 +249,16 @@ class MoveToAssemblyPositionState(SeperatedMotionStateBase):
 class AssemblyFormationState(AssemblyMotionStateBase):
     """Formation assembly state"""
     
-    def __init__(self):
+    def __init__(self, module_ids=[1, 2]):
         AssemblyMotionStateBase.__init__(self, outcomes=['succeeded', 'failed'])
+        self.module_ids = module_ids
         
     def execute(self, userdata):
         rospy.loginfo("Starting formation assembly...")
         
         try:
-            # Use existing assembly functionality
-            assembly_demo = AssemblyDemo(module_ids=[1, 2], real_machine=False)
+            # Use configurable module IDs
+            assembly_demo = AssemblyDemo(module_ids=self.module_ids, real_machine=False)
             
             # Execute assembly
             result = assembly_demo.main()
@@ -372,9 +379,10 @@ class FormationValveRotationState(AssemblyMotionStateBase):
 class DisassemblyState(AssemblyMotionStateBase):
     """Disassembly state"""
     
-    def __init__(self, formation_controller):
+    def __init__(self, formation_controller, module_ids=[1, 2]):
         AssemblyMotionStateBase.__init__(self, outcomes=['succeeded', 'failed'])
         self.formation_controller = formation_controller
+        self.module_ids = module_ids
         
     def execute(self, userdata):
         rospy.loginfo("Starting disassembly...")
@@ -384,8 +392,8 @@ class DisassemblyState(AssemblyMotionStateBase):
             self.formation_controller.disable_unified_control()
             time.sleep(1)
             
-            # 2. Execute disassembly
-            disassembly_demo = DisassemblyDemo(module_ids=[1, 2], real_machine=False)
+            # 2. Execute disassembly with configurable module IDs
+            disassembly_demo = DisassemblyDemo(module_ids=self.module_ids, real_machine=False)
             result = disassembly_demo.main()
             
             if result:
@@ -402,8 +410,27 @@ class DisassemblyState(AssemblyMotionStateBase):
 def create_formation_valve_rotation_sm():
     """Create dual UAV formation valve rotation state machine"""
     
-    # Create formation controller
-    formation_controller = FormationValveRotationController()
+    # Parse module IDs from ROS parameters
+    modules_str = rospy.get_param("~module_ids", "1,2")
+    rospy.loginfo(f"Formation valve rotation with module IDs: {modules_str}")
+    
+    modules = []
+    if modules_str:
+        modules = [int(x) for x in modules_str.split(',')]
+    else:
+        rospy.logwarn("No module IDs specified, using default [1,2]")
+        modules = [1, 2]
+    
+    if len(modules) < 2:
+        rospy.logerr("At least 2 module IDs are required for formation!")
+        modules = [1, 2]
+    
+    # Last module ID is the leader with end-effector
+    leader_id = modules[-1]
+    rospy.loginfo(f"Module {leader_id} designated as leader (carries end-effector)")
+    
+    # Create formation controller with dynamic module IDs
+    formation_controller = FormationValveRotationController(module_ids=modules, leader_id=leader_id)
     
     # Create top-level state machine
     sm = smach.StateMachine(outcomes=['succeeded', 'failed', 'aborted'])
@@ -422,7 +449,7 @@ def create_formation_valve_rotation_sm():
         # 2. Execute formation assembly
         smach.StateMachine.add(
             'ASSEMBLY_FORMATION',
-            AssemblyFormationState(),
+            AssemblyFormationState(module_ids=modules),
             transitions={
                 'succeeded': 'ENABLE_UNIFIED_CONTROL',
                 'failed': 'failed'
@@ -452,7 +479,7 @@ def create_formation_valve_rotation_sm():
         # 5. Disassembly
         smach.StateMachine.add(
             'DISASSEMBLY',
-            DisassemblyState(formation_controller),
+            DisassemblyState(formation_controller, module_ids=modules),
             transitions={
                 'succeeded': 'succeeded',
                 'failed': 'failed'

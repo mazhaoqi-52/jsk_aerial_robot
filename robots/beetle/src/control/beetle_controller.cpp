@@ -547,7 +547,7 @@ namespace aerial_robot_control
     Eigen::Matrix3d formation_inertia = beetle_robot_model_->getInertia<Eigen::Matrix3d>() * assembled_ids.size();
     
     // Calculate required wrench for formation control
-    // This should come from the high-level trajectory controller
+    // Coming from the high-level trajectory controller
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
     if(target_wrench_acc_cog.size() > 0) {
       total_wrench_demand.head(3) = formation_mass * target_wrench_acc_cog.head(3);

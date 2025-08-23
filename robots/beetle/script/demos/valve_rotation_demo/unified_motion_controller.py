@@ -85,15 +85,15 @@ class UnifiedMotionController:
         Execute polynomial trajectory motion with feedback control
         
         Args:
-            start: 起始位置 (x, y, z)
-            target: 目标位置 (x, y, z)
-            avg_speed: 平均速度 m/s
-            pos_threshold: 位置误差阈值 m
-            yaw_threshold: 朝向误差阈值 rad
-            timeout: 超时时间 s
+            start: Starting position (x, y, z)
+            target: Target position (x, y, z)
+            avg_speed: Average speed m/s
+            pos_threshold: Position error threshold m
+            yaw_threshold: Yaw error threshold rad
+            timeout: Timeout duration s
             
         Returns:
-            bool: 成功返回True，失败返回False
+            bool: Returns True on success, False on failure
         """
         distance = math.sqrt((target[0]-start[0])**2 + (target[1]-start[1])**2 + (target[2]-start[2])**2)
         duration = distance / max(avg_speed, 0.05)
@@ -119,24 +119,24 @@ class UnifiedMotionController:
             
             rate.sleep()
         
-        rospy.logerr(f"轨迹运动超时: {timeout}s")
+        rospy.logerr(f"Trajectory motion timeout: {timeout}s")
         return False
     
     def execute_smooth_trajectory_with_yaw(self, start_pos, target_pos, target_yaw, duration=5.0,
                                           pos_threshold=0.03, yaw_threshold=0.08):
         """
-        执行平滑轨迹运动，带朝向控制
+        Execute smooth trajectory motion with yaw control
         
         Args:
-            start_pos: 起始位置 (x, y, z)
-            target_pos: 目标位置 (x, y, z)
-            target_yaw: 目标朝向 rad
-            duration: 轨迹时间 s
-            pos_threshold: 位置误差阈值 m
-            yaw_threshold: 朝向误差阈值 rad
+            start_pos: Starting position (x, y, z)
+            target_pos: Target position (x, y, z)
+            target_yaw: Target yaw rad
+            duration: Trajectory duration s
+            pos_threshold: Position error threshold m
+            yaw_threshold: Yaw error threshold rad
             
         Returns:
-            bool: 成功返回True，失败返回False
+            bool: Returns True on success, False on failure
         """
         traj = PolynomialTrajectory(duration)
         traj.generate_trajectory(start_pos, target_pos)
@@ -248,18 +248,18 @@ class UnifiedMotionController:
         rospy.loginfo("Controlled descent completed")
         return True
     
-    # ===== 对齐控制功能 =====
+    # ===== Alignment control functionality =====
     
     def execute_pre_rotation_alignment(self, valve_pos, timeout=10.0):
         """
-        执行预旋转对齐
+        Execute pre-rotation alignment
         
         Args:
-            valve_pos: 阀门位置 (x, y, z)
-            timeout: 超时时间 s
+            valve_pos: Valve position (x, y, z)
+            timeout: Timeout duration s
             
         Returns:
-            bool: 成功返回True，失败返回False
+            bool: Returns True on success, False on failure
         """
         if not self.strict_alignment_enabled:
             rospy.loginfo("Strict alignment control disabled")
@@ -302,13 +302,13 @@ class UnifiedMotionController:
         Execute constant distance rotation combining trajectory generation and feedback control
         
         Args:
-            trajectory: ConstantDistanceValveRotationTrajectory 轨迹生成器
-            valve_center: 阀门中心位置
+            trajectory: ConstantDistanceValveRotationTrajectory trajectory generator
+            valve_center: Valve center position
             feedback_frequency: Feedback control frequency Hz
-            alignment_check_interval: 对齐检查间隔 s
+            alignment_check_interval: Alignment check interval s
         
         Returns:
-            dict: 执行统计信息
+            dict: Execution statistics
         """
         rospy.loginfo("Starting constant distance feedback control rotation")
         
@@ -403,28 +403,28 @@ class UnifiedMotionController:
         Returns:
             tuple: (corrected_pos, corrected_yaw)
         """
-        # 计算当前末端执行器位置
+        # Calculate current end-effector position
         current_ee_pos = self.calculate_end_effector_position(current_pos, current_yaw)
         
-        # 计算目标末端执行器位置
+        # Calculate target end-effector position
         target_ee_pos = self.calculate_end_effector_position(target_pos, target_yaw)
         
-        # 计算距离误差
+        # Calculate distance error
         valve_x, valve_y, valve_z = valve_center
         current_distance = sqrt((current_ee_pos[0] - valve_x)**2 + (current_ee_pos[1] - valve_y)**2)
         target_distance = sqrt((target_ee_pos[0] - valve_x)**2 + (target_ee_pos[1] - valve_y)**2)
         
         distance_error = abs(current_distance - target_distance)
         
-        # 如果距离误差在容差范围内，不需要纠正
+        # If distance error is within tolerance, no correction needed
         if distance_error <= self.distance_tolerance:
             return target_pos, target_yaw
         
-        # 计算纠正向量
+        # Calculate correction vector
         correction_pos, correction_yaw = self.calculate_distance_correction(
             current_pos, current_yaw, valve_center, target_distance)
         
-        # 应用纠正
+        # Apply correction
         corrected_pos = (
             target_pos[0] + correction_pos[0],
             target_pos[1] + correction_pos[1],
@@ -432,10 +432,10 @@ class UnifiedMotionController:
         )
         corrected_yaw = target_yaw + correction_yaw
         
-        # 记录纠正
+        # Record correction
         self.control_stats['total_corrections'] += 1
         
-        # 记录纠正信息
+        # Record correction information
         if distance_error > self.distance_tolerance * 2:  # Only record large corrections
             rospy.loginfo(f"Applied distance correction: error={distance_error:.4f}m, "
                          f"position correction=[{correction_pos[0]:.3f}, {correction_pos[1]:.3f}, {correction_pos[2]:.3f}], "
@@ -507,14 +507,14 @@ class UnifiedMotionController:
     
     def calculate_end_effector_position(self, uav_pos, uav_yaw):
         """
-        计算末端执行器位置
+        Calculate end-effector position
         
         Args:
-            uav_pos: UAV位置
-            uav_yaw: UAV朝向
+            uav_pos: UAV position
+            uav_yaw: UAV yaw
         
         Returns:
-            tuple: 末端执行器位置 (x, y, z)
+            tuple: End-effector position (x, y, z)
         """
         cos_yaw = cos(uav_yaw)
         sin_yaw = sin(uav_yaw)
@@ -533,16 +533,16 @@ class UnifiedMotionController:
     
     def calculate_distance_error(self, uav_pos, uav_yaw, valve_center, target_distance):
         """
-        计算距离误差
+        Calculate distance error
         
         Args:
-            uav_pos: UAV位置
-            uav_yaw: UAV朝向
-            valve_center: 阀门中心位置
-            target_distance: 目标距离
+            uav_pos: UAV position
+            uav_yaw: UAV yaw
+            valve_center: Valve center position
+            target_distance: Target distance
         
         Returns:
-            float: 距离误差
+            float: Distance error
         """
         ee_pos = self.calculate_end_effector_position(uav_pos, uav_yaw)
         valve_x, valve_y, _ = valve_center
@@ -550,15 +550,15 @@ class UnifiedMotionController:
         current_distance = sqrt((ee_pos[0] - valve_x)**2 + (ee_pos[1] - valve_y)**2)
         return abs(current_distance - target_distance)
     
-    # ===== 基础工具函数 =====
+    # ===== Basic utility functions =====
     
     def send_trajectory_point(self, pos, yaw=None):
         """
-        发送轨迹点
+        Send trajectory point
         
         Args:
-            pos: 位置 (x, y, z)
-            yaw: 朝向 (弧度)
+            pos: Position (x, y, z)
+            yaw: Yaw (radians)
         """
         msg = FlightNav()
         msg.target = 1
@@ -578,31 +578,31 @@ class UnifiedMotionController:
     
     def send_velocity_command(self, vel, yaw_vel, pos_backup=None, yaw_backup=None):
         """
-        发送速度控制命令 (VEL模式)
+        Send velocity control command (VEL mode)
         
         Args:
-            vel: 速度指令 (vx, vy, vz) m/s
-            yaw_vel: 偏航角速度 rad/s
-            pos_backup: 备用位置指令 (x, y, z) - 用于混合控制
-            yaw_backup: 备用偏航角 rad - 用于混合控制
+            vel: Velocity command (vx, vy, vz) m/s
+            yaw_vel: Yaw angular velocity rad/s
+            pos_backup: Backup position command (x, y, z) - for hybrid control
+            yaw_backup: Backup yaw angle rad - for hybrid control
         """
         msg = FlightNav()
         msg.target = 1
         
-        # XY速度控制模式
+        # XY velocity control mode
         msg.pos_xy_nav_mode = FlightNav.VEL_MODE
         msg.target_vel_x = vel[0]
         msg.target_vel_y = vel[1]
         
-        # Z位置控制模式 (for safety and Z-lock)
+        # Z position control mode (for safety and Z-lock)
         msg.pos_z_nav_mode = FlightNav.POS_MODE
         msg.target_pos_z = pos_backup[2] if pos_backup else 0.0
         
-        # 偏航角速度控制
+        # Yaw angular velocity control
         msg.yaw_nav_mode = FlightNav.VEL_MODE
         msg.target_omega_z = yaw_vel
         
-        # 如果提供备用位置，设置为参考
+        # If backup position provided, set as reference
         if pos_backup is not None:
             msg.target_pos_x = pos_backup[0]  # Reference position
             msg.target_pos_y = pos_backup[1]  # Reference position
@@ -613,7 +613,7 @@ class UnifiedMotionController:
         self.pub.publish(msg)
     
     def _wait_for_position(self, target_pos, pos_threshold, point_timeout=2.0):
-        """等待UAV到达目标位置"""
+        """Wait for UAV to reach target position"""
         wait_start = time.time()
         rate = rospy.Rate(50)
         
@@ -635,7 +635,7 @@ class UnifiedMotionController:
         return False
     
     def _wait_for_position_and_yaw(self, target_pos, target_yaw, pos_threshold, yaw_threshold, point_timeout=1.0):
-        """等待UAV到达目标位置和朝向"""
+        """Wait for UAV to reach target position and yaw"""
         wait_start = time.time()
         rate = rospy.Rate(50)
         
@@ -658,7 +658,7 @@ class UnifiedMotionController:
         return False
     
     def _normalize_angle_diff(self, angle_diff):
-        """归一化角度差到 [-π, π] 范围"""
+        """Normalize angle difference to [-π, π] range"""
         while angle_diff > math.pi:
             angle_diff -= 2 * math.pi
         while angle_diff < -math.pi:
@@ -666,7 +666,7 @@ class UnifiedMotionController:
         return angle_diff
     
     def log_control_statistics(self):
-        """记录控制统计信息"""
+        """Log control statistics"""
         rospy.loginfo("=== Unified Motion Controller Statistics ===")
         rospy.loginfo(f"Execution time: {self.control_stats['execution_time']:.2f}s")
         rospy.loginfo(f"Total trajectory points: {self.control_stats['total_points']}")

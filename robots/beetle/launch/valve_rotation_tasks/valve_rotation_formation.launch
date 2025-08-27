@@ -6,6 +6,8 @@
 
   <!-- Formation parameters -->
   <arg name="module_ids" default="1,2" />
+  <arg name="dx" default="1.0" />  <!-- UAV spacing from launch system -->
+  <arg name="airframe_size" default="0.52" />  <!-- From assembly_api.py -->
   <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
   <arg name="approach_height" default="0.5" />
   
@@ -42,17 +44,19 @@
   <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation.py"
         output="screen">
     <param name="module_ids" value="$(arg module_ids)" />
+    <param name="dx" value="$(arg dx)" />
+    <param name="airframe_size" value="$(arg airframe_size)" />
     <param name="rotation_angle" value="$(arg rotation_angle)" />
     <param name="approach_height" value="$(arg approach_height)" />
     <param name="simulation" value="$(arg simulation)" />
     <param name="real_machine" value="$(arg real_machine)" />
     <param name="debug" value="$(arg debug)" />
   </node>
-  
+
   <!-- Launch SMACH viewer for state machine visualization if debug enabled -->
-  <node name="smach_viewer" 
+  <!-- <node name="smach_viewer" 
         pkg="smach_viewer" 
         type="smach_viewer.py" 
         output="screen"
-        if="$(arg debug)" />
+        if="$(arg debug)" /> -->
 </launch>

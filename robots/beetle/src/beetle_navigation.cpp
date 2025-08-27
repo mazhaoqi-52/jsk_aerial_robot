@@ -685,6 +685,15 @@ void BeetleNavigator::calcCenterOfMoving()
     module_state_ = FOLLOWER;
   }
 
+  //define a module on the right edge as leader
+  // std::sort(assembled_modules_ids_.begin(), assembled_modules_ids_.end());
+  // int leader_index = std::round((assembled_modules_ids_.size())) -1;
+  // if(!leader_fix_flag_) leader_id_ = assembled_modules_ids_[leader_index];
+  // if(my_id_ == leader_id_ && control_flag_){
+  //   module_state_ = LEADER;
+  // }else if(control_flag_){
+  //   module_state_ = FOLLOWER;
+  // }
 
   center_of_moving = center_of_moving / assembled_module;
 

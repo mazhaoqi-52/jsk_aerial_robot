@@ -694,3 +694,138 @@ class UnifiedMotionController:
         rospy.loginfo("✓ Enhanced alignment control")
         rospy.loginfo("✓ Constant distance feedback control")
         rospy.loginfo("✓ Specialized valve rotation control")
+
+
+# Formation control utilities
+def execute_formation_motion(pub, start_pos, target_pos, avg_speed):
+    """
+    Execute formation motion using existing polynomial trajectory
+    
+    Args:
+        pub: ROS publisher for PoseStamped messages
+        start_pos: Starting position [x, y, z]
+        target_pos: Target position [x, y, z] 
+        avg_speed: Average movement speed
+    
+    Returns:
+        Thread object for asynchronous execution
+    """
+    import threading
+    from geometry_msgs.msg import PoseStamped
+    
+    def motion_worker():
+        try:
+            # Calculate trajectory duration
+            distance = math.sqrt(sum((t - s) ** 2 for s, t in zip(start_pos, target_pos)))
+            duration = max(distance / avg_speed, 0.5)  # Minimum 0.5 seconds
+            
+            rospy.loginfo(f"Formation motion: {start_pos} -> {target_pos} over {duration:.2f}s")
+            
+            # Generate polynomial trajectory
+            traj = PolynomialTrajectory(duration)
+            traj.generate_trajectory(start_pos, target_pos)
+            
+            # Execute trajectory
+            rate = rospy.Rate(20)  # 20 Hz
+            while not rospy.is_shutdown() and not traj.is_finished():
+                pos = traj.evaluate()
+                if pos is None:
+                    break
+                
+                # Create and publish pose message
+                pose_msg = PoseStamped()
+                pose_msg.header.stamp = rospy.Time.now()
+                pose_msg.header.frame_id = "world"
+                pose_msg.pose.position.x = pos[0]
+                pose_msg.pose.position.y = pos[1]
+                pose_msg.pose.position.z = pos[2]
+                pose_msg.pose.orientation.w = 1.0  # No rotation
+                
+                pub.publish(pose_msg)
+                rate.sleep()
+            
+        except Exception as e:
+            rospy.logerr(f"Error in formation motion: {e}")
+    
+    # Start motion in separate thread
+    thread = threading.Thread(target=motion_worker)
+    thread.start()
+    return thread
+
+def execute_formation_motion_with_yaw(pub, start_pos, target_pos, target_yaw, avg_speed):
+    """
+    Execute formation motion with yaw control
+    
+    Args:
+        pub: ROS publisher for PoseStamped messages
+        start_pos: Starting position [x, y, z]
+        target_pos: Target position [x, y, z]
+        target_yaw: Target yaw angle (radians)
+        avg_speed: Average movement speed
+    
+    Returns:
+        Thread object for asynchronous execution
+    """
+    import threading
+    from geometry_msgs.msg import PoseStamped
+    from tf.transformations import quaternion_from_euler
+    
+    def motion_yaw_worker():
+        try:
+            # Calculate trajectory duration
+            distance = math.sqrt(sum((t - s) ** 2 for s, t in zip(start_pos, target_pos)))
+            duration = max(distance / avg_speed, 0.5)  # Minimum 0.5 seconds
+            
+            rospy.loginfo(f"Formation motion with yaw: {start_pos} -> {target_pos}, yaw: {target_yaw:.3f} over {duration:.2f}s")
+            
+            # Generate polynomial trajectory for position
+            traj = PolynomialTrajectory(duration)
+            traj.generate_trajectory(start_pos, target_pos)
+            
+            # Execute trajectory with yaw
+            rate = rospy.Rate(20)  # 20 Hz
+            while not rospy.is_shutdown() and not traj.is_finished():
+                pos = traj.evaluate()
+                if pos is None:
+                    break
+                
+                # Create and publish pose message with yaw
+                pose_msg = PoseStamped()
+                pose_msg.header.stamp = rospy.Time.now()
+                pose_msg.header.frame_id = "world"
+                pose_msg.pose.position.x = pos[0]
+                pose_msg.pose.position.y = pos[1]
+                pose_msg.pose.position.z = pos[2]
+                
+                # Set orientation from yaw
+                quat = quaternion_from_euler(0, 0, target_yaw)
+                pose_msg.pose.orientation.x = quat[0]
+                pose_msg.pose.orientation.y = quat[1]
+                pose_msg.pose.orientation.z = quat[2]
+                pose_msg.pose.orientation.w = quat[3]
+                
+                pub.publish(pose_msg)
+                rate.sleep()
+            
+        except Exception as e:
+            rospy.logerr(f"Error in formation motion with yaw: {e}")
+    
+    # Start motion in separate thread
+    thread = threading.Thread(target=motion_yaw_worker)
+    thread.start()
+    return thread
+
+
+# Compatibility class for existing code
+class UnifiedMotionController:
+    """Compatibility wrapper for formation control"""
+    
+    @staticmethod 
+    def execute_poly_motion_pose_async(pub, start_pos, target_pos, avg_speed):
+        """Compatibility method for formation control"""
+        return execute_formation_motion(pub, start_pos, target_pos, avg_speed)
+    
+    @staticmethod
+    def execute_poly_motion_pose_yaw_async(pub, start_pos, target_pos, target_yaw, avg_speed):
+        """Compatibility method for formation control with yaw"""
+        return execute_formation_motion_with_yaw(pub, start_pos, target_pos, target_yaw, avg_speed)

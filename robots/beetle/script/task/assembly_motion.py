@@ -45,14 +45,19 @@ class AssemblyDemo():
 
         sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
         sis.start()
-        outcome = sm_top.execute()
-        # rospy.spin()
-        # sis.stop()
-        # 保持ROS节点运行
-        while not rospy.is_shutdown() and outcome not in ['succeeded', 'interupted']:
-            rospy.sleep(0.1)  
-            sis.stop()
-            return outcome  
+        
+        try:
+            outcome = sm_top.execute()
+            rospy.loginfo(f"Assembly demo state machine completed with outcome: {outcome}")
+            return outcome
+        except Exception as e:
+            rospy.logerr(f"Error during assembly demo execution: {e}")
+            return 'interupted'
+        finally:
+            try:
+                sis.stop()
+            except:
+                pass  
 if __name__ == '__main__':
     rospy.init_node("assembly_motion")
     modules_str = rospy.get_param("module_ids", default="")

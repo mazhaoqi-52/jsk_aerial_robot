@@ -17,7 +17,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from tf.transformations import euler_from_quaternion
 from valve_rotation_demo.trajectory import PolynomialTrajectory
-from valve_rotation_demo.motion_controller import MotionController
+from valve_rotation_demo.unified_motion_controller import UnifiedMotionController
 from task.assembly_motion import AssemblyDemo
 
 class SeperatedMotionStateBase(smach.State):
@@ -67,9 +67,10 @@ class AssemblyMotionStateBase(smach.State):
         self.module_ids = [int(x) for x in module_ids_str.split(',')]
         if len(self.module_ids) < 2:
             rospy.logerr("AssemblyMotionStateBase: At least 2 module IDs are required.")
-        # Publisher
+        # Publisher for assembly navigation (formation control)
         self.pos_pub = rospy.Publisher("/assembly/uav/nav", FlightNav, queue_size=1)
-        # Subscribers
+        
+        # Subscribers for position feedback
         rospy.Subscriber("/beetle{}/mocap/pose".format(self.module_ids[0]), PoseStamped, self.beetle1_callback, queue_size=1)
         rospy.Subscriber("/beetle{}/mocap/pose".format(self.module_ids[1]), PoseStamped, self.beetle2_callback, queue_size=1)
         self.beetle1_pose = None
@@ -85,6 +86,24 @@ class AssemblyMotionStateBase(smach.State):
     def beetle2_callback(self, msg):
         self.beetle2_pose = msg
         self.beetle2_received.set()
+
+    def wait_for_uav_positions(self, timeout=5):
+        """Wait for both UAV positions to be received"""
+        return self.beetle1_received.wait(timeout) and self.beetle2_received.wait(timeout)
+
+    def get_uav_positions(self):
+        """Get current UAV positions as [x, y, z] lists"""
+        if self.beetle1_pose and self.beetle2_pose:
+            pos1 = [self.beetle1_pose.pose.position.x,
+                    self.beetle1_pose.pose.position.y,
+                    self.beetle1_pose.pose.position.z]
+            pos2 = [self.beetle2_pose.pose.position.x,
+                    self.beetle2_pose.pose.position.y,
+                    self.beetle2_pose.pose.position.z]
+            return pos1, pos2
+        else:
+            rospy.logwarn("UAV positions not yet received")
+            return None, None
 
     def update_current_pos(self):
         if self.beetle1_pose and self.beetle2_pose:

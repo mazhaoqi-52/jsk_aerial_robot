@@ -1,8 +1,0 @@
-module_ids: [1, 2, 3]   
-spawn:
-  dx: 0.6               
-  y: 0.0
-  yaw: 0.0
-  center: true          
-  base: 0.0            
-  

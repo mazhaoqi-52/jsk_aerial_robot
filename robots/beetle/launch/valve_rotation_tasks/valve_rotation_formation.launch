@@ -1,44 +1,26 @@
 <?xml version="1.0"?>
 <launch>
-  <arg name="module_ids" default=""/>
-  <arg name="real_machine" default="true"/>
-  <arg name="simulation" default="true"/>   
+  <!-- Environment settings -->
+  <arg name="real_machine" default="false"/>
+  <arg name="simulation" default="true"/>
+
+  <!-- Formation parameters -->
+  <arg name="module_ids" default="1,2" />
+  <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
+  <arg name="approach_height" default="0.5" />
+  
+  <!-- Valve parameters -->
   <arg name="valve_ns" default="valve"/>
-  <arg name="valve_id" default="1"/>
+  <arg name="valve_id" default="85"/>
   <arg name="valve_x" default="3"/>
   <arg name="valve_y" default="0"/>
+  <arg name="valve_z" default="0"/>
   <arg name="valve_yaw" default="0"/>
   
-  <!-- Dual UAV Formation Valve Rotation Launch File -->
-  <arg name="simulation" default="true" />
-  <arg name="real_machine" default="false" />
-  <arg name="verbose" default="false" />
+  <!-- Debug mode -->
+  <arg name="debug" default="false" />
   
-  <param name="simulation" value="$(arg simulation)" />
-  <param name="real_machine" value="$(arg real_machine)" />
-  <param name="module_ids" value="$(arg module_ids)" />
-
-  <rosparam file="$(find beetle)/config/UnifiedControlConfig.yaml" command="load" />
-  
-  <param name="controller/unified_control_mode" value="false" />  
-  
-  <param name="controller/valve_rotation_feedforward/enabled" value="false" />
-  <param name="controller/valve_rotation_feedforward/force_x" value="0.0" />
-  <param name="controller/valve_rotation_feedforward/force_y" value="0.0" />
-  <param name="controller/valve_rotation_feedforward/force_z" value="-8.0" />
-  <param name="controller/valve_rotation_feedforward/torque_x" value="0.0" />
-  <param name="controller/valve_rotation_feedforward/torque_y" value="0.0" />
-  <param name="controller/valve_rotation_feedforward/torque_z" value="4.0" />
-  
-  <param name="controller/formation_geometry/module_spacing" value="0.4" />
-  <param name="controller/formation_geometry/rotor_arm_length" value="0.25" />
-  
-  <param name="controller/unified_control_advanced/dynamic_tilt_optimization" value="true" />
-  <param name="controller/unified_control_advanced/max_rotor_tilt_angle" value="0.3" />
-  <param name="controller/unified_control_advanced/attitude_stability_weight" value="8.0" />
-  <param name="controller/unified_control_advanced/torque_optimization_weight" value="3.0" />
-
-  <!-- Valve Positioning -->
+  <!-- Include valve position setup -->
   <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
     <arg name="real_machine" value="$(arg real_machine)" />
     <arg name="simulation" value="$(arg simulation)" />
@@ -46,12 +28,31 @@
     <arg name="robot_id" value="$(arg valve_id)"/>
     <arg name="valve_x" value="$(arg valve_x)" />
     <arg name="valve_y" value="$(arg valve_y)" />
+    <arg name="valve_z" value="$(arg valve_z)" />
     <arg name="valve_yaw" value="$(arg valve_yaw)" />
   </include>
-  <!-- Launch the formation valve rotation state machine -->
-  <node pkg="beetle" type="valve_rotation_formation.py" name="formation_valve_rotation_smach" output="screen" required="true">
-    <param name="simulation" value="$(arg simulation)"/>
-    <param name="module_ids" value="$(arg module_ids)"/>
-    <param name="real_machine" value="$(arg real_machine)"/>
-  </node>  
+  
+  <!-- Controller parameters for formation valve rotation -->
+  <param name="controller/unified_control_mode" value="false" />
+  <param name="controller/valve_rotation_feedforward/enabled" value="false" />
+  <param name="controller/valve_rotation_feedforward/force_z" value="-5.0" />
+  <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />
+  
+  <!-- Formation valve rotation node -->
+  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation.py"
+        output="screen">
+    <param name="module_ids" value="$(arg module_ids)" />
+    <param name="rotation_angle" value="$(arg rotation_angle)" />
+    <param name="approach_height" value="$(arg approach_height)" />
+    <param name="simulation" value="$(arg simulation)" />
+    <param name="real_machine" value="$(arg real_machine)" />
+    <param name="debug" value="$(arg debug)" />
+  </node>
+  
+  <!-- Launch SMACH viewer for state machine visualization if debug enabled -->
+  <node name="smach_viewer" 
+        pkg="smach_viewer" 
+        type="smach_viewer.py" 
+        output="screen"
+        if="$(arg debug)" />
 </launch>

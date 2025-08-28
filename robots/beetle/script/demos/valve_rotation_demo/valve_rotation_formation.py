@@ -117,6 +117,10 @@ class MoveToValveVicinityState(AssemblyMotionStateBase):
         self.avg_speed = avg_speed
         self.safety_margin = safety_margin
         
+        # End effector offset from formation CoG to dual-fang center
+        self.end_effector_offset_x = 0.25346  # Forward offset to dual-fang
+        self.end_effector_offset_z = 0.0221140  # Z offset to dual-fang center
+        
         # Subscribe to valve position (simulation or real)
         self.is_simulation = rospy.get_param("~simulation", True)
         self.valve_received = threading.Event()
@@ -137,7 +141,7 @@ class MoveToValveVicinityState(AssemblyMotionStateBase):
         self.valve_received.set()
 
     def execute(self, userdata):
-        rospy.loginfo("Moving to valve vicinity in assembled state...")
+        rospy.loginfo("Moving to valve vicinity in assembled state with optimized path...")
         
         # Wait for valve position information
         if not self.valve_received.wait(timeout=5):
@@ -149,9 +153,6 @@ class MoveToValveVicinityState(AssemblyMotionStateBase):
             rospy.logwarn("Timeout waiting for UAV positions")
             return 'failed'
             
-        start1, start2 = self.get_uav_positions()
-        rospy.loginfo(f"Current UAV positions - UAV1: {start1}, UAV2: {start2}")
-        
         # Get valve position
         if self.is_simulation and self.pose_valve_sim:
             valve_x = self.pose_valve_sim.pose.pose.position.x
@@ -168,32 +169,39 @@ class MoveToValveVicinityState(AssemblyMotionStateBase):
             return 'failed'
             
         rospy.loginfo(f"Valve position: [{valve_x:.3f}, {valve_y:.3f}, {valve_z:.3f}]")
-        safe_altitude = valve_z + offset
-
-        # Move to safe altitude first
-        safe_target = [start1[0], start1[1], safe_altitude]  # Use formation center as reference
-        self.move_to_target_poly(safe_target, self.avg_speed)
-        time.sleep(2)
-
-        # Move to valve vicinity horizontally
-        horiz_target = [valve_x, valve_y + self.y_offset, safe_altitude + self.safety_margin]
-        self.move_to_target_poly(horiz_target, self.avg_speed)
-        time.sleep(2)
-
-        # Move to final positions above valve
-        final_target = [valve_x, valve_y, safe_altitude + self.safety_margin]
+        
+        # Calculate formation CoG position to place end-effector at valve vicinity
+        approach_height = 0.5  # Standard approach height
+        
+        # End-effector target: valve position + approach height
+        end_effector_target_x = valve_x
+        end_effector_target_y = valve_y  
+        end_effector_target_z = valve_z + approach_height
+        
+        # Formation CoG target: compensate for end-effector offset
+        # Assuming formation faces valve (yaw=0), end-effector is forward
+        formation_target_x = end_effector_target_x - self.end_effector_offset_x
+        formation_target_y = end_effector_target_y
+        formation_target_z = end_effector_target_z - self.end_effector_offset_z
+        
+        final_target = [formation_target_x, formation_target_y, formation_target_z]
+        
+        rospy.loginfo(f"End-effector target: [{end_effector_target_x:.3f}, {end_effector_target_y:.3f}, {end_effector_target_z:.3f}]")
+        rospy.loginfo(f"Formation CoG target (compensated): {final_target}")
+        
+        # Single movement to final position with end-effector compensation
         self.move_to_target_poly(final_target, self.avg_speed)
         time.sleep(2)
         
-        rospy.loginfo("Reached valve vicinity successfully")
+        rospy.loginfo("Reached valve vicinity successfully with optimized direct path")
         return 'succeeded'
 
 class MoveToInsertionPointState(AssemblyMotionStateBase):
-    """Move to insertion point with CoG-to-end-effector transformation"""
+    """Move to insertion point and descend"""
     
     def __init__(self, 
-                 z_offset_real=0.05,
-                 z_offset_sim=0.05, 
+                 z_offset_real=0.47,
+                 z_offset_sim=0.05,
                  descent_speed=0.05):
         
         AssemblyMotionStateBase.__init__(self, outcomes=['succeeded', 'failed'])
@@ -201,19 +209,15 @@ class MoveToInsertionPointState(AssemblyMotionStateBase):
         self.z_offset_sim = z_offset_sim
         self.descent_speed = descent_speed
         
-        # Get formation parameters from global parameters (set in main())
-        self.formation_to_end_effector_x = rospy.get_param('/formation_valve_rotation/formation_to_end_effector_x', 0.325)
-        self.uav_spacing = rospy.get_param('/formation_valve_rotation/uav_spacing', 1.0)
-        modules_str = rospy.get_param('/formation_valve_rotation/module_ids', '1,2')
+        # End effector offset from formation CoG to dual-fang center
+        self.end_effector_offset_x = 0.25346  # Forward offset to dual-fang
+        self.end_effector_offset_z = 0.0221140  # Z offset to dual-fang center
         
         # Identify end effector and support UAVs
+        modules_str = rospy.get_param("~module_ids", "1,2")
         modules = [int(x) for x in modules_str.split(',')]
-        self.modules = sorted(modules)
         self.end_effector_id = modules[-1]  # Rightmost module has end effector
         self.support_ids = modules[:-1]     # Other modules are support UAVs
-        
-        # Calculate formation center of gravity offset
-        self.formation_cog_offset = self.calculate_formation_cog_offset()
         
         # Subscribe to valve position
         self.is_simulation = rospy.get_param("~simulation", True)
@@ -226,46 +230,8 @@ class MoveToInsertionPointState(AssemblyMotionStateBase):
             self.pose_valve = None
             self.valve_sub = rospy.Subscriber("/valve/mocap/pose", PoseStamped, self.valve_callback, queue_size=1)
         
-        # CRITICAL: End-effector offset from formation center (calculated from URDF + spacing)
-        self.end_effector_offset_x = self.formation_to_end_effector_x  # From URDF + spacing calculation
-        self.end_effector_offset_y = 0.0         # Y offset (centered)
-        self.end_effector_offset_z = 0.0         # Z offset handled separately for proper insertion height
-        
-        rospy.loginfo(f"Formation CoG offset: {self.formation_cog_offset}")
         rospy.loginfo(f"End effector UAV: beetle{self.end_effector_id} will perform insertion")
         rospy.loginfo(f"Support UAVs: {[f'beetle{i}' for i in self.support_ids]} will maintain formation")
-        rospy.loginfo(f"End effector offset from formation CoG: X={self.end_effector_offset_x}m (from URDF + spacing), Y={self.end_effector_offset_y}m")
-        rospy.loginfo(f"UAV spacing: {self.uav_spacing}m")
-
-    def calculate_formation_cog_offset(self):
-        """Calculate center of gravity offset for assembled formation"""
-        if len(self.modules) == 1:
-            return {'x': 0.0, 'y': 0.0, 'z': 0.0}
-        
-        # For assembled formation, CoG shifts based on module arrangement
-        # Assuming linear formation with equal mass modules
-        total_modules = len(self.modules)
-        formation_length = (total_modules - 1) * self.formation_spacing
-        
-        # Calculate CoG position (center of mass)
-        cog_x = 0.0  # For equal mass, CoG is at geometric center
-        
-        # End effector position relative to formation CoG
-        end_effector_index = self.modules.index(self.end_effector_id)
-        end_effector_x = (end_effector_index * self.formation_spacing) - (formation_length / 2.0)
-        
-        # Support modules positions
-        support_positions = []
-        for support_id in self.support_ids:
-            support_index = self.modules.index(support_id)
-            support_x = (support_index * self.formation_spacing) - (formation_length / 2.0)
-            support_positions.append({'id': support_id, 'x': support_x, 'y': 0.0, 'z': 0.0})
-        
-        return {
-            'formation_cog': {'x': cog_x, 'y': 0.0, 'z': 0.0},
-            'end_effector_offset': {'x': end_effector_x, 'y': 0.0, 'z': 0.0},
-            'support_offsets': support_positions
-        }
 
     def valve_sim_callback(self, msg):
         self.pose_valve_sim = msg
@@ -276,86 +242,54 @@ class MoveToInsertionPointState(AssemblyMotionStateBase):
         self.valve_received.set()
 
     def execute(self, userdata):
-        rospy.loginfo("Moving to insertion point with CoG-to-end-effector transformation...")
+        rospy.loginfo("Moving to insertion point and descending...")
         
         # Wait for valve position
         if not self.valve_received.wait(timeout=5):
             rospy.logwarn("Failed to get valve position information")
             return 'failed'
             
-        # Get valve position and calculate target with CoG compensation
+        # Get valve position and calculate target
         if self.is_simulation and self.pose_valve_sim:
             valve_x = self.pose_valve_sim.pose.pose.position.x
             valve_y = self.pose_valve_sim.pose.pose.position.y
             valve_z = self.pose_valve_sim.pose.pose.position.z
-            z_offset = self.z_offset_sim
         elif not self.is_simulation and self.pose_valve:
             valve_x = self.pose_valve.pose.position.x
             valve_y = self.pose_valve.pose.position.y
             valve_z = self.pose_valve.pose.position.z
-            z_offset = self.z_offset_real
         else:
             rospy.logerr("Cannot get valid valve position")
             return 'failed'
-        
-        # CRITICAL: Calculate precise insertion height for end-effector placement at valve height
-        # Based on single UAV implementation that works correctly
-        end_effector_z_offset = 0.0221140  # Z offset of end-effector from formation CoG
-        required_formation_z = valve_z - end_effector_z_offset  # Formation position to place end-effector at valve height
-        
-        # Apply CoG-to-end-effector transformation for XY positioning
-        # Formation CoG target position (compensated for end effector offset)
-        formation_target_x = valve_x - self.end_effector_offset_x
-        formation_target_y = valve_y - self.end_effector_offset_y
-        target_z = required_formation_z  # Use precise insertion height calculation
-        
-        rospy.loginfo(f"=== PRECISE INSERTION HEIGHT CALCULATION ===")
-        rospy.loginfo(f"Valve position: [{valve_x:.3f}, {valve_y:.3f}, {valve_z:.3f}]")
-        rospy.loginfo(f"End effector offset: [{self.end_effector_offset_x:.3f}, {self.end_effector_offset_y:.3f}, {end_effector_z_offset:.6f}]")
-        rospy.loginfo(f"Required formation Z for end-effector at valve height: {required_formation_z:.6f}m")
-        rospy.loginfo(f"Formation CoG target: [{formation_target_x:.3f}, {formation_target_y:.3f}, {target_z:.3f}]")
-        
-        # Wait for current positions
-        if not self.wait_for_uav_positions(timeout=5):
-            rospy.logwarn("Timeout waiting for UAV positions")
-            return 'failed'
             
-        start1, start2 = self.get_uav_positions()
+        # CRITICAL: Calculate correct formation CoG position for end-effector insertion
+        # End-effector should be at valve height, so formation CoG should be offset accordingly
         
-        # === TWO-PHASE INSERTION STRATEGY (based on single UAV implementation) ===
-        # Phase 1: Move horizontally to insertion XY position (maintain current height)
-        # Phase 2: Descend to precise insertion height
+        # End-effector target: exactly at valve height for insertion
+        end_effector_target_x = valve_x
+        end_effector_target_y = valve_y  
+        end_effector_target_z = valve_z
         
-        # Calculate current formation center
-        current_formation_center = self.calculate_formation_center()
-        if current_formation_center is None:
-            rospy.logerr("Cannot calculate current formation center")
-            return 'failed'
+        # Formation CoG target: compensate for end-effector offset
+        # Assuming formation faces valve (yaw=0), end-effector is forward
+        formation_target_x = end_effector_target_x - self.end_effector_offset_x
+        formation_target_y = end_effector_target_y
+        formation_target_z = end_effector_target_z - self.end_effector_offset_z
         
-        rospy.loginfo("=== PHASE 1: HORIZONTAL POSITIONING ===")
-        rospy.loginfo("Moving horizontally to insertion XY position (maintaining height)")
+        target_pos = [formation_target_x, formation_target_y, formation_target_z]
         
-        # Phase 1: Horizontal movement to insertion XY position at current height
-        phase1_target = [formation_target_x, formation_target_y, current_formation_center[2]]  # Keep current Z
+        rospy.loginfo(f"=== INSERTION HEIGHT CALCULATION ===")
+        rospy.loginfo(f"Valve height: {valve_z:.6f}m")
+        rospy.loginfo(f"End-effector Z offset: {self.end_effector_offset_z:.6f}m")
+        rospy.loginfo(f"End-effector target: [{end_effector_target_x:.3f}, {end_effector_target_y:.3f}, {end_effector_target_z:.3f}]")
+        rospy.loginfo(f"Formation CoG target: [{formation_target_x:.3f}, {formation_target_y:.3f}, {formation_target_z:.3f}]")
         
-        rospy.loginfo(f"Phase 1 trajectory:")
-        rospy.loginfo(f"  From: [{current_formation_center[0]:.3f}, {current_formation_center[1]:.3f}, {current_formation_center[2]:.3f}]")
-        rospy.loginfo(f"  To:   [{phase1_target[0]:.3f}, {phase1_target[1]:.3f}, {phase1_target[2]:.3f}]")
-        rospy.loginfo(f"  Movement: XY positioning, Z unchanged")
+        # Use assembly navigation for coordinated movement
+        self.move_to_target_poly(target_pos, self.descent_speed)
         
-        # Execute phase 1: horizontal positioning
-        self.move_to_target_poly(phase1_target, self.descent_speed)
-        time.sleep(2)  # Allow settling time
-        
-        rospy.loginfo("✓ Phase 1 completed: Formation positioned above insertion point")
-        
-        rospy.loginfo("=== PHASE 2: VERTICAL DESCENT ===")
-        rospy.loginfo("Descending to precise insertion height for end-effector placement")
-        
-        # Phase 2: Vertical descent to precise insertion height
-        phase2_target = [formation_target_x, formation_target_y, target_z]  # Final insertion position
-        
-        # Update current position for accurate logging
+        time.sleep(2)
+        rospy.loginfo("Reached insertion point")
+        return 'succeeded'
         updated_formation_center = self.calculate_formation_center()
         if updated_formation_center is not None:
             current_formation_center = updated_formation_center
@@ -412,7 +346,7 @@ class MoveToInsertionPointState(AssemblyMotionStateBase):
         return [center_x, center_y, center_z]
 
 class RotateAndContactState(AssemblyMotionStateBase):
-    """Rotate and contact with insertion point"""
+    """Rotate to valve orientation and establish contact"""
     
     def __init__(self, 
                  contact_force_threshold=2.0,
@@ -423,6 +357,10 @@ class RotateAndContactState(AssemblyMotionStateBase):
         self.contact_force_threshold = contact_force_threshold
         self.contact_timeout = contact_timeout
         self.rotation_speed = rotation_speed
+        
+        # End effector offset from formation CoG to dual-fang center
+        self.end_effector_offset_x = 0.25346  # Forward offset to dual-fang
+        self.end_effector_offset_z = 0.0221140  # Z offset to dual-fang center
         
         # Subscribe to external wrench for contact detection
         self.external_wrench = None
@@ -503,6 +441,23 @@ class RotateAndContactState(AssemblyMotionStateBase):
         
         # Contact detection phase
         rospy.loginfo("Establishing contact with valve...")
+        
+        # Add a small forward movement to ensure contact
+        # Get current formation position and move slightly forward (toward valve)
+        current_pos = self.get_current_position()
+        if current_pos is not None:
+            # Small forward movement to ensure end-effector makes contact
+            contact_adjustment = 0.02  # 2cm forward movement
+            contact_target = [
+                current_pos[0] + contact_adjustment,
+                current_pos[1], 
+                current_pos[2]
+            ]
+            
+            rospy.loginfo(f"Fine adjustment for contact: moving {contact_adjustment}m forward")
+            self.move_to_target_poly(contact_target, 0.01)  # Very slow movement
+            time.sleep(1)
+        
         contact_start_time = time.time()
         
         if use_force_feedback:
@@ -567,11 +522,46 @@ class ValveRotationState(AssemblyMotionStateBase):
         self.end_effector_offset_y = 0.0         # Y offset (centered)
         self.end_effector_offset_z = 0.0743823   # Z offset from formation CoG (for trajectory calculation)
         
+        # Feedforward parameters for valve rotation
+        self.feedforward_torque = 3.0
+        self.feedforward_force_z = -5.0
+        
+        # Publishers for feedforward wrench to all modules
+        self.feedforward_pubs = {}
+        for module_id in self.modules:
+            pub = rospy.Publisher(
+                f'/beetle{module_id}/controller/feedforward_wrench', 
+                WrenchStamped, 
+                queue_size=1
+            )
+            self.feedforward_pubs[module_id] = pub
+        
         rospy.loginfo(f"Formation valve rotation initialized:")
         rospy.loginfo(f"  End effector UAV: beetle{self.end_effector_id}")
         rospy.loginfo(f"  Support UAVs: {[f'beetle{i}' for i in self.support_ids]}")
         rospy.loginfo(f"  Rotation: {math.degrees(rotation_angle):.1f}° over {rotation_duration:.1f}s")
         rospy.loginfo(f"  Direction: {'Clockwise' if rotation_direction == 1 else 'Counter-clockwise'}")
+        rospy.loginfo(f"  Feedforward enabled for modules: {self.modules}")
+
+    def set_feedforward_wrench(self, torque_z, force_z):
+        """Set feedforward compensation for valve rotation resistance"""
+        ff_wrench = WrenchStamped()
+        ff_wrench.header.stamp = rospy.Time.now()
+        ff_wrench.header.frame_id = "cog"
+        
+        # Set expected external forces/torques
+        ff_wrench.wrench.force.x = 0.0
+        ff_wrench.wrench.force.y = 0.0
+        ff_wrench.wrench.force.z = force_z
+        ff_wrench.wrench.torque.x = 0.0
+        ff_wrench.wrench.torque.y = 0.0
+        ff_wrench.wrench.torque.z = torque_z
+        
+        # Publish to all modules for formation stability
+        for module_id, pub in self.feedforward_pubs.items():
+            pub.publish(ff_wrench)
+        
+        rospy.loginfo_throttle(1.0, f"Feedforward set - Torque: {torque_z:.2f}Nm, Force: {force_z:.2f}N")
 
     def valve_sim_callback(self, msg):
         self.pose_valve_sim = msg

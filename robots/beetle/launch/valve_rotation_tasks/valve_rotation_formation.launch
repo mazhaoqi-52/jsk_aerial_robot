@@ -6,10 +6,8 @@
 
   <!-- Formation parameters -->
   <arg name="module_ids" default="1,2" />
-  <arg name="dx" default="1.0" />  <!-- UAV spacing from launch system -->
-  <arg name="airframe_size" default="0.52" />  <!-- From assembly_api.py -->
   <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
-  <arg name="approach_height" default="0.5" />
+  <arg name="approach_height" default="0.48" /> <!-- Adjusted for end-effector offset compensation -->
   
   <!-- Valve parameters -->
   <arg name="valve_ns" default="valve"/>
@@ -36,16 +34,14 @@
   
   <!-- Controller parameters for formation valve rotation -->
   <param name="controller/unified_control_mode" value="false" />
-  <param name="controller/valve_rotation_feedforward/enabled" value="false" />
+  <param name="controller/valve_rotation_feedforward/enabled" value="true" />
   <param name="controller/valve_rotation_feedforward/force_z" value="-5.0" />
   <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />
   
   <!-- Formation valve rotation node -->
-  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation.py"
+  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_simplified.py"
         output="screen">
     <param name="module_ids" value="$(arg module_ids)" />
-    <param name="dx" value="$(arg dx)" />
-    <param name="airframe_size" value="$(arg airframe_size)" />
     <param name="rotation_angle" value="$(arg rotation_angle)" />
     <param name="approach_height" value="$(arg approach_height)" />
     <param name="simulation" value="$(arg simulation)" />

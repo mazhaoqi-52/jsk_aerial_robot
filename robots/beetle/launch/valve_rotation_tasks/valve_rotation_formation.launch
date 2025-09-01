@@ -39,7 +39,7 @@
   <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />
   
   <!-- Formation valve rotation node -->
-  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_simplified.py"
+  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_refactored.py"
         output="screen">
     <param name="module_ids" value="$(arg module_ids)" />
     <param name="rotation_angle" value="$(arg rotation_angle)" />

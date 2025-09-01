@@ -817,7 +817,7 @@ def execute_formation_motion_with_yaw(pub, start_pos, target_pos, target_yaw, av
 
 
 # Compatibility class for existing code
-class UnifiedMotionController:
+class FormationMotionCompatibility:
     """Compatibility wrapper for formation control"""
     
     @staticmethod 

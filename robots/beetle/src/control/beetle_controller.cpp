@@ -305,7 +305,7 @@ namespace aerial_robot_control
 
   void BeetleController::calcInteractionWrench()
   {
-    /* 1. calculate external wrench W_w for whole system (e.g. ground effects, model error and etc..)*/
+    /* 1. calculate external wrench W_w for whole system*/
     Eigen::VectorXd W_w = Eigen::VectorXd::Zero(6);
     Eigen::VectorXd W_sum = Eigen::VectorXd::Zero(6);
     int module_num = 0;

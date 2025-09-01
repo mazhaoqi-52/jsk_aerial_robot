@@ -70,6 +70,13 @@ class PolynomialTrajectory:
         """Get next position from trajectory (compatibility method)"""
         return self.evaluate()
     
+    def is_finished(self):
+        """Check if trajectory is finished"""
+        if self.start_time is None:
+            return False
+        elapsed_time = rospy.Time.now().to_sec() - self.start_time
+        return elapsed_time > self.duration
+    
     def get_velocity(self):
         """Get current velocity from trajectory"""
         if self.start_time is None:
@@ -328,13 +335,11 @@ class AlignToGraspTrajectory:
                 (end_effector_x, end_effector_y, end_effector_z))
     
     def set_start_position(self, start_pos):
-        """Set start position and generate trajectory"""
         self._target_body_pos, self._target_body_yaw, _ = self.calculate_grasp_position_and_yaw()
         self._trajectory = PolynomialTrajectory(self.approach_duration)
         self._trajectory.generate_trajectory(start_pos, self._target_body_pos)
         
     def get_next_position_and_yaw(self):
-        """Get next position and yaw"""
         if self._trajectory is None:
             return None
         pos = self._trajectory.evaluate()
@@ -343,14 +348,12 @@ class AlignToGraspTrajectory:
         return (pos, self._target_body_yaw)
     
     def get_next_position(self):
-        """Get next position"""
         result = self.get_next_position_and_yaw()
         if result is None:
             return None
         return result[0]
     
     def is_complete(self):
-        """Check if trajectory is complete"""
         return self.get_next_position() is None
 
 class ConstantDistanceValveRotationTrajectory(ValveRotationTrajectory):

@@ -39,7 +39,7 @@
   <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />
   
   <!-- Formation valve rotation node -->
-  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_refactored.py"
+  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_clean.py"
         output="screen">
     <param name="module_ids" value="$(arg module_ids)" />
     <param name="rotation_angle" value="$(arg rotation_angle)" />
@@ -48,11 +48,4 @@
     <param name="real_machine" value="$(arg real_machine)" />
     <param name="debug" value="$(arg debug)" />
   </node>
-
-  <!-- Launch SMACH viewer for state machine visualization if debug enabled -->
-  <!-- <node name="smach_viewer" 
-        pkg="smach_viewer" 
-        type="smach_viewer.py" 
-        output="screen"
-        if="$(arg debug)" /> -->
 </launch>

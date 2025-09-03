@@ -644,9 +644,6 @@ namespace aerial_robot_control
       
       // Extract commands for this module's 4 rotors
       Eigen::Vector4d module_commands = rotor_commands.segment(i*4, 4);
-      
-      // Convert to appropriate message type and publish
-      // This would interface with the existing gimbalrotor control system
       publishModuleRotorCommands(module_id, module_commands);
     }
   }
@@ -674,7 +671,6 @@ namespace aerial_robot_control
   Eigen::Vector3d BeetleController::getModulePosition(int module_id)
   {
     // Get module position relative to formation center from navigation
-    // For now, return a simple linear arrangement
     double module_spacing = 0.5; // meters between modules
     int my_id = beetle_navigator_->getMyID();
     double x_offset = (module_id - my_id) * module_spacing;
@@ -685,7 +681,6 @@ namespace aerial_robot_control
   Eigen::Vector3d BeetleController::getRotorPosition(int rotor_index)
   {
     // Return rotor position relative to module center
-    // This should match your robot's actual geometry
     double rotor_arm_length = 0.25; // meters
     
     switch(rotor_index) {

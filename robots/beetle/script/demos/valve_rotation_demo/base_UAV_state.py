@@ -164,7 +164,7 @@ class AssemblyMotionStateBase(smach.State):
             rospy.loginfo("Closed-loop correction: current error norm = {:.3f}".format(error))
             if error < tolerance:
                 rospy.loginfo("Terminal position correction complete. Error within tolerance.")
-                return True  # 修复：明确返回True表示成功
+                return True  
             
             correction = [k_p * (t - c) for t, c in zip(target, current_pos)]
             cmd = FlightNav()
@@ -179,15 +179,13 @@ class AssemblyMotionStateBase(smach.State):
             
             if rospy.Time.now().to_sec() - start_correction_time > max_correction_duration:
                 rospy.logwarn("Terminal correction exceeded maximum duration.")
-                # 检查最终误差，如果可接受则返回True，否则返回False
-                if error < tolerance * 2:  # 更宽松的最终检查
+                if error < tolerance * 2:  
                     rospy.loginfo(f"Movement completed with acceptable error {error:.3f}")
                     return True
                 else:
                     rospy.logerr(f"Movement failed - final error {error:.3f} too large")
                     return False
         
-        # 如果循环正常结束（没有break或return），返回False
         rospy.logwarn("Move to target loop ended unexpectedly")
         return False
 

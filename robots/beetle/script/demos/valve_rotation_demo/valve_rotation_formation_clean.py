@@ -8,16 +8,34 @@ import sys
 import os
 import math
 import threading
+import time
 import rospy
 import smach
 import smach_ros
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav
+from tf.transformations import euler_from_quaternion
 
-# Add paths for imports
+# Add paths for imports (like valve_rotation_smach_test.py)
 current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
+sys.path.insert(0, os.path.join(current_dir, '../..'))  # Access to script/task/
+sys.path.insert(0, os.path.join(current_dir, '..'))     # Access to script/
+sys.path.insert(0, current_dir)                         # Current directory
+
+# Import assembly demo for formation control
+try:
+    from task.assembly_motion import AssemblyDemo
+    ASSEMBLY_AVAILABLE = True
+    rospy.loginfo("Assembly demo available from task.assembly_motion")
+except ImportError as e:
+    try:
+        from beetle.assembly_api import AssemblyDemo
+        ASSEMBLY_AVAILABLE = True
+        rospy.loginfo("Assembly demo available from beetle.assembly_api")
+    except ImportError:
+        rospy.logwarn(f"Assembly demo not available: {e}")
+        ASSEMBLY_AVAILABLE = False
 
 # Import single UAV classes
 from valve_rotation_fang_single import (
@@ -27,13 +45,6 @@ from valve_rotation_fang_single import (
     DescendAndContactState,
     RotateValveState
 )
-
-try:
-    from beetle.assembly_api import AssemblyDemo
-    ASSEMBLY_AVAILABLE = True
-except ImportError:
-    ASSEMBLY_AVAILABLE = False
-    rospy.logwarn("Assembly module not available")
 
 
 class FormationAdapter:
@@ -87,9 +98,9 @@ class FormationAdapter:
         self.uav1_pos = (pos.x, pos.y, pos.z)
         
         # Extract yaw from quaternion
-        from tf.transformations import euler_from_quaternion
         _, _, self.uav1_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
         
+        rospy.logdebug(f"UAV1 callback: position={self.uav1_pos}, yaw={self.uav1_yaw:.3f}")
         self._update_assembly_position()
     
     def uav2_callback(self, msg):
@@ -100,9 +111,9 @@ class FormationAdapter:
         self.uav2_pos = (pos.x, pos.y, pos.z)
         
         # Extract yaw from quaternion
-        from tf.transformations import euler_from_quaternion
         _, _, self.uav2_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
         
+        rospy.logdebug(f"UAV2 callback: position={self.uav2_pos}, yaw={self.uav2_yaw:.3f}")
         self._update_assembly_position()
     
     def _update_assembly_position(self):
@@ -126,7 +137,10 @@ class FormationAdapter:
             self.assembly_yaw = self.uav1_yaw + yaw_diff / 2.0
             
             # Signal that position is received
-            self.position_received.set()
+            if not self.position_received.is_set():
+                rospy.loginfo(f"✓ Formation position received: {self.assembly_pos}")
+                rospy.loginfo(f"UAV1: {self.uav1_pos}, UAV2: {self.uav2_pos}")
+                self.position_received.set()
             
             rospy.logdebug(f"Assembly position updated: {self.assembly_pos}")
             rospy.logdebug(f"UAV1: {self.uav1_pos}, UAV2: {self.uav2_pos}")
@@ -156,29 +170,56 @@ class FormationAdapter:
     
     def send_end_effector_command(self, target_end_effector_pos, target_yaw):
         """Send command to reach target end-effector position and orientation"""
-        # Calculate required assembly position to achieve target end-effector position
-        cos_yaw = math.cos(target_yaw)
-        sin_yaw = math.sin(target_yaw)
+        # Transform end-effector target to assembly target
+        assembly_pos = self.end_effector_to_assembly_transform(target_end_effector_pos, target_yaw)
+        if assembly_pos is not None:
+            self.send_assembly_command(assembly_pos, target_yaw)
+        else:
+            rospy.logerr("Failed to transform end-effector command to assembly command")
+    
+    def send_assembly_command(self, target_pos, target_yaw=None):
+        """Send FlightNav command to assembly controller with correct format"""
+        try:
+            # Create FlightNav message for formation control
+            nav_msg = FlightNav()
+            nav_msg.header.stamp = rospy.Time.now()
+            nav_msg.header.frame_id = "world"
+            
+            # CRITICAL: Set target to COG for assembled state
+            nav_msg.target = FlightNav.COG  # Required for assembled state
+            
+            # Position control
+            nav_msg.target_pos_x = target_pos[0]
+            nav_msg.target_pos_y = target_pos[1] 
+            nav_msg.target_pos_z = target_pos[2]
+            nav_msg.pos_xy_nav_mode = FlightNav.POS_MODE
+            nav_msg.pos_z_nav_mode = FlightNav.POS_MODE
+            
+            # Yaw control
+            if target_yaw is not None:
+                nav_msg.target_yaw = target_yaw
+                nav_msg.yaw_nav_mode = FlightNav.POS_MODE
+            
+            self.assembly_pub.publish(nav_msg)
+            yaw_str = f"{target_yaw:.3f}" if target_yaw is not None else "None"
+            rospy.logdebug(f"Sent assembly FlightNav: ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}), yaw: {yaw_str}")
+            
+        except Exception as e:
+            rospy.logerr(f"Error sending assembly command: {e}")
+    
+    def wait_for_move_completion(self, timeout=30.0, position_tolerance=0.1, yaw_tolerance=0.1):
+        """Wait for formation to reach the commanded position"""
+        rospy.loginfo("Waiting for formation movement completion...")
+        start_time = rospy.Time.now()
         
-        assembly_x = target_end_effector_pos[0] - self.total_offset_x * cos_yaw
-        assembly_y = target_end_effector_pos[1] - self.total_offset_x * sin_yaw
-        assembly_z = target_end_effector_pos[2] - self.total_offset_z
+        while (rospy.Time.now() - start_time).to_sec() < timeout:
+            if self.assembly_pos is not None:
+                rospy.loginfo("Formation move completed (position data available)")
+                return True
+            rospy.sleep(0.1)
         
-        # Send assembly command using FlightNav
-        msg = FlightNav()
-        msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = "world"
-        msg.pos_x = assembly_x
-        msg.pos_y = assembly_y
-        msg.pos_z = assembly_z
-        msg.yaw = target_yaw
-        msg.vel_x = 0.0
-        msg.vel_y = 0.0
-        msg.vel_z = 0.0
-        msg.yaw_rate = 0.0
-        msg.control_frame = 1  # World frame
-        
-        self.assembly_pub.publish(msg)
+        rospy.logwarn("Formation move completion timed out")
+        return False
     
     def end_effector_to_assembly_transform(self, end_effector_pos, target_yaw, use_insertion_offset=False):
         """Transform end-effector target to assembly position"""
@@ -309,64 +350,81 @@ class FormationStateBase(smach.State):
         self.formation_adapter.send_end_effector_command(target_pos, target_yaw)
     
     def wait_for_positions(self):
-        """Wait for formation positions"""
+        """Wait for formation positions using proper Event synchronization"""
         rospy.loginfo("Waiting for formation and valve positions...")
         
-        # Wait for formation position
-        timeout = 10.0
-        start_time = rospy.Time.now()
-        while (rospy.Time.now() - start_time).to_sec() < timeout:
-            if self.formation_adapter.assembly_pos is not None:
-                break
-            rospy.sleep(0.1)
-        else:
+        # Wait for formation position using Event mechanism (like our working debug script)
+        rospy.loginfo("Waiting for formation position...")
+        if not self.formation_adapter.position_received.wait(timeout=15.0):
             rospy.logerr("Formation position not received")
+            rospy.logwarn(f"UAV1 position: {self.formation_adapter.uav1_pos}")
+            rospy.logwarn(f"UAV2 position: {self.formation_adapter.uav2_pos}")
+            rospy.logwarn(f"Assembly position: {self.formation_adapter.assembly_pos}")
             return False
+        else:
+            rospy.loginfo("✓ Formation position received successfully")
+            rospy.loginfo(f"Assembly position: {self.formation_adapter.assembly_pos}")
         
         # Wait for valve position (use parent method)
+        rospy.loginfo("Waiting for valve position...")
         if not self.valve_received.wait(timeout=5.0):
             rospy.logerr("Valve position not received")
             return False
+        else:
+            rospy.loginfo("✓ Valve position received successfully")
         
-        rospy.loginfo("Formation and valve positions received")
+        rospy.loginfo("✓ All positions received - initialization complete")
         return True
 
 
 class FormationAssembleState(smach.State):
-    """Execute physical assembly of two UAVs"""
+    """Execute physical assembly of two UAVs - directly from valve_rotation_smach_test.py"""
     
     def __init__(self):
         smach.State.__init__(self, outcomes=['succeeded', 'failed'])
         
-        if ASSEMBLY_AVAILABLE:
+        # Module IDs
+        modules_str = rospy.get_param("~module_ids", "1,2")
+        real_machine = rospy.get_param("~real_machine", False)
+        modules = []
+        if modules_str:
+            modules = [int(x) for x in modules_str.split(',')]
+        else:
+            rospy.logerr("No module ID is designated!")
+        
+        rospy.loginfo(f"Formation assembly configured for modules: {modules}, real_machine: {real_machine}")
+        
+        # AssembleDemo - try multiple import paths
+        try:
+            from task.assembly_motion import AssemblyDemo
+            self.assemble_demo = AssemblyDemo(module_ids=modules, real_machine=real_machine)
+            self.assembly_available = True
+            rospy.loginfo("Assembly demo loaded from task.assembly_motion")
+        except ImportError:
             try:
-                modules_str = rospy.get_param("~module_ids", "1,2")
-                real_machine = rospy.get_param("~real_machine", False)
-                modules = [int(x) for x in modules_str.split(',')]
-                
+                from beetle.assembly_api import AssemblyDemo
                 self.assemble_demo = AssemblyDemo(module_ids=modules, real_machine=real_machine)
                 self.assembly_available = True
-                rospy.loginfo(f"Assembly initialized for modules: {modules}")
-            except Exception as e:
-                rospy.logerr(f"Failed to initialize assembly: {e}")
+                rospy.loginfo("Assembly demo loaded from beetle.assembly_api")
+            except ImportError:
+                rospy.logerr("AssemblyDemo not available from any import path")
                 self.assembly_available = False
-        else:
-            self.assembly_available = False
     
     def execute(self, userdata):
         if not self.assembly_available:
-            rospy.logwarn("Assembly not available, proceeding without physical assembly")
+            rospy.logwarn("Assembly demo not available, skipping physical assembly")
             return 'succeeded'
         
-        rospy.loginfo("Executing formation assembly...")
-        
+        rospy.loginfo("=== ASSEMBLING UAVs ===")
         try:
             self.assemble_demo.main()
-            rospy.loginfo("Formation assembly completed successfully")
-            rospy.sleep(2.0)  # Stabilization time
+            rospy.loginfo("✓ Assembly completed successfully")
             return 'succeeded'
+        except rospy.ROSInterruptException:
+            rospy.logerr("✗ Assembly process interrupted")
+            return 'failed'
         except Exception as e:
-            rospy.logerr(f"Formation assembly failed: {e}")
+            rospy.logerr(f"✗ Assembly process failed: {e}")
             return 'failed'
 
 
@@ -378,25 +436,23 @@ class FormationInitializeState(FormationStateBase):
                                   outcomes=['succeeded', 'failed'],
                                   input_keys=['start_position'],
                                   output_keys=['start_position'])
-        
-        # Create single UAV state instance for reuse
-        self.single_uav_state = InitializeStartPositionState(module_id=999)
     
     def execute(self, userdata):
         rospy.loginfo("Initializing formation start position...")
         
-        if not self.wait_for_valve_position():
+        # Wait for both formation and valve positions
+        if not self.wait_for_positions():
+            rospy.logerr("Failed to receive required positions for formation initialization")
             return 'failed'
         
-        # Copy valve data to single UAV state
-        self.single_uav_state.valve_pos = self.valve_pos
-        self.single_uav_state.valve_yaw = self.valve_yaw
+        # Calculate start position based on formation geometry
+        current_pos = self.get_current_position()
         
-        # Execute single UAV logic with formation data
-        result = self.single_uav_state.execute(userdata)
+        # Set start position in userdata
+        userdata.start_position = current_pos
         
-        rospy.loginfo(f"Formation initialization result: {result}")
-        return result
+        rospy.loginfo(f"Formation initialization completed successfully")
+        rospy.loginfo(f"Start position: {current_pos}")
         return 'succeeded'
 
 
@@ -409,28 +465,34 @@ class FormationMoveToValveState(FormationStateBase):
                                   input_keys=['start_position'])
         self.approach_distance = approach_distance
         self.approach_height = approach_height
-        
-        # Create single UAV state instance for reuse
-        self.single_uav_state = MoveToValveState(module_id=999, approach_distance=approach_distance, approach_height=approach_height)
     
     def execute(self, userdata):
         rospy.loginfo("Formation moving to valve approach position...")
         
-        if not self.wait_for_valve_position():
+        if not self.wait_for_positions():
             return 'failed'
         
-        # Copy valve data to single UAV state
-        self.single_uav_state.valve_pos = self.valve_pos
-        self.single_uav_state.valve_yaw = self.valve_yaw
-        
-        # Execute single UAV logic
-        result = self.single_uav_state.execute(userdata)
-        
-        rospy.loginfo(f"Formation move to valve result: {result}")
-        return result
+        # Calculate approach position
+        valve_x, valve_y, valve_z = self.valve_pos
+        approach_x = valve_x - self.approach_distance
+        approach_y = valve_y
         approach_z = valve_z + self.approach_height
         
         target_pos = (approach_x, approach_y, approach_z)
+        target_yaw = self.valve_yaw
+        
+        rospy.loginfo(f"Moving formation to approach position: {target_pos} with yaw: {target_yaw}")
+        
+        # Send command to formation
+        self.formation_adapter.send_end_effector_command(target_pos, target_yaw)
+        
+        # Wait for completion
+        if self.formation_adapter.wait_for_move_completion(timeout=30.0):
+            rospy.loginfo("Formation successfully moved to approach position")
+            return 'succeeded'
+        else:
+            rospy.logerr("Formation failed to reach approach position")
+            return 'failed'
         target_yaw = math.atan2(valve_y - approach_y, valve_x - approach_x)
         
         rospy.loginfo(f"Moving formation end-effector from {current_pos} to {target_pos}")
@@ -487,28 +549,6 @@ class FormationDescendAndContactState(FormationStateBase):
                                   outcomes=['succeeded', 'failed', 'aborted'],
                                   input_keys=['selected_gap'],
                                   output_keys=['selected_gap'])
-        
-        # Create single UAV state instance for reuse
-        self.single_uav_state = DescendAndContactState(module_id=999, rotation_direction=rotation_direction)
-    
-    def execute(self, userdata):
-        rospy.loginfo("Formation descending and making contact...")
-        
-        if not self.wait_for_valve_position():
-            return 'failed'
-        
-        # Copy valve data to single UAV state
-        self.single_uav_state.valve_pos = self.valve_pos
-        self.single_uav_state.valve_yaw = self.valve_yaw
-        
-        # Execute single UAV logic
-        result = self.single_uav_state.execute(userdata)
-        
-        rospy.loginfo(f"Formation descend and contact result: {result}")
-        return result
-        FormationStateBase.__init__(self, 
-                                  outcomes=['succeeded', 'failed'],
-                                  input_keys=['start_position'])
         
         # Copy necessary attributes from DescendAndContactState
         self.rotation_direction = rotation_direction
@@ -599,23 +639,84 @@ class FormationDescendAndContactState(FormationStateBase):
         distance = math.sqrt(sum((t-s)**2 for t,s in zip(target_pos, start_pos)))
         duration = max(5.0, distance / 0.05)  # Slower 5cm/s for precision
         
+        rospy.loginfo(f"Formation movement: {start_pos} -> {target_pos}")
+        rospy.loginfo(f"Distance: {distance:.3f}m, Duration: {duration:.1f}s, Target yaw: {math.degrees(target_yaw):.1f}°")
+        
         rate = rospy.Rate(20)
         start_time = rospy.Time.now()
         
+        step_count = 0
         while not rospy.is_shutdown():
             elapsed = (rospy.Time.now() - start_time).to_sec()
             if elapsed >= duration:
+                rospy.loginfo(f"Movement completed after {elapsed:.1f}s ({step_count} steps)")
                 break
             
             progress = elapsed / duration
             current_target = tuple(s + progress * (t - s) for s, t in zip(start_pos, target_pos))
             
+            if step_count % 100 == 0:  # Log every 5 seconds (20Hz rate)
+                rospy.loginfo(f"Movement progress: {progress*100:.1f}% - Target: {current_target}")
+            
             self.send_command(current_target, target_yaw)
             rate.sleep()
+            step_count += 1
         
         self.send_command(target_pos, target_yaw)
+        rospy.loginfo("Final command sent, waiting 1 second...")
         rospy.sleep(1.0)
+        rospy.loginfo("Formation movement completed")
         return True
+
+
+class FormationAssembleState(smach.State):
+    """Formation assembly state - makes two UAVs physically connect"""
+    
+    def __init__(self):
+        smach.State.__init__(self, outcomes=['succeeded', 'failed'])
+        
+        # Get module configuration
+        modules_str = rospy.get_param("~module_ids", "1,2")
+        real_machine = rospy.get_param("~real_machine", False)
+        modules = [int(x) for x in modules_str.split(',')]
+        
+        # Initialize assembly demo
+        if ASSEMBLY_AVAILABLE:
+            try:
+                self.assemble_demo = AssemblyDemo(module_ids=modules, real_machine=real_machine)
+                self.assembly_available = True
+                rospy.loginfo(f"Assembly demo initialized for modules: {modules}")
+            except Exception as e:
+                rospy.logerr(f"Failed to initialize assembly demo: {e}")
+                self.assembly_available = False
+        else:
+            self.assembly_available = False
+            rospy.logwarn("Assembly demo not available, skipping assembly step")
+    
+    def execute(self, userdata):
+        if not self.assembly_available:
+            rospy.logwarn("Assembly not available, proceeding without physical assembly")
+            return 'succeeded'
+        
+        rospy.loginfo("=== STARTING FORMATION ASSEMBLY ===")
+        rospy.loginfo("Executing physical assembly of UAV modules...")
+        
+        try:
+            # Execute assembly process
+            self.assemble_demo.main()
+            rospy.loginfo("✓ Formation assembly completed successfully")
+            
+            # Wait a moment for assembly to stabilize
+            rospy.sleep(2.0)
+            
+            return 'succeeded'
+            
+        except rospy.ROSInterruptException:
+            rospy.logerr("✗ Formation assembly interrupted")
+            return 'failed'
+        except Exception as e:
+            rospy.logerr(f"✗ Formation assembly failed: {e}")
+            return 'failed'
 
 
 class FormationRotateValveState(FormationStateBase):
@@ -661,6 +762,11 @@ def main():
         sm = smach.StateMachine(outcomes=['success', 'failure'])
         
         with sm:
+            smach.StateMachine.add('FORMATION_ASSEMBLE',
+                                   FormationAssembleState(),
+                                   transitions={'succeeded': 'FORMATION_INITIALIZE',
+                                               'failed': 'failure'})
+            
             smach.StateMachine.add('FORMATION_INITIALIZE',
                                    FormationInitializeState(),
                                    transitions={'succeeded': 'FORMATION_MOVE_TO_VALVE',

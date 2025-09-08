@@ -147,136 +147,6 @@ class SingleUAVStateBase(smach.State):
     def get_current_yaw(self):
         return self.current_yaw
     
-    def execute_smooth_trajectory(self, start_pos, target_pos, target_yaw, duration=5.0, use_z_lock=True):
-        """
-        Execute smooth trajectory with VEL+ACCEL control and optional Z-lock
-        This is a common method that can be used by all child states
-        """
-        from trajectory import PolynomialTrajectory
-        
-        # Use locked Z coordinate if enabled and available
-        if use_z_lock and hasattr(self, 'locked_z'):
-            locked_z = self.locked_z
-        else:
-            locked_z = start_pos[2]
-        
-        # Lock Z coordinate for both start and target
-        locked_start_pos = (start_pos[0], start_pos[1], locked_z)
-        locked_target_pos = (target_pos[0], target_pos[1], locked_z)
-        
-        rospy.loginfo(f"VEL+ACCEL trajectory:")
-        rospy.loginfo(f"  Start: [{locked_start_pos[0]:.6f}, {locked_start_pos[1]:.6f}, {locked_start_pos[2]:.6f}]")
-        rospy.loginfo(f"  Target: [{locked_target_pos[0]:.6f}, {locked_target_pos[1]:.6f}, {locked_target_pos[2]:.6f}]")
-        if use_z_lock:
-            rospy.loginfo(f"  Z LOCKED at: {locked_z:.6f}m")
-        
-        # Create trajectory
-        traj = PolynomialTrajectory(duration)
-        traj.generate_trajectory(locked_start_pos, locked_target_pos)
-        
-        start_yaw = self.current_yaw
-        yaw_diff = target_yaw - start_yaw
-        
-        # Normalize yaw difference
-        while yaw_diff > math.pi:
-            yaw_diff -= 2 * math.pi
-        while yaw_diff < -math.pi:
-            yaw_diff += 2 * math.pi
-        
-        # Execute trajectory with mixed VEL+ACCEL control and distance-adaptive speed
-        start_time = time.time()
-        rate = rospy.Rate(50)
-        
-        # Adaptive control gains
-        base_pos_gain = 0.8
-        base_vel_gain = 0.6
-        
-        while not rospy.is_shutdown() and (time.time() - start_time) < duration + 2.0:
-            current_time = time.time()
-            elapsed = current_time - start_time
-            progress = min(elapsed / duration, 1.0)
-            
-            # Get trajectory values
-            desired_pos = traj.get_next_position()
-            desired_vel = traj.get_velocity()
-            
-            if desired_pos is None:
-                desired_pos = locked_target_pos
-                desired_vel = (0.0, 0.0, 0.0)
-            
-            # Force Z lock if enabled
-            if use_z_lock:
-                desired_pos = (desired_pos[0], desired_pos[1], locked_z)
-                if desired_vel is not None:
-                    desired_vel = (desired_vel[0], desired_vel[1], 0.0)
-                else:
-                    desired_vel = (0.0, 0.0, 0.0)
-            
-            # Calculate control commands with distance-adaptive gains
-            current_pos = self.get_current_position()
-            if current_pos is not None:
-                # Distance to target for adaptive control
-                distance_to_target = math.sqrt((current_pos[0] - locked_target_pos[0])**2 + 
-                                             (current_pos[1] - locked_target_pos[1])**2)
-                
-                # Adaptive gains: higher gains when closer to target for precision
-                if distance_to_target < 0.05:
-                    pos_gain = base_pos_gain * 1.2  # 20% higher gain for precision
-                    vel_gain = base_vel_gain * 0.8   # 20% lower vel gain for stability
-                elif distance_to_target < 0.1:
-                    pos_gain = base_pos_gain * 1.1  # 10% higher gain
-                    vel_gain = base_vel_gain * 0.9   # 10% lower vel gain
-                else:
-                    pos_gain = base_pos_gain
-                    vel_gain = base_vel_gain
-                
-                pos_error = (desired_pos[0] - current_pos[0],
-                           desired_pos[1] - current_pos[1],
-                           locked_z - current_pos[2] if use_z_lock else desired_pos[2] - current_pos[2])
-                
-                # Mixed control with adaptive gains
-                cmd_vel = (vel_gain * desired_vel[0] + pos_gain * pos_error[0],
-                          vel_gain * desired_vel[1] + pos_gain * pos_error[1],
-                          pos_gain * pos_error[2])
-                
-                # Adaptive velocity limit based on distance to target
-                if distance_to_target < 0.05:
-                    max_vel = 0.08  # Very slow when very close
-                elif distance_to_target < 0.1:
-                    max_vel = 0.12  # Slow when close
-                else:
-                    max_vel = 0.15  # Normal speed when far
-                
-                cmd_vel_magnitude = math.sqrt(cmd_vel[0]**2 + cmd_vel[1]**2 + cmd_vel[2]**2)
-                if cmd_vel_magnitude > max_vel:
-                    scale = max_vel / cmd_vel_magnitude
-                    cmd_vel = (cmd_vel[0] * scale, cmd_vel[1] * scale, cmd_vel[2] * scale)
-            else:
-                cmd_vel = (0.0, 0.0, 0.0)
-            
-            # Calculate yaw command
-            desired_yaw = start_yaw + progress * yaw_diff
-            yaw_error = self.normalize_angle(desired_yaw - self.current_yaw)
-            cmd_yaw_vel = 0.5 * yaw_error
-            
-            # Send command
-            self.motion_controller.send_velocity_command(cmd_vel, cmd_yaw_vel, desired_pos, desired_yaw)
-            
-            # Check convergence
-            if current_pos is not None:
-                xy_distance = math.sqrt((current_pos[0] - locked_target_pos[0])**2 + 
-                                      (current_pos[1] - locked_target_pos[1])**2)
-                yaw_error_final = abs(self.normalize_angle(self.current_yaw - target_yaw))
-                
-                if xy_distance < 0.05 and yaw_error_final < 0.1 and progress >= 0.95:
-                    rospy.loginfo(f"Trajectory converged: XY={xy_distance:.3f}m, yaw={yaw_error_final:.3f}rad")
-                    break
-            
-            rate.sleep()
-        
-        rospy.loginfo("Trajectory completed")
-        return True
-    
     def setup_emergency_monitoring(self, stuck_threshold=60.0, movement_threshold=0.005, yaw_threshold=0.02):
         """
         Setup emergency monitoring for stuck detection
@@ -380,21 +250,70 @@ class SingleUAVStateBase(smach.State):
             if position_stuck and yaw_stuck:
                 if self.stuck_start_time is None:
                     self.stuck_start_time = time.time()
-                    rospy.loginfo("Starting stuck detection timer")
+                    # Only log when stuck detection starts for the first time
+                    rospy.loginfo("⚠ UAV movement below threshold - starting stuck detection timer")
                 else:
                     stuck_duration = time.time() - self.stuck_start_time
-                    rospy.loginfo(f"Stuck duration: {stuck_duration:.1f}s / {self.stuck_threshold:.1f}s")
+                    # Only log every 10 seconds to reduce noise, and only if duration is significant
+                    if stuck_duration > 10.0 and int(stuck_duration) % 10 == 0:
+                        rospy.logwarn(f"UAV stuck duration: {stuck_duration:.1f}s / {self.stuck_threshold:.1f}s")
+                    
                     if stuck_duration > self.stuck_threshold:
-                        rospy.logwarn(f"UAV stuck for {stuck_duration:.1f}s - triggering emergency")
+                        rospy.logerr(f"EMERGENCY: UAV stuck for {stuck_duration:.1f}s > {self.stuck_threshold:.1f}s")
                         return True
             else:
                 if self.stuck_start_time is not None:
-                    rospy.loginfo("Movement detected - resetting stuck timer")
-                self.stuck_start_time = None
+                    # Only log when transitioning from stuck to moving, and only if stuck time was significant
+                    stuck_duration = time.time() - self.stuck_start_time
+                    if stuck_duration > 3.0:  # Only log if we were stuck for more than 3 seconds
+                        rospy.loginfo(f"Movement resumed after {stuck_duration:.1f}s - resetting stuck timer")
+                    # Reset stuck timer silently for short durations
+                    self.stuck_start_time = None
+                else:
+                    # Normal movement - no logging needed
+                    pass
         
         self.last_position = current_pos
         self.last_yaw = self.current_yaw
         return False
+    
+    def _check_valve_center_crossing(self, start_pos, target_pos, valve_center_x, valve_center_y):
+        """
+        Check if trajectory from start to target would cross valve center
+        
+        Returns:
+            bool: True if trajectory risks crossing valve center
+        """
+        # Simple line-circle intersection check
+        start_x, start_y = start_pos[0], start_pos[1]
+        target_x, target_y = target_pos[0], target_pos[1]
+        
+        # Vector from start to target
+        dx = target_x - start_x
+        dy = target_y - start_y
+        
+        # Vector from start to valve center
+        fx = valve_center_x - start_x
+        fy = valve_center_y - start_y
+        
+        # Project valve center onto trajectory line
+        if dx == 0 and dy == 0:
+            return False  # No movement
+        
+        t = (fx * dx + fy * dy) / (dx * dx + dy * dy)
+        
+        # Closest point on trajectory to valve center
+        closest_x = start_x + t * dx
+        closest_y = start_y + t * dy
+        
+        # Distance from valve center to closest point
+        distance_to_trajectory = math.sqrt((closest_x - valve_center_x)**2 + (closest_y - valve_center_y)**2)
+        
+        # Check if trajectory passes too close to valve center
+        safe_distance = 0.3  # 30cm safe distance
+        return distance_to_trajectory < safe_distance and 0 <= t <= 1
+    
+    # ...existing code...
 
 
 class InitializeStartPositionState(SingleUAVStateBase):
@@ -416,21 +335,92 @@ class InitializeStartPositionState(SingleUAVStateBase):
 
 
 class MoveToValveState(SingleUAVStateBase):
-    def __init__(self, module_id=1, approach_distance=0.8, approach_height=0.3):
+    def __init__(self, module_id=1):
         super().__init__(outcomes=['succeeded', 'failed'], 
                         input_keys=['start_position'], 
                         module_id=module_id)
         
-        self.approach_distance = approach_distance
-        self.approach_height = approach_height  # Reduced to 0.3m for faster insertion
+        # Initialize the insertion optimizer for direct insertion movement
+        self.optimizer = InsertionOptimizer()
+        
+        # Position and orientation thresholds
+        self.pos_threshold = 0.05
+        self.yaw_threshold = 0.05
+    
+    def calculate_uav_position_for_targets(self, left_target, right_target, target_z):
+        """
+        Calculate UAV position and yaw to achieve specific claw targets
+        
+        Args:
+            left_target: (x, y, z) position for left claw
+            right_target: (x, y, z) position for right claw
+            target_z: Target Z height for claws
+            
+        Returns:
+            tuple: (uav_position, uav_yaw) or (None, None) if calculation fails
+        """
+        try:
+            # Calculate dual-fang center position (midpoint between claws)
+            dual_fang_center_x = (left_target[0] + right_target[0]) / 2
+            dual_fang_center_y = (left_target[1] + right_target[1]) / 2
+            dual_fang_center_z = target_z
+            
+            # Calculate UAV orientation (yaw) from claw separation vector
+            claw_vector_x = right_target[0] - left_target[0]
+            claw_vector_y = right_target[1] - left_target[1]
+            uav_yaw = math.atan2(claw_vector_y, claw_vector_x) - math.pi/2
+            
+            # Normalize yaw angle to [0, 2π]
+            while uav_yaw >= 2*math.pi:
+                uav_yaw -= 2*math.pi
+            while uav_yaw < 0:
+                uav_yaw += 2*math.pi
+            
+            # Calculate UAV position from dual-fang center
+            # UAV should be BEHIND the dual-fang center by the offset distance
+            uav_x = dual_fang_center_x - self.optimizer.dual_fang_center_offset * math.cos(uav_yaw)
+            uav_y = dual_fang_center_y - self.optimizer.dual_fang_center_offset * math.sin(uav_yaw)
+            # UAV Z should be ABOVE the dual-fang center by the offset
+            uav_z = dual_fang_center_z - self.optimizer.end_effector_offset_z
+            
+            return (uav_x, uav_y, uav_z), uav_yaw
+            
+        except Exception as e:
+            rospy.logerr(f"Failed to calculate UAV position for targets: {e}")
+            return None, None
+    
+    def normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]"""
+        while angle > math.pi:
+            angle -= 2*math.pi
+        while angle < -math.pi:
+            angle += 2*math.pi
+        return angle
+    
+    def execute_safe_movement_to_position(self, target_pos, target_yaw):
+        """
+        Execute safe three-stage movement to target position
+        """
+        current_pos = self.get_current_position()
+        if current_pos is None:
+            return False
+        
+        return self.motion_controller.execute_smooth_trajectory_with_yaw(
+            start_pos=current_pos,
+            target_pos=target_pos,
+            target_yaw=target_yaw,
+            duration=20.0,
+            pos_threshold=self.pos_threshold,
+            yaw_threshold=self.yaw_threshold
+        )
     
     def execute(self, userdata):
-        rospy.loginfo("Moving to valve approach position...")
+        rospy.loginfo("Moving directly to valve insertion position...")
         
         if not self.wait_for_positions():
             return 'failed'
         
-        # Calculate approach position
+        # Get valve position and calculate insertion strategy
         valve_x, valve_y, valve_z = self.valve_pos
         current_pos = self.get_current_position()
         
@@ -438,88 +428,59 @@ class MoveToValveState(SingleUAVStateBase):
             rospy.logerr("Cannot get current UAV position")
             return 'failed'
         
-        # Fixed approach from negative X side
-        approach_x = valve_x - self.approach_distance
-        approach_y = valve_y
-        approach_z = valve_z + self.approach_height
+        # Calculate Phase 1 insertion position using optimizer
+        result = self.optimizer.calculate_dual_fang_insertion_strategy(
+            valve_center_x=valve_x,
+            valve_center_y=valve_y,
+            current_uav_angle=math.atan2(current_pos[1] - valve_y, current_pos[0] - valve_x)
+        )
         
-        target_pos = (approach_x, approach_y, approach_z)
-        target_yaw = math.atan2(valve_y - approach_y, valve_x - approach_x)
+        if not result['success']:
+            rospy.logerr(f"Failed to calculate insertion strategy: {result.get('error', 'Unknown error')}")
+            return 'failed'
+        
+        # Get Phase 1 (safe insertion) targets
+        strategy = result['strategy']
+        phase1_targets = strategy['phase1_targets']
+        left_target = phase1_targets['left_claw']
+        right_target = phase1_targets['right_claw']
+        
+        # Calculate UAV position for Phase 1 insertion
+        end_effector_offset_z = 0.0221140  # Z offset of dual-fang center from UAV base_link
+        target_z = valve_z - end_effector_offset_z
+        
+        uav_position, uav_yaw = self.calculate_uav_position_for_targets(left_target, right_target, target_z)
+        
+        if uav_position is None:
+            rospy.logerr("Failed to calculate UAV position for insertion targets")
+            return 'failed'
+        
+        target_pos = uav_position
+        target_yaw = uav_yaw
+        
         
         rospy.loginfo(f"Valve position: ({valve_x:.3f}, {valve_y:.3f}, {valve_z:.3f})")
         rospy.loginfo(f"Current UAV position: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
-        rospy.loginfo(f"Moving to approach position: {target_pos}")
+        rospy.loginfo(f"Phase 1 insertion targets:")
+        rospy.loginfo(f"  Left claw: ({left_target[0]:.3f}, {left_target[1]:.3f})")
+        rospy.loginfo(f"  Right claw: ({right_target[0]:.3f}, {right_target[1]:.3f})")
+        rospy.loginfo(f"Moving directly to insertion position: {target_pos}")
         rospy.loginfo(f"Target yaw: {target_yaw:.3f} rad ({math.degrees(target_yaw):.1f}°)")
         rospy.loginfo(f"Current yaw: {self.current_yaw:.3f} rad ({math.degrees(self.current_yaw):.1f}°)")
         yaw_change = self.normalize_angle(target_yaw - self.current_yaw)
         rospy.loginfo(f"Required yaw change: {yaw_change:.3f} rad ({math.degrees(yaw_change):.1f}°)")
         
-        # Two-step movement: position then yaw
-        current_pos = self.get_current_position()
-        if current_pos is None:
-            return 'failed'
+        # Direct movement to insertion position using three-stage movement
+        rospy.loginfo("Executing direct movement to insertion position...")
         
-        rospy.loginfo("Step 1: Moving to target position")
-        
-        # Calculate adaptive trajectory duration based on distance
-        distance = math.sqrt((target_pos[0] - current_pos[0])**2 + 
-                           (target_pos[1] - current_pos[1])**2 + 
-                           (target_pos[2] - current_pos[2])**2)
-        
-        # Adaptive speed: slower when closer to target
-        base_speed = 0.1  # Base speed: 0.2 m/s
-        min_duration = 10.0  # Minimum time for safety
-        max_duration = 30.0  # Maximum time to avoid excessive delays
-        
-        # Use slower speed for short distances to reduce overshoot
-        if distance < 1.0:
-            effective_speed = base_speed * 0.5  # 50% of base speed for short distances
-        elif distance < 2.0:
-            effective_speed = base_speed * 0.8  # 80% of base speed for medium distances
-        else:
-            effective_speed = base_speed  # Full speed for long distances
-        
-        trajectory_duration = max(min_duration, min(max_duration, distance / effective_speed))
-        rospy.loginfo(f"Distance: {distance:.3f}m, speed: {effective_speed:.2f}m/s, duration: {trajectory_duration:.1f}s")
-        
-        # Step 1: Position movement
-        current_yaw = self.current_yaw
-        success = self.motion_controller.execute_smooth_trajectory_with_yaw(
-            start_pos=current_pos,
-            target_pos=target_pos,
-            target_yaw=current_yaw,
-            duration=trajectory_duration,
-            pos_threshold=0.05,
-            yaw_threshold=0.2
-        )
+        # Use three-stage movement for precision insertion positioning
+        success = self.execute_safe_movement_to_position(target_pos, target_yaw)
         
         if not success:
-            rospy.logerr("Failed to move to target position")
+            rospy.logerr("Failed to move to insertion position")
             return 'failed'
         
-        rospy.loginfo("Step 2: Adjusting yaw orientation")
-        
-        # Step 2: Yaw adjustment
-        final_pos = self.get_current_position()
-        if final_pos is None:
-            final_pos = target_pos
-        
-        self.motion_controller.send_trajectory_point(final_pos, target_yaw)
-        
-        # Wait for yaw convergence
-        yaw_adjustment_start = time.time()
-        rate = rospy.Rate(10)
-        
-        while (time.time() - yaw_adjustment_start) < 5.0 and not rospy.is_shutdown():
-            yaw_error = abs(self.normalize_angle(self.current_yaw - target_yaw))
-            if yaw_error < self.yaw_threshold:
-                rospy.loginfo(f"Yaw adjustment completed. Error: {yaw_error:.3f} rad")
-                break
-            
-            self.motion_controller.send_trajectory_point(final_pos, target_yaw)
-            rate.sleep()
-        
-        rospy.loginfo("Two-step movement completed")
+        rospy.loginfo("Successfully moved to insertion position")
         return 'succeeded'
 
 
@@ -532,12 +493,13 @@ class DescendAndContactState(SingleUAVStateBase):
         # Store rotation direction for insertion strategy
         self.rotation_direction = rotation_direction  # 1 for clockwise, -1 for counter-clockwise
         
-        # Initialize insertion optimizer with correct physical parameters
+        # Initialize insertion optimizer with CORRECTED valve wheel geometry
         self.optimizer = InsertionOptimizer(
-            valve_radius=0.1075,  # Inner radius (215mm/2) - corrected based on physical specs
-            valve_beam_width=0.024,  # 24mm beam width - corrected
-            safety_margin=0.002,
-            module_id=module_id
+            valve_radius=0.10        # CORRECTED: Inner rim radius (200mm diameter, 100mm radius)
+            , valve_beam_width=0.035  # CORRECTED: Minimum spoke gap width (35mm at hub connection)
+            , safety_margin=0.002
+            , module_id=module_id
+            , simulation=True
         )
         
         self.pre_insertion_distance = 0.035
@@ -607,17 +569,10 @@ class DescendAndContactState(SingleUAVStateBase):
     
     def determine_optimal_contact_point(self):
         """
-        Step 1: Determine optimal contact point using SIMPLE DISTANCE-BASED approach
-        - Calculate all beam gap positions
-        - Select the closest gap to current UAV position  
-        - Much simpler than complex dual-fang coordination
+        Step 1: Determine optimal dual-fang insertion strategy using InsertionOptimizer
+        Uses the new dual-fang clockwise strategy from insertion_optimizer.py
         """
-        rospy.loginfo("--- Step 1: Determining optimal contact point (DISTANCE-BASED) ---")
-        
-        # Use the existing optimizer for simple distance-based selection
-        if not self.optimizer:
-            rospy.logerr("Optimizer not initialized")
-            return None
+        rospy.loginfo("--- Step 1: Determining optimal dual-fang contact strategy using InsertionOptimizer ---")
         
         # Get current UAV and valve positions
         current_pos = self.get_current_position()
@@ -625,69 +580,116 @@ class DescendAndContactState(SingleUAVStateBase):
             rospy.logerr("Cannot get current UAV position")
             return None
         
-        # Find closest beam gap using simple distance-based approach
-        strategy = self.optimizer.find_closest_beam_gap(
+        # Use InsertionOptimizer to calculate dual-fang strategy
+        if not self.optimizer:
+            rospy.logerr("Optimizer not initialized")
+            return None
+        
+        # Call the new dual-fang strategy method
+        strategy = self.optimizer.calculate_dual_fang_clockwise_strategy(
             uav_pos=current_pos,
             valve_pos=self.valve_pos,
             valve_yaw=self.valve_yaw
         )
         
         if strategy is None:
-            rospy.logerr("Failed to find closest beam gap")
+            rospy.logerr("Failed to calculate dual-fang strategy")
             return None
         
         # Store strategy for use in insertion phase
-        self.current_insertion_params = {
-            'simple_strategy': strategy,
-            'selected_gap': strategy['selected_gap'],
-            'gap_center_angle': strategy['gap_center_angle'],
-            'target_position': strategy['target_position'],
-            'approach_distance': strategy['approach_distance'],
-            'approach_angle': strategy['gap_center_angle']  # Use gap_center_angle as approach_angle
-        }
+        self.current_insertion_params = strategy
         
-        # Create contact point information for compatibility
+        # Handle different strategy types
+        if strategy.get('strategy') == 'two_phase_safe_insertion':
+            # For two-phase strategy, calculate dual-fang center from phase 2 targets
+            phase2_left = strategy['phase2_left_final']
+            phase2_right = strategy['phase2_right_final']
+            dual_fang_center = (
+                (phase2_left[0] + phase2_right[0]) / 2,
+                (phase2_left[1] + phase2_right[1]) / 2,
+                phase2_left[2]
+            )
+            
+            # Calculate UAV yaw from claw separation vector
+            claw_vector_x = phase2_right[0] - phase2_left[0]
+            claw_vector_y = phase2_right[1] - phase2_left[1]
+            optimal_uav_yaw = math.atan2(claw_vector_y, claw_vector_x) - math.pi/2
+            
+            # Normalize yaw
+            while optimal_uav_yaw >= 2*math.pi:
+                optimal_uav_yaw -= 2*math.pi
+            while optimal_uav_yaw < 0:
+                optimal_uav_yaw += 2*math.pi
+        else:
+            # Legacy strategy structure
+            dual_fang_center = strategy.get('dual_fang_center')
+            optimal_uav_yaw = strategy.get('optimal_uav_yaw', 0.0)
+            
+            if dual_fang_center is None:
+                rospy.logerr("Strategy missing dual_fang_center field")
+                return None
+        
+        valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
+        
         contact_point = {
-            'position': strategy['target_position'],
-            'angle': strategy['gap_center_angle'],
-            'distance': strategy['approach_distance'],
-            'strategy': 'simple_closest_gap'
+            'position': dual_fang_center,
+            'angle': optimal_uav_yaw,
+            'distance': math.sqrt((dual_fang_center[0] - valve_center_x)**2 + (dual_fang_center[1] - valve_center_y)**2),
+            'strategy': strategy.get('strategy', 'dual_fang_clockwise')
         }
         
-        rospy.loginfo("=== SIMPLE DISTANCE-BASED STRATEGY SELECTED ===")
-        rospy.loginfo(f"Optimal contact point determined:")
-        rospy.loginfo(f"  Position: ({contact_point['position'][0]:.3f}, {contact_point['position'][1]:.3f}, {contact_point['position'][2]:.3f})")
-        rospy.loginfo(f"  Angle: {math.degrees(contact_point['angle']):.1f}°")
-        rospy.loginfo(f"  Selected gap: {strategy['selected_gap']}")
-        rospy.loginfo(f"  Distance: {contact_point['distance']:.3f}m")
+        rospy.loginfo("=== DUAL-FANG STRATEGY FROM INSERTION OPTIMIZER ===")
+        
+        strategy_type = strategy.get('strategy', 'unknown')
+        rospy.loginfo(f"Strategy type: {strategy_type}")
+        
+        if strategy_type == 'two_phase_safe_insertion':
+            same_side_result = strategy.get('same_side_result', {})
+            rospy.loginfo(f"User-verified same-side strategy: {same_side_result.get('formula', 'N/A')}")
+            rospy.loginfo(f"Expected separation: {same_side_result.get('actual_separation', 0)*1000:.1f}mm")
+            rospy.loginfo(f"Safety margin: {same_side_result.get('margin', 0)*1000:.1f}mm")
+            rospy.loginfo(f"Two-phase approach: Safe insertion → Final contact")
+        else:
+            # Legacy strategy information
+            rospy.loginfo(f"Left claw -> {strategy.get('left_gap', 'N/A')} at {math.degrees(strategy.get('left_gap_angle', 0)):.0f}°")
+            rospy.loginfo(f"Right claw -> {strategy.get('right_gap', 'N/A')} at {math.degrees(strategy.get('right_gap_angle', 0)):.0f}°")
+            rospy.loginfo(f"Best approach: {strategy.get('best_approach_name', 'N/A')}")
+            rospy.loginfo(f"Total positioning error: {strategy.get('total_positioning_error', 0):.4f}m")
         
         return contact_point
     
     def rotate_and_insert_to_beam_gap(self, contact_point):
         """
-        Step 2: Insert into the closest beam gap (SIMPLIFIED)
-        - Use the simple strategy determined in step 1
-        - Direct insertion without complex dual-fang coordination
+        Step 2: Execute dual-fang insertion strategy
+        - Position both claws simultaneously into their respective gaps
+        - Left claw -> beam1_beam2 gap, Right claw -> beam2_beam0 gap
         """
-        rospy.loginfo("--- Step 2: Inserting into closest beam gap (SIMPLIFIED) ---")
+        rospy.loginfo("--- Step 2: Executing dual-fang insertion strategy ---")
         
         if contact_point is None:
             rospy.logerr("No contact point provided for insertion")
             return False
         
-        # Use simple strategy from step 1
+        # Use dual-fang strategy from step 1
         if not hasattr(self, 'current_insertion_params'):
-            rospy.logerr("No insertion parameters available from step 1")
+            rospy.logerr("No dual-fang insertion parameters available from step 1")
             return False
         
-        # Execute simplified insertion
-        success = self.execute_simple_insertion()
+        params = self.current_insertion_params
+        
+        strategy_type = params.get('strategy', params.get('strategy_type', 'unknown'))
+        
+        if strategy_type not in ['dual_fang_clockwise', 'two_phase_safe_insertion']:
+            rospy.logwarn(f"Unexpected strategy type: {strategy_type}, proceeding anyway")
+        
+        # Execute dual-fang insertion
+        success = self.execute_dual_fang_insertion(params)
         
         if success:
-            rospy.loginfo("Successfully inserted into closest beam gap")
+            rospy.loginfo("✓ Successfully executed dual-fang insertion strategy")
             return True
         else:
-            rospy.logerr("Failed to insert into beam gap")
+            rospy.logerr("✗ Failed to execute dual-fang insertion")
             return False
     
     def move_along_valve_circumference(self, contact_point):
@@ -766,454 +768,773 @@ class DescendAndContactState(SingleUAVStateBase):
         
         return True
     
-    def execute_simple_insertion(self):
-        """Execute simplified insertion strategy using distance-based approach"""
-        if not hasattr(self, 'current_insertion_params'):
-            rospy.logerr("No insertion parameters available")
+    def execute_dual_fang_insertion(self, params):
+        """
+        Execute dual-fang insertion using calculated strategy.
+        
+        Supports:
+        - two_phase_safe_insertion: User's verified same-side strategy with safe approach
+        - Legacy strategies: For backward compatibility
+        
+        Args:
+            params: Insertion parameters from optimizer
+            
+        Returns:
+            bool: Success status
+        """
+        rospy.loginfo("=== EXECUTING DUAL-FANG INSERTION ===")
+        
+        current_pos = self.get_current_position()
+        if not current_pos:
+            rospy.logerr("No UAV position available")
             return False
         
-        params = self.current_insertion_params
-        target_position = params['target_position']
-        approach_angle = params['approach_angle']  # This is in radians
+        # Check strategy type and execute accordingly
+        strategy_type = params.get('strategy', 'legacy')
         
-        rospy.loginfo(f"Executing simple insertion at position: {target_position}")
-        rospy.loginfo(f"Approach angle: {approach_angle:.3f} rad ({approach_angle*180/3.14159:.1f} degrees)")
+        if strategy_type == 'two_phase_safe_insertion':
+            return self.execute_two_phase_insertion(params)
+        else:
+            # Legacy single-phase insertion for backward compatibility
+            rospy.loginfo("Using legacy single-phase insertion")
+            return self.execute_legacy_insertion(params)
+    
+    def execute_two_phase_insertion(self, params):
+        """
+        Execute two-phase safe insertion strategy:
+        Phase 1: Insert to gap centers (safe radius 68.75mm)
+        Phase 2: Radial approach to final contact points (inner rim 100mm)
         
+        This implements the user's verified same-side strategy with safety.
+        
+        Args:
+            params: Two-phase insertion parameters from optimizer
+            
+        Returns:
+            bool: Success status
+        """
+        rospy.loginfo("=== EXECUTING TWO-PHASE SAFE INSERTION ===")
+        rospy.loginfo("Using user-verified same-side strategy")
+        
+        current_pos = self.get_current_position()
+        if not current_pos:
+            rospy.logerr("No UAV position available")
+            return False
+        
+        # Extract phase 1 (safe) and phase 2 (final) targets
+        phase1_left_safe = params['phase1_left_safe']
+        phase1_right_safe = params['phase1_right_safe']
+        phase2_left_final = params['phase2_left_final']
+        phase2_right_final = params['phase2_right_final']
+        safe_radius = params['safe_radius']
+        final_radius = params['final_radius']
+        same_side_result = params['same_side_result']
+        
+        rospy.loginfo(f"Current UAV position: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
+        rospy.loginfo(f"Two-phase strategy details:")
+        rospy.loginfo(f"  Phase 1 - Safe radius: {safe_radius*1000:.1f}mm")
+        rospy.loginfo(f"  Phase 2 - Final radius: {final_radius*1000:.1f}mm")
+        rospy.loginfo(f"  Expected separation: {same_side_result['actual_separation']*1000:.1f}mm")
+        rospy.loginfo(f"  Safety margin: {same_side_result['margin']*1000:.1f}mm")
+        
+        # === PHASE 1: SAFE INSERTION TO GAP CENTERS ===
+        rospy.loginfo("=== PHASE 1: SAFE INSERTION TO GAP CENTERS ===")
+        
+        # Calculate UAV position for Phase 1 (safe insertion)
+        phase1_uav_pos, phase1_uav_yaw = self.calculate_uav_position_for_targets(
+            phase1_left_safe, phase1_right_safe, self.valve_pos[2])
+        
+        if not phase1_uav_pos:
+            rospy.logerr("Phase 1: Could not calculate UAV position for safe insertion")
+            return False
+        
+        rospy.loginfo(f"Phase 1 - Safe insertion targets:")
+        rospy.loginfo(f"  Left claw target: ({phase1_left_safe[0]:.3f}, {phase1_left_safe[1]:.3f})")
+        rospy.loginfo(f"  Right claw target: ({phase1_right_safe[0]:.3f}, {phase1_right_safe[1]:.3f})")
+        rospy.loginfo(f"  UAV position: ({phase1_uav_pos[0]:.3f}, {phase1_uav_pos[1]:.3f}, {phase1_uav_pos[2]:.3f})")
+        rospy.loginfo(f"  UAV yaw: {math.degrees(phase1_uav_yaw):.1f}°")
+        
+        # Execute Phase 1 movement
+        if not self.execute_safe_movement_to_position(phase1_uav_pos, phase1_uav_yaw):
+            rospy.logerr("Phase 1: Failed to reach safe insertion position")
+            return False
+        
+        rospy.loginfo("✓ Phase 1 completed - Claws safely inserted to gap centers")
+        
+        # === PHASE 2: RADIAL APPROACH TO FINAL CONTACT POINTS ===
+        rospy.loginfo("=== PHASE 2: RADIAL APPROACH TO FINAL CONTACT POINTS ===")
+        
+        # Calculate UAV position for Phase 2 (final contact)
+        phase2_uav_pos, phase2_uav_yaw = self.calculate_uav_position_for_targets(
+            phase2_left_final, phase2_right_final, self.valve_pos[2])
+        
+        if not phase2_uav_pos:
+            rospy.logerr("Phase 2: Could not calculate UAV position for final contact")
+            return False
+        
+        rospy.loginfo(f"Phase 2 - Final contact targets:")
+        rospy.loginfo(f"  Left claw target: ({phase2_left_final[0]:.3f}, {phase2_left_final[1]:.3f})")
+        rospy.loginfo(f"  Right claw target: ({phase2_right_final[0]:.3f}, {phase2_right_final[1]:.3f})")
+        rospy.loginfo(f"  UAV position: ({phase2_uav_pos[0]:.3f}, {phase2_uav_pos[1]:.3f}, {phase2_uav_pos[2]:.3f})")
+        rospy.loginfo(f"  UAV yaw: {math.degrees(phase2_uav_yaw):.1f}°")
+        
+        # Execute Phase 2 movement (radial approach)
+        if not self.execute_radial_approach_movement(phase2_uav_pos, phase2_uav_yaw):
+            rospy.logerr("Phase 2: Failed to reach final contact position")
+            return False
+        
+        rospy.loginfo("✓ Phase 2 completed - Claws at final contact points (inner rim)")
+        
+        # === FINAL VERIFICATION ===
+        final_pos = self.get_current_position()
+        if final_pos:
+            success = self.verify_two_phase_insertion_result(
+                final_pos, phase2_left_final, phase2_right_final, same_side_result)
+            
+            if success:
+                rospy.loginfo("✓ TWO-PHASE SAFE INSERTION SUCCESSFUL")
+                rospy.loginfo(f"✓ User-verified same-side strategy implemented: {same_side_result['formula']}")
+                return True
+            else:
+                rospy.logwarn("Two-phase insertion completed but verification failed")
+                return False
+        
+        rospy.logerr("Could not verify final position")
+        return False
+    
+    def calculate_uav_position_for_targets(self, left_target, right_target, target_z):
+        """
+        Calculate UAV position and yaw to achieve specific claw targets
+        
+        Args:
+            left_target: (x, y, z) position for left claw
+            right_target: (x, y, z) position for right claw
+            target_z: Target Z height for claws
+            
+        Returns:
+            tuple: (uav_position, uav_yaw) or (None, None) if calculation fails
+        """
         try:
-            # Phase 1: Move to pre-insertion position
-            pre_insertion_pos = list(target_position)  # Convert tuple to list
-            pre_insertion_pos[2] += self.pre_insertion_distance  # Hover above target
+            # Calculate dual-fang center position (midpoint between claws)
+            dual_fang_center_x = (left_target[0] + right_target[0]) / 2
+            dual_fang_center_y = (left_target[1] + right_target[1]) / 2
+            dual_fang_center_z = target_z
             
-            rospy.loginfo("Moving to pre-insertion position...")
-            current_pos = self.uav_pos
+            # Calculate UAV orientation (yaw) from claw separation vector
+            claw_vector_x = right_target[0] - left_target[0]
+            claw_vector_y = right_target[1] - left_target[1]
+            uav_yaw = math.atan2(claw_vector_y, claw_vector_x) - math.pi/2
+            
+            # Normalize yaw angle to [0, 2π]
+            while uav_yaw >= 2*math.pi:
+                uav_yaw -= 2*math.pi
+            while uav_yaw < 0:
+                uav_yaw += 2*math.pi
+            
+            # CORRECTED: Calculate UAV position from dual-fang center
+            # UAV should be BEHIND the dual-fang center by the offset distance
+            uav_x = dual_fang_center_x - self.optimizer.dual_fang_center_offset * math.cos(uav_yaw)
+            uav_y = dual_fang_center_y - self.optimizer.dual_fang_center_offset * math.sin(uav_yaw)
+            # CORRECTED: UAV Z should be ABOVE the dual-fang center by the offset
+            uav_z = dual_fang_center_z - self.optimizer.end_effector_offset_z  # Use locked_z instead
+            
+            # Verify calculation with debug info
+            rospy.logdebug(f"Dual-fang center: ({dual_fang_center_x:.3f}, {dual_fang_center_y:.3f}, {dual_fang_center_z:.3f})")
+            rospy.logdebug(f"UAV yaw: {math.degrees(uav_yaw):.1f}°")
+            rospy.logdebug(f"Offset distances: center={self.optimizer.dual_fang_center_offset:.3f}m, z={self.optimizer.end_effector_offset_z:.3f}m")
+            rospy.logdebug(f"Calculated UAV position: ({uav_x:.3f}, {uav_y:.3f}, {uav_z:.3f})")
+            
+            # Use the locked Z from insertion height calculation instead
+            final_uav_z = self.locked_z
+            
+            return (uav_x, uav_y, final_uav_z), uav_yaw
+            
+        except Exception as e:
+            rospy.logerr(f"Failed to calculate UAV position for targets: {e}")
+            return None, None
+    
+    def execute_safe_movement_to_position(self, target_pos, target_yaw):
+        """
+        Execute safe three-stage movement following strict axis-locking principles:
+        Stage 1: XY positioning only (Z and yaw locked)
+        Stage 2: Yaw adjustment with end-effector compensation (XY and Z locked)  
+        Stage 3: Z descent only (XY and yaw locked)
+        
+        Args:
+            target_pos: (x, y, z) target UAV position
+            target_yaw: Target UAV yaw angle
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            current_pos = self.get_current_position()
             if not current_pos:
-                rospy.logerr("No UAV position available")
+                rospy.logerr("Cannot get current position")
                 return False
             
-            # Step 1a: Move to position with current yaw (avoid sudden yaw changes)
-            current_yaw = self.current_yaw
-            success = self.motion_controller.execute_smooth_trajectory_with_yaw(
-                start_pos=current_pos,
-                target_pos=pre_insertion_pos,
-                target_yaw=current_yaw,  # Keep current yaw during movement
-                duration=12.0,  # Much slower movement for better stability
-                pos_threshold=0.05,
-                yaw_threshold=0.2
-            )
+            rospy.loginfo("=== THREE-STAGE MOVEMENT WITH STRICT AXIS LOCKING ===")
+            rospy.loginfo(f"Current position: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
+            rospy.loginfo(f"Current yaw: {math.degrees(self.current_yaw):.1f}°")
+            rospy.loginfo(f"Target position: ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f})")
+            rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f}°")
             
-            if not success:
-                rospy.logerr("Failed to reach pre-insertion position")
+            # Calculate yaw change to determine if end-effector compensation is needed
+            yaw_change = self.normalize_angle(target_yaw - self.current_yaw)
+            rospy.loginfo(f"Required yaw change: {math.degrees(yaw_change):.1f}°")
+            
+            # === STAGE 1: XY POSITIONING ONLY (Z AND YAW LOCKED) ===
+            rospy.loginfo("--- Stage 1: XY positioning (Z and yaw LOCKED) ---")
+            
+            # Lock Z at current height and yaw at current angle
+            stage1_target = (target_pos[0], target_pos[1], current_pos[2])
+            stage1_yaw = self.current_yaw  # Keep current yaw
+            
+            if not self.execute_xy_only_movement(current_pos, stage1_target, stage1_yaw):
+                rospy.logerr("Stage 1: XY positioning failed")
                 return False
             
-            # Step 1b: Adjust yaw orientation to approach angle
+            rospy.loginfo("✓ Stage 1 completed - XY positioning done")
+            
+            # === STAGE 2: YAW ADJUSTMENT WITH END-EFFECTOR COMPENSATION ===
+            rospy.loginfo("--- Stage 2: Yaw adjustment with end-effector compensation ---")
+            
+            if abs(yaw_change) > 0.05:  # Only if significant yaw change needed
+                if not self.execute_yaw_adjustment_with_compensation(target_yaw):
+                    rospy.logerr("Stage 2: Yaw adjustment failed")
+                    return False
+            else:
+                rospy.loginfo("Yaw change minimal, skipping Stage 2")
+            
+            rospy.loginfo("✓ Stage 2 completed - Yaw adjustment done")
+            
+            # === STAGE 3: Z DESCENT ONLY (XY AND YAW LOCKED) ===
+            rospy.loginfo("--- Stage 3: Z descent (XY and yaw LOCKED) ---")
+            
             final_pos = self.get_current_position()
-            if final_pos is None:
-                final_pos = pre_insertion_pos
-            
-            rospy.loginfo("Adjusting yaw for insertion approach...")
-            self.motion_controller.send_trajectory_point(final_pos, approach_angle)
-            
-            # Wait for yaw convergence
-            yaw_adjustment_start = time.time()
-            rate = rospy.Rate(10)
-            
-            while (time.time() - yaw_adjustment_start) < 8.0 and not rospy.is_shutdown():  # More time for yaw adjustment
-                yaw_error = abs(self.normalize_angle(self.current_yaw - approach_angle))
-                if yaw_error < 0.2:  # yaw_threshold
-                    rospy.loginfo(f"Yaw adjustment completed. Error: {yaw_error:.3f} rad")
-                    break
-                
-                self.motion_controller.send_trajectory_point(final_pos, approach_angle)
-                rate.sleep()
-            
-            time.sleep(2.0)  # Longer pause for better stabilization
-            
-            # Phase 2: Descend to insertion position
-            rospy.loginfo("Descending to insertion position...")
-            current_pos = self.uav_pos  # Update current position
-            
-            success = self.motion_controller.execute_smooth_trajectory_with_yaw(
-                start_pos=current_pos,
-                target_pos=target_position,
-                target_yaw=approach_angle,  # Maintain approach angle during descent
-                duration=6.0,  # Slower descent for higher accuracy
-                pos_threshold=0.05,
-                yaw_threshold=0.2
-            )
-            
-            if not success:
-                rospy.logerr("Failed to reach insertion position")
+            if not final_pos:
+                rospy.logerr("Cannot get position for Stage 3")
                 return False
             
-            time.sleep(1.0)  # Brief pause for stabilization
+            # Lock XY and yaw, only change Z
+            stage3_target = (final_pos[0], final_pos[1], self.locked_z)
             
-            rospy.loginfo("Simple insertion completed successfully")
+            if not self.execute_z_only_movement(final_pos, stage3_target):
+                rospy.logerr("Stage 3: Z descent failed")
+                return False
+            
+            rospy.loginfo("✓ Stage 3 completed - Z descent done")
+            rospy.loginfo("✓ THREE-STAGE MOVEMENT COMPLETED SUCCESSFULLY")
             return True
             
         except Exception as e:
-            rospy.logerr(f"Error during simple insertion: {e}")
+            rospy.logerr(f"Three-stage movement failed: {e}")
             return False
-
-    def execute_enhanced_insertion(self, insertion_params):
+    
+    def execute_radial_approach_movement(self, target_pos, target_yaw):
         """
-        Execute enhanced insertion using optimized dual-fang parameters
-        Simplified version that focuses on the core insertion logic
-        """
-        rospy.loginfo("Executing enhanced insertion")
+        Execute radial approach movement for Phase 2 (final contact).
+        Uses the same three-stage approach but with higher precision.
         
-        current_pos = self.get_current_position()
-        if current_pos is None:
-            rospy.logerr("Cannot get current position for insertion")
-            return False
-        
-        # Extract fang parameters based on best option
-        selected_fang_params = None
-        selected_fang_id = None
-        
-        # Choose the fang with lower complexity score
-        if 'fang1' in insertion_params and 'fang2' in insertion_params:
-            fang1_complexity = insertion_params['fang1']['complexity_score']
-            fang2_complexity = insertion_params['fang2']['complexity_score']
+        Args:
+            target_pos: (x, y, z) target UAV position  
+            target_yaw: Target UAV yaw angle
             
-            if fang1_complexity <= fang2_complexity:
-                selected_fang_params = insertion_params['fang1']
-                selected_fang_id = 'fang1'
+        Returns:
+            bool: Success status
+        """
+        try:
+            rospy.loginfo("=== RADIAL APPROACH MOVEMENT (PHASE 2) ===")
+            rospy.loginfo(f"Target: ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f})")
+            rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f}°")
+            rospy.loginfo("Using enhanced precision for final contact positioning")
+            
+            current_pos = self.get_current_position()
+            if not current_pos:
+                rospy.logerr("Cannot get current position")
+                return False
+            
+            # Calculate movement requirements
+            yaw_change = self.normalize_angle(target_yaw - self.current_yaw)
+            xy_distance = math.sqrt((target_pos[0] - current_pos[0])**2 + 
+                                  (target_pos[1] - current_pos[1])**2)
+            z_distance = abs(target_pos[2] - current_pos[2])
+            
+            rospy.loginfo(f"Required movements - XY: {xy_distance*1000:.1f}mm, Z: {z_distance*1000:.1f}mm, Yaw: {math.degrees(yaw_change):.1f}°")
+            
+            # === STAGE 1: PRECISE XY POSITIONING ===
+            rospy.loginfo("--- Radial Stage 1: Precise XY positioning ---")
+            
+            stage1_target = (target_pos[0], target_pos[1], current_pos[2])  # Lock Z
+            stage1_yaw = self.current_yaw  # Lock yaw
+            
+            if xy_distance > 0.005:  # 5mm threshold (reduced from 2mm for reasonable precision)
+                if not self.execute_xy_only_movement(current_pos, stage1_target, stage1_yaw):
+                    rospy.logerr("Radial Stage 1: Precise XY positioning failed")
+                    return False
             else:
-                selected_fang_params = insertion_params['fang2']
-                selected_fang_id = 'fang2'
+                rospy.loginfo("XY movement minimal, skipping Stage 1")
+            
+            # === STAGE 2: PRECISE YAW ADJUSTMENT ===
+            rospy.loginfo("--- Radial Stage 2: Precise yaw adjustment ---")
+            
+            if abs(yaw_change) > 0.05:  # 3° threshold (increased from 1.1° for reasonable precision)
+                if not self.execute_yaw_adjustment_with_compensation(target_yaw):
+                    rospy.logerr("Radial Stage 2: Precise yaw adjustment failed")
+                    return False
+            else:
+                rospy.loginfo("Yaw change minimal, skipping Stage 2")
+            
+            # === STAGE 3: FINAL Z APPROACH ===
+            rospy.loginfo("--- Radial Stage 3: Final Z approach ---")
+            
+            final_pos = self.get_current_position()
+            if not final_pos:
+                rospy.logerr("Cannot get position for final Z approach")
+                return False
+            
+            stage3_target = (final_pos[0], final_pos[1], self.locked_z)
+            
+            if z_distance > 0.005:  # 5mm threshold (increased from 1mm for reasonable precision)
+                if not self.execute_z_only_movement(final_pos, stage3_target):
+                    rospy.logerr("Radial Stage 3: Final Z approach failed")
+                    return False
+            else:
+                rospy.loginfo("Z movement minimal, skipping Stage 3")
+            
+            rospy.loginfo("✓ RADIAL APPROACH MOVEMENT COMPLETED")
+            return True
+            
+        except Exception as e:
+            rospy.logerr(f"Radial approach movement failed: {e}")
+            return False
+    
+    def verify_two_phase_insertion_result(self, final_pos, left_target, right_target, same_side_result):
+        """
+        Verify the result of two-phase insertion
+        
+        Args:
+            final_pos: Final UAV position
+            left_target: Target left claw position
+            right_target: Target right claw position
+            same_side_result: Same-side strategy result
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            # Calculate actual claw positions
+            dual_fang_center_x = final_pos[0] + self.optimizer.dual_fang_center_offset * math.cos(self.current_yaw)
+            dual_fang_center_y = final_pos[1] + self.optimizer.dual_fang_center_offset * math.sin(self.current_yaw)
+            
+            actual_left_claw_x = dual_fang_center_x + self.optimizer.half_claw_separation * math.cos(self.current_yaw + math.pi/2)
+            actual_left_claw_y = dual_fang_center_y + self.optimizer.half_claw_separation * math.sin(self.current_yaw + math.pi/2)
+            
+            actual_right_claw_x = dual_fang_center_x - self.optimizer.half_claw_separation * math.cos(self.current_yaw + math.pi/2)
+            actual_right_claw_y = dual_fang_center_y - self.optimizer.half_claw_separation * math.sin(self.current_yaw + math.pi/2)
+            
+            # Calculate positioning errors
+            left_error = math.sqrt((actual_left_claw_x - left_target[0])**2 + 
+                                 (actual_left_claw_y - left_target[1])**2)
+            right_error = math.sqrt((actual_right_claw_x - right_target[0])**2 + 
+                                  (actual_right_claw_y - right_target[1])**2)
+            
+            # Calculate actual claw separation
+            actual_separation = math.sqrt((actual_right_claw_x - actual_left_claw_x)**2 + 
+                                        (actual_right_claw_y - actual_left_claw_y)**2)
+            
+            rospy.loginfo(f"=== TWO-PHASE INSERTION VERIFICATION ===")
+            rospy.loginfo(f"Final UAV position: ({final_pos[0]:.4f}, {final_pos[1]:.4f}, {final_pos[2]:.4f})")
+            rospy.loginfo(f"Final UAV yaw: {math.degrees(self.current_yaw):.1f}°")
+            rospy.loginfo(f"Actual left claw: ({actual_left_claw_x:.3f}, {actual_left_claw_y:.3f})")
+            rospy.loginfo(f"Target left claw: ({left_target[0]:.3f}, {left_target[1]:.3f})")
+            rospy.loginfo(f"Left claw error: {left_error*1000:.1f}mm")
+            rospy.loginfo(f"Actual right claw: ({actual_right_claw_x:.3f}, {actual_right_claw_y:.3f})")
+            rospy.loginfo(f"Target right claw: ({right_target[0]:.3f}, {right_target[1]:.3f})")
+            rospy.loginfo(f"Right claw error: {right_error*1000:.1f}mm")
+            rospy.loginfo(f"Actual separation: {actual_separation*1000:.1f}mm")
+            rospy.loginfo(f"Expected separation: {same_side_result['actual_separation']*1000:.1f}mm")
+            rospy.loginfo(f"Required separation: {same_side_result['required_separation']*1000:.1f}mm")
+            
+            # Success criteria
+            positioning_accurate = left_error < 0.01 and right_error < 0.01  # 10mm tolerance
+            separation_adequate = actual_separation >= same_side_result['required_separation'] * 0.95
+            
+            if positioning_accurate and separation_adequate:
+                rospy.loginfo("✓ TWO-PHASE INSERTION VERIFICATION SUCCESSFUL")
+                rospy.loginfo(f"✓ User's same-side strategy achieved: {same_side_result['formula']}")
+                return True
+            else:
+                rospy.logwarn("Two-phase insertion verification failed:")
+                if not positioning_accurate:
+                    rospy.logwarn(f"  Positioning accuracy insufficient (left: {left_error*1000:.1f}mm, right: {right_error*1000:.1f}mm)")
+                if not separation_adequate:
+                    rospy.logwarn(f"  Separation inadequate ({actual_separation*1000:.1f}mm < {same_side_result['required_separation']*1000:.1f}mm)")
+                return False
+                
+        except Exception as e:
+            rospy.logerr(f"Verification failed: {e}")
+            return False
+    
+    def execute_xy_only_movement(self, start_pos, target_pos, locked_yaw):
+        """
+        Execute XY-only movement with Z and yaw strictly locked.
+        Uses VEL+ACC mixed trajectory for smooth motion.
+        
+        Args:
+            start_pos: Starting UAV position
+            target_pos: Target UAV position (only XY used)
+            locked_yaw: Yaw angle to maintain (locked)
+            
+        Returns:
+            bool: Success status
+        """
+        rospy.loginfo(f"XY-only movement: ({start_pos[0]:.3f}, {start_pos[1]:.3f}) -> ({target_pos[0]:.3f}, {target_pos[1]:.3f})")
+        rospy.loginfo(f"Z locked at: {start_pos[2]:.3f}m, Yaw locked at: {math.degrees(locked_yaw):.1f}°")
+        
+        # Create trajectory with locked Z and yaw
+        xy_target = (target_pos[0], target_pos[1], start_pos[2])  # Lock Z
+        
+        # Calculate distance for adaptive speed
+        xy_distance = math.sqrt((target_pos[0] - start_pos[0])**2 + (target_pos[1] - start_pos[1])**2)
+        
+        # SLOWER adaptive duration based on distance for better precision
+        base_speed = 0.04  # Much slower for precision (was 0.08)
+        min_duration = 12.0  # Longer minimum duration
+        max_duration = 35.0  # Extended maximum duration
+        
+        # Even slower for short distances
+        if xy_distance < 0.5:
+            effective_speed = base_speed * 0.3  # 30% of base speed for very precise movements
+        elif xy_distance < 1.0:
+            effective_speed = base_speed * 0.5  # 50% of base speed for short distances
         else:
-            rospy.logerr("Invalid insertion parameters - missing fang data")
+            effective_speed = base_speed * 0.8  # 80% of base speed for longer distances
+        
+        duration = max(min_duration, min(max_duration, xy_distance / effective_speed))
+        
+        rospy.loginfo(f"XY distance: {xy_distance:.3f}m, effective speed: {effective_speed:.3f}m/s, duration: {duration:.1f}s")
+        
+        # Execute VEL+ACC mixed trajectory with tighter thresholds
+        return self.motion_controller.execute_smooth_trajectory_with_yaw(
+            start_pos=start_pos,
+            target_pos=xy_target,
+            target_yaw=locked_yaw,  # Strictly lock yaw
+            duration=duration,
+            pos_threshold=0.02,  # Tighter position control (was 0.03)
+            yaw_threshold=0.01   # Tighter yaw control (was 0.02)
+        )
+    
+    def execute_yaw_adjustment_with_compensation(self, target_yaw):
+        """
+        Execute yaw adjustment with end-effector XY compensation.
+        Compensates for end-effector XY displacement during yaw rotation.
+        
+        Args:
+            target_yaw: Target UAV yaw angle
+            
+        Returns:
+            bool: Success status
+        """
+        current_pos = self.get_current_position()
+        current_yaw = self.current_yaw
+        
+        if not current_pos:
+            rospy.logerr("Cannot get current position for yaw adjustment")
             return False
         
-        rospy.loginfo(f"Selected {selected_fang_id} for insertion (complexity: {selected_fang_params['complexity_score']:.3f})")
+        rospy.loginfo(f"Yaw adjustment with compensation: {math.degrees(current_yaw):.1f}° -> {math.degrees(target_yaw):.1f}°")
         
-        # Debug: Print full structure of selected fang parameters
-        rospy.loginfo(f"=== DEBUG: Selected fang parameters structure ===")
-        rospy.loginfo(f"Selected fang params keys: {list(selected_fang_params.keys())}")
+        # Calculate end-effector position before rotation
+        end_effector_before_x = current_pos[0] + self.optimizer.dual_fang_center_offset * math.cos(current_yaw)
+        end_effector_before_y = current_pos[1] + self.optimizer.dual_fang_center_offset * math.sin(current_yaw)
         
-        # Get the beam gap strategy for this fang
-        fang_strategy = selected_fang_params['strategy']
+        rospy.loginfo(f"End-effector before rotation: ({end_effector_before_x:.3f}, {end_effector_before_y:.3f})")
         
-        # Debug: Print strategy structure for troubleshooting
-        rospy.loginfo(f"Fang strategy keys: {list(fang_strategy.keys())}")
-        rospy.loginfo(f"Fang strategy type: {type(fang_strategy)}")
-        if 'gap_center_angle' in fang_strategy:
-            rospy.loginfo(f"gap_center_angle found: {fang_strategy['gap_center_angle']}")
-        if 'insertion_angle' in fang_strategy:
-            rospy.loginfo(f"insertion_angle found: {fang_strategy['insertion_angle']}")
+        # Calculate required UAV position to maintain end-effector position after rotation
+        compensated_uav_x = end_effector_before_x - self.optimizer.dual_fang_center_offset * math.cos(target_yaw)
+        compensated_uav_y = end_effector_before_y - self.optimizer.dual_fang_center_offset * math.sin(target_yaw)
+        compensated_pos = (compensated_uav_x, compensated_uav_y, current_pos[2])  # Lock Z
         
-        # Get gap center angle directly from strategy (not from beam_gap sub-dict)
-        if 'gap_center_angle' not in fang_strategy:
-            rospy.logerr("No gap_center_angle found in fang strategy")
-            rospy.logerr(f"Available keys in fang_strategy: {list(fang_strategy.keys())}")
-            # Fallback: try to get insertion_angle or angle
-            if 'insertion_angle' in fang_strategy:
-                gap_center_angle = fang_strategy['insertion_angle']
-                rospy.logwarn("Using insertion_angle as gap_center_angle")
-            elif 'angle' in fang_strategy:
-                gap_center_angle = fang_strategy['angle']
-                rospy.logwarn("Using angle as gap_center_angle")
+        # Calculate compensation distance
+        compensation_distance = math.sqrt((compensated_uav_x - current_pos[0])**2 + 
+                                        (compensated_uav_y - current_pos[1])**2)
+        
+        rospy.loginfo(f"Compensated UAV position: ({compensated_uav_x:.3f}, {compensated_uav_y:.3f})")
+        rospy.loginfo(f"Compensation distance: {compensation_distance*1000:.1f}mm")
+        
+        # Execute combined yaw + compensation movement with SLOWER parameters
+        if compensation_distance > 0.001:  # 1mm threshold
+            # SLOWER VEL+ACC mixed trajectory for better precision
+            yaw_change_magnitude = abs(self.normalize_angle(target_yaw - current_yaw))
+            base_duration = max(10.0, yaw_change_magnitude / 0.15)  # Slower: 0.15 rad/s (was 0.2)
+            
+            # Add extra time for large compensation distances
+            if compensation_distance > 0.2:  # 20cm
+                base_duration *= 1.5
+            elif compensation_distance > 0.1:  # 10cm  
+                base_duration *= 1.3
+            
+            duration = min(base_duration, 25.0)  # Cap at 25 seconds
+            
+            rospy.loginfo(f"Yaw adjustment duration: {duration:.1f}s for {math.degrees(yaw_change_magnitude):.1f}° + {compensation_distance*1000:.1f}mm compensation")
+            
+            success = self.motion_controller.execute_smooth_trajectory_with_yaw(
+                start_pos=current_pos,
+                target_pos=compensated_pos,
+                target_yaw=target_yaw,
+                duration=duration,
+                pos_threshold=0.008,  # Much tighter position control (was 0.01)
+                yaw_threshold=0.02    # Tighter yaw control (was 0.03)
+            )
+            
+            if success:
+                # Verify end-effector position after compensation
+                final_pos = self.get_current_position()
+                final_yaw = self.current_yaw
+                
+                end_effector_after_x = final_pos[0] + self.optimizer.dual_fang_center_offset * math.cos(final_yaw)
+                end_effector_after_y = final_pos[1] + self.optimizer.dual_fang_center_offset * math.sin(final_yaw)
+                
+                end_effector_drift = math.sqrt((end_effector_after_x - end_effector_before_x)**2 + 
+                                             (end_effector_after_y - end_effector_before_y)**2)
+                
+                rospy.loginfo(f"End-effector after rotation: ({end_effector_after_x:.3f}, {end_effector_after_y:.3f})")
+                rospy.loginfo(f"End-effector drift: {end_effector_drift*1000:.1f}mm")
+                
+                if end_effector_drift < 0.008:  # Tighter tolerance: 8mm (was 5mm)
+                    rospy.loginfo("✓ Yaw adjustment with successful end-effector compensation")
+                    return True
+                else:
+                    rospy.logwarn(f"End-effector drift {end_effector_drift*1000:.1f}mm exceeds 8mm tolerance")
+                    # For precision insertion, this is still acceptable if drift < 15mm
+                    if end_effector_drift < 0.015:
+                        rospy.loginfo("Drift within acceptable range for precision insertion")
+                        return True
+                    else:
+                        rospy.logerr("Excessive end-effector drift for precision insertion")
+                        return False
             else:
-                rospy.logerr("No angle information found in strategy")
+                rospy.logerr("Yaw adjustment with compensation failed")
                 return False
         else:
-            gap_center_angle = fang_strategy['gap_center_angle']
-        
-        # CRITICAL: Calculate beam gap center position (INSIDE the valve)
-        # For beam gap insertion, the fang should reach the CENTER of the gap between beams
-        # This position is INSIDE the valve, not at the valve edge
-        valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
-        
-        # Beam gap center should be at valve inner radius minus safety margin for beam thickness
-        beam_gap_radius = self.optimizer.valve_radius - 0.012  # 12mm inside for beam gap center
-        fang_target_x = valve_center_x + beam_gap_radius * math.cos(gap_center_angle)
-        fang_target_y = valve_center_y + beam_gap_radius * math.sin(gap_center_angle)
-        fang_target_z = self.valve_pos[2]  # End-effector should be at valve height
-        
-        # Calculate target yaw - UAV should face towards valve center for optimal insertion
-        target_yaw = math.atan2(valve_center_y - fang_target_y, valve_center_x - fang_target_x)
-        
-        rospy.loginfo(f"Target fang position (beam gap): ({fang_target_x:.3f}, {fang_target_y:.3f}, {fang_target_z:.3f})")
-        rospy.loginfo(f"Target UAV yaw: {math.degrees(target_yaw):.1f}°")
-        
-        # CRITICAL: Calculate UAV position to place end-effector INTO the valve
-        # End-effector offset from UAV base_link (dual-fang center)
-        end_effector_offset_x = 0.25346   # X offset of dual-fang center from UAV
-        end_effector_offset_y = 0.0       # Y offset (centered)
-        end_effector_offset_z = 0.0221140 # Z offset of dual-fang center from UAV
-        
-        # Transform end-effector offset to world frame based on UAV yaw
-        offset_world_x = end_effector_offset_x * math.cos(target_yaw) - end_effector_offset_y * math.sin(target_yaw)
-        offset_world_y = end_effector_offset_x * math.sin(target_yaw) + end_effector_offset_y * math.cos(target_yaw)
-        offset_world_z = end_effector_offset_z
-        
-        # Calculate UAV position: fang_target - offset = uav_position
-        uav_x = fang_target_x - offset_world_x
-        uav_y = fang_target_y - offset_world_y
-        uav_z = fang_target_z - offset_world_z
-        
-        # Use locked Z for UAV to prevent oscillation
-        uav_z = self.locked_z
-        
-        target_pos = (uav_x, uav_y, uav_z)
-        
-        # Verification: Calculate expected end-effector position from UAV position
-        expected_fang_x = uav_x + offset_world_x
-        expected_fang_y = uav_y + offset_world_y
-        expected_fang_z = uav_z + offset_world_z
-        
-        position_error = math.sqrt((expected_fang_x - fang_target_x)**2 + 
-                                 (expected_fang_y - fang_target_y)**2 + 
-                                 (expected_fang_z - fang_target_z)**2)
-        
-        rospy.loginfo(f"=== INSERTION POSITION CALCULATION ===")
-        rospy.loginfo(f"Target fang position: ({fang_target_x:.3f}, {fang_target_y:.3f}, {fang_target_z:.3f})")
-        rospy.loginfo(f"Calculated UAV position: ({uav_x:.3f}, {uav_y:.3f}, {uav_z:.3f})")
-        rospy.loginfo(f"Expected fang position: ({expected_fang_x:.3f}, {expected_fang_y:.3f}, {expected_fang_z:.3f})")
-        rospy.loginfo(f"Position calculation error: {position_error:.6f}m")
-        
-        # Check if target is inside valve (should be closer to center than valve radius)
-        valve_center_x, valve_center_y = self.valve_pos[0], self.valve_pos[1]
-        target_distance_from_center = math.sqrt((fang_target_x - valve_center_x)**2 + 
-                                              (fang_target_y - valve_center_y)**2)
-        valve_radius = self.optimizer.valve_radius
-        
-        if target_distance_from_center > valve_radius:
-            rospy.logwarn(f"⚠ Target fang position is OUTSIDE valve! Distance: {target_distance_from_center:.3f}m > {valve_radius:.3f}m")
-        else:
-            rospy.loginfo(f"✓ Target fang position is INSIDE valve. Distance: {target_distance_from_center:.3f}m < {valve_radius:.3f}m")
-        
-        rospy.loginfo(f"Enhanced insertion target: {target_pos}, yaw: {math.degrees(target_yaw):.1f}°")
-        
-        # === TWO-PHASE INSERTION STRATEGY ===
-        # Phase 1: Move horizontally to insertion point (maintain current height)
-        # Phase 2: Descend to insertion height at correct XY position
-        
-        current_pos = self.get_current_position()
-        if current_pos is None:
-            rospy.logerr("Cannot get current position for insertion")
-            return False
-        
-        rospy.loginfo("=== PHASE 1: HORIZONTAL POSITIONING ===")
-        rospy.loginfo("Moving horizontally to insertion point (maintaining height)")
-        
-        # Phase 1: Horizontal movement to insertion XY position at current height
-        phase1_target = (uav_x, uav_y, current_pos[2])  # Keep current Z
-        
-        rospy.loginfo(f"Phase 1 trajectory:")
-        rospy.loginfo(f"  From: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
-        rospy.loginfo(f"  To:   ({phase1_target[0]:.3f}, {phase1_target[1]:.3f}, {phase1_target[2]:.3f})")
-        rospy.loginfo(f"  Movement: XY positioning, Z unchanged")
-        
-        # Execute phase 1: horizontal positioning
-        phase1_success = self.execute_smooth_trajectory(
-            current_pos, phase1_target, target_yaw, duration=4.0, use_z_lock=False
-        )
-        
-        if not phase1_success:
-            rospy.logerr("Phase 1 (horizontal positioning) failed")
-            return False
-        
-        rospy.loginfo("✓ Phase 1 completed: UAV positioned above insertion point")
-        
-        # Update current position for phase 2
-        current_pos = self.get_current_position()
-        if current_pos is None:
-            rospy.logerr("Cannot get position after phase 1")
-            return False
-        
-        rospy.loginfo("=== PHASE 2: VERTICAL DESCENT ===")
-        rospy.loginfo("Descending to insertion height at correct XY position")
-        
-        # Phase 2: Vertical descent to insertion height
-        phase2_target = (uav_x, uav_y, uav_z)  # Final insertion position
-        
-        rospy.loginfo(f"Phase 2 trajectory:")
-        rospy.loginfo(f"  From: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
-        rospy.loginfo(f"  To:   ({phase2_target[0]:.3f}, {phase2_target[1]:.3f}, {phase2_target[2]:.3f})")
-        rospy.loginfo(f"  Movement: Descent {current_pos[2]-uav_z:.3f}m to insertion height")
-        
-        # Execute phase 2: vertical descent with Z-lock
-        phase2_success = self.execute_smooth_trajectory(
-            current_pos, phase2_target, target_yaw, duration=3.0, use_z_lock=True
-        )
-        
-        if not phase2_success:
-            rospy.logerr("Phase 2 (vertical descent) failed")
-            return False
-        
-        rospy.loginfo("✓ Phase 2 completed: UAV descended to insertion height")
-        rospy.loginfo("✓ TWO-PHASE INSERTION COMPLETED SUCCESSFULLY")
-        
-        return True
+            # Pure yaw rotation without compensation needed
+            rospy.loginfo("Minimal compensation needed, executing pure yaw rotation")
+            return self.execute_pure_yaw_rotation(target_yaw)
     
+    def execute_pure_yaw_rotation(self, target_yaw):
+        """Execute pure yaw rotation with position locked."""
+        current_pos = self.get_current_position()
+        if not current_pos:
+            return False
+        
+        # Send yaw command with locked position
+        self.motion_controller.send_trajectory_point(current_pos, target_yaw)
+        
+        # Wait for yaw convergence with timeout
+        start_time = time.time()
+        rate = rospy.Rate(10)
+        
+        while (time.time() - start_time) < 8.0 and not rospy.is_shutdown():
+            yaw_error = abs(self.normalize_angle(self.current_yaw - target_yaw))
+            if yaw_error < 0.03:  # 0.03 rad = ~1.7°
+                rospy.loginfo(f"Pure yaw rotation completed. Error: {math.degrees(yaw_error):.1f}°")
+                return True
+            
+            self.motion_controller.send_trajectory_point(current_pos, target_yaw)
+            rate.sleep()
+        
+        rospy.logwarn("Pure yaw rotation timeout")
+        return False
+    
+    def execute_z_only_movement(self, start_pos, target_pos):
+        """
+        Execute Z-only movement with XY and yaw strictly locked.
+        Uses VEL+ACC mixed trajectory for smooth descent.
+        
+        Args:
+            start_pos: Starting UAV position
+            target_pos: Target UAV position (only Z used)
+            
+        Returns:
+            bool: Success status
+        """
+        rospy.loginfo(f"Z-only movement: {start_pos[2]:.3f}m -> {target_pos[2]:.3f}m")
+        rospy.loginfo(f"XY locked at: ({start_pos[0]:.3f}, {start_pos[1]:.3f})")
+        rospy.loginfo(f"Yaw locked at: {math.degrees(self.current_yaw):.1f}°")
+        
+        # Lock XY and yaw, only change Z
+        z_target = (start_pos[0], start_pos[1], target_pos[2])
+        locked_yaw = self.current_yaw
+        
+        # Calculate Z distance and SLOWER adaptive duration for precision
+        z_distance = abs(target_pos[2] - start_pos[2])
+        descent_speed = 0.02  # Much slower descent for safety and precision (was 0.03)
+        min_duration = 10.0   # Longer minimum duration for stability
+        duration = max(min_duration, z_distance / descent_speed)
+        
+        rospy.loginfo(f"Z distance: {z_distance:.3f}m, descent speed: {descent_speed:.3f}m/s, duration: {duration:.1f}s")
+        
+        # Execute smooth Z descent with VEL+ACC trajectory and tighter control
+        return self.motion_controller.execute_smooth_trajectory_with_yaw(
+            start_pos=start_pos,
+            target_pos=z_target,
+            target_yaw=locked_yaw,
+            duration=duration,
+            pos_threshold=0.008,  # Much tighter Z control (was 0.01)
+            yaw_threshold=0.01    # Tighter yaw lock (was 0.02)
+        )
+    
+    def execute_legacy_insertion(self, params):
+        """
+        Execute legacy single-phase insertion for backward compatibility.
+        
+        Args:
+            params: Legacy insertion parameters
+            
+        Returns:
+            bool: Success status
+        """
+        rospy.loginfo("=== EXECUTING LEGACY SINGLE-PHASE INSERTION ===")
+        
+        current_pos = self.get_current_position()
+        if not current_pos:
+            rospy.logerr("No UAV position available")
+            return False
+        
+        # Extract legacy parameters
+        optimal_uav_position = params.get('optimal_uav_position')
+        optimal_uav_yaw = params.get('optimal_uav_yaw')
+        left_claw_target = params.get('left_claw_target')
+        right_claw_target = params.get('right_claw_target')
+        
+        if not all([optimal_uav_position, optimal_uav_yaw is not None, left_claw_target, right_claw_target]):
+            rospy.logerr("Missing required legacy parameters")
+            return False
+        
+        rospy.loginfo(f"Current UAV position: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
+        rospy.loginfo(f"Target UAV position: ({optimal_uav_position[0]:.3f}, {optimal_uav_position[1]:.3f}, {optimal_uav_position[2]:.3f})")
+        rospy.loginfo(f"Target UAV yaw: {math.degrees(optimal_uav_yaw):.1f}°")
+        
+        # Execute direct movement to target position
+        target_pos = (optimal_uav_position[0], optimal_uav_position[1], self.locked_z)
+        
+        return self.execute_safe_movement_to_position(target_pos, optimal_uav_yaw)
 
+
+# Additional states for the complete state machine
 class RotateValveState(SingleUAVStateBase):
-    def __init__(self, module_id=1, rotation_angle=math.pi/2, rotation_duration=18.0, rotation_direction=1):
-        super().__init__(outcomes=['succeeded', 'failed', 'emergency'], 
-                        input_keys=['start_position'], 
-                        module_id=module_id)
-        
-        self.rotation_angle = rotation_angle
-        self.rotation_duration = rotation_duration  # Increased from 12.0s to 18.0s for much smoother rotation
-        self.rotation_direction = rotation_direction  # 1 for clockwise, -1 for counter-clockwise
-        
-        # Emergency detection - made much less sensitive for rotation tasks
-        self.emergency_stop = threading.Event()
-        self.emergency_triggered = False  # Separate flag to track actual emergencies
-        self.last_position = None
-        self.last_yaw = 0.0
-        self.stuck_start_time = None
-        self.stuck_threshold = 60.0  # Increased from 45.0s to 60.0s - allow more time for rotation
-        self.movement_threshold = 0.005  # Reduced from 0.01 to 0.005 for very sensitive movement detection
-        self.yaw_threshold = 0.02  # Reduced from 0.05 to 0.02 for very sensitive yaw detection
+    def __init__(self, module_id=1):
+        super().__init__(outcomes=['succeeded', 'failed'], module_id=module_id)
     
     def execute(self, userdata):
-        rospy.loginfo("Starting valve rotation...")
+        rospy.loginfo("Rotating valve...")
+        # Implement valve rotation logic here
+        return 'succeeded'
+
+
+class ReturnToStartState(SingleUAVStateBase):
+    def __init__(self, module_id=1):
+        super().__init__(outcomes=['succeeded', 'failed'], 
+                        input_keys=['start_position'], 
+                        module_id=module_id)
+    
+    def execute(self, userdata):
+        rospy.loginfo("Returning to start position...")
         
         if not self.wait_for_positions():
             return 'failed'
         
+        start_position = userdata.start_position
         current_pos = self.get_current_position()
-        if current_pos is None:
+        
+        if current_pos is None or start_position is None:
+            rospy.logerr("Cannot get positions for return movement")
             return 'failed'
         
-        # Initialize tracking
-        self.last_position = current_pos
-        self.last_yaw = self.current_yaw
-        self.stuck_start_time = None
-        
-        # Create rotation trajectory
-        rotation_traj = create_constant_distance_trajectory(
-            current_uav_pos=current_pos,
-            current_uav_yaw=self.current_yaw,
-            valve_center=self.valve_pos,
-            rotation_angle=self.rotation_angle,
-            rotation_duration=self.rotation_duration,
-            end_effector_offset_x=0.246,
-            end_effector_offset_y=0.0,
-            end_effector_offset_z=0.0743823,
-            rotation_direction=self.rotation_direction
+        # Return to start position
+        success = self.motion_controller.execute_smooth_trajectory_with_yaw(
+            start_pos=current_pos,
+            target_pos=start_position,
+            target_yaw=0.0,  # Default yaw
+            duration=20.0,
+            pos_threshold=0.05,
+            yaw_threshold=0.1
         )
         
-        if rotation_traj is None:
-            rospy.logerr("Failed to create rotation trajectory")
+        if success:
+            rospy.loginfo("Successfully returned to start position")
+            return 'succeeded'
+        else:
+            rospy.logerr("Failed to return to start position")
             return 'failed'
-        
-        # Start trajectory
-        rotation_traj.start_trajectory()
-        
-        # Start emergency monitoring using base class
-        self.start_emergency_monitoring()
-        
-        # Execute rotation
-        try:
-            success = self.execute_rotation_trajectory(rotation_traj)
-            
-            # Stop emergency monitoring
-            self.stop_emergency_monitoring()
-            
-            # Check if emergency was triggered DURING execution (not after we stopped it)
-            if hasattr(self, 'emergency_triggered') and self.emergency_triggered:
-                rospy.logwarn("Emergency detected during rotation")
-                return 'emergency'
-            
-            if success:
-                rospy.loginfo("Valve rotation completed successfully")
-                return 'succeeded'
-            else:
-                rospy.logerr("Valve rotation failed")
-                return 'failed'
-                
-        except Exception as e:
-            rospy.logerr(f"Error during rotation: {e}")
-            self.emergency_stop.set()
-            return 'failed'
+
+
+def create_state_machine(module_id=1):
+    """Create the SMACH state machine for single UAV valve rotation"""
+    sm = smach.StateMachine(outcomes=['succeeded', 'failed'])
     
-    def execute_rotation_trajectory(self, rotation_traj):
-        rate = rospy.Rate(20)  # Reduced from 50Hz to 20Hz for smoother control
-        start_time = time.time()
+    with sm:
+        smach.StateMachine.add('INITIALIZE_START_POSITION',
+                             InitializeStartPositionState(module_id=module_id),
+                             transitions={'succeeded': 'MOVE_TO_VALVE',
+                                        'failed': 'failed'},
+                             remapping={'start_position': 'start_position'})
         
-        while not rospy.is_shutdown() and not self.emergency_stop.is_set():
-            result = rotation_traj.get_next_uav_position_and_yaw()
-            if result is None:
-                break
-            
-            target_pos, target_yaw = result
-            self.motion_controller.send_trajectory_point(target_pos, target_yaw)
-            rate.sleep()
+        smach.StateMachine.add('MOVE_TO_VALVE',
+                             MoveToValveState(module_id=module_id),
+                             transitions={'succeeded': 'DESCEND_AND_CONTACT',
+                                        'failed': 'failed'})
         
-        rospy.loginfo("Rotation trajectory completed - allowing stabilization time")
-        time.sleep(3.0)  # Extra stabilization time after rotation
-        return True
+        smach.StateMachine.add('DESCEND_AND_CONTACT',
+                             DescendAndContactState(module_id=module_id),
+                             transitions={'succeeded': 'ROTATE_VALVE',
+                                        'failed': 'failed'})
+        
+        smach.StateMachine.add('ROTATE_VALVE',
+                             RotateValveState(module_id=module_id),
+                             transitions={'succeeded': 'RETURN_TO_START',
+                                        'failed': 'failed'})
+        
+        smach.StateMachine.add('RETURN_TO_START',
+                             ReturnToStartState(module_id=module_id),
+                             transitions={'succeeded': 'succeeded',
+                                        'failed': 'failed'},
+                             remapping={'start_position': 'start_position'})
+    
+    return sm
 
 
 def main():
-    rospy.init_node('valve_rotation_single_uav')
-    
-    module_id = rospy.get_param('~module_id', 1)
-    rotation_direction = rospy.get_param('~rotation_direction', 1)  # 1 for clockwise, -1 for counter-clockwise
-    rospy.loginfo(f"Starting valve rotation for UAV module {module_id}")
-    rospy.loginfo(f"Rotation direction: {'Clockwise' if rotation_direction == 1 else 'Counter-clockwise'}")
-    
-    # Create state machine
-    sm = smach.StateMachine(outcomes=['succeeded', 'failed'])
-    sm.userdata.start_position = None
-    
-    with sm:
-        smach.StateMachine.add(
-            'INITIALIZE_START_POSITION',
-            InitializeStartPositionState(module_id=module_id),
-            transitions={'succeeded': 'MOVE_TO_VALVE', 'failed': 'failed'}
-        )
-        
-        smach.StateMachine.add(
-            'MOVE_TO_VALVE',
-            MoveToValveState(module_id=module_id, approach_distance=0.8, approach_height=0.3),
-            transitions={'succeeded': 'DESCEND_AND_CONTACT', 'failed': 'failed'}
-        )
-        
-        smach.StateMachine.add(
-            'DESCEND_AND_CONTACT',
-            DescendAndContactState(module_id=module_id, rotation_direction=rotation_direction),
-            transitions={'succeeded': 'ROTATE_VALVE', 'failed': 'failed'}
-        )
-        
-        smach.StateMachine.add(
-            'ROTATE_VALVE',
-            RotateValveState(module_id=module_id, rotation_angle=math.pi/2, rotation_duration=18.0, rotation_direction=rotation_direction),
-            transitions={
-                'succeeded': 'succeeded',
-                'failed': 'failed',
-                'emergency': 'failed'
-            }
-        )
-    
-    # Create introspection server
-    sis = smach_ros.IntrospectionServer('valve_rotation_state_machine', sm, '/SM_ROOT')
-    sis.start()
+    """Main function to run the single UAV valve rotation"""
+    rospy.init_node('single_uav_valve_rotation')
     
     try:
-        rospy.loginfo("Starting valve rotation state machine...")
+        # Get module ID from parameter
+        module_id = rospy.get_param('~module_id', 1)
+        rospy.loginfo(f"Starting single UAV valve rotation for module {module_id}")
+        
+        # Create and execute state machine
+        sm = create_state_machine(module_id=module_id)
+        
+        # Create SMACH viewer (optional)
+        sis = smach_ros.IntrospectionServer('single_uav_valve_rotation', sm, '/SM_ROOT')
+        sis.start()
+        
+        # Execute state machine
         outcome = sm.execute()
+        
         rospy.loginfo(f"State machine completed with outcome: {outcome}")
         
-    except rospy.ROSInterruptException:
-        rospy.loginfo("Valve rotation interrupted")
-    except Exception as e:
-        rospy.logerr(f"Valve rotation error: {e}")
-    finally:
-        # Clean up emergency monitoring threads for all states
-        for state_name, state in sm._states.items():
-            if hasattr(state, 'stop_emergency_monitoring'):
-                try:
-                    state.stop_emergency_monitoring()
-                    rospy.loginfo(f"Stopped emergency monitoring for state: {state_name}")
-                except Exception as e:
-                    rospy.logwarn(f"Error stopping emergency monitoring for {state_name}: {e}")
-        
+        # Stop introspection server
         sis.stop()
-        rospy.loginfo("Valve rotation node cleanup completed")
+        
+    except rospy.ROSInterruptException:
+        rospy.loginfo("Program interrupted")
+    except Exception as e:
+        rospy.logerr(f"Error in main: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == '__main__':

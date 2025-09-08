@@ -525,8 +525,7 @@ class FormationUAVStateBase(AssemblyMotionStateBase):
             WrenchStamped, 
             self.wrench_callback, 
             queue_size=1
-        )
-        
+        )        
         # Control parameters (from single UAV version - INCREASED descent speed)
         self.position_threshold = 0.03
         self.yaw_threshold = 0.05

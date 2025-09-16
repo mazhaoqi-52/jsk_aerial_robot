@@ -22,41 +22,77 @@ class PolynomialTrajectory:
         self.is_scalar = False  
 
     def compute_coefficients(self, start, target):
+        # Handle near-zero movement case
         if abs(target - start) < 1e-6:
             return np.array([0, 0, 0, 0, 0, start])
+            
         T = self.duration
         if T <= 0:
             raise ValueError("Duration must be positive.")
+        
+        # 使用数值稳定的归一化时间 t/T ∈ [0,1]
+        # 这避免了大T值造成的数值问题
         A = np.array([
-            [0,       0,      0,    0,  0, 1],
-            [T**5,     T**4,   T**3,  T**2, T, 1],
-            [0,         0,      0,    0,  1, 0],
-            [5*T**4,   4*T**3, 3*T**2, 2*T, 1, 0],
-            [0,         0,      0,    2,   0, 0],
-            [20*T**3, 12*T**2, 6*T,    2,   0, 0]
+            [0,    0,    0,    0,  0, 1],    # t=0: position = start
+            [1,    1,    1,    1,  1, 1],    # t=1: position = target  
+            [0,    0,    0,    0,  1, 0],    # t=0: velocity = 0
+            [5,    4,    3,    2,  1, 0],    # t=1: velocity = 0
+            [0,    0,    0,    2,  0, 0],    # t=0: acceleration = 0  
+            [20,  12,    6,    2,  0, 0]     # t=1: acceleration = 0
         ])
         B = np.array([start, target, 0, 0, 0, 0])
-        return np.linalg.solve(A, B)
+        
+        # 求解多项式系数
+        coeffs = np.linalg.solve(A, B)
+        
+        # 检查数值稳定性 - 验证边界条件
+        start_check = coeffs[5]  # t=0时的位置
+        target_check = np.sum(coeffs)  # t=1时的位置
+        
+        start_error = abs(start_check - start)
+        target_error = abs(target_check - target)
+        
+        if start_error > 1e-10 or target_error > 1e-10:
+            rospy.logwarn(f"⚠ Polynomial coefficient numerical instability detected:")
+            rospy.logwarn(f"  Start error: {start_error*1000:.6f}mm")
+            rospy.logwarn(f"  Target error: {target_error*1000:.6f}mm")
+            rospy.logwarn(f"  Duration: {T:.3f}s, Movement: {abs(target-start)*1000:.3f}mm")
+        
+        return coeffs
     
     def generate_trajectory(self, start_pos, target_pos):
+        """生成多项式轨迹并存储目标位置用于边界验证"""
         if isinstance(start_pos, (int, float)) and isinstance(target_pos, (int, float)):
             self.is_scalar = True
             self.coeffs_scalar = self.compute_coefficients(start_pos, target_pos)
+            self.start_value = start_pos
+            self.target_value = target_pos
         else:
             self.is_scalar = False
             self.coeffs_x = self.compute_coefficients(start_pos[0], target_pos[0])
             self.coeffs_y = self.compute_coefficients(start_pos[1], target_pos[1])
             self.coeffs_z = self.compute_coefficients(start_pos[2], target_pos[2])
+            self.start_pos = start_pos
+            self.target_pos = target_pos
         self.start_time = rospy.Time.now().to_sec()
 
     def evaluate(self):
         if self.start_time is None:
             return None
         elapsed_time = rospy.Time.now().to_sec() - self.start_time
-        if elapsed_time > self.duration:
-            return None 
-        T = np.array([elapsed_time**5, elapsed_time**4, elapsed_time**3, 
-                      elapsed_time**2, elapsed_time, 1])
+        
+        # CRITICAL FIX: Return target position when trajectory completes instead of None
+        if elapsed_time >= self.duration:
+            if self.is_scalar:
+                return self.target_value
+            else:
+                return self.target_pos
+        
+        # CRITICAL FIX: Use normalized time t/T ∈ [0,1] as designed in compute_coefficients
+        normalized_time = elapsed_time / self.duration
+        T = np.array([normalized_time**5, normalized_time**4, normalized_time**3, 
+                      normalized_time**2, normalized_time, 1])
+        
         if self.is_scalar:
             return np.dot(self.coeffs_scalar, T)
         else:
@@ -75,12 +111,20 @@ class PolynomialTrajectory:
         if self.start_time is None:
             return None
         elapsed_time = rospy.Time.now().to_sec() - self.start_time
-        if elapsed_time > self.duration:
-            return None
         
-        # Velocity coefficients (derivative of position)
-        T_vel = np.array([5*elapsed_time**4, 4*elapsed_time**3, 3*elapsed_time**2, 
-                         2*elapsed_time, 1, 0])
+        # CRITICAL FIX: Return zero velocity when trajectory completes instead of None
+        if elapsed_time >= self.duration:
+            if self.is_scalar:
+                return 0.0
+            else:
+                return (0.0, 0.0, 0.0)
+        
+        # CRITICAL FIX: Use normalized time and correct derivative scaling
+        normalized_time = elapsed_time / self.duration
+        # Velocity = d/dt[p(t)] = d/dt[p(τ)] * dτ/dt = (1/T) * dp/dτ
+        # where τ = t/T is normalized time
+        T_vel = np.array([5*normalized_time**4, 4*normalized_time**3, 3*normalized_time**2, 
+                         2*normalized_time, 1, 0]) / self.duration
         
         if self.is_scalar:
             return np.dot(self.coeffs_scalar, T_vel)
@@ -90,6 +134,42 @@ class PolynomialTrajectory:
                 np.dot(self.coeffs_y, T_vel),
                 np.dot(self.coeffs_z, T_vel)
             )
+
+    def evaluate_at_time(self, elapsed_time):
+        """计算轨迹开始后特定时间点的轨迹值，包含边界验证
+        
+        Args:
+            elapsed_time: 轨迹开始后经过的时间（秒）
+        """
+        # CRITICAL FIX: 使用相对时间而不是绝对时间
+        # elapsed_time 是轨迹开始后的相对时间，不需要减去 start_time
+        normalized_time = elapsed_time / self.duration
+        
+        # 边界检查和处理
+        if normalized_time <= 0:
+            if self.is_scalar:
+                return self.start_value
+            else:
+                return self.start_pos
+        elif normalized_time >= 1:
+            if self.is_scalar:
+                return self.target_value
+            else:
+                return self.target_pos
+        
+        # 计算多项式值
+        if self.is_scalar:
+            return self._evaluate_polynomial(self.coeffs_scalar, normalized_time)
+        else:
+            x_val = self._evaluate_polynomial(self.coeffs_x, normalized_time)
+            y_val = self._evaluate_polynomial(self.coeffs_y, normalized_time)
+            z_val = self._evaluate_polynomial(self.coeffs_z, normalized_time)
+            return [x_val, y_val, z_val]
+    
+    def _evaluate_polynomial(self, coeffs, t):
+        """使用归一化时间计算5阶多项式值"""
+        return (coeffs[0] + coeffs[1]*t + coeffs[2]*t**2 + 
+                coeffs[3]*t**3 + coeffs[4]*t**4 + coeffs[5]*t**5)
 
 class ValveRotationTrajectory:
     """
@@ -287,7 +367,7 @@ class AlignToGraspTrajectory:
     def __init__(self, approach_duration, valve_center, valve_pose_yaw, grasp_height, 
                  valve_radius=0.1225, valve_beam_width=0.0185, 
                  end_effector_offset_x=0.246, end_effector_offset_y=0.0, end_effector_offset_z=0.0743823,
-                 claw_separation=0.16876, rotation_direction=1, insertion_offset=0.015):
+                 claw_separation=0.150, rotation_direction=1, insertion_offset=0.015):
         # Minimal implementation for backward compatibility
         self.approach_duration = approach_duration
         self.valve_center = valve_center
@@ -372,3 +452,159 @@ class ConstantDistanceValveRotationTrajectory(ValveRotationTrajectory):
             end_effector_offset_z=end_effector_offset_z
         )
         rospy.logwarn("ConstantDistanceValveRotationTrajectory is deprecated - use ValveRotationTrajectory instead")
+
+class AdaptiveTrajectoryPlanner:
+    """
+    自适应轨迹重规划器 - 负责轨迹生成和重规划的数学逻辑
+    职责：纯轨迹计算，不涉及控制执行
+    """
+    
+    def __init__(self):
+        self.precision_thresholds = {
+            'position': 0.020,  # 20mm
+            'yaw': 0.02         # 1.1°
+        }
+        
+    def create_trajectory(self, start_pos, target_pos, duration):
+        """创建基础轨迹"""
+        trajectory = PolynomialTrajectory(duration)
+        trajectory.generate_trajectory(start_pos, target_pos)
+        return trajectory
+    
+    def calculate_deviation(self, planned_pos, actual_pos, planned_yaw=None, actual_yaw=None):
+        """计算位置和角度偏差"""
+        if isinstance(planned_pos, (list, tuple)) and len(planned_pos) >= 3:
+            pos_deviation = math.sqrt(
+                (actual_pos[0] - planned_pos[0])**2 + 
+                (actual_pos[1] - planned_pos[1])**2 + 
+                (actual_pos[2] - planned_pos[2])**2
+            )
+        else:
+            pos_deviation = abs(actual_pos - planned_pos)
+        
+        yaw_deviation = 0
+        if planned_yaw is not None and actual_yaw is not None:
+            yaw_deviation = abs(self._normalize_angle(actual_yaw - planned_yaw))
+        
+        return pos_deviation, yaw_deviation
+    
+    def needs_replanning(self, pos_deviation, yaw_deviation, stage_name=""):
+        """判断是否需要重规划"""
+        pos_threshold = self.precision_thresholds['position']
+        yaw_threshold = self.precision_thresholds['yaw']
+        
+        needs_replan = (pos_deviation > pos_threshold or yaw_deviation > yaw_threshold)
+        
+        if needs_replan:
+            rospy.logwarn(f"{stage_name} deviation detected - Position: {pos_deviation*1000:.1f}mm (>{pos_threshold*1000:.0f}mm), Yaw: {math.degrees(yaw_deviation):.2f}° (>{math.degrees(yaw_threshold):.1f}°)")
+        else:
+            rospy.loginfo(f"{stage_name} deviation acceptable - Position: {pos_deviation*1000:.1f}mm, Yaw: {math.degrees(yaw_deviation):.2f}°")
+        
+        return needs_replan
+    
+    def replan_from_current(self, current_pos, current_yaw, original_target_pos, original_target_yaw, duration):
+        """从当前位置重新规划到目标位置"""
+        rospy.loginfo("=== ADAPTIVE TRAJECTORY REPLANNING ===")
+        rospy.loginfo(f"Replanning from actual position: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}) at {math.degrees(current_yaw):.1f}°")
+        rospy.loginfo(f"To target: ({original_target_pos[0]:.3f}, {original_target_pos[1]:.3f}, {original_target_pos[2]:.3f}) at {math.degrees(original_target_yaw):.1f}°")
+        
+        # 重新计算距离和持续时间
+        distance = math.sqrt(
+            (original_target_pos[0] - current_pos[0])**2 + 
+            (original_target_pos[1] - current_pos[1])**2 + 
+            (original_target_pos[2] - current_pos[2])**2
+        )
+        
+        # 自适应调整持续时间
+        adjusted_duration = max(duration * 0.3, distance / 0.1)  # 最小30%原时间，或以0.1m/s速度
+        
+        rospy.loginfo(f"Replanned trajectory: {distance:.3f}m in {adjusted_duration:.1f}s")
+        
+        # 创建新轨迹
+        new_trajectory = self.create_trajectory(current_pos, original_target_pos, adjusted_duration)
+        
+        return new_trajectory, adjusted_duration
+    
+    def replan_intermediate_target(self, current_pos, original_target, valve_center, intermediate_distance):
+        """重新计算中间目标位置（用于多阶段插入）"""
+        # 重新计算中间位置基于实际当前位置
+        direction_to_valve = math.atan2(
+            valve_center[1] - current_pos[1], 
+            valve_center[0] - current_pos[0]
+        )
+        
+        intermediate_x = valve_center[0] - intermediate_distance * math.cos(direction_to_valve)
+        intermediate_y = valve_center[1] - intermediate_distance * math.sin(direction_to_valve)
+        intermediate_z = original_target[2]  # 保持原始高度
+        
+        new_intermediate = (intermediate_x, intermediate_y, intermediate_z)
+        
+        rospy.loginfo(f"Recalculated intermediate target from actual position:")
+        rospy.loginfo(f"  Original intermediate: {original_target}")
+        rospy.loginfo(f"  New intermediate: {new_intermediate}")
+        
+        return new_intermediate
+    
+    def set_precision_thresholds(self, position_threshold, yaw_threshold):
+        """设置精度阈值"""
+        self.precision_thresholds['position'] = position_threshold
+        self.precision_thresholds['yaw'] = yaw_threshold
+        rospy.loginfo(f"Updated precision thresholds: Position {position_threshold*1000:.0f}mm, Yaw {math.degrees(yaw_threshold):.1f}°")
+    
+    def _normalize_angle(self, angle):
+        """标准化角度到[-π, π]"""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+    
+    def create_z_only_trajectory(self, start_pos, target_z, duration):
+        """创建仅Z轴变化的轨迹，XY保持锁定"""
+        target_pos = (start_pos[0], start_pos[1], target_z)
+        trajectory = PolynomialTrajectory(duration)
+        trajectory.generate_trajectory(start_pos, target_pos)
+        return trajectory
+    
+    def calculate_optimal_z_segments(self, total_z_distance, max_segment_distance=0.18):
+        """
+        计算Z轴下降的最优分段策略
+        
+        Args:
+            total_z_distance: 总Z下降距离
+            max_segment_distance: 最大段距离（默认180mm）
+            
+        Returns:
+            list: 每段的距离列表
+        """
+        if total_z_distance <= max_segment_distance:
+            return [total_z_distance]
+        
+        # 计算分段数量和每段距离
+        num_segments = math.ceil(total_z_distance / max_segment_distance)
+        segment_distance = total_z_distance / num_segments
+        
+        segments = [segment_distance] * num_segments
+        
+        rospy.loginfo(f"Z descent segmentation: {total_z_distance*1000:.0f}mm → {num_segments} segments of {segment_distance*1000:.0f}mm each")
+        
+        return segments
+    
+    def calculate_z_descent_speed(self, z_distance, min_speed=0.06, max_speed=0.10):
+        """
+        根据Z下降距离计算最优速度，减少控制震荡
+        
+        Args:
+            z_distance: Z下降距离
+            min_speed: 最小速度（用于大幅下降）
+            max_speed: 最大速度（用于小幅下降）
+            
+        Returns:
+            float: 最优下降速度
+        """
+        if z_distance < 0.10:  # 小于100mm
+            return max_speed  # 0.10m/s
+        elif z_distance < 0.20:  # 100-200mm
+            return 0.08  # 0.08m/s
+        else:  # 大于200mm
+            return min_speed  # 0.06m/s

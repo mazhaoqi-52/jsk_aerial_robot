@@ -161,7 +161,7 @@ class UnifiedMotionController:
         return False
     
     def execute_progressive_precision_trajectory(self, start_pos, target_pos, target_yaw, 
-                                                final_pos_threshold=0.015, final_yaw_threshold=0.02):
+                                                final_pos_threshold=0.025, final_yaw_threshold=0.03):
         """
         Execute trajectory with progressive precision control to avoid oscillation
         
@@ -309,9 +309,14 @@ class UnifiedMotionController:
         rospy.loginfo(f"Yaw change: {math.degrees(yaw_diff):.1f}°")
         
         # ENHANCED: PID控制器参数 (针对XY漂移优化)
-        pid_kp = 2.0    # 比例增益 - 增强响应
-        pid_ki = 0.1    # 积分增益 - 消除稳态误差  
-        pid_kd = 0.5    # 微分增益 - 减少超调
+        pid_kp = 2.0    # 比例增益 - 保持原有XY响应
+        pid_ki = 0.1    # 积分增益 - 保持原有XY稳态误差控制  
+        pid_kd = 0.5    # 微分增益 - 保持原有XY超调控制
+        
+        # BALANCED: Z轴专用PID参数 (平衡响应性和稳定性)
+        z_pid_kp = 2.2    # Z轴比例增益 - 适度提高响应性(1.5→2.2)
+        z_pid_ki = 0.08   # Z轴积分增益 - 略微增加收敛能力(0.05→0.08)
+        z_pid_kd = 0.4    # Z轴微分增益 - 轻微增加阻尼(0.3→0.4)
         
         # PID状态变量
         integral_error = [0.0, 0.0, 0.0]  # x, y, z积分误差
@@ -363,14 +368,21 @@ class UnifiedMotionController:
                     (error[i] - last_error[i]) / dt for i in range(3)
                 ]
                 
-                # PID控制输出
+                # PID控制输出 - 方案A：Z轴使用专用参数
                 pid_correction = []
                 for i in range(3):
-                    correction = (pid_kp * error[i] + 
-                                pid_ki * integral_error[i] + 
-                                pid_kd * derivative_error[i])
-                    # 限制最大修正量
-                    correction = max(-0.05, min(0.05, correction))  # ±5cm限制
+                    if i == 2:  # Z轴使用增强参数
+                        correction = (z_pid_kp * error[i] + 
+                                    z_pid_ki * integral_error[i] + 
+                                    z_pid_kd * derivative_error[i])
+                        # Z轴允许更大修正量以解决32-45mm误差
+                        correction = max(-0.08, min(0.08, correction))  # ±8cm限制
+                    else:  # XY轴使用标准参数
+                        correction = (pid_kp * error[i] + 
+                                    pid_ki * integral_error[i] + 
+                                    pid_kd * derivative_error[i])
+                        # XY轴保持原有限制
+                        correction = max(-0.05, min(0.05, correction))  # ±5cm限制
                     pid_correction.append(correction)
                 
                 # 应用PID修正到轨迹点
@@ -2416,9 +2428,9 @@ class UnifiedMotionController:
         
         # 计算Z轴下降距离
         z_distance = abs(target_pos[2] - start_pos[2])
-        # 进一步减慢Z下降速度，提高控制稳定性
-        z_speed = 0.03  # 从0.05m/s进一步减慢到0.03m/s，优先稳定性
-        adaptive_duration = max(4.0, z_distance / z_speed)  # 增加最小时间，确保充分稳定
+        # 大幅减慢Z下降速度，解决跟踪误差问题
+        z_speed = 0.02  # 从0.03m/s进一步减慢到0.02m/s，优先响应跟踪
+        adaptive_duration = max(5.0, z_distance / z_speed)  # 增加最小时间到5秒
         
         rospy.loginfo(f"{segment_name} OPTIMIZED parameters:")
         rospy.loginfo(f"  Z descent: {z_distance*1000:.0f}mm at {z_speed:.3f}m/s (SLOWER for precision)")
@@ -2719,13 +2731,13 @@ class UnifiedMotionController:
                 # 动态调整Z轴速度限制，根据实际跟踪情况
                 z_command_rate = abs(current_traj_point[2] - last_z_command) / (1.0/20.0)  # m/s (20Hz)
                 
-                # 根据跟踪误差动态调整速度限制
-                if z_tracking_error > 0.04:  # 40mm以上误差时更保守
-                    speed_limit_factor = 1.0  # 更严格限制
+                # 方案A：增强Z轴PID控制 - 根据跟踪误差动态调整速度限制
+                if z_tracking_error > 0.04:  # 40mm以上误差时允许更快响应（改进）
+                    speed_limit_factor = 1.2  # 从1.0增加到1.2，提高响应速度
                 elif z_tracking_error > 0.02:  # 20-40mm误差时适中
-                    speed_limit_factor = 1.1
+                    speed_limit_factor = 1.4  # 从1.1增加到1.4，加快收敛
                 else:  # 跟踪良好时允许更快
-                    speed_limit_factor = 1.3
+                    speed_limit_factor = 1.6  # 从1.3增加到1.6，保持高精度时的响应
                 
                 max_allowed_rate = speed * speed_limit_factor
                 

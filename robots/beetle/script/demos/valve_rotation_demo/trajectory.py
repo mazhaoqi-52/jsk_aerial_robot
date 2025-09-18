@@ -90,6 +90,9 @@ class PolynomialTrajectory:
         
         # CRITICAL FIX: Use normalized time t/T ∈ [0,1] as designed in compute_coefficients
         normalized_time = elapsed_time / self.duration
+        # CRITICAL FIX: Correct polynomial evaluation order to match coefficient matrix
+        # coeffs order: [a5, a4, a3, a2, a1, a0] (highest to lowest degree)
+        # T powers: [t^5, t^4, t^3, t^2, t^1, 1] (highest to lowest degree)
         T = np.array([normalized_time**5, normalized_time**4, normalized_time**3, 
                       normalized_time**2, normalized_time, 1])
         
@@ -123,6 +126,9 @@ class PolynomialTrajectory:
         normalized_time = elapsed_time / self.duration
         # Velocity = d/dt[p(t)] = d/dt[p(τ)] * dτ/dt = (1/T) * dp/dτ
         # where τ = t/T is normalized time
+        # CRITICAL FIX: Correct velocity coefficient order to match polynomial coefficients
+        # coeffs order: [a5, a4, a3, a2, a1, a0]
+        # velocity coeffs: [5*a5, 4*a4, 3*a3, 2*a2, 1*a1, 0*a0] / duration
         T_vel = np.array([5*normalized_time**4, 4*normalized_time**3, 3*normalized_time**2, 
                          2*normalized_time, 1, 0]) / self.duration
         
@@ -167,9 +173,13 @@ class PolynomialTrajectory:
             return [x_val, y_val, z_val]
     
     def _evaluate_polynomial(self, coeffs, t):
-        """使用归一化时间计算5阶多项式值"""
-        return (coeffs[0] + coeffs[1]*t + coeffs[2]*t**2 + 
-                coeffs[3]*t**3 + coeffs[4]*t**4 + coeffs[5]*t**5)
+        """使用归一化时间计算5阶多项式值
+        
+        coeffs order: [a5, a4, a3, a2, a1, a0] (from compute_coefficients matrix)
+        polynomial: a5*t^5 + a4*t^4 + a3*t^3 + a2*t^2 + a1*t + a0
+        """
+        return (coeffs[5] + coeffs[4]*t + coeffs[3]*t**2 + 
+                coeffs[2]*t**3 + coeffs[1]*t**4 + coeffs[0]*t**5)
 
 class ValveRotationTrajectory:
     """
@@ -608,3 +618,267 @@ class AdaptiveTrajectoryPlanner:
             return 0.08  # 0.08m/s
         else:  # 大于200mm
             return min_speed  # 0.06m/s
+
+
+class SelfRotationRevolutionTrajectory:
+    """
+    自转+公转阀门旋转轨迹生成器
+    
+    实现真正的"自转+公转"运动模式：
+    - 公转：UAV绕阀门中心做圆周运动
+    - 自转：UAV自身yaw角同步旋转
+    
+    这种运动模式可以保持爪子与阀门槽的接触角度恒定，避免脱出
+    """
+    
+    def __init__(self, valve_center, radius, rotation_angle, duration, 
+                 start_pos, start_yaw, clockwise=True):
+        """
+        初始化自转+公转轨迹
+        
+        Args:
+            valve_center: 阀门中心坐标 (x, y, z)
+            radius: 旋转半径（UAV到阀门中心的距离）
+            rotation_angle: 旋转角度（弧度）
+            duration: 运动持续时间（秒）
+            start_pos: 起始位置 (x, y, z)
+            start_yaw: 起始yaw角度（弧度）
+            clockwise: 是否顺时针旋转
+        """
+        self.valve_center = valve_center
+        self.radius = radius
+        self.rotation_angle = rotation_angle if not clockwise else -rotation_angle
+        self.duration = duration
+        self.start_pos = start_pos
+        self.start_yaw = start_yaw
+        self.clockwise = clockwise
+        
+        # 计算起始角度
+        dx = start_pos[0] - valve_center[0]
+        dy = start_pos[1] - valve_center[1]
+        self.start_angle = math.atan2(dy, dx)
+        
+        # 计算初始yaw参考角度（面向阀门中心的角度）
+        self.initial_center_facing_yaw = math.atan2(
+            valve_center[1] - start_pos[1],
+            valve_center[0] - start_pos[0]
+        )
+        
+        rospy.loginfo("=== SELF-ROTATION + REVOLUTION TRAJECTORY ===")
+        rospy.loginfo(f"Valve center: ({valve_center[0]:.3f}, {valve_center[1]:.3f}, {valve_center[2]:.3f})")
+        rospy.loginfo(f"Rotation radius: {radius*1000:.1f}mm")
+        rospy.loginfo(f"Rotation angle: {math.degrees(abs(rotation_angle)):.1f}°")
+        rospy.loginfo(f"Direction: {'Clockwise' if clockwise else 'Counter-clockwise'}")
+        rospy.loginfo(f"Duration: {duration:.1f}s")
+        rospy.loginfo(f"Start angle: {math.degrees(self.start_angle):.1f}°")
+        rospy.loginfo(f"Start yaw: {math.degrees(start_yaw):.1f}°")
+    
+    def get_position_and_yaw_at_progress(self, progress):
+        """
+        根据进度计算位置和yaw角度
+        
+        Args:
+            progress: 运动进度 [0.0, 1.0]
+            
+        Returns:
+            tuple: ((x, y, z), yaw)
+        """
+        if progress < 0.0:
+            progress = 0.0
+        elif progress > 1.0:
+            progress = 1.0
+        
+        # === 公转：计算圆周运动位置 ===
+        current_angle = self.start_angle + progress * self.rotation_angle
+        target_x = self.valve_center[0] + self.radius * math.cos(current_angle)
+        target_y = self.valve_center[1] + self.radius * math.sin(current_angle)
+        target_z = self.start_pos[2]  # 保持Z高度不变
+        
+        # === 自转：UAV yaw角同步旋转 ===
+        # 方法：UAV的yaw随着圆周运动同步旋转，保持相对接触角度
+        target_yaw = self.start_yaw + progress * self.rotation_angle
+        
+        return ((target_x, target_y, target_z), target_yaw)
+    
+    def get_velocity_at_progress(self, progress):
+        """
+        计算指定进度下的线速度和角速度
+        
+        Args:
+            progress: 运动进度 [0.0, 1.0]
+            
+        Returns:
+            tuple: ((vx, vy, vz), yaw_velocity)
+        """
+        # 计算角速度
+        angular_velocity = abs(self.rotation_angle) / self.duration
+        
+        # 计算当前角度
+        current_angle = self.start_angle + progress * self.rotation_angle
+        
+        # 计算切向角度（垂直于半径方向）
+        tangential_angle = current_angle + math.pi/2
+        if self.rotation_angle < 0:  # 顺时针旋转，反向切向角度
+            tangential_angle += math.pi
+        
+        # 计算切向速度
+        tangential_speed = self.radius * angular_velocity
+        vx = tangential_speed * math.cos(tangential_angle)
+        vy = tangential_speed * math.sin(tangential_angle)
+        vz = 0.0  # Z方向速度为0
+        
+        # 计算yaw角速度
+        yaw_direction = 1.0 if self.rotation_angle < 0 else -1.0  # 顺时针vs逆时针
+        yaw_velocity = angular_velocity * yaw_direction
+        
+        return ((vx, vy, vz), yaw_velocity)
+    
+    def apply_velocity_smoothing(self, progress, velocity, yaw_velocity):
+        """
+        应用速度平滑（加速和减速）
+        
+        Args:
+            progress: 运动进度 [0.0, 1.0]
+            velocity: 原始速度 (vx, vy, vz)
+            yaw_velocity: 原始yaw角速度
+            
+        Returns:
+            tuple: (平滑后的速度, 平滑后的yaw速度)
+        """
+        smooth_factor = 1.0
+        
+        # 前10%：平滑加速
+        if progress < 0.1:
+            smooth_factor = progress / 0.1
+        # 后10%：平滑减速
+        elif progress > 0.9:
+            smooth_factor = (1.0 - progress) / 0.1
+        
+        # 应用平滑因子
+        smoothed_velocity = (
+            velocity[0] * smooth_factor,
+            velocity[1] * smooth_factor,
+            velocity[2] * smooth_factor
+        )
+        smoothed_yaw_velocity = yaw_velocity * smooth_factor
+        
+        return (smoothed_velocity, smoothed_yaw_velocity)
+    
+    def validate_trajectory(self, progress_points=10):
+        """
+        验证轨迹的有效性
+        
+        Args:
+            progress_points: 验证点数量
+            
+        Returns:
+            tuple: (is_valid, error_messages)
+        """
+        errors = []
+        
+        # 检查基本参数
+        if self.duration <= 0:
+            errors.append("Duration must be positive")
+        
+        if self.radius <= 0:
+            errors.append("Radius must be positive")
+        
+        if abs(self.rotation_angle) < math.radians(1):
+            errors.append("Rotation angle too small (< 1°)")
+        
+        # 检查轨迹点
+        for i in range(progress_points + 1):
+            progress = i / progress_points
+            position, yaw = self.get_position_and_yaw_at_progress(progress)
+            
+            # 检查半径一致性
+            actual_radius = math.sqrt(
+                (position[0] - self.valve_center[0])**2 + 
+                (position[1] - self.valve_center[1])**2
+            )
+            radius_error = abs(actual_radius - self.radius)
+            
+            if radius_error > 0.001:  # 1mm tolerance
+                errors.append(f"Radius inconsistency at progress {progress:.1f}: "
+                             f"expected {self.radius:.3f}, got {actual_radius:.3f}")
+        
+        is_valid = len(errors) == 0
+        return (is_valid, errors)
+    
+    def get_trajectory_info(self):
+        """
+        获取轨迹信息摘要
+        
+        Returns:
+            dict: 轨迹信息
+        """
+        return {
+            'type': 'self_rotation_revolution',
+            'valve_center': self.valve_center,
+            'radius': self.radius,
+            'rotation_angle_deg': math.degrees(abs(self.rotation_angle)),
+            'duration': self.duration,
+            'clockwise': self.clockwise,
+            'angular_velocity_deg_per_sec': math.degrees(abs(self.rotation_angle) / self.duration),
+            'tangential_speed_m_per_sec': self.radius * abs(self.rotation_angle) / self.duration
+        }
+
+
+class ValveRotationTrajectoryManager:
+    """
+    阀门旋转轨迹管理器
+    
+    提供统一的接口来创建和管理不同类型的阀门旋转轨迹
+    """
+    
+    @staticmethod
+    def create_self_rotation_revolution_trajectory(valve_center, radius, rotation_angle_deg, 
+                                                  duration, start_pos, start_yaw, clockwise=True):
+        """
+        创建自转+公转轨迹
+        
+        Args:
+            valve_center: 阀门中心坐标
+            radius: 旋转半径
+            rotation_angle_deg: 旋转角度（度）
+            duration: 持续时间
+            start_pos: 起始位置
+            start_yaw: 起始yaw角度
+            clockwise: 是否顺时针
+            
+        Returns:
+            SelfRotationRevolutionTrajectory: 轨迹对象
+        """
+        rotation_angle_rad = math.radians(rotation_angle_deg)
+        return SelfRotationRevolutionTrajectory(
+            valve_center=valve_center,
+            radius=radius,
+            rotation_angle=rotation_angle_rad,
+            duration=duration,
+            start_pos=start_pos,
+            start_yaw=start_yaw,
+            clockwise=clockwise
+        )
+    
+    @staticmethod
+    def create_legacy_trajectory(valve_center, radius, rotation_angle_deg, duration, start_angle):
+        """
+        创建传统轨迹（仅公转，始终面向中心）
+        
+        Args:
+            valve_center: 阀门中心坐标
+            radius: 旋转半径
+            rotation_angle_deg: 旋转角度（度）
+            duration: 持续时间
+            start_angle: 起始角度
+            
+        Returns:
+            ConstantDistanceValveRotationTrajectory: 轨迹对象
+        """
+        return ConstantDistanceValveRotationTrajectory(
+            valve_center=valve_center,
+            end_effector_distance=radius,
+            rotation_angle=math.radians(rotation_angle_deg),
+            rotation_duration=duration,
+            start_angle=start_angle
+        )

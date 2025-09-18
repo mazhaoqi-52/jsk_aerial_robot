@@ -225,5 +225,13 @@ class AssemblyMotionStateBase(smach.State):
                    self.current_pos.pose.position.y,
                    self.current_pos.pose.position.z)
         error = math.sqrt(sum((t - c) ** 2 for t, c in zip(target, current)))
-        rospy.loginfo("Position error: {:.2f} m".format(error))
-        return error < tolerance
+        
+        # 方案A：根据阶段调整容差（插入阶段需要更高精度）
+        if hasattr(self, '_insertion_phase') and self._insertion_phase:
+            # 插入阶段使用更严格的容差
+            adjusted_tolerance = min(tolerance, 0.15)  # 最大15cm容差
+            rospy.loginfo("Position error: {:.2f} m (insertion phase, tolerance: {:.2f} m)".format(error, adjusted_tolerance))
+            return error < adjusted_tolerance
+        else:
+            rospy.loginfo("Position error: {:.2f} m (normal phase, tolerance: {:.2f} m)".format(error, tolerance))
+            return error < tolerance

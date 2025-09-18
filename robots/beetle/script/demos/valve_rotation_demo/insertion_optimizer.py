@@ -68,20 +68,26 @@ class InsertionOptimizer:
         self.claw_separation = 0.150  # Distance between left and right claws (updated from 168.8mm to 150mm)
         self.half_claw_separation = self.claw_separation / 2  # Distance from center to each claw
         self.end_effector_offset_z = 0.0221140  # Z offset of dual-fang center from UAV
-        self.insertion_safety_margin_z = 0.030  # 减少从35mm到30mm (建议3)
+        
+        # Spoke locking mechanism for insertion session consistency
+        self.locked_spoke_index = None       # Locked spoke index during insertion session
+        self.locked_spoke_angle = None       # Locked spoke angle during insertion session
+        self.insertion_session_active = False # Whether an insertion session is active
+        self.session_start_time = None       # Session start timestamp for timeout handling
+        self.insertion_safety_margin_z = 0.0673 + 0.0221140  # UAV CoG比阀门中心高67.3mm，加上end-effector偏移
         
         # CRITICAL SAFETY CONSTRAINTS: Prevent UAV-valve collision during insertion
         # GEOMETRIC ANALYSIS FOR VALVE INTERIOR INSERTION:
         # For claws to reach valve interior (inner radius = 100mm):
         # √(end_effector_distance² + half_claw_separation²) ≤ valve_inner_radius
         # √(end_effector_distance² + 75²) ≤ 100
-        # For exact edge insertion: end_effector_distance = √(100² - 75²) = √3125 ≈ 55.9mm
-        # Theoretical minimum: 55.9mm, practical with margin: 55mm
+        # CORRECTED: Hub constraint = 37.5mm + 5.5mm safety margin = 43mm minimum
+        # Theoretical minimum: 55.9mm, practical: use hub constraint 43mm for better insertion
         # Previous 75mm resulted in claws at √(75² + 75²) = 106.1mm (outside valve interior)
         
-        self.min_end_effector_to_valve_center_distance = 0.055  # Updated from 75mm to 55mm for valve interior insertion
+        self.min_end_effector_to_valve_center_distance = 0.043  # Corrected: Hub constraint 37.5mm + 5.5mm = 43mm
         self.min_uav_to_valve_outer_rim_distance = 0.175      # UAV COG ≥ 0.175m from valve outer rim (maintained)
-        self.min_uav_to_valve_center_distance = 0.265        # 减少从280mm到265mm (建议1)
+        self.min_uav_to_valve_center_distance = 0.245        # 方案A: 渐进式减少从265mm到245mm (减少20mm)
         
         # Default rotation direction (for compatibility)
         self.rotation_direction = 1  # 1 for clockwise, -1 for counter-clockwise
@@ -97,10 +103,11 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Hub width: {self.spoke_hub_width:.4f}m (35mm)")
         rospy.loginfo(f"  Rim width: {self.spoke_rim_width:.4f}m (60mm)")
         rospy.loginfo(f"  Minimum gap: {self.min_spoke_gap:.4f}m (35mm)")
-        rospy.loginfo(f"Insertion Strategy (SPOKE-ALIGNED SYMMETRIC):")
+        rospy.loginfo(f"Insertion Strategy (BEAM-END POSITIONING):")
         rospy.loginfo(f"  UAV aligns with valve spoke (yaw角度对齐)")
-        rospy.loginfo(f"  Claws distributed symmetrically on both sides of spoke (均匀分布在辐条两侧)")
-        rospy.loginfo(f"  Strategy: Spoke alignment + symmetric claw positioning for collision avoidance")
+        rospy.loginfo(f"  Claws positioned at beam ends rather than within sector spaces (beam两端插入)")
+        rospy.loginfo(f"  Strategy: Beam-end attachment + symmetric positioning for collision avoidance")
+        rospy.loginfo(f"  Advantage: Optimized 45mm radius for reduced claw collision risk")
         rospy.loginfo(f"Dual-fang Physical Parameters:")
         rospy.loginfo(f"  Center offset: {self.dual_fang_center_offset:.4f}m")
         rospy.loginfo(f"  Claw separation: {self.claw_separation:.4f}m (half-separation: {self.half_claw_separation:.3f}m)")
@@ -110,14 +117,14 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Half claw separation: {self.half_claw_separation:.3f}m (75mm)")
         rospy.loginfo(f"  For valve interior insertion: √(end_effector_distance² + 75²) ≤ 100mm")
         rospy.loginfo(f"  Theoretical edge insertion: √(100² - 75²) = {math.sqrt(100**2 - 75**2):.1f}mm")
-        rospy.loginfo(f"  Practical constraint with margin: 55mm")
-        rospy.loginfo(f"  Expected claw radius with 55mm: √(55² + 75²) = {math.sqrt(55**2 + 75**2):.1f}mm")
-        rospy.loginfo(f"UPDATED SAFETY CONSTRAINTS:")
-        rospy.loginfo(f"  End-effector to valve center: ≥{self.min_end_effector_to_valve_center_distance:.3f}m (Updated: 75→55mm for interior insertion)")
-        rospy.loginfo(f"  UAV to valve outer rim: ≥{self.min_uav_to_valve_outer_rim_distance:.3f}m (MAINTAINED)") 
-        rospy.loginfo(f"  UAV to valve center: ≥{self.min_uav_to_valve_center_distance:.3f}m (减少15mm: 280→265mm)")
-        rospy.loginfo(f"  Z-axis safety margin: {self.insertion_safety_margin_z:.3f}m (减少5mm: 35→30mm)")
-        rospy.loginfo(f"EXPECTED IMPROVEMENT: 爪子插入深度增加~15mm，更好的抓取效果")
+        rospy.loginfo(f"  Practical constraint with margin: 45mm (解决左爪阻挡问题)")
+        rospy.loginfo(f"  Expected claw radius with 45mm: √(45² + 75²) = {math.sqrt(45**2 + 75**2):.1f}mm")
+        rospy.loginfo(f"UPDATED SAFETY CONSTRAINTS (方案A - 渐进式优化):")
+        rospy.loginfo(f"  End-effector to valve center: ≥{self.min_end_effector_to_valve_center_distance:.3f}m (Hub constraint: 37.5mm + 5.5mm = 43mm)")
+        rospy.loginfo(f"  UAV to valve outer rim: ≥{self.min_uav_to_valve_outer_rim_distance:.3f}m (MAINTAINED)")
+        rospy.loginfo(f"  UAV to valve center: ≥{self.min_uav_to_valve_center_distance:.3f}m (方案A减少20mm: 265→245mm)")
+        rospy.loginfo(f"  Z-axis safety margin: {self.insertion_safety_margin_z:.3f}m (UAV CoG比阀门中心高67.3mm)")
+        rospy.loginfo(f"EXPECTED IMPROVEMENT: UAV CoG精确定位在比阀门中心高67.3mm处，完全插入配置")
     
     def calculate_insertion_uav_z(self, valve_z):
         """
@@ -137,13 +144,102 @@ class InsertionOptimizer:
         rospy.loginfo(f"=== OPTIMIZED Z-AXIS INSERTION CALCULATION ===")
         rospy.loginfo(f"Valve center Z: {valve_z:.6f}m")
         rospy.loginfo(f"End-effector offset: {self.end_effector_offset_z:.6f}m (22.1mm below UAV)")
-        rospy.loginfo(f"Safety margin: {self.insertion_safety_margin_z:.6f}m (30mm ABOVE valve - 减少5mm)")
+        rospy.loginfo(f"Safety margin: {self.insertion_safety_margin_z:.6f}m (UAV CoG比阀门中心高67.3mm)")
         rospy.loginfo(f"Required UAV Z: {uav_z:.6f}m")
         rospy.loginfo(f"Resulting end-effector Z: {end_effector_z:.6f}m")
-        rospy.loginfo(f"End-effector above valve center: +{(end_effector_z - valve_z)*1000:.1f}mm (IMPROVED CONTACT)")
-        rospy.loginfo(f"IMPROVEMENT: 更近的Z轴距离 = 更好的阀门接触效果")
+        rospy.loginfo(f"End-effector above valve center: +{(end_effector_z - valve_z)*1000:.1f}mm")
+        rospy.loginfo(f"UAV CoG above valve center: +{(uav_z - valve_z)*1000:.1f}mm (目标: 67.3mm)")
+        rospy.loginfo(f"CONFIGURATION: UAV CoG精确定位在阀门中心上方67.3mm处")
         
         return uav_z
+    
+    # =================== SPOKE LOCKING MECHANISM ===================
+    
+    def start_insertion_session(self):
+        """
+        Start a new insertion session with spoke locking
+        
+        Call this method when beginning a new insertion task to ensure
+        spoke selection remains consistent throughout the session.
+        """
+        self.insertion_session_active = True
+        self.session_start_time = rospy.get_time()
+        self.locked_spoke_index = None
+        self.locked_spoke_angle = None
+        rospy.loginfo("=== INSERTION SESSION STARTED ===")
+        rospy.loginfo("Spoke locking mechanism activated for session consistency")
+        
+    def end_insertion_session(self):
+        """
+        End the current insertion session and reset spoke lock
+        
+        Call this method when the insertion task is completed or aborted
+        to allow fresh spoke selection for the next insertion.
+        """
+        self.insertion_session_active = False
+        self.session_start_time = None
+        self.locked_spoke_index = None
+        self.locked_spoke_angle = None
+        rospy.loginfo("=== INSERTION SESSION ENDED ===")
+        rospy.loginfo("Spoke lock released, fresh selection enabled for next session")
+        
+    def lock_spoke_selection(self, spoke_index, spoke_angle):
+        """
+        Lock the spoke selection for the current insertion session
+        
+        Args:
+            spoke_index: Index of the selected spoke (0, 1, or 2)
+            spoke_angle: World angle of the selected spoke in radians
+        """
+        self.locked_spoke_index = spoke_index
+        self.locked_spoke_angle = spoke_angle
+        rospy.loginfo(f"SPOKE LOCKED for insertion session:")
+        rospy.loginfo(f"  Locked spoke: beam{spoke_index} at {math.degrees(spoke_angle):.1f}°")
+        rospy.loginfo(f"  Session time: {rospy.get_time() - self.session_start_time:.1f}s")
+        rospy.loginfo(f"  Lock status: ACTIVE until session end")
+        
+    def get_locked_spoke(self):
+        """
+        Get the currently locked spoke information
+        
+        Returns:
+            tuple: (spoke_index, spoke_angle) if locked, (None, None) if not locked
+        """
+        if self.insertion_session_active and self.locked_spoke_index is not None:
+            return self.locked_spoke_index, self.locked_spoke_angle
+        return None, None
+        
+    def is_spoke_locked(self):
+        """
+        Check if a spoke is currently locked for the session
+        
+        Returns:
+            bool: True if spoke is locked, False otherwise
+        """
+        return (self.insertion_session_active and 
+                self.locked_spoke_index is not None and 
+                self.locked_spoke_angle is not None)
+        
+    def check_session_timeout(self, timeout_seconds=300):
+        """
+        Check if the insertion session has timed out
+        
+        Args:
+            timeout_seconds: Maximum session duration (default: 5 minutes)
+            
+        Returns:
+            bool: True if session has timed out, False otherwise
+        """
+        if not self.insertion_session_active or self.session_start_time is None:
+            return False
+            
+        session_duration = rospy.get_time() - self.session_start_time
+        if session_duration > timeout_seconds:
+            rospy.logwarn(f"Insertion session timeout ({timeout_seconds}s exceeded)")
+            rospy.logwarn(f"Session duration: {session_duration:.1f}s")
+            self.end_insertion_session()  # Auto-end timed out session
+            return True
+        return False
     
     def set_rotation_direction(self, direction):
         """
@@ -334,8 +430,18 @@ class InsertionOptimizer:
         rospy.loginfo("=== DUAL-FANG CLOCKWISE STRATEGY (SPOKE-ALIGNED) ===")
         rospy.loginfo("Using new spoke-aligned symmetric approach for collision avoidance")
         
-        # Use the verified same-side strategy which now implements spoke alignment
-        strategy_result = self.calculate_same_side_insertion_strategy(valve_pos, valve_yaw)
+        # Start insertion session if not already active (spoke locking mechanism)
+        if not self.insertion_session_active:
+            self.start_insertion_session()
+            rospy.loginfo("Insertion session started for spoke consistency")
+        
+        # Check for session timeout
+        if self.check_session_timeout():
+            rospy.logwarn("Session timeout detected, restarting session")
+            self.start_insertion_session()
+        
+        # Use the verified same-side strategy which now implements spoke alignment with locking
+        strategy_result = self.calculate_same_side_insertion_strategy(valve_pos, valve_yaw, uav_pos)
         
         if not strategy_result['feasible']:
             rospy.logerr("Spoke-aligned symmetric strategy failed feasibility check")
@@ -718,10 +824,23 @@ class InsertionOptimizer:
         for i, spoke_world in enumerate(spoke_angles_world):
             rospy.loginfo(f"  Spoke {i}: {math.degrees(spoke_world):.1f}°")
         
-        # SPOKE SELECTION: Choose spoke based on accessibility and clearance
-        # Strategy: Select the spoke that allows best insertion geometry with current UAV position
+        # SPOKE SELECTION WITH LOCKING MECHANISM
+        # Strategy: Use locked spoke if available, otherwise select optimal spoke and lock it
         
-        if uav_pos is not None:
+        # Check if spoke is already locked for this session
+        locked_spoke_index, locked_spoke_angle = self.get_locked_spoke()
+        
+        if self.is_spoke_locked():
+            # Use locked spoke from current session
+            optimal_spoke_index = locked_spoke_index
+            optimal_spoke_angle = locked_spoke_angle
+            
+            rospy.loginfo(f"SPOKE LOCK ACTIVE - Using locked selection:")
+            rospy.loginfo(f"  Locked spoke: beam{optimal_spoke_index} at {math.degrees(optimal_spoke_angle):.1f}°")
+            rospy.loginfo(f"  Session time: {rospy.get_time() - self.session_start_time:.1f}s")
+            rospy.loginfo(f"  Lock status: ENFORCED for session consistency")
+            
+        elif uav_pos is not None:
             # Calculate UAV angle relative to valve center  
             uav_angle_to_valve = math.atan2(uav_pos[1] - valve_center_y, uav_pos[0] - valve_center_x)
             
@@ -750,28 +869,38 @@ class InsertionOptimizer:
             optimal_spoke_index = best_spoke_index
             optimal_spoke_angle = spoke_angles_world[optimal_spoke_index]
             
-            rospy.loginfo(f"INTELLIGENT SPOKE SELECTION:")
+            # Lock the selected spoke for session consistency
+            if self.insertion_session_active:
+                self.lock_spoke_selection(optimal_spoke_index, optimal_spoke_angle)
+            
+            rospy.loginfo(f"INTELLIGENT SPOKE SELECTION (NEW):")
             rospy.loginfo(f"  Current UAV angle to valve: {math.degrees(uav_angle_to_valve):.1f}°")
             rospy.loginfo(f"  Selected spoke: beam{optimal_spoke_index} at {math.degrees(optimal_spoke_angle):.1f}°")
             rospy.loginfo(f"  Required UAV rotation: {math.degrees(abs(self._normalize_angle_diff(optimal_spoke_angle - uav_angle_to_valve))):.1f}°")
             rospy.loginfo(f"  Insertion geometry: 阀门中心 → end-effector → 辐条末端 → UAV CoG")
+            rospy.loginfo(f"  Lock status: {'LOCKED for session' if self.insertion_session_active else 'NO SESSION'}")
             
         else:
             # Fallback: use beam1 (120°) as default when UAV position is unknown
             optimal_spoke_index = 1  # beam1 at 120°
             optimal_spoke_angle = valve_yaw + math.pi * 2/3  # beam1 world angle
             
+            # Lock the fallback selection if session is active
+            if self.insertion_session_active:
+                self.lock_spoke_selection(optimal_spoke_index, optimal_spoke_angle)
+            
             rospy.loginfo(f"DEFAULT SPOKE SELECTION (UAV position unknown):")
             rospy.loginfo(f"  Selected spoke: beam{optimal_spoke_index} at {math.degrees(optimal_spoke_angle):.1f}°")
             rospy.loginfo(f"  Using default beam1 for spoke alignment")
+            rospy.loginfo(f"  Lock status: {'LOCKED for session' if self.insertion_session_active else 'NO SESSION'}")
         
         rospy.loginfo(f"Spoke-aligned symmetric strategy:")
         rospy.loginfo(f"  Selected spoke: beam{optimal_spoke_index} at {math.degrees(optimal_spoke_angle):.1f}°")
-        rospy.loginfo(f"  Strategy: UAV aligns with spoke, claws distributed symmetrically on both sides")
+        rospy.loginfo(f"  Strategy: UAV aligns with spoke, claws perpendicular to spoke direction")
+        rospy.loginfo(f"  Key insight: Both claws at equal distance from valve center, connection line perpendicular to spoke")
         
-        # UAV yaw should be OPPOSITE to spoke direction so end-effector points toward spoke
-        # CORRECTION: If end-effector is in UAV body +X direction, UAV should face away from target
-        optimal_uav_yaw = optimal_spoke_angle + math.pi  # UAV faces opposite direction
+        # UAV yaw should be ALIGNED with spoke direction so end-effector points toward valve center along spoke
+        optimal_uav_yaw = optimal_spoke_angle + math.pi  # UAV faces opposite to spoke direction
         
         # Normalize UAV yaw to [-pi, pi]
         while optimal_uav_yaw > math.pi:
@@ -779,67 +908,106 @@ class InsertionOptimizer:
         while optimal_uav_yaw < -math.pi:
             optimal_uav_yaw += 2*math.pi
         
-        # Calculate symmetric angular offsets for 150mm claw separation
-        # For 150mm separation at 75mm radius: angular separation ≈ 2 * arcsin(75/75) = 120°
-        claw_angular_offset = math.pi/3  # 60° offset on each side of spoke
+        # CORRECTED PERPENDICULAR POSITIONING: Both claws at equal distance from valve center
+        # End-effector center positioned along spoke direction at optimal distance
         
-        # Position claws symmetrically around the aligned spoke
-        left_claw_angle = optimal_spoke_angle - claw_angular_offset   # 60° left of spoke
-        right_claw_angle = optimal_spoke_angle + claw_angular_offset  # 60° right of spoke
+        # 正确的几何约束计算：
+        # 1. Hub约束：37.5mm半径 + 12.5mm安全裕度 = 50mm最小距离
+        # 2. Valve内径约束：claw_radius = √(end_effector_distance² + 75²) ≤ 100mm
+        #    求解：end_effector_distance ≤ √(100² - 75²) = √(10000 - 5625) = √4375 ≈ 66.14mm
         
-        # Calculate correct insertion radius for 150mm claw separation with end-effector distance constraint
-        # For symmetric positioning: separation = 2 * radius * sin(angular_offset)
-        # Required: separation = 150mm, angular_offset = 60°
-        # radius = separation / (2 * sin(60°)) = 150mm / (2 * 0.866) = 86.6mm
-        theoretical_insertion_radius = self.claw_separation / (2 * math.sin(claw_angular_offset))
+        # Calculate constraints with proper safety margins
+        hub_radius = 0.0375  # 37.5mm hub radius
+        hub_safety_margin = 0.0055  # 5.5mm safety margin (reduced for closer insertion)
+        min_end_effector_distance = hub_radius + hub_safety_margin  # 43mm minimum
         
-        # CRITICAL: Enforce minimum end-effector distance constraint (45mm from valve center)
-        min_insertion_radius = self.min_end_effector_to_valve_center_distance  # 45mm minimum
+        # Maximum distance: valve interior constraint (claw_radius ≤ 100mm)
+        valve_inner_radius = 0.100  # 100mm inner radius (已包含安全余量)
+        half_claw_separation = 0.075  # 75mm half separation
+        # √(end_effector_distance² + 75²) ≤ 100mm
+        max_end_effector_distance = math.sqrt(valve_inner_radius**2 - half_claw_separation**2)  # ≈66.14mm
         
-        # Use the larger of theoretical requirement or minimum constraint
-        if theoretical_insertion_radius < min_insertion_radius:
-            insertion_radius = min_insertion_radius
-            rospy.logwarn(f"Theoretical radius {theoretical_insertion_radius*1000:.1f}mm < minimum constraint {min_insertion_radius*1000:.1f}mm")
-            rospy.logwarn(f"Using minimum end-effector distance: {insertion_radius*1000:.1f}mm")
-        else:
-            insertion_radius = theoretical_insertion_radius
-            rospy.loginfo(f"Using theoretical optimal radius: {insertion_radius*1000:.1f}mm (satisfies 60mm constraint)")
+        # 根据实际运行经验调整：从49mm进一步降低到45mm以解决左爪阻挡问题
+        # 原策略：49mm导致89.6mm claw半径，现调整为45mm得到87.7mm claw半径，增加安全裕度
+        optimal_end_effector_distance = 0.045  # 45mm - 解决左爪阻挡问题，增加安全裕度到12.3mm
+        
+        rospy.loginfo(f"CORRECTED PERPENDICULAR POSITIONING CONSTRAINTS:")
+        rospy.loginfo(f"  Hub constraint: {hub_radius*1000:.1f}mm + {hub_safety_margin*1000:.1f}mm = {min_end_effector_distance*1000:.1f}mm minimum")
+        rospy.loginfo(f"  Valve interior constraint: √(distance² + {half_claw_separation*1000:.0f}²) ≤ {valve_inner_radius*1000:.0f}mm")
+        rospy.loginfo(f"  Calculated maximum: √({valve_inner_radius*1000:.0f}² - {half_claw_separation*1000:.0f}²) = {max_end_effector_distance*1000:.1f}mm")
+        rospy.loginfo(f"  Optimal selection: 45mm (解决左爪阻挡：从89.6mm减少到87.7mm claw半径)")
+        rospy.loginfo(f"  Valid range: [{min_end_effector_distance*1000:.1f}mm, {max_end_effector_distance*1000:.1f}mm]")
+        rospy.loginfo(f"  Selected: {optimal_end_effector_distance*1000:.1f}mm (防止左爪被阀门外圈阻挡)")
+        rospy.loginfo(f"  安全裕度增加: {(optimal_end_effector_distance - min_end_effector_distance)*1000:.0f}mm from hub constraint")
+        
+        # 验证几何约束
+        predicted_claw_radius = math.sqrt(optimal_end_effector_distance**2 + half_claw_separation**2)
+        rospy.loginfo(f"  验证claw半径: √({optimal_end_effector_distance*1000:.1f}² + {half_claw_separation*1000:.0f}²) = {predicted_claw_radius*1000:.1f}mm")
+        rospy.loginfo(f"  约束检查: {predicted_claw_radius*1000:.1f}mm ≤ {valve_inner_radius*1000:.0f}mm = {'✓ PASS' if predicted_claw_radius <= valve_inner_radius else '✗ FAIL'}")
+        rospy.loginfo(f"  安全裕度: {(valve_inner_radius - predicted_claw_radius)*1000:.1f}mm from valve inner rim")
+        
+        
+        # Calculate end-effector center position along spoke direction
+        end_effector_center_x = valve_center_x + optimal_end_effector_distance * math.cos(optimal_spoke_angle)
+        end_effector_center_y = valve_center_y + optimal_end_effector_distance * math.sin(optimal_spoke_angle)
+        end_effector_center_z = valve_pos[2] + self.insertion_safety_margin_z
+        
+        # Calculate claw positions: Both claws at equal distance from valve center, perpendicular to spoke
+        # Left claw: end_effector_center + half_separation * perpendicular_direction
+        # Right claw: end_effector_center - half_separation * perpendicular_direction
+        perpendicular_angle = optimal_spoke_angle + math.pi/2  # 90° rotation from spoke direction
+        
+        left_claw_target_x = end_effector_center_x + self.half_claw_separation * math.cos(perpendicular_angle)
+        left_claw_target_y = end_effector_center_y + self.half_claw_separation * math.sin(perpendicular_angle)
+        left_claw_target_z = valve_pos[2] + self.insertion_safety_margin_z
+        
+        right_claw_target_x = end_effector_center_x - self.half_claw_separation * math.cos(perpendicular_angle)
+        right_claw_target_y = end_effector_center_y - self.half_claw_separation * math.sin(perpendicular_angle)
+        right_claw_target_z = valve_pos[2] + self.insertion_safety_margin_z
+        
+        # Verify both claws are at equal distance from valve center
+        left_claw_distance = math.sqrt((left_claw_target_x - valve_center_x)**2 + 
+                                     (left_claw_target_y - valve_center_y)**2)
+        right_claw_distance = math.sqrt((right_claw_target_x - valve_center_x)**2 + 
+                                      (right_claw_target_y - valve_center_y)**2)
+        
+        # Calculate actual end-effector distance from valve center for verification
+        actual_end_effector_distance = math.sqrt((end_effector_center_x - valve_center_x)**2 + 
+                                                (end_effector_center_y - valve_center_y)**2)
+        
+        rospy.loginfo(f"PERPENDICULAR POSITIONING RESULTS:")
+        rospy.loginfo(f"  End-effector center: ({end_effector_center_x:.3f}, {end_effector_center_y:.3f})")
+        rospy.loginfo(f"  Actual end-effector distance: {actual_end_effector_distance*1000:.1f}mm")
+        rospy.loginfo(f"  Left claw distance from valve center: {left_claw_distance*1000:.1f}mm")
+        rospy.loginfo(f"  Right claw distance from valve center: {right_claw_distance*1000:.1f}mm")
+        rospy.loginfo(f"  Distance equality: {'✓ EQUAL' if abs(left_claw_distance - right_claw_distance) < 0.001 else '✗ UNEQUAL'}")
         
         # Ensure radius is within valve physical limits
         min_safe_radius = self.hub_radius + 0.005  # 5mm clearance from hub
         max_safe_radius = self.valve_inner_radius - 0.005  # 5mm clearance from inner rim
         
-        if insertion_radius < min_safe_radius:
-            insertion_radius = min_safe_radius
-            rospy.logwarn(f"Minimum constraint {min_insertion_radius*1000:.1f}mm too small, using hub clearance {insertion_radius*1000:.1f}mm")
-        elif insertion_radius > max_safe_radius:
-            insertion_radius = max_safe_radius
-            rospy.logwarn(f"Required radius {insertion_radius*1000:.1f}mm too large, using rim clearance {insertion_radius*1000:.1f}mm")
+        if optimal_end_effector_distance < min_end_effector_distance:
+            optimal_end_effector_distance = min_end_effector_distance
+            rospy.logwarn(f"End-effector distance adjusted to minimum: {optimal_end_effector_distance*1000:.1f}mm")
+        elif optimal_end_effector_distance > max_end_effector_distance:
+            optimal_end_effector_distance = max_end_effector_distance
+            rospy.logwarn(f"End-effector distance adjusted to maximum: {optimal_end_effector_distance*1000:.1f}mm")
         
-        # Position claws at calculated symmetric angles
-        left_claw_target_x = valve_center_x + insertion_radius * math.cos(left_claw_angle)
-        left_claw_target_y = valve_center_y + insertion_radius * math.sin(left_claw_angle)
-        left_claw_target_z = valve_pos[2] + self.insertion_safety_margin_z
-        
-        right_claw_target_x = valve_center_x + insertion_radius * math.cos(right_claw_angle)
-        right_claw_target_y = valve_center_y + insertion_radius * math.sin(right_claw_angle)
-        right_claw_target_z = valve_pos[2] + self.insertion_safety_margin_z
-        
-        # Verify the symmetric calculation
+        # Verify the separation calculation
         calculated_separation = math.sqrt((right_claw_target_x - left_claw_target_x)**2 + 
                                         (right_claw_target_y - left_claw_target_y)**2)
         
-        rospy.loginfo(f"Spoke-aligned symmetric insertion strategy:")
+        
+        rospy.loginfo(f"Perpendicular claw positioning strategy:")
         rospy.loginfo(f"  UAV yaw for spoke alignment: {math.degrees(optimal_uav_yaw):.1f}° (aligned with spoke)")
-        rospy.loginfo(f"  Insertion radius: {insertion_radius*1000:.1f}mm")
-        rospy.loginfo(f"  Left claw angle: {math.degrees(left_claw_angle):.1f}° (spoke left side)")
-        rospy.loginfo(f"  Right claw angle: {math.degrees(right_claw_angle):.1f}° (spoke right side)")
+        rospy.loginfo(f"  End-effector distance: {optimal_end_effector_distance*1000:.1f}mm (within {min_end_effector_distance*1000:.1f}-{max_end_effector_distance*1000:.1f}mm range)")
+        rospy.loginfo(f"  Perpendicular angle: {math.degrees(perpendicular_angle):.1f}° (90° from spoke)")
         rospy.loginfo(f"  Left claw position: ({left_claw_target_x:.3f}, {left_claw_target_y:.3f})")
         rospy.loginfo(f"  Right claw position: ({right_claw_target_x:.3f}, {right_claw_target_y:.3f})")
         rospy.loginfo(f"  Calculated separation: {calculated_separation*1000:.1f}mm")
         rospy.loginfo(f"  Required separation: {self.claw_separation*1000:.1f}mm")
         rospy.loginfo(f"  Separation accuracy: {'✓ CORRECT' if abs(calculated_separation - self.claw_separation) < 0.001 else '✗ ERROR'}")
-        rospy.loginfo(f"GEOMETRY: 350mm UAV distance constraint will ensure proper 'grab' positioning vs 'lying on' valve")
+        rospy.loginfo(f"GEOMETRY: End-effector along spoke, claws perpendicular to spoke at equal distance from valve center")
         
         # Check clearance from all spokes
         safety_margins = []
@@ -861,97 +1029,90 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Minimum safety margin: {min_safety_margin*1000:.1f}mm")
         rospy.loginfo(f"  Safety status: {'✓ ADEQUATE' if safety_adequate else '✗ INSUFFICIENT'}")
         
-        # CORRECT UAV POSITIONING: 阀门中心 → end-effector中心 → 辐条末端 → UAV CoG
+        # CORRECT UAV POSITIONING: 阀门中心 → end-effector中心 → UAV CoG
         # UAV CoG位于从阀门中心出发沿辐条方向延伸的射线上
         
-        # Step 1: Calculate end-effector center position at insertion radius along spoke direction
-        end_effector_center_x = valve_center_x + insertion_radius * math.cos(optimal_spoke_angle)
-        end_effector_center_y = valve_center_y + insertion_radius * math.sin(optimal_spoke_angle)
-        end_effector_center_z = valve_pos[2] + self.insertion_safety_margin_z
-        
+        # Step 1: End-effector center already calculated at optimal distance along spoke direction
         # Step 2: UAV CoG positioned BEHIND end-effector center along spoke direction  
-        # CORRECT UNDERSTANDING: UAV should be positioned away from valve center
-        # The sequence should be: valve_center → end-effector → UAV (all along spoke direction)
-        # Therefore: UAV = valve_center + (insertion_radius + dual_fang_offset) * spoke_direction
-        total_distance = insertion_radius + self.dual_fang_center_offset
+        # Calculate UAV position based on end-effector center position
+        # UAV = end_effector_center + dual_fang_offset * spoke_direction
+        total_distance = optimal_end_effector_distance + self.dual_fang_center_offset
         uav_center_x = valve_center_x + total_distance * math.cos(optimal_spoke_angle)
         uav_center_y = valve_center_y + total_distance * math.sin(optimal_spoke_angle)
         uav_center_z = end_effector_center_z - self.end_effector_offset_z
         
-        # Step 3: UAV yaw faces AWAY from valve (so end-effector points toward valve)
-        # UAV should face opposite to spoke direction to point end-effector toward valve
-        
         # Check total distance from valve center to UAV CoG
         uav_to_valve_distance = math.sqrt((uav_center_x - valve_center_x)**2 + (uav_center_y - valve_center_y)**2)
-        theoretical_distance = insertion_radius + self.dual_fang_center_offset  # Expected distance
+        expected_distance = optimal_end_effector_distance + self.dual_fang_center_offset  # Expected distance
         
         rospy.loginfo(f"CORRECT UAV POSITIONING (沿辐条方向延伸):")
         rospy.loginfo(f"  Selected spoke direction: {math.degrees(optimal_spoke_angle):.1f}°")
-        rospy.loginfo(f"  Total distance (insertion + offset): {total_distance*1000:.1f}mm")
+        rospy.loginfo(f"  Total distance (end-effector + offset): {total_distance*1000:.1f}mm")
         rospy.loginfo(f"  End-effector center: ({end_effector_center_x:.3f}, {end_effector_center_y:.3f}, {end_effector_center_z:.3f})")
         rospy.loginfo(f"  UAV CoG position: ({uav_center_x:.3f}, {uav_center_y:.3f}, {uav_center_z:.3f})")
         rospy.loginfo(f"  UAV yaw (facing away from spoke): {math.degrees(optimal_uav_yaw):.1f}°")
         rospy.loginfo(f"  Distance valve center to UAV: {uav_to_valve_distance*1000:.1f}mm")
-        rospy.loginfo(f"  Expected distance: {theoretical_distance*1000:.1f}mm")
-        rospy.loginfo(f"  End-effector distance from valve: {insertion_radius*1000:.1f}mm (≥45mm constraint)")
-        rospy.loginfo(f"  Geometry: 阀门中心 → end-effector中心({insertion_radius*1000:.1f}mm) → UAV CoG({self.dual_fang_center_offset*1000:.1f}mm)")
+        rospy.loginfo(f"  Expected distance: {expected_distance*1000:.1f}mm")
+        rospy.loginfo(f"  End-effector distance from valve: {optimal_end_effector_distance*1000:.1f}mm (45mm reduces claw collision risk)")
+        rospy.loginfo(f"  Geometry: 阀门中心 → end-effector中心({optimal_end_effector_distance*1000:.1f}mm) → UAV CoG({self.dual_fang_center_offset*1000:.1f}mm)")
         
         # Verify distance constraint calculations are correct
-        distance_error = abs(uav_to_valve_distance - theoretical_distance)
+        distance_error = abs(uav_to_valve_distance - expected_distance)
         if distance_error > 0.001:  # 1mm tolerance
             rospy.logwarn(f"Distance calculation error: {distance_error*1000:.1f}mm difference")
-            rospy.logwarn(f"Actual: {uav_to_valve_distance*1000:.1f}mm vs Expected: {theoretical_distance*1000:.1f}mm")
+            rospy.logwarn(f"Actual: {uav_to_valve_distance*1000:.1f}mm vs Expected: {expected_distance*1000:.1f}mm")
         
-        # Check end-effector distance constraint
-        end_effector_distance = math.sqrt((end_effector_center_x - valve_center_x)**2 + (end_effector_center_y - valve_center_y)**2)
-        if end_effector_distance < self.min_end_effector_to_valve_center_distance:
-            rospy.logwarn(f"End-effector距离{end_effector_distance*1000:.1f}mm < 最小约束{self.min_end_effector_to_valve_center_distance*1000:.1f}mm")
+        # Check end-effector distance constraint with tolerance for floating point precision
+        tolerance = 0.001  # 1mm tolerance for floating point precision
+        if actual_end_effector_distance < (min_end_effector_distance - tolerance):
+            rospy.logwarn(f"End-effector距离{actual_end_effector_distance*1000:.1f}mm < 最小约束{min_end_effector_distance*1000:.1f}mm")
         else:
-            rospy.loginfo(f"✓ End-effector constraint satisfied: {end_effector_distance*1000:.1f}mm ≥ {self.min_end_effector_to_valve_center_distance*1000:.1f}mm")
+            rospy.loginfo(f"✓ End-effector constraint satisfied: {actual_end_effector_distance*1000:.1f}mm ≥ {min_end_effector_distance*1000:.1f}mm")
         
-        # Verify 280mm UAV distance constraint
+        # Verify UAV distance constraint (now 245mm per Scheme A)
         if uav_to_valve_distance < self.min_uav_to_valve_center_distance:
             rospy.logwarn(f"UAV距离{uav_to_valve_distance*1000:.1f}mm < 最小约束{self.min_uav_to_valve_center_distance*1000:.1f}mm")
-            rospy.logwarn(f"ADJUSTING end-effector distance to satisfy UAV ≥280mm constraint while maintaining spoke alignment")
+            rospy.logwarn(f"ADJUSTING end-effector distance to satisfy UAV ≥{self.min_uav_to_valve_center_distance*1000:.1f}mm constraint while maintaining spoke alignment")
             
-            # Calculate required end-effector distance to achieve ≥280mm UAV distance
+            # Calculate required end-effector distance to achieve minimum UAV distance
             # UAV distance = end_effector_distance + dual_fang_offset
-            # ≥280mm = end_effector_distance + 253.46mm
-            # end_effector_distance = ≥280mm - 253.46mm = ≥26.54mm
+            # min_distance = end_effector_distance + 253.46mm
+            # end_effector_distance = min_distance - 253.46mm
             required_end_effector_distance = self.min_uav_to_valve_center_distance - self.dual_fang_center_offset
             
-            rospy.loginfo(f"Required end-effector distance for ≥280mm UAV constraint: ≥{required_end_effector_distance*1000:.1f}mm")
+            rospy.loginfo(f"Required end-effector distance for ≥{self.min_uav_to_valve_center_distance*1000:.1f}mm UAV constraint: ≥{required_end_effector_distance*1000:.1f}mm")
             
             # Update insertion radius while maintaining spoke alignment
-            insertion_radius = max(required_end_effector_distance, self.min_end_effector_to_valve_center_distance)
+            optimal_end_effector_distance = max(required_end_effector_distance, min_end_effector_distance)
             
-            rospy.loginfo(f"Adjusting insertion radius: {insertion_radius*1000:.1f}mm (was {theoretical_insertion_radius*1000:.1f}mm)")
+            rospy.loginfo(f"Adjusting end-effector distance: {optimal_end_effector_distance*1000:.1f}mm (perpendicular positioning method)")
             
             # Recalculate end-effector center with adjusted radius
-            end_effector_center_x = valve_center_x + insertion_radius * math.cos(optimal_spoke_angle)
-            end_effector_center_y = valve_center_y + insertion_radius * math.sin(optimal_spoke_angle)
+            end_effector_center_x = valve_center_x + optimal_end_effector_distance * math.cos(optimal_spoke_angle)
+            end_effector_center_y = valve_center_y + optimal_end_effector_distance * math.sin(optimal_spoke_angle)
             
             # Recalculate UAV position maintaining spoke alignment
-            total_distance = insertion_radius + self.dual_fang_center_offset
+            total_distance = optimal_end_effector_distance + self.dual_fang_center_offset
             uav_center_x = valve_center_x + total_distance * math.cos(optimal_spoke_angle)
             uav_center_y = valve_center_y + total_distance * math.sin(optimal_spoke_angle)
             
             # Recalculate distances after adjustment
             uav_to_valve_distance = math.sqrt((uav_center_x - valve_center_x)**2 + (uav_center_y - valve_center_y)**2)
-            rospy.loginfo(f"ADJUSTED UAV distance: {uav_to_valve_distance*1000:.1f}mm (≥280mm satisfied)")
+            rospy.loginfo(f"ADJUSTED UAV distance: {uav_to_valve_distance*1000:.1f}mm (≥{self.min_uav_to_valve_center_distance*1000:.1f}mm satisfied)")
             rospy.loginfo(f"Spoke alignment maintained: UAV at {math.degrees(optimal_spoke_angle):.1f}° direction")
         else:
             rospy.loginfo(f"✓ UAV distance constraint satisfied: {uav_to_valve_distance*1000:.1f}mm ≥ {self.min_uav_to_valve_center_distance*1000:.1f}mm")
         
-        # Recalculate claw positions based on final end-effector center
-        final_left_claw_x = end_effector_center_x + self.half_claw_separation * math.cos(optimal_spoke_angle + math.pi/2)
-        final_left_claw_y = end_effector_center_y + self.half_claw_separation * math.sin(optimal_spoke_angle + math.pi/2)
-        final_right_claw_x = end_effector_center_x + self.half_claw_separation * math.cos(optimal_spoke_angle - math.pi/2)
-        final_right_claw_y = end_effector_center_y + self.half_claw_separation * math.sin(optimal_spoke_angle - math.pi/2)
+        
+        # Recalculate claw positions based on final end-effector center (if adjusted)
+        final_left_claw_x = end_effector_center_x + self.half_claw_separation * math.cos(perpendicular_angle)
+        final_left_claw_y = end_effector_center_y + self.half_claw_separation * math.sin(perpendicular_angle)
+        final_right_claw_x = end_effector_center_x - self.half_claw_separation * math.cos(perpendicular_angle)
+        final_right_claw_y = end_effector_center_y - self.half_claw_separation * math.sin(perpendicular_angle)
         
         # Calculate final end-effector position from corrected UAV position
         # Since UAV = valve_center + total_distance * spoke_direction
-        # Then EE = valve_center + insertion_radius * spoke_direction = end_effector_center
+        # Then EE = valve_center + optimal_end_effector_distance * spoke_direction = end_effector_center
         # We can directly use the calculated end_effector_center position
         direct_end_effector_x = end_effector_center_x
         direct_end_effector_y = end_effector_center_y
@@ -972,10 +1133,12 @@ class InsertionOptimizer:
         uav_to_outer_rim_distance = final_uav_to_valve_distance - self.valve_outer_radius
         
         rospy.loginfo(f"FINAL CORRECTED GEOMETRY:")
-        rospy.loginfo(f"  End-effector distance: {final_end_effector_to_valve_distance*1000:.1f}mm (≥45mm: {'✓' if final_end_effector_to_valve_distance >= 0.045 else '✗'})")
-        rospy.loginfo(f"  UAV distance: {final_uav_to_valve_distance*1000:.1f}mm (≥280mm: {'✓' if final_uav_to_valve_distance >= 0.280 else '✗'})")
+        rospy.loginfo(f"  End-effector distance: {final_end_effector_to_valve_distance*1000:.1f}mm ({min_end_effector_distance*1000:.1f}-{max_end_effector_distance*1000:.1f}mm: {'✓' if min_end_effector_distance <= final_end_effector_to_valve_distance <= max_end_effector_distance else '✗'})")
+        rospy.loginfo(f"  UAV distance: {final_uav_to_valve_distance*1000:.1f}mm (≥{self.min_uav_to_valve_center_distance*1000:.1f}mm: {'✓' if final_uav_to_valve_distance >= self.min_uav_to_valve_center_distance else '✗'})")
         rospy.loginfo(f"  Geometry sequence: 阀门中心 → end-effector({final_end_effector_to_valve_distance*1000:.1f}mm) → UAV({self.dual_fang_center_offset*1000:.1f}mm)")
-        rospy.loginfo(f"  UAV CONSTRAINT: Minimum distance ≥280mm (not fixed at 280mm)")
+        rospy.loginfo(f"  UAV CONSTRAINT: Minimum distance ≥{self.min_uav_to_valve_center_distance*1000:.1f}mm (not fixed at {self.min_uav_to_valve_center_distance*1000:.1f}mm)")
+        rospy.loginfo(f"  Left claw distance from valve center: {left_claw_distance*1000:.1f}mm")
+        rospy.loginfo(f"  Right claw distance from valve center: {right_claw_distance*1000:.1f}mm")
         
         # Create direct positioning result with corrected positions
         safety_result = {
@@ -983,10 +1146,10 @@ class InsertionOptimizer:
             'uav_yaw': optimal_uav_yaw,
             'end_effector_center': [end_effector_center_x, end_effector_center_y, end_effector_center_z],
             'safety_check': {
-                'safety_corrections_applied': final_uav_to_valve_distance != theoretical_distance,
+                'safety_corrections_applied': final_uav_to_valve_distance != expected_distance,
                 'direct_spoke_aligned': True,
                 'natural_safety_margin': min_safety_margin,
-                'positioning_error': abs(final_uav_to_valve_distance - theoretical_distance),
+                'positioning_error': abs(final_uav_to_valve_distance - expected_distance),
                 
                 # Required fields for valve_rotation_fang_single.py compatibility
                 'end_effector_to_valve_distance': final_end_effector_to_valve_distance,
@@ -1001,11 +1164,12 @@ class InsertionOptimizer:
         
         rospy.loginfo(f"Final corrected UAV position: ({uav_center_x:.3f}, {uav_center_y:.3f}, {uav_center_z:.3f})")
         rospy.loginfo(f"Final corrected end-effector position: ({end_effector_center_x:.3f}, {end_effector_center_y:.3f}, {end_effector_center_z:.3f})")
-        rospy.loginfo(f"Constraint enforcement: End-effector ≥45mm, UAV ≥280mm from valve center (minimum distance, not fixed value)")
+        rospy.loginfo(f"Constraint enforcement: End-effector {min_end_effector_distance*1000:.1f}-{max_end_effector_distance*1000:.1f}mm, UAV ≥{self.min_uav_to_valve_center_distance*1000:.1f}mm from valve center")
+        rospy.loginfo(f"NEW STRATEGY: Both claws at equal distance from valve center, perpendicular to spoke direction")
 
         return {
-            'strategy': 'spoke_aligned_symmetric',
-            'description': 'UAV aligns with spoke, claws distributed symmetrically on both sides',
+            'strategy': 'perpendicular_claw_positioning',
+            'description': 'UAV aligns with spoke, claws perpendicular to spoke at equal distance from valve center',
             'feasible': safety_adequate and abs(calculated_separation - self.claw_separation) < 0.001,
             
             # NEW: Direct targets for compatibility with valve_rotation_fang_single.py
@@ -1021,21 +1185,25 @@ class InsertionOptimizer:
             # Original return data for debugging and analysis
             'uav_position': [uav_center_x, uav_center_y, uav_center_z],
             'uav_yaw': optimal_uav_yaw,
-            'insertion_radius': insertion_radius,
+            'insertion_radius': optimal_end_effector_distance,
             'safety_margin': min_safety_margin,
             'safety_adequate': safety_adequate,
             'spoke_alignment': {
                 'optimal_spoke_index': optimal_spoke_index,
                 'optimal_spoke_angle': optimal_spoke_angle,
-                'claw_angular_offset': claw_angular_offset,
-                'left_claw_angle': left_claw_angle,
-                'right_claw_angle': right_claw_angle,
+                'perpendicular_angle': perpendicular_angle,
+                'end_effector_distance': optimal_end_effector_distance,
+                'min_end_effector_distance': min_end_effector_distance,
+                'max_end_effector_distance': max_end_effector_distance,
                 'spoke_angles_world': spoke_angles_world
             },
             'verification': {
                 'calculated_separation': calculated_separation,
                 'required_separation': self.claw_separation,
-                'separation_accuracy': abs(calculated_separation - self.claw_separation) < 0.001
+                'separation_accuracy': abs(calculated_separation - self.claw_separation) < 0.001,
+                'left_claw_distance': left_claw_distance,
+                'right_claw_distance': right_claw_distance,
+                'distance_equality': abs(left_claw_distance - right_claw_distance) < 0.001
             }
         }
 
@@ -1376,3 +1544,35 @@ class InsertionOptimizer:
             'gap_angles': (gap1_angle, gap2_angle),
             'same_side_result': same_side_result
         }
+    
+    def complete_insertion_task(self):
+        """
+        Mark the insertion task as complete and end the session
+        
+        Call this method when the insertion task is successfully completed
+        to release the spoke lock and allow fresh selection for next insertion.
+        """
+        rospy.loginfo("=== INSERTION TASK COMPLETED ===")
+        if self.insertion_session_active:
+            session_duration = rospy.get_time() - self.session_start_time
+            rospy.loginfo(f"Session duration: {session_duration:.1f}s")
+            rospy.loginfo(f"Locked spoke was: beam{self.locked_spoke_index} at {math.degrees(self.locked_spoke_angle):.1f}°")
+        
+        self.end_insertion_session()
+        rospy.loginfo("Ready for next insertion task with fresh spoke selection")
+        
+    def abort_insertion_task(self):
+        """
+        Abort the current insertion task and end the session
+        
+        Call this method when the insertion task fails or is cancelled
+        to release the spoke lock and allow recovery.
+        """
+        rospy.logwarn("=== INSERTION TASK ABORTED ===")
+        if self.insertion_session_active:
+            session_duration = rospy.get_time() - self.session_start_time
+            rospy.logwarn(f"Session duration: {session_duration:.1f}s")
+            rospy.logwarn(f"Locked spoke was: beam{self.locked_spoke_index} at {math.degrees(self.locked_spoke_angle):.1f}°")
+        
+        self.end_insertion_session()
+        rospy.loginfo("Ready for retry with fresh spoke selection")

@@ -3149,23 +3149,47 @@ class RotateValveState(SingleUAVStateBase):
                     rospy.loginfo(f"Original duration completed - continuing until valve rotation target achieved")
                     rospy.loginfo(f"Current valve rotation: {math.degrees(total_valve_rotation):.1f}° / {math.degrees(target_valve_rotation):.1f}°")
             
-            # === 统一采用时间驱动的进度 ===
-            progress = min(elapsed_time / duration, 1.0)
-            if hasattr(self, '_last_progress'):
-                self._last_progress = progress
-            rospy.logdebug(f"Time-driven progress: {progress:.3f}")
-
-            # 仅用阀门角度判断任务完成
-            current_valve_yaw = self.get_current_valve_yaw()
-            if current_valve_yaw is not None:
-                current_valve_rotation = abs(current_valve_yaw - initial_valve_yaw)
-                valve_progress = min(current_valve_rotation / target_valve_rotation, 1.0)
-                if progress >= 0.99 and valve_progress >= 0.95:
-                    rospy.loginfo(f"✓ TRAJECTORY COMPLETION via TIME + VALVE ANGLE!")
-                    rospy.loginfo(f"  Valve progress: {valve_progress*100:.1f}%")
-                    rospy.loginfo(f"  Geometric progress: {progress*100:.1f}%")
-                    valve_rotation_achieved = True
-                    break
+            # Calculate progress (0.0 to 1.0) - Choose calculation method based on mode
+            if valve_angle_driven and valve_contact_detected:
+                # VALVE ANGLE DRIVEN APPROACH for main rotation phase
+                current_valve_yaw = self.get_current_valve_yaw()
+                if current_valve_yaw is not None:
+                    # Calculate valve rotation progress
+                    current_valve_rotation = abs(current_valve_yaw - initial_valve_yaw)
+                    valve_progress = min(current_valve_rotation / target_valve_rotation, 1.0)
+                    
+                    # Use valve-based progress, but ensure minimum time-based progress for smooth start
+                    min_time_progress = min(elapsed_time / duration, 0.3)  # Allow up to 30% time-based progress
+                    progress = max(valve_progress, min_time_progress)
+                    
+                    # Additional safeguard: limit progress jump to prevent sudden trajectory changes
+                    if hasattr(self, '_last_progress'):
+                        max_progress_jump = 0.05  # Maximum 5% progress jump per iteration
+                        progress = min(progress, self._last_progress + max_progress_jump)
+                    
+                    self._last_progress = progress
+                    rospy.logdebug(f"Valve-driven progress: valve={valve_progress:.3f}, time={min_time_progress:.3f}, final={progress:.3f}")
+                    
+                    # Additional completion check: if progress reaches 100% with sufficient valve rotation
+                    if progress >= 0.99 and valve_progress >= 0.9:  # 99% progress + 90% valve rotation
+                        rospy.loginfo(f"✓ TRAJECTORY COMPLETION via VALVE PROGRESS!")
+                        rospy.loginfo(f"  Valve progress: {valve_progress*100:.1f}%")
+                        rospy.loginfo(f"  Geometric progress: {progress*100:.1f}%")
+                        valve_rotation_achieved = True
+                        break
+                else:
+                    # Fall back to time-based progress if valve feedback unavailable
+                    progress = min(elapsed_time / duration, 1.0)
+                    if hasattr(self, '_last_progress'):
+                        self._last_progress = progress
+                    rospy.logdebug(f"Time-driven progress (valve feedback unavailable): {progress:.3f}")
+            else:
+                # TIME-BASED APPROACH for disengagement phase or when valve contact not detected
+                progress = min(elapsed_time / duration, 1.0)
+                if hasattr(self, '_last_progress'):
+                    self._last_progress = progress
+                mode_description = "disengagement" if not valve_angle_driven else "no valve contact"
+                rospy.logdebug(f"Time-driven progress ({mode_description}): {progress:.3f}")
             
             # === USE MODULAR TRAJECTORY GENERATOR ===
             # Get target position and yaw from trajectory generator

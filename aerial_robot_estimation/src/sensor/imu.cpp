@@ -143,11 +143,30 @@ namespace sensor_plugin
 
   void Imu::estimateProcess()
   {
+    // Initialize prev_time on first run
+    if(prev_time.isZero())
+      {
+        prev_time = imu_stamp_;
+        ROS_INFO("IMU: Initialized timestamp baseline at %f", imu_stamp_.toSec());
+        return;
+      }
+    
     if(imu_stamp_.toSec() <= prev_time.toSec())
       {
-        ROS_WARN("IMU: bad timestamp. curr time stamp: %f, prev time stamp: %f",
-                 imu_stamp_.toSec(), prev_time.toSec());
-        return;
+        double time_diff = imu_stamp_.toSec() - prev_time.toSec();
+        ROS_WARN("IMU: bad timestamp. curr: %f, prev: %f, diff: %f sec", 
+                 imu_stamp_.toSec(), prev_time.toSec(), time_diff);
+        
+        // If the time difference is very small (< 1ms), it might be a timing precision issue
+        if(time_diff > -0.001)
+          {
+            ROS_WARN("IMU: Small time difference detected, might be precision issue. Continuing...");
+          }
+        else
+          {
+            ROS_WARN("IMU: Significant time regression detected. Skipping this frame.");
+            return;
+          }
       }
 
     /* set the time internal */

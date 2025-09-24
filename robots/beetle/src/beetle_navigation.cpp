@@ -391,6 +391,40 @@ void BeetleNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & 
       setTargetPosZ(target_cog_pos.z());
       setTargetVelZ(msg->target_vel_z);
     }
+
+  /* pitch control */
+  if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setY(msg->target_pitch);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+    }
+  if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_VEL_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setY(msg->target_pitch);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+      
+      trajectory_mode_ = true;
+      trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
+    }
+
+  /* roll control */
+  if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setX(msg->target_roll);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+    }
+  if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_VEL_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setX(msg->target_roll);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+      
+      trajectory_mode_ = true;
+      trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
+    }
 }
 
 

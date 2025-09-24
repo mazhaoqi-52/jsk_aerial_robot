@@ -166,7 +166,7 @@
       <collision>
         <origin xyz="0 0 -0.04" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="package://beetle/urdf/mesh/200mm_valve.STL" scale="0.001 0.001 0.001"/>
+          <mesh filename="package://beetle/urdf/mesh/beetle_valve.STL" scale="0.001 0.001 0.001"/>
         </geometry>
       </collision>
     </xacro:unless>

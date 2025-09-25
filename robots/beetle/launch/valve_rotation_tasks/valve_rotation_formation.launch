@@ -38,6 +38,14 @@
   <param name="controller/valve_rotation_feedforward/force_z" value="-5.0" />
   <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />
   
+  <!-- Assembly CoG publisher node -->
+  <node name="assembly_cog_publisher" pkg="beetle" type="assembly_cog_publisher.py"
+        output="screen">
+    <param name="module_ids" value="$(arg module_ids)" />
+    <param name="publish_rate" value="50.0" /> <!-- 50Hz -->
+    <param name="timeout_threshold" value="0.5" /> <!-- 0.5s timeout -->
+  </node>
+  
   <!-- Formation valve rotation node -->
   <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_clean.py"
         output="screen">

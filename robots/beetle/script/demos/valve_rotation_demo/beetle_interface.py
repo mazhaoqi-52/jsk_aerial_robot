@@ -9,11 +9,38 @@ from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from sensor_msgs.msg import Joy
-from beetle.msg import TaggedWrench
+
+# Safe import for beetle.msg with fallback
+try:
+    from beetle.msg import TaggedWrench
+except ImportError as e:
+    rospy.logwarn("Failed to import beetle.msg: {}. Creating mock TaggedWrench.".format(e))
+    # Create a proper ROS message mock class
+    import genpy
+    
+    class TaggedWrench(genpy.Message):
+        _md5sum = "fake_md5"
+        _type = "beetle/TaggedWrench"
+        _has_header = False
+        _full_text = "int32 id\ngeometry_msgs/WrenchStamped wrench"
+        
+        __slots__ = ['id', 'wrench']
+        _slot_types = ['int32', 'geometry_msgs/WrenchStamped']
+        
+        def __init__(self, *args, **kwds):
+            super(TaggedWrench, self).__init__()
+            if args or kwds:
+                super(TaggedWrench, self).__init__(*args, **kwds)
+            else:
+                self.id = 0
+                self.wrench = WrenchStamped()
+        
+        def _get_types(self):
+            return self._slot_types[:]
 
 
 class BeetleInterface(object):
-    def __init__(self, module_id=1, debug_view=False):
+    def __init__(self, module_id=1, debug_view=False, assembly_mode=False, assembly_tf_calculator=None):
         
         # Flight states
         self.ARM_OFF_STATE = 0
@@ -28,6 +55,15 @@ class BeetleInterface(object):
         self.debug_view = debug_view
         self.robot_name = f"beetle{module_id}"
         
+        # Assembly mode configuration
+        self.assembly_mode = assembly_mode
+        self.assembly_tf_calculator = assembly_tf_calculator
+        if self.assembly_mode and self.assembly_tf_calculator:
+            rospy.loginfo(f"BeetleInterface initialized in ASSEMBLY mode for module {module_id}")
+            rospy.loginfo(f"  Leader ID: {self.assembly_tf_calculator.get_leader_id()}")
+        else:
+            rospy.loginfo(f"BeetleInterface initialized in SINGLE mode for module {module_id}")
+        
         # Robot parameters
         self.mass = rospy.get_param('~robot_mass', 1.5)
         self.default_pos_thresh = rospy.get_param('~default_pos_thresh', 0.03)
@@ -35,14 +71,23 @@ class BeetleInterface(object):
         
         # State variables
         self.uav_odom = Odometry()
+        self.assembly_odom = Odometry()  # Assembly CoG odometry
         self.valve_pose = None
         self.flight_state = self.ARM_OFF_STATE
         self.target_pos = np.array([0, 0, 0])
         self.est_wrench = None
         self.is_simulation = rospy.get_param("~simulation", True)
         
-        # Publishers
-        self.nav_pub = rospy.Publisher(f'/beetle{module_id}/uav/nav', FlightNav, queue_size=1)
+        # Publishers - choose based on mode
+        if self.assembly_mode:
+            # Assembly mode: control the entire formation through assembly CoG
+            self.nav_pub = rospy.Publisher('/assembly/uav/nav', FlightNav, queue_size=1)
+            rospy.loginfo(f"Using assembly navigation topic: /assembly/uav/nav")
+        else:
+            # Single mode: control individual UAV
+            self.nav_pub = rospy.Publisher(f'/beetle{module_id}/uav/nav', FlightNav, queue_size=1)
+            rospy.loginfo(f"Using single UAV navigation topic: /beetle{module_id}/uav/nav")
+            
         self.start_pub = rospy.Publisher('teleop_command/start', Empty, queue_size=1)
         self.takeoff_pub = rospy.Publisher('teleop_command/takeoff', Empty, queue_size=1)
         self.land_pub = rospy.Publisher('teleop_command/land', Empty, queue_size=1)
@@ -55,8 +100,20 @@ class BeetleInterface(object):
         self.external_wrench_active = False
         self.current_external_wrench = TaggedWrench()
         
-        # Subscribers
-        self.uav_sub = rospy.Subscriber(f'/beetle{module_id}/mocap/pose', PoseStamped, self.uavCallback, queue_size=1)
+        # Subscribers - setup for both individual and assembly tracking
+        if self.assembly_mode:
+            # Subscribe to assembly CoG position
+            self.assembly_sub = rospy.Subscriber('/assemble/cog/odom', Odometry, self.assemblyCallback, queue_size=1)
+            # Also subscribe to individual UAV for leader tracking (if this UAV is leader)
+            if self.assembly_tf_calculator and module_id == self.assembly_tf_calculator.get_leader_id():
+                self.leader_sub = rospy.Subscriber(f'/beetle{module_id}/mocap/pose', PoseStamped, self.uavCallback, queue_size=1)
+                rospy.loginfo(f"Leader UAV {module_id}: subscribing to both assembly and individual topics")
+            else:
+                rospy.loginfo(f"Follower UAV {module_id}: subscribing to assembly topic only")
+        else:
+            # Single mode: individual UAV tracking only
+            self.uav_sub = rospy.Subscriber(f'/beetle{module_id}/mocap/pose', PoseStamped, self.uavCallback, queue_size=1)
+            
         self.wrench_sub = rospy.Subscriber(f'/beetle{module_id}/estimated_external_wrench', WrenchStamped, self.wrenchCallback, queue_size=1)
         self.flight_state_sub = rospy.Subscriber('flight_state', UInt8, self.flightStateCallback, queue_size=1)
         
@@ -75,6 +132,10 @@ class BeetleInterface(object):
         self.uav_odom.header = msg.header
         self.uav_odom.pose.pose.position = msg.pose.position
         self.uav_odom.pose.pose.orientation = msg.pose.orientation
+        
+    def assemblyCallback(self, msg):
+        """Callback for assembly CoG odometry"""
+        self.assembly_odom = msg
         
     def valveCallback(self, msg):
         self.valve_pose = msg.pose
@@ -116,6 +177,40 @@ class BeetleInterface(object):
         
     # State getters
     def getUavPos(self):
+        """
+        Get effective UAV position for control.
+        
+        In single mode: returns individual UAV position
+        In assembly mode: returns assembly CoG position (used for formation control)
+        """
+        if self.assembly_mode:
+            # Return assembly CoG position for formation control
+            return np.array([
+                self.assembly_odom.pose.pose.position.x,
+                self.assembly_odom.pose.pose.position.y,
+                self.assembly_odom.pose.pose.position.z
+            ])
+        else:
+            # Return individual UAV position
+            return np.array([
+                self.uav_odom.pose.pose.position.x,
+                self.uav_odom.pose.pose.position.y,
+                self.uav_odom.pose.pose.position.z
+            ])
+            
+    def getAssemblyPos(self):
+        """Get assembly CoG position (only available in assembly mode)"""
+        if not self.assembly_mode:
+            rospy.logwarn("getAssemblyPos() called in single mode - returning None")
+            return None
+        return np.array([
+            self.assembly_odom.pose.pose.position.x,
+            self.assembly_odom.pose.pose.position.y,
+            self.assembly_odom.pose.pose.position.z
+        ])
+        
+    def getIndividualUavPos(self):
+        """Get individual UAV position (available in both modes if subscribed)"""
         return np.array([
             self.uav_odom.pose.pose.position.x,
             self.uav_odom.pose.pose.position.y,
@@ -123,15 +218,78 @@ class BeetleInterface(object):
         ])
         
     def getUavRot(self):
-        return np.array([
-            self.uav_odom.pose.pose.orientation.x,
-            self.uav_odom.pose.pose.orientation.y,
-            self.uav_odom.pose.pose.orientation.z,
-            self.uav_odom.pose.pose.orientation.w
-        ])
+        """
+        Get effective UAV orientation for control.
+        
+        In single mode: returns individual UAV orientation
+        In assembly mode: returns assembly orientation
+        """
+        if self.assembly_mode:
+            return np.array([
+                self.assembly_odom.pose.pose.orientation.x,
+                self.assembly_odom.pose.pose.orientation.y,
+                self.assembly_odom.pose.pose.orientation.z,
+                self.assembly_odom.pose.pose.orientation.w
+            ])
+        else:
+            return np.array([
+                self.uav_odom.pose.pose.orientation.x,
+                self.uav_odom.pose.pose.orientation.y,
+                self.uav_odom.pose.pose.orientation.z,
+                self.uav_odom.pose.pose.orientation.w
+            ])
         
     def getUavRPY(self):
         return euler_from_quaternion(self.getUavRot())
+        
+    def getAssemblyRPY(self):
+        """Get assembly orientation (only in assembly mode)"""
+        if not self.assembly_mode:
+            return None
+        assembly_quat = np.array([
+            self.assembly_odom.pose.pose.orientation.x,
+            self.assembly_odom.pose.pose.orientation.y,
+            self.assembly_odom.pose.pose.orientation.z,
+            self.assembly_odom.pose.pose.orientation.w
+        ])
+        return euler_from_quaternion(assembly_quat)
+    
+    def getEndEffectorPos(self):
+        """
+        Get end-effector position in world coordinates.
+        
+        In single mode: calculated from individual UAV position
+        In assembly mode: calculated from assembly CoG using coordinate transforms
+        """
+        if self.assembly_mode and self.assembly_tf_calculator:
+            # Assembly mode: transform from assembly CoG to end-effector
+            assembly_pos = self.getAssemblyPos()
+            assembly_rpy = self.getAssemblyRPY()
+            if assembly_pos is None or assembly_rpy is None:
+                rospy.logwarn("Assembly position/orientation not available")
+                return None
+                
+            assembly_yaw = assembly_rpy[2]
+            return self.assembly_tf_calculator.transform_assembly_to_end_effector(
+                tuple(assembly_pos), assembly_yaw
+            )
+        else:
+            # Single mode: calculate from individual UAV position
+            uav_pos = self.getIndividualUavPos()
+            uav_rpy = self.getUavRPY()
+            if len(uav_pos) == 0 or len(uav_rpy) == 0:
+                return None
+                
+            uav_yaw = uav_rpy[2]
+            # Use hardcoded parameters for single mode (backward compatibility)
+            dual_fang_center_offset = 0.246
+            end_effector_offset_z = 0.074382
+            
+            end_effector_x = uav_pos[0] + dual_fang_center_offset * math.cos(uav_yaw)
+            end_effector_y = uav_pos[1] + dual_fang_center_offset * math.sin(uav_yaw)
+            end_effector_z = uav_pos[2] + end_effector_offset_z
+            
+            return (end_effector_x, end_effector_y, end_effector_z)
         
     def getValvePos(self):
         if self.valve_pose is None:
@@ -187,9 +345,9 @@ class BeetleInterface(object):
             angular_vel: Target angular velocity [wx, wy, wz] or scalar yaw rate
         """
         nav_msg = FlightNav()
-        nav_msg.control_frame = nav_msg.WORLD_FRAME
+        nav_msg.control_frame = nav_msg.WORLD_FRAME  # Always use WORLD_FRAME
+        nav_msg.target = FlightNav.COG               # Always use COG target
         nav_msg.header.stamp = rospy.Time.now()
-        nav_msg.target = FlightNav.COG
         
         # Enable POS_VEL_MODE if linear or angular velocity is provided
         mode = FlightNav.POS_VEL_MODE if (linear_vel is not None or angular_vel is not None) else FlightNav.POS_MODE

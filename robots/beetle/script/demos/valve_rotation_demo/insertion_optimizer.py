@@ -91,6 +91,11 @@ class InsertionOptimizer:
         
         # Default rotation direction (for compatibility)
         self.rotation_direction = 1  # 1 for clockwise, -1 for counter-clockwise
+
+        # Cached valve pose for formation helpers
+        self._valve_position = None
+        self._valve_yaw = None
+        self._spoke_angles_world = None
         
         rospy.loginfo("=== DUAL-FANG INSERTION OPTIMIZER FOR VALVE WHEEL ===")
         rospy.loginfo(f"Valve Wheel Geometry:")
@@ -127,6 +132,44 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Z-axis safety margin: {self.insertion_safety_margin_z:.3f}m (UAV CoG比阀门中心高67.3mm)")
         rospy.loginfo(f"EXPECTED IMPROVEMENT: UAV CoG更接近阀门，提供更大操作空间，减少碰撞风险")
     
+    @staticmethod
+    def _normalize_angle(angle):
+        """Normalize raw angle to [-pi, pi] for consistent downstream use."""
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def update_valve_info(self, valve_pos, valve_yaw):
+        """Cache valve pose information for downstream helpers."""
+        if valve_pos is None:
+            rospy.logwarn("update_valve_info called with None valve_pos")
+            return
+
+        try:
+            self._valve_position = tuple(valve_pos[:3])
+        except TypeError:
+            # Fall back to direct tuple conversion if valve_pos is already iterable without slicing support
+            self._valve_position = tuple(valve_pos)
+
+        self._valve_yaw = float(valve_yaw) if valve_yaw is not None else 0.0
+        offsets = (0.0, math.pi * 2 / 3, math.pi * 4 / 3)
+        self._spoke_angles_world = [self._normalize_angle(self._valve_yaw + offset) for offset in offsets]
+
+        rospy.loginfo("[InsertionOptimizer] Valve pose cached for formation helpers:")
+        rospy.loginfo(f"  Position: {self._valve_position}")
+        rospy.loginfo(f"  Yaw: {math.degrees(self._valve_yaw):.1f}°")
+
+    def get_spoke_angles(self):
+        """Return world-frame spoke angles using cached valve yaw."""
+        if self._spoke_angles_world is None:
+            if self._valve_yaw is None:
+                rospy.logwarn("get_spoke_angles called before valve info cached; using default offsets")
+                base_angles = (0.0, math.pi * 2 / 3, math.pi * 4 / 3)
+                return [self._normalize_angle(angle) for angle in base_angles]
+
+            offsets = (0.0, math.pi * 2 / 3, math.pi * 4 / 3)
+            self._spoke_angles_world = [self._normalize_angle(self._valve_yaw + offset) for offset in offsets]
+
+        return list(self._spoke_angles_world)
+
     def get_optimal_end_effector_distance(self):
         """
         Get the optimal end-effector distance from valve center

@@ -1621,26 +1621,20 @@ class OnlineCircularTrajectoryGenerator:
         actual_angle = math.atan2(relative_pos[1], relative_pos[0])
         
         # Dragon风格在线轨迹更新：delta_yaw = delta_t * turn_vel
-        # 根据当前性能调整角速度（支持正负方向）
-        if valve_angular_velocity > 0.1:  # 阀门开始转动
-            # 逐渐加速到目标角速度，保持符号
-            if self.target_angular_velocity >= 0:
-                acceleration = min(0.1, self.target_angular_velocity - self.angular_velocity)
-                self.angular_velocity = min(self.target_angular_velocity, 
-                                          self.angular_velocity + acceleration * actual_dt)
-            else:
-                acceleration = max(-0.1, self.target_angular_velocity - self.angular_velocity)
-                self.angular_velocity = max(self.target_angular_velocity, 
-                                          self.angular_velocity + acceleration * actual_dt)
+        # 直接设置目标角速度，避免累积加速导致的速度过快问题
+        if valve_angular_velocity > 0.1:  # 阀门开始转动，使用100%目标速度
+            self.angular_velocity = self.target_angular_velocity
         else:
-            # 缓慢启动到目标速度，保持符号方向
-            startup_acceleration = 0.01  # 较小的启动加速度，确保平滑启动
-            if self.target_angular_velocity >= 0:
-                self.angular_velocity = min(self.target_angular_velocity, 
-                                          self.angular_velocity + startup_acceleration * actual_dt)
-            else:
-                self.angular_velocity = max(self.target_angular_velocity, 
-                                          self.angular_velocity - startup_acceleration * actual_dt)
+            # 接触阶段使用70%目标速度，确保平稳接触
+            self.angular_velocity = self.target_angular_velocity * 0.7
+        
+        # 🔧 速度安全限制：从控制层面确保安全运行
+        SPEED_SAFETY_LIMIT = 0.1  # 0.1 rad/s ≈ 5.7°/s 安全上限
+        if abs(self.angular_velocity) > SPEED_SAFETY_LIMIT:
+            speed_sign = 1 if self.angular_velocity > 0 else -1
+            self.angular_velocity = speed_sign * SPEED_SAFETY_LIMIT
+            if self.debug:
+                rospy.logwarn(f"速度安全限制启动: 角速度被限制到 {self.angular_velocity:.3f} rad/s ({math.degrees(abs(self.angular_velocity)):.1f}°/s)")
         
         # 更新角度：核心Dragon公式
         delta_angle = self.angular_velocity * actual_dt

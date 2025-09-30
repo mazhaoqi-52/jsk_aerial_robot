@@ -226,7 +226,7 @@ class AssemblyMotionStateBase(smach.State):
                    self.current_pos.pose.position.z)
         error = math.sqrt(sum((t - c) ** 2 for t, c in zip(target, current)))
         
-        # 方案A：根据阶段调整容差（插入阶段需要更高精度）
+        # 方案A：根据阶段调整容差(插入阶段需要更高精度)
         if hasattr(self, '_insertion_phase') and self._insertion_phase:
             # 插入阶段使用更严格的容差
             adjusted_tolerance = min(tolerance, 0.15)  # 最大15cm容差

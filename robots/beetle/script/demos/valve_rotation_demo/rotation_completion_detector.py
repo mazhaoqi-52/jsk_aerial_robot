@@ -67,7 +67,7 @@ class RotationCompletionDetector:
             self.distance_stable_start_time = None
             self.valve_rotation_achieved = False
             
-        rospy.loginfo("✓ Rotation completion monitoring started")
+        rospy.loginfo("Rotation completion monitoring started")
     
     def update_valve_rotation(self, current_valve_rotation):
         """Update valve rotation progress"""
@@ -75,12 +75,12 @@ class RotationCompletionDetector:
             if current_valve_rotation >= self.valve_rotation_threshold:
                 if not self.valve_rotation_achieved:
                     self.valve_rotation_achieved = True
-                    rospy.loginfo(f"✓ VALVE ROTATION TARGET ACHIEVED: {math.degrees(current_valve_rotation):.1f}°")
+                    rospy.loginfo(f"VALVE ROTATION TARGET ACHIEVED: {math.degrees(current_valve_rotation):.1f}°")
                     
                     if current_valve_rotation >= self.target_valve_rotation:
                         self.completion_detected = True
                         self.completion_reason = "valve_rotation_complete"
-                        rospy.loginfo("✓ COMPLETION DETECTED: Valve rotation target fully achieved")
+                        rospy.loginfo("COMPLETION DETECTED: Valve rotation target fully achieved")
     
     def update_distance_error(self, distance_error):
         """Update distance error and check for stabilization"""
@@ -120,7 +120,7 @@ class RotationCompletionDetector:
                         if self.valve_rotation_achieved:
                             self.completion_detected = True
                             self.completion_reason = "distance_stabilized_with_rotation"
-                            rospy.loginfo("✓ COMPLETION DETECTED: Distance stabilized after valve rotation")
+                            rospy.loginfo("COMPLETION DETECTED: Distance stabilized after valve rotation")
                 elif not has_min_time:
                     # Too early - minimum time not reached
                     rospy.loginfo(f"⏱ Minimum time protection: {execution_time:.1f}s < {self.min_rotation_duration:.1f}s required")
@@ -141,7 +141,7 @@ class RotationCompletionDetector:
             if self.correction_count >= self.max_correction_attempts:
                 self.completion_detected = True
                 self.completion_reason = "max_corrections_reached"
-                rospy.logwarn(f"⚠ COMPLETION FORCED: Maximum correction attempts reached ({self.max_correction_attempts})")
+                rospy.logwarn(f"WARNING: COMPLETION FORCED: Maximum correction attempts reached ({self.max_correction_attempts})")
     
     def check_timeout(self):
         """Check for timeout condition"""
@@ -155,7 +155,7 @@ class RotationCompletionDetector:
             if elapsed_time >= self.max_rotation_duration:
                 self.completion_detected = True
                 self.completion_reason = "timeout"
-                rospy.logwarn(f"⚠ COMPLETION FORCED: Maximum rotation duration reached ({self.max_rotation_duration:.0f}s)")
+                rospy.logwarn(f"WARNING: COMPLETION FORCED: Maximum rotation duration reached ({self.max_rotation_duration:.0f}s)")
                 return True
         
         return False

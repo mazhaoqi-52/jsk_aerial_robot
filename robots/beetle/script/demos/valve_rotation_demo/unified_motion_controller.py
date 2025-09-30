@@ -75,11 +75,11 @@ class UnifiedMotionController:
             from rotation_completion_detector import get_completion_detector
             self.completion_detector = get_completion_detector()
             self.use_completion_detection = True
-            rospy.loginfo("✓ Rotation completion detector enabled")
+            rospy.loginfo("Rotation completion detector enabled")
         except ImportError:
             self.completion_detector = None
             self.use_completion_detection = False
-            rospy.logwarn("⚠ Rotation completion detector not available - using legacy mode")
+            rospy.logwarn("WARNING: Rotation completion detector not available - using legacy mode")
         
         # End-effector parameters
         self.end_effector_offset_x = 0.246
@@ -99,8 +99,8 @@ class UnifiedMotionController:
         self.return_to_start_active = False  # Return to start position phase
         self.pre_final_descent = True        # Pre-final descent (uses PID, then switches to PD)
         
-        rospy.loginfo("✓ Controller state management initialized")
-        rospy.loginfo("✓ Phase-specific control flags initialized")
+        rospy.loginfo("Controller state management initialized")
+        rospy.loginfo("Phase-specific control flags initialized")
         
     def _get_valve_surface_height(self):
         """
@@ -429,7 +429,7 @@ class UnifiedMotionController:
         )
         
         if success:
-            rospy.loginfo("✓ SINGLE-PHASE TRAJECTORY COMPLETED - NO OSCILLATION")
+            rospy.loginfo("SINGLE-PHASE TRAJECTORY COMPLETED - NO OSCILLATION")
             return True
         else:
             rospy.logerr("Single-phase trajectory failed")
@@ -519,7 +519,7 @@ class UnifiedMotionController:
                     if point_speed > max_allowed_speed:
                         speed_violations += 1
                         if speed_violations <= 2:  # 记录前2次
-                            rospy.logwarn(f"⚠ 轨迹速度异常 t={t:.2f}s: {point_speed:.3f}m/s > {max_allowed_speed:.3f}m/s")
+                            rospy.logwarn(f"WARNING: 轨迹速度异常 t={t:.2f}s: {point_speed:.3f}m/s > {max_allowed_speed:.3f}m/s")
             
             if speed_violations > len(check_times) * 0.2:  # 超过20%异常
                 rospy.logwarn(f"轨迹数值不稳定：{speed_violations}/{len(check_times)} 采样点速度异常")
@@ -530,11 +530,11 @@ class UnifiedMotionController:
                 traj = PolynomialTrajectory(safer_duration)
                 traj.generate_trajectory(start_pos, target_pos)
                 duration = safer_duration
-                rospy.loginfo(f"✓ 重新生成轨迹，持续时间: {duration:.1f}s")
+                rospy.loginfo(f"重新生成轨迹，持续时间: {duration:.1f}s")
             else:
-                rospy.loginfo(f"✓ 轨迹数值稳定性检查通过：{speed_violations} 异常点")
+                rospy.loginfo(f"轨迹数值稳定性检查通过：{speed_violations} 异常点")
         
-        rospy.loginfo("✓ 轨迹平滑化验证完成")
+        rospy.loginfo("轨迹平滑化验证完成")
         
         start_yaw = self.sm.current_yaw
         yaw_diff = self._normalize_angle_diff(target_yaw - start_yaw)
@@ -881,7 +881,7 @@ class UnifiedMotionController:
                 rospy.loginfo_throttle(3, f"HIGH_PRECISION PID mode: {total_movement_distance*1000:.1f}mm movement - conservative gains")
             else:
                 # 长距离移动(>30mm)使用标准PID，不需要高精度
-                rospy.loginfo_throttle(5, f"🛩️ LONG_DISTANCE movement: {total_movement_distance*1000:.1f}mm - using standard PID")
+                rospy.loginfo_throttle(5, f"LONG_DISTANCE movement: {total_movement_distance*1000:.1f}mm - using standard PID")
         
         rospy.loginfo(f"Control mode: {control_mode}, Max correction: {max_correction:.1f}mm")
         rospy.loginfo(f"PID gains - P:{pid_kp:.2f}, I:{pid_ki:.3f}, D:{pid_kd:.2f}")
@@ -1281,7 +1281,7 @@ class UnifiedMotionController:
                     target_pos, target_yaw, pos_threshold, yaw_threshold, point_timeout=2.0)
                 
                 if convergence_success:
-                    rospy.loginfo("✓ Trajectory converged successfully")
+                    rospy.loginfo("Trajectory converged successfully")
                     return True
                 else:
                     # Check actual final error with depth-adaptive thresholds
@@ -1338,10 +1338,10 @@ class UnifiedMotionController:
                         # Use depth-adaptive acceptance criteria with conservative yaw relaxation
                         relaxed_yaw_threshold = yaw_threshold * yaw_relaxation
                         if final_error < adaptive_pos_threshold and final_yaw_error < relaxed_yaw_threshold:
-                            rospy.logwarn(f"✓ Accepting trajectory with depth-adaptive relaxed thresholds (pos: {adaptive_pos_threshold*1000:.1f}mm, yaw: {math.degrees(relaxed_yaw_threshold):.2f}°)")
+                            rospy.logwarn(f"Accepting trajectory with depth-adaptive relaxed thresholds (pos: {adaptive_pos_threshold*1000:.1f}mm, yaw: {math.degrees(relaxed_yaw_threshold):.2f}°)")
                             return True
                         else:
-                            rospy.logerr(f"✗ Trajectory failed - pos: {final_error*1000:.1f}mm > {adaptive_pos_threshold*1000:.1f}mm OR yaw: {math.degrees(final_yaw_error):.2f}° > {math.degrees(relaxed_yaw_threshold):.2f}°")
+                            rospy.logerr(f"Trajectory failed - pos: {final_error*1000:.1f}mm > {adaptive_pos_threshold*1000:.1f}mm OR yaw: {math.degrees(final_yaw_error):.2f}° > {math.degrees(relaxed_yaw_threshold):.2f}°")
                             return False
                     else:
                         rospy.logerr("Lost position feedback - trajectory failed")
@@ -1559,7 +1559,7 @@ class UnifiedMotionController:
             if pos_error <= pos_threshold and yaw_error <= yaw_threshold:
                 converged_count += 1
                 if converged_count >= required_convergence:
-                    rospy.loginfo(f"✓ PID precision positioning converged: {pos_error*1000:.1f}mm, {math.degrees(yaw_error):.2f}°")
+                    rospy.loginfo(f"PID precision positioning converged: {pos_error*1000:.1f}mm, {math.degrees(yaw_error):.2f}°")
                     return True
             else:
                 converged_count = 0
@@ -1752,12 +1752,12 @@ class UnifiedMotionController:
                     
                     # Provide diagnosis
                     if abs(final_pitch) > math.radians(2.0):  # >2° pitch error
-                        rospy.logwarn(f"⚠️ SIGNIFICANT PITCH ERROR DETECTED IN NON-CONTACT SEGMENT!")
-                        rospy.logwarn(f"⚠️ This suggests CONTROL ALGORITHM issue, not physical interference")
+                        rospy.logwarn(f"SIGNIFICANT PITCH ERROR DETECTED IN NON-CONTACT SEGMENT!")
+                        rospy.logwarn(f"This suggests CONTROL ALGORITHM issue, not physical interference")
                         if final_analysis['required_vel_magnitude'] > 0.1:
-                            rospy.logwarn(f"⚠️ High velocity requirement may cause pitch-forward control response")
+                            rospy.logwarn(f"High velocity requirement may cause pitch-forward control response")
                         if final_analysis['pos_error_xy'] > 0.02:
-                            rospy.logwarn(f"⚠️ Large XY tracking error may cause aggressive control corrections")
+                            rospy.logwarn(f"Large XY tracking error may cause aggressive control corrections")
                     else:
                         rospy.loginfo(f"First segment pitch control is NORMAL")
                         rospy.loginfo(f"If pitch errors occur later, likely due to physical contact")
@@ -1788,7 +1788,7 @@ class UnifiedMotionController:
                 
                 if not valve_contact_detected and valve_yaw_change > math.radians(2.0):  # 2° threshold
                     valve_contact_detected = True
-                    rospy.loginfo(f"✓ Valve contact detected (yaw change: {math.degrees(valve_yaw_change):.1f}°)")
+                    rospy.loginfo(f"Valve contact detected (yaw change: {math.degrees(valve_yaw_change):.1f}°)")
             
             # Check for stable contact and replan if needed (skip during disengagement)
             if not is_disengagement_mode and valve_contact_detected and not stable_contact_detected and not trajectory_replanned:
@@ -1797,7 +1797,7 @@ class UnifiedMotionController:
                     stable_contact_detected = True
                     elapsed_time = current_time - start_time
                     
-                    rospy.loginfo(f"✓ STABLE CONTACT ACHIEVED after {elapsed_time:.1f}s!")
+                    rospy.loginfo(f"STABLE CONTACT ACHIEVED after {elapsed_time:.1f}s!")
                     
                     # Calculate remaining rotation
                     progress = trajectory.get_progress() if hasattr(trajectory, 'get_progress') else 0.5
@@ -1815,11 +1815,11 @@ class UnifiedMotionController:
                         if new_trajectory is not None:
                             trajectory = new_trajectory
                             trajectory_replanned = True
-                            rospy.loginfo("✓ Successfully switched to replanned trajectory")
+                            rospy.loginfo("Successfully switched to replanned trajectory")
                             # Reset timing for new trajectory
                             start_time = current_time
                         else:
-                            rospy.logwarn("⚠ Trajectory replanning failed, continuing with original")
+                            rospy.logwarn("WARNING: Trajectory replanning failed, continuing with original")
                     else:
                         rospy.loginfo("Remaining rotation is small, continuing with original trajectory")
             
@@ -1885,7 +1885,7 @@ class UnifiedMotionController:
                 
                 # Add progressive warnings and control actions as drift increases
                 if distance_drift >= soft_threshold:  # Soft warning level
-                    rospy.logwarn(f"⚠️ DISTANCE DRIFT WARNING: {distance_drift*1000:.0f}mm exceeds {soft_threshold*1000:.0f}mm soft limit")
+                    rospy.logwarn(f"DISTANCE DRIFT WARNING: {distance_drift*1000:.0f}mm exceeds {soft_threshold*1000:.0f}mm soft limit")
                     
                     # GENTLE CORRECTION: Reduce trajectory speed for gradual correction
                     if hasattr(trajectory.adaptive_controller, 'speed_factor'):
@@ -1992,7 +1992,7 @@ class UnifiedMotionController:
                             trajectory_replanned = False
                             valve_contact_detected = False
                         except Exception as e:
-                            rospy.logerr(f"❌ TRAJECTORY RESET FAILED: {e}")
+                            rospy.logerr(f"TRAJECTORY RESET FAILED: {e}")
                             # Continue with current trajectory rather than crashing
             else:
                 # Error is manageable, reset tracking
@@ -2147,7 +2147,7 @@ class UnifiedMotionController:
             )
             
             if new_trajectory is not None:
-                rospy.loginfo("✓ Trajectory successfully replanned from stable contact position")
+                rospy.loginfo("Trajectory successfully replanned from stable contact position")
             return new_trajectory
             
         except Exception as e:
@@ -2339,7 +2339,7 @@ class UnifiedMotionController:
             # Check if rotation is considered complete
             if self.completion_detector.is_completed():
                 reason = self.completion_detector.get_completion_reason()
-                rospy.loginfo(f"✓ ROTATION COMPLETION DETECTED: {reason}")
+                rospy.loginfo(f"ROTATION COMPLETION DETECTED: {reason}")
                 rospy.loginfo("Terminating position corrections to prevent infinite loop")
                 return target_pos, target_yaw  # Rotation complete, stop corrections
         
@@ -2707,17 +2707,17 @@ class UnifiedMotionController:
         
         # Evaluate control performance
         if self.control_stats['max_distance_error'] < self.distance_tolerance * 2:
-            rospy.loginfo("✓ Distance control performance: Excellent")
+            rospy.loginfo("Distance control performance: Excellent")
         elif self.control_stats['max_distance_error'] < self.distance_tolerance * 3:
-            rospy.loginfo("✓ Distance control performance: Good")
+            rospy.loginfo("Distance control performance: Good")
         else:
-            rospy.logwarn("⚠ Distance control performance: Needs improvement")
+            rospy.logwarn("WARNING: Distance control performance: Needs improvement")
         
         rospy.loginfo("=== Unified Motion Controller with Adaptive Control ===")
-        rospy.loginfo("✓ Basic trajectory execution and feedback control")
-        rospy.loginfo("✓ Enhanced alignment control")
-        rospy.loginfo("✓ Constant distance feedback control")
-        rospy.loginfo("✓ Specialized valve rotation control")
+        rospy.loginfo("Basic trajectory execution and feedback control")
+        rospy.loginfo("Enhanced alignment control")
+        rospy.loginfo("Constant distance feedback control")
+        rospy.loginfo("Specialized valve rotation control")
     
     def execute_vel_accel_trajectory(self, start_pos, target_pos, target_yaw, duration=5.0,
                                     pos_threshold=0.03, yaw_threshold=0.08, axis_lock_mode=None):
@@ -2902,17 +2902,17 @@ class UnifiedMotionController:
             rospy.loginfo(f"  Max XY drift: {max_xy_drift:.6f}m (should be ~0)")
             rospy.loginfo(f"  Max yaw drift: {math.degrees(max_yaw_drift):.3f}° (should be ~0)")
             if max_xy_drift > 0.01 or max_yaw_drift > math.radians(2):
-                rospy.logwarn("⚠ Significant drift detected in locked axes")
+                rospy.logwarn("WARNING: Significant drift detected in locked axes")
             else:
-                rospy.loginfo("✓ Excellent axis control - locked axes maintained")
+                rospy.loginfo("Excellent axis control - locked axes maintained")
                 
         elif axis_lock_mode == 'xy_yaw':
             rospy.loginfo(f"Axis control performance (XY+Yaw mode):")
             rospy.loginfo(f"  Max Z drift: {max_z_drift:.6f}m (should be ~0)")
             if max_z_drift > 0.01:
-                rospy.logwarn("⚠ Significant Z-axis drift detected")
+                rospy.logwarn("WARNING: Significant Z-axis drift detected")
             else:
-                rospy.loginfo("✓ Excellent Z-axis control maintained")
+                rospy.loginfo("Excellent Z-axis control maintained")
         
         rospy.loginfo("VEL+ACCEL trajectory completed")
         return True
@@ -2972,7 +2972,7 @@ class UnifiedMotionController:
             rospy.logerr("Phase 1 (simple approach) failed")
             return False
         
-        rospy.loginfo("✓ Phase 1 completed: Simple approach successful")
+        rospy.loginfo("Phase 1 completed: Simple approach successful")
         
         # === PHASE 2: PRECISION INSERTION BASED ON ACTUAL POSITION ===
         rospy.loginfo("--- PHASE 2: PRECISION INSERTION ---")
@@ -3006,7 +3006,7 @@ class UnifiedMotionController:
             rospy.logerr("Phase 2 (precision insertion) failed")
             return False
         
-        rospy.loginfo("✓ Phase 2 completed: Precision insertion successful")
+        rospy.loginfo("Phase 2 completed: Precision insertion successful")
         
         # === PHASE 3: VERIFY INSERTION AND PREPARE FOR ROTATION ===
         rospy.loginfo("--- PHASE 3: INSERTION VERIFICATION ---")
@@ -3021,14 +3021,14 @@ class UnifiedMotionController:
             rospy.loginfo(f"Final insertion error: {insertion_error*1000:.1f}mm")
             
             if insertion_error < 0.015:  # 15mm tolerance
-                rospy.loginfo("✓ Phase 3: Insertion verification PASSED")
-                rospy.loginfo("✓ ADAPTIVE VALVE INSERTION COMPLETED")
+                rospy.loginfo("Phase 3: Insertion verification PASSED")
+                rospy.loginfo("ADAPTIVE VALVE INSERTION COMPLETED")
                 rospy.loginfo("Ready for real-time rotation trajectory planning")
                 return True
             else:
                 rospy.logwarn(f"Phase 3: Insertion error {insertion_error*1000:.1f}mm exceeds 15mm tolerance")
         
-        rospy.loginfo("✓ ADAPTIVE VALVE INSERTION COMPLETED (with warnings)")
+        rospy.loginfo("ADAPTIVE VALVE INSERTION COMPLETED (with warnings)")
         return True
     
     # ===== Wait and convergence checking methods =====
@@ -3382,20 +3382,20 @@ class UnifiedMotionController:
             )
             
             if not segment_success:
-                rospy.logerr(f"✗ Z descent segment {segment + 1} failed")
+                rospy.logerr(f"Z descent segment {segment + 1} failed")
                 return False
             
             # 更新当前位置为下一段做准备
             current_segment_pos = self.sm.get_current_position()
             current_segment_yaw = self.sm.get_current_yaw()
             
-            rospy.loginfo(f"✓ Z descent segment {segment + 1} completed")
+            rospy.loginfo(f"Z descent segment {segment + 1} completed")
         
         stage3b_success = True  # 所有分段都成功
         
         if stage3b_success:
-            rospy.loginfo("✓ THREE-STAGE INSERTION WITH ADAPTIVE REPLANNING COMPLETED SUCCESSFULLY")
-            rospy.loginfo("✓ Z-AXIS DESCENT COMPLETED - INSERTION STRATEGY FIXED")
+            rospy.loginfo("THREE-STAGE INSERTION WITH ADAPTIVE REPLANNING COMPLETED SUCCESSFULLY")
+            rospy.loginfo("Z-AXIS DESCENT COMPLETED - INSERTION STRATEGY FIXED")
             
             # === 关键节点强制精度校正 ===
             rospy.loginfo("=== CRITICAL PRECISION VERIFICATION BEFORE DUAL-FANG POSITIONING ===")
@@ -3479,22 +3479,22 @@ class UnifiedMotionController:
                         final_z_threshold = 0.025   # Relaxed to 25mm (was 20mm)
                         
                         if xy_error_after <= final_xy_threshold and z_error_after <= final_z_threshold:
-                            rospy.loginfo("✓ PRECISION CORRECTION SUCCESSFUL - Ready for dual-fang positioning")
+                            rospy.loginfo("PRECISION CORRECTION SUCCESSFUL - Ready for dual-fang positioning")
                         else:
-                            rospy.logwarn(f"✓ PRECISION CORRECTION ACCEPTABLE - XY: {xy_error_after*1000:.1f}mm, Z: {z_error_after*1000:.1f}mm")
+                            rospy.logwarn(f"PRECISION CORRECTION ACCEPTABLE - XY: {xy_error_after*1000:.1f}mm, Z: {z_error_after*1000:.1f}mm")
                             rospy.loginfo("  Proceeding with circular arc trajectory (can handle moderate positioning errors)")
                             # Still return success since circular arc can handle moderate errors
                 else:
-                    rospy.logwarn("✗ PRECISION CORRECTION FAILED")
-                    rospy.loginfo("⚠️  Proceeding anyway - circular arc trajectory can handle moderate positioning errors")
+                    rospy.logwarn("PRECISION CORRECTION FAILED")
+                    rospy.loginfo(" Proceeding anyway - circular arc trajectory can handle moderate positioning errors")
                     # Don't return False here - let the circular arc trajectory handle the positioning
             else:
-                rospy.loginfo("✓ Position precision sufficient for dual-fang positioning")
+                rospy.loginfo("Position precision sufficient for dual-fang positioning")
             
             rospy.loginfo("=== PRECISION VERIFICATION COMPLETE ===")
             return True
         else:
-            rospy.logerr("✗ Stage 3B (Z descent) failed after adaptive replanning")
+            rospy.logerr("Stage 3B (Z descent) failed after adaptive replanning")
             return False
     
     def _execute_stage_with_replanning(self, stage_name, start_pos, target_pos, target_yaw, 
@@ -3559,7 +3559,7 @@ class UnifiedMotionController:
             )
             
             if success:
-                rospy.loginfo(f"✓ {stage_name} completed successfully")
+                rospy.loginfo(f"{stage_name} completed successfully")
                 return True
             
             # 如果失败且还有重规划机会
@@ -3628,8 +3628,8 @@ class UnifiedMotionController:
             speed_desc = "SLOW precision"
             
             # SEGMENT 3 CRITICAL PHASE MONITORING SETUP
-            rospy.logwarn("⚠️  ENTERING CRITICAL SEGMENT 3 (241-284mm depth)")
-            rospy.logwarn("⚠️  This is the highest failure-risk phase - implementing enhanced monitoring")
+            rospy.logwarn(" ENTERING CRITICAL SEGMENT 3 (241-284mm depth)")
+            rospy.logwarn(" This is the highest failure-risk phase - implementing enhanced monitoring")
             
             # Pre-execution XY position validation for Segment 3
             if hasattr(self, 'tf_listener'):
@@ -3680,7 +3680,7 @@ class UnifiedMotionController:
         )
         
         if not descent_success:
-            rospy.logerr(f"✗ {segment_name} polynomial descent failed")
+            rospy.logerr(f"{segment_name} polynomial descent failed")
             return False
         
         # 第二步：验证并校正XY位置
@@ -3693,10 +3693,10 @@ class UnifiedMotionController:
         )
         
         if correction_success:
-            rospy.loginfo(f"✓ {segment_name} completed successfully with XY correction")
+            rospy.loginfo(f"{segment_name} completed successfully with XY correction")
             return True
         else:
-            rospy.logwarn(f"⚠ {segment_name} completed but XY correction had issues")
+            rospy.logwarn(f"WARNING: {segment_name} completed but XY correction had issues")
             return True  # 继续执行，不因校正失败而停止整个过程
     
     def _execute_polynomial_z_trajectory(self, start_pos, target_pos, target_yaw, duration, speed=0.05):
@@ -3809,10 +3809,10 @@ class UnifiedMotionController:
             conservative_duration = duration * 1.5
             traj = PolynomialTrajectory(conservative_duration)
             traj.generate_trajectory(start_pos, target_pos)
-            rospy.loginfo(f"✓ Regenerated trajectory with duration: {conservative_duration:.2f}s (was {duration:.2f}s)")
+            rospy.loginfo(f"Regenerated trajectory with duration: {conservative_duration:.2f}s (was {duration:.2f}s)")
             duration = conservative_duration
         
-        rospy.loginfo(f"✓ Trajectory smoothing complete: {excessive_speed_count} points corrected")
+        rospy.loginfo(f"Trajectory smoothing complete: {excessive_speed_count} points corrected")
         
         # === 轨迹生成后即时验证Z目标一致性 ===
         rospy.loginfo("=== IMMEDIATE TRAJECTORY Z CONSISTENCY VERIFICATION ===")
@@ -3827,7 +3827,7 @@ class UnifiedMotionController:
             rospy.loginfo(f"Start Z error: {start_z_error*1000:.1f}mm")
             
             if start_z_error > 0.001:  # 1mm tolerance
-                rospy.logwarn(f"⚠ TRAJECTORY START Z MISMATCH: {start_z_error*1000:.1f}mm")
+                rospy.logwarn(f"WARNING: TRAJECTORY START Z MISMATCH: {start_z_error*1000:.1f}mm")
                 rospy.logwarn("  → Polynomial trajectory start point != input start point")
         
         if final_traj_point is not None:
@@ -3836,7 +3836,7 @@ class UnifiedMotionController:
             rospy.loginfo(f"End Z error: {end_z_error*1000:.1f}mm")
             
             if end_z_error > 0.001:  # 1mm tolerance
-                rospy.logwarn(f"⚠ TRAJECTORY END Z MISMATCH: {end_z_error*1000:.1f}mm")
+                rospy.logwarn(f"WARNING: TRAJECTORY END Z MISMATCH: {end_z_error*1000:.1f}mm")
                 rospy.logwarn("  → Polynomial trajectory end point != input target point")
                 rospy.logwarn("  → This is the likely root cause of Z TARGET INCONSISTENCY")
                 rospy.logwarn("  → Check PolynomialTrajectory.generate_trajectory() boundary conditions")
@@ -3873,9 +3873,9 @@ class UnifiedMotionController:
             rospy.loginfo(f"End Z error: {end_z_error*1000:.1f}mm")
             
             if start_z_error > 0.001:
-                rospy.logwarn(f"⚠ TRAJECTORY START MISMATCH: {start_z_error*1000:.1f}mm")
+                rospy.logwarn(f"WARNING: TRAJECTORY START MISMATCH: {start_z_error*1000:.1f}mm")
             if end_z_error > 0.001:
-                rospy.logwarn(f"⚠ TRAJECTORY END MISMATCH: {end_z_error*1000:.1f}mm")
+                rospy.logwarn(f"WARNING: TRAJECTORY END MISMATCH: {end_z_error*1000:.1f}mm")
                 rospy.logwarn("  → This is the likely cause of Z TARGET INCONSISTENCY warnings")
         
         rospy.loginfo(f"Trajectory validation: max Z rate = {max_expected_z_rate:.3f} m/s (target: {speed:.3f} m/s)")
@@ -3941,7 +3941,7 @@ class UnifiedMotionController:
                         # 检查轨迹方向一致性（仅当有明显移动时）
                         if expected_z_direction != 0 and abs(z_trajectory_change) > 0.001 and trajectory_direction != expected_z_direction:
                             z_inconsistency_count += 1
-                            rospy.logwarn(f"⚠ Z TRAJECTORY DIRECTION INCONSISTENCY")
+                            rospy.logwarn(f"WARNING: Z TRAJECTORY DIRECTION INCONSISTENCY")
                             rospy.logwarn(f"  Expected direction: {'DOWN' if expected_z_direction < 0 else 'UP'}")
                             rospy.logwarn(f"  Trajectory direction: {'DOWN' if trajectory_direction < 0 else 'UP'}")
                             rospy.logwarn("  → Trajectory may have unexpected reversals")
@@ -3961,7 +3961,7 @@ class UnifiedMotionController:
                         # RELAXED THRESHOLD: 3.0x instead of 2.5x for complex 3D trajectories
                         if trajectory_speed > speed * 3.0:  # 超过期望速度3.0倍 (was 2.5x)
                             z_inconsistency_count += 1
-                            rospy.logwarn(f"⚠ Z TRAJECTORY SPEED EXCESSIVE: {trajectory_speed:.3f}m/s > {speed*3.0:.3f}m/s")
+                            rospy.logwarn(f"WARNING: Z TRAJECTORY SPEED EXCESSIVE: {trajectory_speed:.3f}m/s > {speed*3.0:.3f}m/s")
                             rospy.logwarn(f"  → Smoothed speed: {self._smoothed_trajectory_speed:.3f}m/s")
                             rospy.logwarn("  → Trajectory may be too aggressive")
                     
@@ -4261,11 +4261,11 @@ class UnifiedMotionController:
             
             # 最终状态下，轨迹应该与目标完全一致
             if final_traj_target_diff > 0.01:  # 最终状态使用严格的10mm阈值
-                rospy.logwarn("❌ DIAGNOSIS: Final trajectory position differs from target")
+                rospy.logwarn("DIAGNOSIS: Final trajectory position differs from target")
                 rospy.logwarn("   → Root cause: PolynomialTrajectory boundary conditions may be incorrect")
                 rospy.logwarn("   → Recommendation: Review trajectory.py generate_trajectory() method")
             else:
-                rospy.loginfo("✓ DIAGNOSIS: Final trajectory position matches target")
+                rospy.loginfo("DIAGNOSIS: Final trajectory position matches target")
                 
             # 平均跟踪误差分析
             if len(z_trajectory_samples) > 10:
@@ -4273,13 +4273,13 @@ class UnifiedMotionController:
                 rospy.loginfo(f"  Average Z tracking error (last 50 points): {avg_error*1000:.1f}mm")
                 
                 if avg_error > 0.04:  # 40mm平均误差
-                    rospy.logwarn("❌ DIAGNOSIS: Persistent large Z tracking errors")
+                    rospy.logwarn("DIAGNOSIS: Persistent large Z tracking errors")
                     rospy.logwarn("   → UAV Z control response may be inadequate")
                 elif avg_error > 0.02:  # 20mm平均误差
-                    rospy.logwarn("⚠ DIAGNOSIS: Moderate Z tracking errors")
+                    rospy.logwarn("WARNING: DIAGNOSIS: Moderate Z tracking errors")
                     rospy.logwarn("   → Consider reducing Z trajectory speed")
                 else:
-                    rospy.loginfo("✓ DIAGNOSIS: Z tracking performance acceptable")
+                    rospy.loginfo("DIAGNOSIS: Z tracking performance acceptable")
         
         rospy.loginfo("=== Z-AXIS DIAGNOSTIC COMPLETE ===")
         
@@ -4415,13 +4415,13 @@ class UnifiedMotionController:
             )
             
             if success:
-                rospy.loginfo(f"✓ {correction_name} XY correction successful")
+                rospy.loginfo(f"{correction_name} XY correction successful")
                 return True
             else:
-                rospy.logwarn(f"⚠ {correction_name} XY correction failed")
+                rospy.logwarn(f"WARNING: {correction_name} XY correction failed")
                 return False
         else:
-            rospy.loginfo(f"✓ {correction_name} XY position acceptable ({xy_error*1000:.1f}mm)")
+            rospy.loginfo(f"{correction_name} XY position acceptable ({xy_error*1000:.1f}mm)")
             return True
     
     # ===== PITCH ANGLE CONSTRAINT CONTROL METHODS =====
@@ -4443,7 +4443,7 @@ class UnifiedMotionController:
         # Check if pitch angle exceeds warning threshold
         if abs_pitch > self.pitch_warning_threshold:
             pitch_warning = True
-            rospy.logwarn(f"⚠ PITCH WARNING: Current pitch {math.degrees(current_pitch):.1f}° exceeds {math.degrees(self.pitch_warning_threshold):.1f}°")
+            rospy.logwarn(f"WARNING: PITCH WARNING: Current pitch {math.degrees(current_pitch):.1f}° exceeds {math.degrees(self.pitch_warning_threshold):.1f}°")
         
         # Apply yaw damping if pitch is large
         if abs_pitch > self.pitch_warning_threshold:
@@ -4457,7 +4457,7 @@ class UnifiedMotionController:
         
         # Hard limit check
         if abs_pitch > self.max_pitch_angle:
-            rospy.logerr(f"⚠ PITCH LIMIT EXCEEDED: {math.degrees(current_pitch):.1f}° > {math.degrees(self.max_pitch_angle):.1f}°")
+            rospy.logerr(f"WARNING: PITCH LIMIT EXCEEDED: {math.degrees(current_pitch):.1f}° > {math.degrees(self.max_pitch_angle):.1f}°")
             rospy.logerr("EMERGENCY: Stopping yaw corrections to prevent dangerous attitude")
             constrained_yaw_correction = 0.0  # Stop all yaw corrections
             pitch_warning = True
@@ -4535,9 +4535,9 @@ class UnifiedMotionController:
         """Start rotation completion monitoring session"""
         if self.use_completion_detection and self.completion_detector:
             self.completion_detector.start_rotation_monitoring()
-            rospy.loginfo("✓ Rotation completion monitoring started")
+            rospy.loginfo("Rotation completion monitoring started")
         else:
-            rospy.logwarn("⚠ Completion detection not available")
+            rospy.logwarn("WARNING: Completion detection not available")
     
     def update_valve_rotation_progress(self, current_valve_rotation):
         """Update valve rotation progress for completion detection"""
@@ -4628,7 +4628,7 @@ class UnifiedMotionController:
             self.pub.publish(nav_msg)
             rospy.sleep(0.05)  # 50ms间隔
         
-        rospy.loginfo("✓ All controllers stopped, UAV locked at current position")
+        rospy.loginfo("All controllers stopped, UAV locked at current position")
     
     def _reset_all_integral_errors(self):
         """
@@ -4723,7 +4723,7 @@ class UnifiedMotionController:
         elif controller_type == 'pid':
             self.pid_active = True
         
-        rospy.loginfo(f"✓ {controller_type.upper()} controller activated")
+        rospy.loginfo(f"{controller_type.upper()} controller activated")
     
     def is_controller_active(self, controller_type=None):
         """
@@ -4801,7 +4801,7 @@ class UnifiedMotionController:
             
             # Validate current position is reasonable
             if current_pos is None or any(abs(coord) > 100 for coord in current_pos):
-                rospy.logwarn(f"⚠️ Suspicious current position: {current_pos}, proceeding anyway")
+                rospy.logwarn(f"Suspicious current position: {current_pos}, proceeding anyway")
             
             # Use existing smooth trajectory execution
             success = self.execute_smooth_trajectory_with_yaw(
@@ -4814,9 +4814,9 @@ class UnifiedMotionController:
             )
             
             if success:
-                rospy.loginfo(f"✓ move_to_position_with_yaw completed successfully")
+                rospy.loginfo(f"move_to_position_with_yaw completed successfully")
             else:
-                rospy.logwarn(f"✗ move_to_position_with_yaw failed")
+                rospy.logwarn(f"move_to_position_with_yaw failed")
                 
             return success
             

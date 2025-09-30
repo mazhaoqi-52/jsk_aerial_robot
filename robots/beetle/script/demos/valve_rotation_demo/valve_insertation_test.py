@@ -39,7 +39,7 @@ from valve_rotation_fang_single import (
 
 class ValveInsertionState(SingleUAVStateBase):
     """
-    专门的阀门插入状态 - 执行插入后立即返回
+    专门的阀门插入状态 - Execute插入后immediate返回
     基于 DescendAndContactState 但去除阀门旋转功能
     """
     def __init__(self, module_id=1, rotation_direction=1):
@@ -68,13 +68,13 @@ class ValveInsertionState(SingleUAVStateBase):
     
     def execute(self, userdata):
         """
-        执行插入测试流程：
+        Execute插入测试流程：
         1. 等待位置信息
         2. 计算插入策略
         3. 移动到插入点
-        4. 执行插入
+        4. Execute插入
         5. 等待确认
-        6. 立即返回
+        6. immediate返回
         """
         rospy.loginfo("=== VALVE INSERTION TEST - NO ROTATION ===")
         
@@ -103,13 +103,13 @@ class ValveInsertionState(SingleUAVStateBase):
             rospy.logerr("Failed to calculate insertion strategy")
             return 'failed'
         
-        # Step 4: 执行插入移动
+        # Step 4: Execute插入移动
         insertion_success = self.execute_insertion_movement(insertion_strategy, required_uav_z)
         if not insertion_success:
             rospy.logerr("Failed to execute insertion movement")
             return 'failed'
         
-        # Step 5: 验证插入位置
+        # Step 5: verify插入位置
         insertion_verification = self.verify_insertion_position()
         if not insertion_verification:
             rospy.logwarn("Insertion position verification failed, but continuing...")
@@ -157,17 +157,17 @@ class ValveInsertionState(SingleUAVStateBase):
         return strategy
     
     def execute_insertion_movement(self, strategy, target_z):
-        """执行插入移动"""
+        """Execute插入移动"""
         rospy.loginfo("--- Executing insertion movement ---")
         
-        # 根据策略类型执行不同的插入逻辑
+        # 根据策略类型Execute不同的插入逻辑
         if strategy.get('strategy') == 'two_phase_safe_insertion':
             return self.execute_two_phase_insertion(strategy, target_z)
         else:
             return self.execute_direct_insertion(strategy, target_z)
     
     def execute_two_phase_insertion(self, strategy, target_z):
-        """执行两阶段插入"""
+        """Execute两阶段插入"""
         rospy.loginfo("Executing two-phase insertion strategy")
         
         # Phase 1: 移动到插入预备位置
@@ -190,7 +190,7 @@ class ValveInsertionState(SingleUAVStateBase):
         rospy.loginfo(f"Phase 1 target: {dual_fang_center}")
         rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f}°")
         
-        # 执行移动到Phase 1位置
+        # Execute移动到Phase 1位置
         success = self.motion_controller.execute_smooth_trajectory_with_yaw(
             self.get_current_position(),
             dual_fang_center,
@@ -218,7 +218,7 @@ class ValveInsertionState(SingleUAVStateBase):
         
         rospy.loginfo(f"Phase 2 target: {dual_fang_center_phase2}")
         
-        # 执行精确插入移动
+        # Execute精确插入移动
         success = self.motion_controller.execute_smooth_trajectory_with_yaw(
             self.get_current_position(),
             dual_fang_center_phase2,
@@ -232,11 +232,11 @@ class ValveInsertionState(SingleUAVStateBase):
             rospy.logerr("Failed to reach Phase 2 insertion position")
             return False
         
-        rospy.loginfo("✓ Two-phase insertion completed successfully")
+        rospy.loginfo("Two-phase insertion completed successfully")
         return True
     
     def execute_direct_insertion(self, strategy, target_z):
-        """执行直接插入"""
+        """Execute直接插入"""
         rospy.loginfo("Executing direct insertion strategy")
         
         dual_fang_center = strategy.get('dual_fang_center')
@@ -250,7 +250,7 @@ class ValveInsertionState(SingleUAVStateBase):
         rospy.loginfo(f"Direct insertion target: {target_pos}")
         rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f}°")
         
-        # 执行直接插入移动
+        # Execute直接插入移动
         success = self.motion_controller.execute_smooth_trajectory_with_yaw(
             self.get_current_position(),
             target_pos,
@@ -264,11 +264,11 @@ class ValveInsertionState(SingleUAVStateBase):
             rospy.logerr("Failed to reach direct insertion position")
             return False
         
-        rospy.loginfo("✓ Direct insertion completed successfully")
+        rospy.loginfo("Direct insertion completed successfully")
         return True
     
     def verify_insertion_position(self):
-        """验证插入位置精度"""
+        """verify插入位置精度"""
         rospy.loginfo("--- Verifying insertion position ---")
         
         current_pos = self.get_current_position()
@@ -289,12 +289,12 @@ class ValveInsertionState(SingleUAVStateBase):
         rospy.loginfo(f"Distance to valve center: {distance_to_valve*1000:.1f}mm")
         rospy.loginfo(f"Height difference from target: {height_difference*1000:.1f}mm")
         
-        # 验证标准（相对宽松用于测试）
+        # verify标准(相对宽松用于测试)
         if distance_to_valve < 0.15 and height_difference < 0.05:  # 150mm xy, 50mm z
-            rospy.loginfo("✓ Insertion position verification passed")
+            rospy.loginfo("Insertion position verification passed")
             return True
         else:
-            rospy.logwarn(f"⚠ Insertion position verification failed")
+            rospy.logwarn(f"WARNING: Insertion position verification failed")
             rospy.logwarn(f"  XY error: {distance_to_valve*1000:.1f}mm (limit: 150mm)")
             rospy.logwarn(f"  Z error: {height_difference*1000:.1f}mm (limit: 50mm)")
             return False
@@ -318,7 +318,7 @@ def create_insertion_test_state_machine(module_id=1):
                              transitions={'succeeded': 'VALVE_INSERTION',
                                         'failed': 'failed'})
         
-        # 执行插入测试（新状态，替代DescendAndContactState + RotateValveState）
+        # Execute插入测试(新状态，替代DescendAndContactState + RotateValveState)
         smach.StateMachine.add('VALVE_INSERTION',
                              ValveInsertionState(module_id=module_id),
                              transitions={'succeeded': 'RETURN_TO_START',
@@ -344,14 +344,14 @@ def main():
         module_id = rospy.get_param('~module_id', 1)
         rospy.loginfo(f"Starting valve insertion test for module {module_id}")
         
-        # 创建并执行状态机
+        # 创建并Execute状态机
         sm = create_insertion_test_state_machine(module_id=module_id)
         
-        # 创建SMACH查看器（可选）
+        # 创建SMACH查看器(可选)
         sis = smach_ros.IntrospectionServer('valve_insertion_test', sm, '/SM_ROOT')
         sis.start()
         
-        # 执行状态机
+        # Execute状态机
         rospy.loginfo("=== STARTING VALVE INSERTION TEST ===")
         rospy.loginfo("This test will:")
         rospy.loginfo("1. Move to valve vicinity")

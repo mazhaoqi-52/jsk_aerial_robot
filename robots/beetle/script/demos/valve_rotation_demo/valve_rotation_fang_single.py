@@ -76,7 +76,7 @@ class SingleUAVStateBase(smach.State):
         }
         self.timeout = 20.0  # 20秒超时，给圆周接触建立充分的时间
         self.z_offset = 0.0743823
-        self.descent_speed = 0.025
+        self.descent_speed = 0.1  # 提速: 从0.025提升到0.1 m/s
         
         # Backward compatibility properties
         self.is_simulation = self.beetle.is_simulation
@@ -808,10 +808,10 @@ class SingleUAVStateBase(smach.State):
         
         # Stage 2: Move to intermediate position with VALVE YAW LOCKED
         rospy.loginfo("CRITICAL: VALVE YAW LOCKED during position movement (spoke alignment later)")
-        # Calculate distance and use SLOWER speed for safety
+        # Calculate distance and use improved speed for efficiency
         stage2_distance = math.sqrt((intermediate_x - aligned_pos[0])**2 + (intermediate_y - aligned_pos[1])**2)
-        stage2_speed = 0.15  # REDUCED from 0.15 default to safer speed
-        stage2_duration = max(15.0, stage2_distance / stage2_speed)  # Longer minimum duration
+        stage2_speed = 0.25  # 🚀 提速: 从0.15提升到0.25 m/s
+        stage2_duration = max(8.0, stage2_distance / stage2_speed)  # 减少最小持续时间
         
         rospy.loginfo(f"Stage 2: Distance {stage2_distance:.3f}m, Speed {stage2_speed:.2f}m/s, Duration {stage2_duration:.1f}s")
         
@@ -1331,10 +1331,10 @@ class MoveToValveState(SingleUAVStateBase):
             debug=False
         )
         
-        # Enhanced movement parameters for smooth trajectory execution (reduced speed for smoothness)
-        self.max_linear_velocity = 0.12  # 0.12 m/s maximum speed (reduced from 0.15 for smoother motion)
-        self.average_linear_velocity = 0.08  # 0.08 m/s average speed target (reduced from 0.1 for stability)
-        self.max_angular_velocity = 0.02  # 0.02 rad/s maximum rotation speed (reduced from 0.05 for precision)
+        # Enhanced movement parameters for efficient trajectory execution
+        self.max_linear_velocity = 0.25  # 🚀 提速: 从0.12提升到0.25 m/s
+        self.average_linear_velocity = 0.15  # 🚀 提速: 从0.08提升到0.15 m/s
+        self.max_angular_velocity = 0.02  # � 降速: 从0.04降低到0.02 rad/s for stable yaw control
         self.waypoint_threshold = 0.050  # 5cm threshold for waypoint completion (tightened for better precision)
         self.final_pos_threshold = 0.025  # 2.5cm final positioning accuracy (relaxed from 15mm to 25mm for reliability)
         self.final_yaw_threshold = 0.0175  # 1° final yaw accuracy (tightened to meet 1° requirement)
@@ -1559,20 +1559,16 @@ class MoveToValveState(SingleUAVStateBase):
             
             rospy.loginfo(f"Adjusting yaw from {math.degrees(current_yaw):.1f}° to {math.degrees(intermediate_yaw):.1f}°")
             
-            # Execute major yaw adjustment with current position maintained
-            self.beetle.targetMotion(
-                pos=current_pos,  # Keep current position
-                rot=intermediate_yaw,
-                linear_vel=None,
-                angular_vel=0.04  # Improved angular velocity: 0.04 rad/s (2.3°/s) for major yaw adjustment
-            )
-            
-            # Wait for yaw convergence with generous timeout for large rotations
-            success = self.wait_for_final_convergence(
+            # Execute major yaw adjustment using active convergence (like Formation version)
+            # 🔧 FIXED: 使用active_position_convergence替代wait_for_final_convergence
+            # 原理: Formation版本的10Hz连续修正机制 vs Single UAV的单次命令
+            rospy.loginfo("🔧 Using active convergence with yaw step limiting for controlled rotation speed")
+            success = self.active_position_convergence(
                 current_pos, intermediate_yaw,
-                pos_thresh=0.05,   # 5cm position tolerance (allow some drift)
-                yaw_thresh=0.0524, # 3° yaw tolerance
-                timeout=10.0       # Optimized timeout for slow major yaw adjustment (0.02 rad/s)
+                pos_thresh=0.035,  # 35mm tolerance (relaxed to reduce position correction time)
+                yaw_thresh=0.0524, # 3° yaw tolerance (looser for major adjustment phase)
+                timeout=20.0,      # 🕐 Reduced timeout for faster overall completion
+                max_yaw_step=math.radians(3.5)  # 🎯 3.5°/step ≈ 7°/s effective speed (accounting for delays)
             )
             
             if not success:
@@ -1592,7 +1588,7 @@ class MoveToValveState(SingleUAVStateBase):
             # Use controlled stepwise Z descent
             success = self._execute_controlled_z_descent(
                 current_pos, final_target, final_yaw, 
-                descent_speed=0.05  # 0.05 m/s descent speed as requested
+                descent_speed=0.12  # 🚀 提速: 从0.05提升到0.12 m/s
             )
             
             if not success:
@@ -1622,7 +1618,7 @@ class MoveToValveState(SingleUAVStateBase):
         rospy.loginfo("Phase 3 completed successfully")
         return True
     
-    def _execute_controlled_z_descent(self, start_pos, final_target, final_yaw, descent_speed=0.05):
+    def _execute_controlled_z_descent(self, start_pos, final_target, final_yaw, descent_speed=0.12):
         """
         Execute controlled stepwise Z descent with separated yaw and Z control (Scheme 1)
         
@@ -1653,26 +1649,29 @@ class MoveToValveState(SingleUAVStateBase):
                 rospy.loginfo(f"Adjusting yaw from {math.degrees(current_yaw):.1f}° to {math.degrees(final_yaw):.1f}°")
                 rospy.loginfo("Locking XYZ position during yaw adjustment to prevent drift")
                 
-                # Lock current XYZ position, only adjust yaw
-                self.beetle.targetMotion(
-                    pos=start_pos,  # Lock XYZ at current position
-                    rot=final_yaw,   # Target yaw
-                    linear_vel=None,
-                    angular_vel=0.05  # Faster angular velocity: 0.05 rad/s (2.87°/s)
-                )
+                # 🔧 FORMATION-STYLE: Use continuous control with max_yaw_step like Formation version
+                rospy.loginfo("🔧 Using Formation-style continuous yaw control with step limiting")
                 
-                # Wait for yaw convergence with tight yaw threshold, loose position threshold
-                yaw_converged = self.active_position_convergence(
-                    start_pos, final_yaw,
-                    pos_thresh=0.05,    # Loose position threshold (5cm) - allow slight XYZ drift
-                    yaw_thresh=0.0175,  # Tight yaw threshold (1°)
-                    timeout=8.0
-                )
+                # Get current position for locking XYZ
+                current_pos = self.get_current_position()
+                if current_pos is not None:
+                    # Use active_position_convergence with max_yaw_step for controlled rotation speed
+                    yaw_converged = self.active_position_convergence(
+                        target_pos=current_pos,         # Lock XYZ position
+                        target_yaw=final_yaw,           # Target yaw angle
+                        pos_thresh=0.020,               # 20mm tolerance (balanced for precision phase)
+                        yaw_thresh=0.0175,              # 1° tolerance for yaw
+                        timeout=15.0,                   # Reasonable timeout for precision phase
+                        max_yaw_step=math.radians(2.0)  # 2°/step ≈ 4°/s for fine adjustment phase
+                    )
+                else:
+                    rospy.logwarn("Cannot get current position, skipping Phase 3B-1")
+                    yaw_converged = False
                 
                 if not yaw_converged:
                     rospy.logwarn("Phase 3B-1 yaw adjustment timeout, continuing with current yaw")
                 else:
-                    rospy.loginfo("✓ Phase 3B-1 completed: Yaw precision adjustment successful")
+                    rospy.loginfo("✓ Phase 3B-1 completed: Formation-style yaw precision adjustment successful")
                 
                 # Active stabilization after yaw adjustment
                 current_pos = self.get_current_position()
@@ -1707,11 +1706,16 @@ class MoveToValveState(SingleUAVStateBase):
             )
         
         # Calculate step parameters for controlled Z descent
-        # Fixed step size for smooth, predictable descent
-        fixed_step_size = 0.025  # 25mm per step for smooth descent
-        num_steps = max(3, int(math.ceil(total_z_descent / fixed_step_size)))  # Ensure sufficient steps
+        # 🔧 OPTIMIZED: 5段式下降，大幅减少累积误差和过冲
+        num_steps = 5  # 从3段改为5段：387.5mm ÷ 5 = 77.5mm/步 (更合理)
+        step_size = total_z_descent / num_steps  # 平均分配下降距离
         
-        rospy.loginfo(f"Z descent plan: {num_steps} steps, {fixed_step_size*1000:.1f}mm per step")
+        # 🎯 真机友好的渐进式速度控制 (0.05-0.08m/s)
+        z_speeds = [0.08, 0.08, 0.065, 0.055, 0.05]  # m/s - 渐进式减速
+        z_timeouts = [15, 15, 15, 15, 20]  # 秒 - 合理的收敛时间，避免长时间等待
+        
+        rospy.loginfo(f"🔧 OPTIMIZED Z descent: {num_steps} steps, {step_size*1000:.1f}mm per step")
+        rospy.loginfo(f"Speed profile: {z_speeds} m/s, Timeouts: {z_timeouts}s")
         rospy.loginfo("Pure Z descent: XY and yaw will be LOCKED during descent")
         
         # Execute stepwise Z descent with LOCKED XY and yaw
@@ -1724,16 +1728,21 @@ class MoveToValveState(SingleUAVStateBase):
                 current_z = final_target[2]
             else:
                 # Calculate planned Z for this step
-                planned_z_descent = fixed_step_size * (step + 1)
+                planned_z_descent = step_size * (step + 1)
                 planned_z = current_pos[2] - planned_z_descent
                 
                 # Safety limit: ensure we don't go below final target
                 current_z = max(planned_z, final_target[2])
             
-            # Additional safety check: limit single step distance to 30mm max
+            # Additional safety check: limit single step distance (increased for final steps)
             if step > 0:
                 single_step_distance = abs(previous_z - current_z)
-                max_single_step = 0.030  # 30mm maximum single step
+                # 🔧 FIXED: Progressive step limit - larger steps allowed for final descent
+                if step == num_steps - 1:
+                    max_single_step = 0.300  # 300mm for final step to reach target
+                else:
+                    max_single_step = 0.080  # 80mm for intermediate steps (increased from 30mm)
+                    
                 if single_step_distance > max_single_step:
                     rospy.logwarn(f"Step {step+1} distance {single_step_distance*1000:.1f}mm exceeds {max_single_step*1000:.1f}mm limit")
                     # Clamp the step size
@@ -1751,9 +1760,9 @@ class MoveToValveState(SingleUAVStateBase):
             is_final_step = (step == num_steps - 1)
             progress = (step + 1) / num_steps  # Progress ratio for threshold calculation
             
-            # Tighten position threshold as we approach target (Z-focused)
+            # 🔧 FIXED: Realistic position thresholds for Z descent with some XY drift tolerance
             base_threshold = 0.050  # Relaxed 50mm initial threshold (Z-descent focused)
-            final_threshold = 0.015  # 15mm final threshold
+            final_threshold = 0.025  # 25mm final threshold (relaxed from 15mm to avoid oscillation)
             step_pos_thresh = base_threshold - (base_threshold - final_threshold) * progress
             
             # Tight yaw threshold since yaw should be locked
@@ -1763,33 +1772,38 @@ class MoveToValveState(SingleUAVStateBase):
             rospy.loginfo(f"  Z descent: {(current_pos[2] - current_z)*1000:.1f}mm (XY locked)")
             rospy.loginfo(f"  Threshold: pos={step_pos_thresh*1000:.1f}mm, yaw={math.degrees(step_yaw_thresh):.1f}°")
             
-            # Speed control strategy: Different approaches for precise XY control
-            if is_final_step:
-                # Final step: Pure position control for maximum precision
-                rospy.loginfo(f"  Final step mode: Pure position control for maximum XY precision")
-                self.beetle.targetMotion(
-                    pos=step_target,
-                    rot=final_yaw,      # LOCKED yaw
-                    linear_vel=None,    # Use position controller's built-in speed limits
-                    angular_vel=0.0     # NO angular velocity - yaw locked
-                )
-            else:
-                # Earlier steps: Use slow Z descent but prioritize XY accuracy
-                rospy.loginfo(f"  Normal step mode: Slow Z descent = {descent_speed * 0.5:.3f} m/s for XY precision")
-                self.beetle.targetMotion(
-                    pos=step_target,
-                    rot=final_yaw,      # LOCKED yaw  
-                    linear_vel=[0.0, 0.0, descent_speed * 0.5],  # Very slow Z, zero XY velocities
-                    angular_vel=0.0     # NO angular velocity - yaw locked
-                )
+            # 🔧 OPTIMIZED: 5段渐进式速度控制，真机友好
+            current_z_speed = z_speeds[step]  # 使用预定义的速度档位
+            step_timeout = z_timeouts[step]   # 使用对应的超时时间
             
-            # Wait for step convergence with enhanced XY precision requirements
-            step_converged = self.active_position_convergence(
-                step_target, final_yaw,  # Locked yaw target
-                pos_thresh=step_pos_thresh,
-                yaw_thresh=step_yaw_thresh,
-                timeout=12.0  # Fixed 12s timeout for each step
+            step_desc = ['初始下降', '稳定下降', '开始减速', '接近目标', '精确到位'][step]
+            rospy.loginfo(f"  Step {step+1}/{num_steps} ({step_desc}): speed={current_z_speed:.3f}m/s, timeout={step_timeout}s")
+            
+            # 统一的速度控制：所有步骤都使用相同的控制逻辑
+            self.beetle.targetMotion(
+                pos=step_target,
+                rot=final_yaw,      # LOCKED yaw
+                linear_vel=[0.0, 0.0, -current_z_speed],  # 渐进式Z下降速度
+                angular_vel=0.0     # NO angular velocity - yaw locked
             )
+                
+            # 🔧 SELECTIVE Z-STEP CONTROL: 为第4、5步添加步长控制，防止大距离下降震荡
+            if step >= 3:  # 第4步和第5步（step索引从0开始）
+                step_converged = self.active_position_convergence(
+                    step_target, final_yaw,  # Locked yaw target
+                    pos_thresh=step_pos_thresh,
+                    yaw_thresh=step_yaw_thresh,
+                    timeout=step_timeout,
+                    max_z_step=0.020  # 20mm Z步长，防止大距离下降震荡
+                )
+            else:  # 前3步保持高效逻辑
+                step_converged = self.active_position_convergence(
+                    step_target, final_yaw,  # Locked yaw target
+                    pos_thresh=step_pos_thresh,
+                    yaw_thresh=step_yaw_thresh,
+                    timeout=step_timeout
+                    # 不使用Z步长控制，保持原有高效性能
+                )
             
             if not step_converged:
                 rospy.logerr(f"Z descent step {step+1} convergence failed - stopping for collision safety")
@@ -1860,12 +1874,13 @@ class MoveToValveState(SingleUAVStateBase):
             angular_vel=None
         )
         
-        # Final convergence with strict requirements and extended timeout
-        final_success = self.wait_for_final_convergence(
+        # Final convergence with strict requirements and Z-step control
+        final_success = self.active_position_convergence(
             final_target, final_yaw,
-            pos_thresh=0.012,  # Tightened to 1.2cm final precision for valve insertion
+            pos_thresh=0.025,  # Relaxed to 2.5cm to avoid oscillation
             yaw_thresh=0.0175, # 1° final yaw precision
-            timeout=20.0       # INCREASED: 20 seconds for final precision convergence
+            timeout=25.0,      # Extended timeout for step-by-step convergence
+            max_z_step=0.020   # 20mm Z步长，防震荡的同时保持合理效率
         )
         
         # Additional XY stabilization period for valve insertion precision
@@ -2267,16 +2282,23 @@ class MoveToValveState(SingleUAVStateBase):
                 point_time = rospy.get_time() - point_start_time
                 rospy.loginfo(f"Final trajectory point completed, duration: {point_time:.2f}s")
             else:
-                # For intermediate points: Enhanced convergence checking for smooth speed transitions
-                # Verify basic convergence before moving to next point to ensure smooth velocity changes
-                intermediate_pos_thresh = 0.04  # 4cm for intermediate points (tightened from 8cm)
-                intermediate_yaw_thresh = 0.1745  # 10° for intermediate points (looser than final)
-                intermediate_timeout = 5.0  # Increased from 3s for better stability
+                # 🚀 方案A：区分轨迹跟随模式和精度收敛模式
+                is_final_precision_point = (i >= len(trajectory_points) - 2)  # 最后2个点使用精度模式
                 
-                rospy.loginfo(f"Intermediate point convergence check: pos_thresh={intermediate_pos_thresh*1000:.1f}mm, "
-                            f"yaw_thresh={math.degrees(intermediate_yaw_thresh):.1f}° (tightened for better tracking)")
+                if is_final_precision_point:
+                    # 精度收敛模式：倒数第2个点也需要较高精度
+                    intermediate_pos_thresh = 0.03  # 30mm精度要求
+                    intermediate_yaw_thresh = 0.1   # 6°航向要求  
+                    intermediate_timeout = 8.0      # 充分时间确保精度
+                    rospy.loginfo(f"精度收敛模式 (点 {i+1}): pos_thresh={intermediate_pos_thresh*1000:.1f}mm")
+                else:
+                    # 轨迹跟随模式：前面的点使用快速通过
+                    intermediate_pos_thresh = 0.08  # 🚀 80mm大容差（快速通过）
+                    intermediate_yaw_thresh = 0.25  # 🚀 14°宽松航向要求
+                    intermediate_timeout = 3.0      # 🚀 3秒快速超时
+                    rospy.loginfo(f"轨迹跟随模式 (点 {i+1}): pos_thresh={intermediate_pos_thresh*1000:.1f}mm (快速通过)")
                 
-                # Enhanced convergence check with tighter thresholds
+                # 执行收敛检查
                 converged = self.active_position_convergence(
                     target_pos, target_yaw,
                     pos_thresh=intermediate_pos_thresh,
@@ -2302,15 +2324,26 @@ class MoveToValveState(SingleUAVStateBase):
                     else:
                         required_time = point_distance / 0.08  # Fallback to default speed
                     
-                    # Reduced delay since we already spent time in convergence attempt
-                    remaining_delay = max(0.05, required_time * 0.5)  # 50% of required time, minimum 50ms
+                    # 🚀 动态停顿时间：轨迹跟随模式更快，精度模式稍慢
+                    if is_final_precision_point:
+                        remaining_delay = max(0.1, required_time * 0.5)  # 精度模式：较长停顿
+                    else:
+                        remaining_delay = max(0.02, required_time * 0.2)  # 🚀 轨迹跟随模式：更短停顿
                     
-                    rospy.loginfo(f"Fallback dynamic delay: distance={point_distance*1000:.1f}mm, "
-                                f"vel={current_vel_magnitude:.3f}m/s, remaining_delay={remaining_delay:.2f}s")
+                    rospy.loginfo(f"Fallback dynamic delay ({'精度模式' if is_final_precision_point else '跟随模式'}): "
+                                f"distance={point_distance*1000:.1f}mm, vel={current_vel_magnitude:.3f}m/s, "
+                                f"delay={remaining_delay:.2f}s")
                     
                     rospy.sleep(remaining_delay)
                 else:
-                    rospy.loginfo(f"Intermediate point {i+1} converged successfully for smooth transition")
+                    mode_desc = "精度模式" if is_final_precision_point else "跟随模式"  
+                    rospy.loginfo(f"Intermediate point {i+1} converged successfully for smooth transition ({mode_desc})")
+                    
+                    # 🚀 成功收敛时的停顿时间也区分模式
+                    if is_final_precision_point:
+                        rospy.sleep(0.1)  # 精度模式：100ms停顿
+                    else:
+                        rospy.sleep(0.027)  # 轨迹跟随模式：27ms停顿（75%速度，20ms -> 27ms）
                 
                 point_time = rospy.get_time() - point_start_time
                 rospy.loginfo(f"Trajectory point {i+1} completed, duration: {point_time:.2f}s")
@@ -2319,10 +2352,10 @@ class MoveToValveState(SingleUAVStateBase):
         rospy.loginfo(f"Polynomial trajectory execution completed, total time: {total_time:.2f}s")
         return True
 
-    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0):
+    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_z_step=None):
         """
         Dragon-style active convergence: continuously send target position commands
-        until convergence is achieved, instead of passive waiting.
+        until convergence is achieved, with Formation-style yaw step limiting.
         
         Args:
             target_pos: Target position [x, y, z]
@@ -2330,6 +2363,8 @@ class MoveToValveState(SingleUAVStateBase):
             pos_thresh: Position convergence threshold (meters)
             yaw_thresh: Yaw convergence threshold (radians)
             timeout: Maximum time to attempt convergence (seconds)
+            max_yaw_step: Maximum yaw step per cycle (radians), None for no limit
+            max_z_step: Maximum Z step per cycle (meters), None for no limit
             
         Returns:
             bool: True if converged within timeout, False otherwise
@@ -2370,12 +2405,64 @@ class MoveToValveState(SingleUAVStateBase):
                     return True
             else:
                 consecutive_good_readings = 0
-                # DRAGON-STYLE: Actively send target position command instead of passive waiting
+                
+                # 🔧 FORMATION-STYLE: Apply max_yaw_step limitation like Formation version
+                command_yaw = target_yaw
+                if max_yaw_step is not None and max_yaw_step > 0.0:
+                    yaw_delta = self.normalize_angle(target_yaw - current_yaw)
+                    if abs(yaw_delta) > max_yaw_step:
+                        yaw_delta = math.copysign(max_yaw_step, yaw_delta)
+                        command_yaw = self.normalize_angle(current_yaw + yaw_delta)
+                        # Log yaw step limiting occasionally for verification
+                        elapsed = rospy.get_time() - start_time
+                        if int(elapsed * 5.0) % 20 == 0:  # Every 4 seconds
+                            rospy.loginfo(f"[YawLimit] Step limited to {math.degrees(yaw_delta):.1f}° "
+                                        f"(remaining {math.degrees(abs(self.normalize_angle(target_yaw - current_yaw))):.1f}°)")
+                
+                # 🔧 Z-STEP控制：类似yaw步长限制，避免Z轴震荡
+                command_pos = list(target_pos)  # 复制目标位置
+                if max_z_step is not None and max_z_step > 0.0:
+                    z_delta = target_pos[2] - current_pos[2] 
+                    if abs(z_delta) > max_z_step:
+                        z_delta = math.copysign(max_z_step, z_delta)
+                        command_pos[2] = current_pos[2] + z_delta
+                        # Z步长限制日志
+                        elapsed = rospy.get_time() - start_time
+                        if int(elapsed * 5.0) % 20 == 0:  # Every 4 seconds
+                            rospy.loginfo(f"[ZLimit] Step limited to {z_delta*1000:.1f}mm "
+                                        f"(remaining {abs(target_pos[2] - current_pos[2])*1000:.1f}mm)")
+                
+                # 🔧 FIXED: 添加角速度和线性速度限制，像Formation版本一样平滑
+                max_angular_vel = 0.05  # 0.05 rad/s ≈ 2.9°/s，更保守的角速度限制
+                max_linear_vel = 0.08   # 0.08 m/s，降低线性速度避免position drift
+                
+                # 计算基于实际command_yaw的角速度
+                actual_yaw_error = abs(self.normalize_angle(command_yaw - current_yaw))
+                smooth_angular_vel = min(actual_yaw_error / 1.5, max_angular_vel) if actual_yaw_error > 0.005 else 0.0
+                
+                # 🔧 FIXED: 计算平滑的线性速度，确保返回正确的格式
+                if pos_error > 0.02:
+                    # 计算标量速度值
+                    speed_magnitude = min(pos_error / 2.0, max_linear_vel)
+                    # 计算方向向量（从当前位置指向目标位置）
+                    direction = np.array(target_pos) - np.array(current_pos)
+                    direction_norm = np.linalg.norm(direction)
+                    if direction_norm > 0.001:  # 避免除零
+                        direction = direction / direction_norm
+                        smooth_linear_vel = [direction[0] * speed_magnitude, 
+                                           direction[1] * speed_magnitude, 
+                                           direction[2] * speed_magnitude]
+                    else:
+                        smooth_linear_vel = None  # 距离太近，不需要速度控制
+                else:
+                    smooth_linear_vel = None
+                
+                # DRAGON-STYLE: 发送带yaw和Z步长限制的目标位置命令
                 self.beetle.targetMotion(
-                    pos=target_pos,
-                    rot=target_yaw,
-                    linear_vel=None,  # Let system determine velocity
-                    angular_vel=None
+                    pos=command_pos,  # 使用步长限制后的位置
+                    rot=command_yaw,  # 使用步长限制后的yaw
+                    linear_vel=smooth_linear_vel,  # 平滑线性速度
+                    angular_vel=smooth_angular_vel  # 平滑角速度，避免"一步到位"
                 )
                 
                 # Log progress every 2 seconds
@@ -2396,6 +2483,8 @@ class MoveToValveState(SingleUAVStateBase):
                          f"yaw={math.degrees(final_yaw_error):.1f}°")
         
         return False
+    
+
 
     def wait_for_trajectory_convergence(self, target_pos, target_yaw, pos_thresh, yaw_thresh, timeout):
         """
@@ -4340,16 +4429,16 @@ class DescendAndContactState(SingleUAVStateBase):
             rospy.loginfo(f"🔒 ACTIVATING POSITION HOLD mode for gentle descent: {z_distance*1000:.1f}mm")
             self.motion_controller._force_position_hold = True
             
-            # Use very gentle approach for minimal descent
-            descent_speed = 0.005  # Ultra-slow 5mm/s for position hold
-            min_duration = 15.0    # Extended duration for stability
+            # Use gentle approach for minimal descent but still fast enough
+            descent_speed = 0.075  # 🚀 最慢速度提升到0.075 m/s
+            min_duration = 8.0     # Reduced duration due to higher speed
             pos_threshold = 0.008  # Relaxed threshold for gentle mode
             yaw_threshold = 0.05   # Very relaxed yaw threshold
         else:
             # Standard descent mode
             self.motion_controller._force_position_hold = False
-            descent_speed = 0.015  # Standard slow descent 
-            min_duration = 10.0    # Standard minimum duration
+            descent_speed = 0.1    # 🚀 标准速度提升到0.1 m/s
+            min_duration = 5.0     # Reduced minimum duration
             pos_threshold = 0.015  # Standard precision
             yaw_threshold = 0.02   # Standard yaw precision
         
@@ -5062,8 +5151,8 @@ class DisengageFromValveState(SingleUAVStateBase):
             # 使用分段Z上升策略（模仿MoveToValve的分段下降逻辑）
             rospy.loginfo(f"使用分段Z上升策略，距离={ascent_distance*1000:.1f}mm")
             
-            # 使用MoveToValve相同的固定步长
-            fixed_step_size = 0.025  # 25mm步长，与MoveToValve保持一致
+            # 使用更大的固定步长来减少段数
+            fixed_step_size = 0.05  # 🚀 减少段数: 从25mm提升到50mm步长
             num_steps = int(ascent_distance / fixed_step_size)
             remaining_distance = ascent_distance - num_steps * fixed_step_size
             

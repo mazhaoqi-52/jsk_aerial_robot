@@ -10,33 +10,82 @@ from aerial_robot_msgs.msg import FlightNav
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from sensor_msgs.msg import Joy
 
-# Safe import for beetle.msg with fallback
+# Import beetle messages - handle path conflicts more aggressively
 try:
     from beetle.msg import TaggedWrench
-except ImportError as e:
-    rospy.logwarn("Failed to import beetle.msg: {}. Creating mock TaggedWrench.".format(e))
-    # Create a proper ROS message mock class
-    import genpy
+except (ImportError, AttributeError) as e:
+    # Handle case where script/beetle package shadows devel/beetle package
+    import sys
+    import os
+    import importlib
     
-    class TaggedWrench(genpy.Message):
-        _md5sum = "fake_md5"
-        _type = "beetle/TaggedWrench"
-        _has_header = False
-        _full_text = "int32 id\ngeometry_msgs/WrenchStamped wrench"
+    # More aggressive path manipulation to handle rosrun environment
+    original_sys_path = sys.path.copy()
+    
+    try:
+        # Remove ALL paths that might contain conflicting beetle packages
+        paths_to_remove = []
+        for path in sys.path:
+            beetle_path = os.path.join(path, 'beetle')
+            if os.path.exists(beetle_path):
+                # Check if this beetle package has msg module
+                msg_path = os.path.join(beetle_path, 'msg')
+                if not os.path.exists(msg_path):
+                    # This beetle package doesn't have msg, remove it temporarily
+                    paths_to_remove.append(path)
         
-        __slots__ = ['id', 'wrench']
-        _slot_types = ['int32', 'geometry_msgs/WrenchStamped']
+        # Remove conflicting paths
+        for path in paths_to_remove:
+            if path in sys.path:
+                sys.path.remove(path)
         
-        def __init__(self, *args, **kwds):
-            super(TaggedWrench, self).__init__()
-            if args or kwds:
-                super(TaggedWrench, self).__init__(*args, **kwds)
-            else:
-                self.id = 0
-                self.wrench = WrenchStamped()
+        # Clear any cached imports
+        if 'beetle' in sys.modules:
+            del sys.modules['beetle']
+        if 'beetle.msg' in sys.modules:
+            del sys.modules['beetle.msg']
         
-        def _get_types(self):
-            return self._slot_types[:]
+        # Now try to import
+        from beetle.msg import TaggedWrench
+        
+        # Success! Restore the removed paths
+        for path in paths_to_remove:
+            if path not in sys.path:
+                sys.path.append(path)
+                
+    except ImportError as import_error:
+        # Restore original path even on failure
+        sys.path = original_sys_path
+        
+        # Create a minimal mock as last resort
+        import genpy
+        from geometry_msgs.msg import WrenchStamped
+        
+        class TaggedWrench(genpy.Message):
+            _md5sum = "fake_md5"
+            _type = "beetle/TaggedWrench"
+            _has_header = False
+            _full_text = "uint8 index\ngeometry_msgs/WrenchStamped wrench"
+            
+            __slots__ = ['index', 'wrench']
+            _slot_types = ['uint8', 'geometry_msgs/WrenchStamped']
+            
+            def __init__(self, *args, **kwds):
+                super(TaggedWrench, self).__init__()
+                if args or kwds:
+                    super(TaggedWrench, self).__init__(*args, **kwds)
+                else:
+                    self.index = 0
+                    self.wrench = WrenchStamped()
+            
+            def _get_types(self):
+                return self._slot_types[:]
+        
+        import rospy
+        rospy.logwarn(f"Using mock TaggedWrench due to import failure: {import_error}")
+        
+        # Make TaggedWrench available globally in this module
+        globals()['TaggedWrench'] = TaggedWrench
 
 
 class BeetleInterface(object):
@@ -339,30 +388,65 @@ class BeetleInterface(object):
         Enhanced SE(3) position-velocity control for complex trajectory execution
         
         Args:
-            pos: Target position [x, y, z]
-            rot: Target rotation (yaw angle or quaternion)
-            linear_vel: Target linear velocity [vx, vy, vz] (enables POS_VEL_MODE)
+            pos: Target position [x, y, z] (various formats supported)
+            rot: Target rotation (yaw angle or quaternion)  
+            linear_vel: Target linear velocity [vx, vy, vz] (various formats supported)
             angular_vel: Target angular velocity [wx, wy, wz] or scalar yaw rate
         """
+        # 🔧 Robust parameter format conversion
+        def ensure_position_format(pos_data):
+            """Convert position to [x, y, z] list format"""
+            if hasattr(pos_data, '__getitem__'):
+                try:
+                    return [float(pos_data[0]), float(pos_data[1]), float(pos_data[2])]
+                except (IndexError, TypeError, ValueError) as e:
+                    rospy.logwarn(f"🔧 Invalid position format: {type(pos_data)}, error: {e}")
+                    return [0.0, 0.0, 0.0]
+            else:
+                rospy.logwarn(f"🔧 Non-indexable position: {type(pos_data)}")
+                return [0.0, 0.0, 0.0]
+        
+        def ensure_velocity_format(vel_data):
+            """Convert velocity to [vx, vy, vz] list format"""
+            if vel_data is None:
+                return None
+            elif hasattr(vel_data, '__getitem__'):
+                try:
+                    return [float(vel_data[0]), float(vel_data[1]), float(vel_data[2])]
+                except (IndexError, TypeError, ValueError) as e:
+                    rospy.logwarn(f"🔧 Invalid velocity format: {type(vel_data)}, error: {e}, using zeros")
+                    return [0.0, 0.0, 0.0]
+            else:
+                rospy.logwarn(f"🔧 Non-indexable velocity: {type(vel_data)}, using zeros")
+                return [0.0, 0.0, 0.0]
+        
+        # Convert parameters to robust formats
+        pos_list = ensure_position_format(pos)
+        linear_vel_list = ensure_velocity_format(linear_vel)
+        
+        # 🔧 Debug: Log parameter conversion success
+        rospy.logdebug(f"✅ targetMotion params converted - pos: {type(pos)} → {type(pos_list)}, "
+                      f"linear_vel: {type(linear_vel)} → {type(linear_vel_list)}")
+        
         nav_msg = FlightNav()
         nav_msg.control_frame = nav_msg.WORLD_FRAME  # Always use WORLD_FRAME
         nav_msg.target = FlightNav.COG               # Always use COG target
         nav_msg.header.stamp = rospy.Time.now()
         
         # Enable POS_VEL_MODE if linear or angular velocity is provided
-        mode = FlightNav.POS_VEL_MODE if (linear_vel is not None or angular_vel is not None) else FlightNav.POS_MODE
+        mode = FlightNav.POS_VEL_MODE if (linear_vel_list is not None or angular_vel is not None) else FlightNav.POS_MODE
         
         nav_msg.pos_xy_nav_mode = mode
         nav_msg.pos_z_nav_mode = mode
-        nav_msg.target_pos_x = pos[0]
-        nav_msg.target_pos_y = pos[1]
-        nav_msg.target_pos_z = pos[2]
+        nav_msg.target_pos_x = pos_list[0]
+        nav_msg.target_pos_y = pos_list[1]
+        nav_msg.target_pos_z = pos_list[2]
         
-        # Linear velocity control
-        if linear_vel is not None:
-            nav_msg.target_vel_x = linear_vel[0]
-            nav_msg.target_vel_y = linear_vel[1]
-            nav_msg.target_vel_z = linear_vel[2]
+        # Linear velocity control (using converted format)
+        if linear_vel_list is not None:
+            nav_msg.target_vel_x = linear_vel_list[0]
+            nav_msg.target_vel_y = linear_vel_list[1]
+            nav_msg.target_vel_z = linear_vel_list[2]
         else:
             nav_msg.target_vel_x = 0.0
             nav_msg.target_vel_y = 0.0
@@ -409,27 +493,60 @@ class BeetleInterface(object):
         if self.external_wrench_active:
             self.tagged_wrench_pub.publish(self.current_external_wrench)
     
+
     # External wrench control methods for force feedforward
     def addExternalWrench(self, force, torque, frame_id="world"):
         """
         Apply external wrench for force/torque feedforward control
         
         Args:
-            force: Force vector [fx, fy, fz] in Newtons
-            torque: Torque vector [tx, ty, tz] in Newton-meters  
+            force: Force vector [fx, fy, fz] in Newtons (should be list/tuple)
+            torque: Torque vector [tx, ty, tz] in Newton-meters (should be list/tuple)
             frame_id: Reference frame (default: "world")
         """
+        # 🔧 DEBUG: 输入参数类型检查
+        rospy.logdebug(f"🔍 addExternalWrench input - force: {type(force)}, torque: {type(torque)}")
+        
+        # 🔧 Simplified: Expect pre-converted list format from upper layer
+        # If somehow non-list format reaches here, convert to list
+        def ensure_list_format(data, param_name):
+            if isinstance(data, (list, tuple)):
+                return list(data[:3]) if len(data) >= 3 else list(data) + [0.0] * (3 - len(data))
+            elif hasattr(data, '__getitem__'):
+                # Handle numpy arrays or other indexable objects
+                try:
+                    return [float(data[0]), float(data[1]), float(data[2])]
+                except (IndexError, TypeError):
+                    rospy.logwarn(f"🔧 Invalid {param_name} format: {type(data)}, using [0,0,0]")
+                    return [0.0, 0.0, 0.0]
+            else:
+                rospy.logwarn(f"🔧 Unexpected {param_name} format: {type(data)}, using [0,0,0]")
+                return [0.0, 0.0, 0.0]
+        
+        try:
+            # Convert inputs to list format (should already be lists from upper layer)
+            force_list = ensure_list_format(force, "force")
+            torque_list = ensure_list_format(torque, "torque")
+            
+            # 🔧 DEBUG: 转换结果检查
+            rospy.logdebug(f"🔍 addExternalWrench converted - force: {type(force_list)}, torque: {type(torque_list)}")
+            
+        except Exception as e:
+            rospy.logerr(f"🔍 addExternalWrench format conversion failed: {type(e).__name__}: {e}")
+            force_list = [0.0, 0.0, 0.0]
+            torque_list = [0.0, 0.0, 0.0]
+        
         self.current_external_wrench.index = self.module_id
         self.current_external_wrench.wrench.header.stamp = rospy.Time.now()
         self.current_external_wrench.wrench.header.frame_id = frame_id
         
-        self.current_external_wrench.wrench.wrench.force.x = force[0]
-        self.current_external_wrench.wrench.wrench.force.y = force[1]
-        self.current_external_wrench.wrench.wrench.force.z = force[2]
+        self.current_external_wrench.wrench.wrench.force.x = force_list[0]
+        self.current_external_wrench.wrench.wrench.force.y = force_list[1]
+        self.current_external_wrench.wrench.wrench.force.z = force_list[2]
         
-        self.current_external_wrench.wrench.wrench.torque.x = torque[0]
-        self.current_external_wrench.wrench.wrench.torque.y = torque[1]
-        self.current_external_wrench.wrench.wrench.torque.z = torque[2]
+        self.current_external_wrench.wrench.wrench.torque.x = torque_list[0]
+        self.current_external_wrench.wrench.wrench.torque.y = torque_list[1]
+        self.current_external_wrench.wrench.wrench.torque.z = torque_list[2]
         
         self.external_wrench_active = True
         
@@ -437,8 +554,8 @@ class BeetleInterface(object):
         self.tagged_wrench_pub.publish(self.current_external_wrench)
         
         if self.debug_view:
-            rospy.loginfo(f"External wrench applied - Force: [{force[0]:.3f}, {force[1]:.3f}, {force[2]:.3f}], "
-                         f"Torque: [{torque[0]:.3f}, {torque[1]:.3f}, {torque[2]:.3f}]")
+            rospy.loginfo(f"✅ External wrench applied - Force: [{force_list[0]:.3f}, {force_list[1]:.3f}, {force_list[2]:.3f}], "
+                         f"Torque: [{torque_list[0]:.3f}, {torque_list[1]:.3f}, {torque_list[2]:.3f}]")
     
     def clearExternalWrench(self):
         """
@@ -508,13 +625,23 @@ class BeetleInterface(object):
             force: Feedforward force [fx, fy, fz]
             torque: Feedforward torque [tx, ty, tz]
         """
-        # Apply external wrench first
-        self.addExternalWrench(force, torque)
+        # 🔧 DEBUG: 输入参数类型检查
+        rospy.logdebug(f"🔍 executeTrajectoryWithWrench input - pos: {type(pos)}, "
+                      f"linear_vel: {type(linear_vel)}, force: {type(force)}, torque: {type(torque)}")
         
-        # Execute motion command with SE(3) control
-        self.targetMotion(pos, rot, linear_vel, angular_vel)
-        
-        return True
+        try:
+            # Apply external wrench first
+            self.addExternalWrench(force, torque)
+            
+            # Execute motion command with SE(3) control
+            self.targetMotion(pos, rot, linear_vel, angular_vel)
+            
+            return True
+        except Exception as e:
+            # 🔧 DEBUG: 捕获并记录任何异常
+            rospy.logerr(f"🔍 executeTrajectoryWithWrench failed: {type(e).__name__}: {e}")
+            rospy.logdebug(f"🔍 Failed with parameters - pos: {pos}, linear_vel: {linear_vel}")
+            raise  # 重新抛出异常以便上层处理
         
     # Core convergence wait method
     def goPoseWaitConvergence(self, pos, rot=None, pos_thresh=None, vel_thresh=0.1, rot_thresh=None, timeout=30, check_func=None):
@@ -590,22 +717,22 @@ class BeetleInterface(object):
     def valveApproachConvergenceCheck(self, target_pos, target_rot, pos_thresh, vel_thresh, rot_thresh,
                                      valve_rotation_threshold=0.035, contact_force_threshold=0.5):
         """
-        专门用于阀门接近和转动检测的收敛检查函数
+        专门用于阀门接近和转动检测的convergence检查函数
         
-        这个函数不仅检查UAV位置收敛，更重要的是检测阀门是否开始转动
-        这对于确定何时开始执行阀门转动任务至关重要
+        这个函数不仅检查UAV位置convergence，更重要的是检测阀门是否开始转动
+        这对于确定何时开始Executevalve rotation任务至关重要
         
         Args:
-            target_pos: 目标位置
+            target_pos: Target position
             target_rot: 目标姿态
             pos_thresh: 位置阈值
             vel_thresh: 速度阈值 (兼容参数)
             rot_thresh: 旋转阈值
-            valve_rotation_threshold: 阀门转动检测阈值 (默认: 2°)
+            valve_rotation_threshold: valve rotation检测阈值 (默认: 2°)
             contact_force_threshold: 接触力阈值 (默认: 0.5N)
         
         Returns:
-            bool: 是否收敛 (考虑阀门转动检测)
+            bool: 是否convergence (考虑valve rotation检测)
         """
         current_pos = self.getUavPos()
         current_rpy = self.getUavRPY()
@@ -613,10 +740,10 @@ class BeetleInterface(object):
         current_valve_yaw = self.getValveYaw()
         
         if valve_pos is None or current_valve_yaw is None:
-            rospy.logwarn("阀门状态信息不可用，回退到标准收敛检查")
+            rospy.logwarn("Valve status information unavailable, fallback to standard convergence check")
             return self.posYawConvergenceCheck(target_pos, target_rot, pos_thresh, vel_thresh, rot_thresh)
             
-        # 标准位置和姿态收敛检查
+        # 标准位置和姿态convergence检查
         valve_to_uav = current_pos - valve_pos
         valve_yaw = self.getValveYaw()
         
@@ -643,16 +770,16 @@ class BeetleInterface(object):
         z_thresh = pos_thresh if isinstance(pos_thresh, (int, float)) else pos_thresh[2]
         attitude_thresh = rot_thresh if isinstance(rot_thresh, (int, float)) else rot_thresh[2]
         
-        # 基本收敛条件
+        # 基本convergence条件
         basic_converged = (xy_error_valve < xy_thresh and 
                           z_error < z_thresh and 
                           roll_error < attitude_thresh and 
                           pitch_error < attitude_thresh and 
                           yaw_error < attitude_thresh)
         
-        # 阀门转动检测 - 关键新增功能
+        # valve rotation检测 - 关键新增功能
         if not hasattr(self, '_initial_valve_yaw') or not hasattr(self, '_valve_yaw_history'):
-            # 初始化阀门转动检测
+            # 初始化valve rotation检测
             self._initial_valve_yaw = current_valve_yaw
             self._valve_yaw_history = [current_valve_yaw]
             self._last_valve_check_time = rospy.Time.now().to_sec()
@@ -667,7 +794,7 @@ class BeetleInterface(object):
                     self._valve_yaw_history.pop(0)
                 self._last_valve_check_time = current_time
             
-            # 计算总的阀门转动角度
+            # 计算总的valve rotation角度
             valve_rotation_angle = abs(self._normalize_angle_diff(current_valve_yaw - self._initial_valve_yaw))
             
             # 检测阀门是否正在转动 (通过角度变化率)
@@ -676,7 +803,7 @@ class BeetleInterface(object):
                     self._valve_yaw_history[-1] - self._valve_yaw_history[-5]))
                 valve_rotation_rate = recent_change / 0.5  # 0.5秒内的变化率
                 
-                # 阀门转动检测：总角度超过阈值 或 转动速率超过1°/s
+                # valve rotation检测：总角度超过阈值 或 转动速率超过1°/s
                 self._valve_rotation_detected = (valve_rotation_angle > valve_rotation_threshold or 
                                                valve_rotation_rate > 0.017)  # 1°/s = 0.017 rad/s
             else:
@@ -686,7 +813,7 @@ class BeetleInterface(object):
         contact_established = False
         if hasattr(self, 'wrench_data') and self.wrench_data:
             try:
-                # 检查末端执行器的力/扭矩
+                # 检查末端Execute器的力/扭矩
                 force_magnitude = math.sqrt(
                     self.wrench_data.force.x**2 + 
                     self.wrench_data.force.y**2 + 
@@ -707,14 +834,14 @@ class BeetleInterface(object):
             self._last_valve_debug_time = 0
         current_time = rospy.Time.now().to_sec()
         if current_time - self._last_valve_debug_time > 2.0:  # 每2秒打印一次
-            rospy.loginfo(f"阀门接近检查 - 位置误差: {xy_error_valve*1000:.1f}mm, "
+            rospy.loginfo(f"Valve approach check - position error: {xy_error_valve*1000:.1f}mm, "
                          f"Z误差: {z_error*1000:.1f}mm, 偏航误差: {math.degrees(yaw_error):.1f}°")
-            rospy.loginfo(f"阀门转动: {math.degrees(valve_rotation_angle):.1f}°, "
+            rospy.loginfo(f"valve rotation: {math.degrees(valve_rotation_angle):.1f}°, "
                          f"转动检测: {self._valve_rotation_detected}, 接触: {contact_established}")
             self._last_valve_debug_time = current_time
         
-        # 收敛条件：基本位置收敛 + (建立接触 或 检测到阀门转动)
-        # 这样可以确保在开始检测到阀门转动时就认为已经准备好了
+        # convergence条件：基本位置convergence + (建立接触 或 检测到valve rotation)
+        # 这样可以确保在开始检测到valve rotation时就认为已经准备好了
         converged = basic_converged and (contact_established or self._valve_rotation_detected)
         
         # 存储状态供其他函数使用

@@ -3,7 +3,7 @@
 """
 Online Circular Trajectory Generator for Valve Rotation Tasks
 
-This module implements Dragon-style online trajectory generation for "自转+公转" 
+This module implements Dragon-style online trajectory generation for "self-rotation + revolution" 
 circular motions around valve center of gravity (CoG). It provides real-time
 trajectory planning with constant angular velocity, radius adaptation, and 
 centripetal force compensation.
@@ -28,7 +28,7 @@ class CircularTrajectoryGenerator(object):
     """
     Online circular trajectory generator for valve rotation tasks
     
-    Implements Dragon-style "自转+公转" trajectory generation with:
+    Implements Dragon-style "self-rotation + revolution" trajectory generation with:
     - Constant angular velocity around valve CoG
     - Radius adaptation based on current geometry
     - Half-radius locking when system reaches 80% target velocity

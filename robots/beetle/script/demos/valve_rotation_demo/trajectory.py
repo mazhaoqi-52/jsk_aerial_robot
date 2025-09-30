@@ -19,14 +19,14 @@ class AdaptiveTrajectoryController:
         'rotation': {
             'speed_min': 0.3,              # Minimum speed factor (30%)
             'speed_max': 1.2,              # Maximum speed factor (120%)
-            'error_threshold_high': 0.05,  # 50mm high error threshold (优化: 40mm→50mm)
+            'error_threshold_high': 0.05,  # 50mm high error threshold (optimized: 40mm→50mm)
             'error_threshold_low': 0.015,  # 15mm low error threshold
             'adaptation_rate': 0.1,        # Adaptation rate
             'history_window': 20,          # Error history window
             'update_frequency': 5,         # Update every 5 control cycles
-            'speed_reduction_factor': 0.95, # Speed reduction factor when error is too large (优化: 0.8→0.95, 减速5%而非20%)
+            'speed_reduction_factor': 0.95, # Speed reduction factor when error is too large (optimized: 0.8→0.95, 5% deceleration instead of 20%)
             'speed_increase_factor': 1.1,  # Speed increase factor when error is small
-            'trend_reduction_factor': 0.95, # Speed reduction factor when trend deteriorates (优化: 0.9→0.95)
+            'trend_reduction_factor': 0.95, # Speed reduction factor when trend deteriorates (optimized: 0.9→0.95)
         },
         'disengagement': {
             'speed_min': 0.5,              # Minimum speed factor (50%) - more conservative
@@ -74,9 +74,9 @@ class AdaptiveTrajectoryController:
         }
         
         rospy.loginfo(f"AdaptiveTrajectoryController initialized for {mode_desc.get(control_mode, control_mode)}")
-        rospy.loginfo(f"  Speed range: {self.adaptation_params['speed_min']:.1%} - {self.adaptation_params['speed_max']:.1%}")
-        rospy.loginfo(f"  Error thresholds: {self.adaptation_params['error_threshold_low']*1000:.0f}mm - {self.adaptation_params['error_threshold_high']*1000:.0f}mm")
-        rospy.loginfo(f"  Update frequency: every {self.adaptation_params['update_frequency']} cycles")
+        rospy.loginfo(f"Speed range: {self.adaptation_params['speed_min']:.1%} - {self.adaptation_params['speed_max']:.1%}")
+        rospy.loginfo(f"Error thresholds: {self.adaptation_params['error_threshold_low']*1000:.0f}mm - {self.adaptation_params['error_threshold_high']*1000:.0f}mm")
+        rospy.loginfo(f"Update frequency: every {self.adaptation_params['update_frequency']} cycles")
     
     def update_tracking_performance(self, position_error, velocity_error=None):
         """Update tracking performance data"""
@@ -130,9 +130,9 @@ class AdaptiveTrajectoryController:
         
         # Log output (on each adjustment)
         if abs(speed_change) > 0.05:  # Record only when change exceeds 5%
-            mode_emoji = "🔄" if self.control_mode == 'disengagement' else "🔧"
+            mode_str = "ROTATION" if self.control_mode == 'disengagement' else "MANIPULATION"
             mode_name = self.control_mode.upper()
-            rospy.loginfo(f"{mode_emoji} {mode_name} adaptive control: speed factor {self.current_speed_factor:.2f} "
+            rospy.loginfo(f"{mode_str} {mode_name} adaptive control: speed factor {self.current_speed_factor:.2f} "
                          f"(avg_error: {performance['avg_error']*1000:.1f}mm, "
                          f"trend: {performance['error_trend']:.3f})")
     
@@ -366,12 +366,12 @@ class PolynomialTrajectory:
         
         if movement_distance < 0.200:  # Short/medium movement (<200mm) = LINEAR TRAJECTORY
             rospy.loginfo(f"LINEAR TRAJECTORY SELECTED: {movement_distance*1000:.1f}mm < 200mm threshold")
-            rospy.loginfo(f"  Eliminates polynomial speed spikes, uses constant velocity")
+            rospy.loginfo(f"Eliminates polynomial speed spikes, uses constant velocity")
             
             # Linear trajectory: p(τ) = start + (target - start) * τ
             # This gives constant velocity = (target - start) / T
             constant_velocity = (target - start) / T
-            rospy.loginfo(f"  Constant velocity: {abs(constant_velocity)*1000:.1f}mm/s (no spikes)")
+            rospy.loginfo(f"Constant velocity: {abs(constant_velocity)*1000:.1f}mm/s (no spikes)")
             
             # Polynomial representation of linear trajectory: a₁τ + a₀
             # All higher-order terms (a₂, a₃, a₄, a₅) = 0
@@ -390,9 +390,9 @@ class PolynomialTrajectory:
             velocity_check = linear_coeffs[4] / T  # Velocity = a₁/T = constant
             
             rospy.loginfo(f"LINEAR TRAJECTORY VERIFICATION:")
-            rospy.loginfo(f"  Start: {start:.6f} → {start_check:.6f} (error: {abs(start-start_check)*1000:.3f}mm)")
-            rospy.loginfo(f"  Target: {target:.6f} → {target_check:.6f} (error: {abs(target-target_check)*1000:.3f}mm)")
-            rospy.loginfo(f"  Velocity: {velocity_check*1000:.3f}mm/s (constant, no peaks)")
+            rospy.loginfo(f"Start: {start:.6f} → {start_check:.6f} (error: {abs(start-start_check)*1000:.3f}mm)")
+            rospy.loginfo(f"Target: {target:.6f} → {target_check:.6f} (error: {abs(target-target_check)*1000:.3f}mm)")
+            rospy.loginfo(f"Velocity: {velocity_check*1000:.3f}mm/s (constant, no peaks)")
             
             return linear_coeffs
         
@@ -465,9 +465,9 @@ class PolynomialTrajectory:
         # Enhanced debug logging for speed optimization
         final_max_velocity = self._estimate_max_velocity(coeffs, T)
         rospy.loginfo(f"SPEED OPTIMIZED POLYNOMIAL: max_vel={final_max_velocity:.3f}m/s (avg={average_velocity:.3f}m/s)")
-        rospy.loginfo(f"   Movement: {movement_distance*1000:.1f}mm in {T:.2f}s")
-        rospy.loginfo(f"   Boundary velocities: start={start_velocity:.4f}m/s, end={end_velocity:.4f}m/s")
-        rospy.loginfo(f"   Boundary fraction: {boundary_velocity_fraction:.1%} of average velocity")
+        rospy.loginfo(f" Movement: {movement_distance*1000:.1f}mm in {T:.2f}s")
+        rospy.loginfo(f" Boundary velocities: start={start_velocity:.4f}m/s, end={end_velocity:.4f}m/s")
+        rospy.loginfo(f" Boundary fraction: {boundary_velocity_fraction:.1%} of average velocity")
             
         return coeffs
 
@@ -618,7 +618,7 @@ class PolynomialTrajectory:
         if not self.is_paused and self.start_time is not None:
             self.is_paused = True
             self.pause_start_time = rospy.Time.now().to_sec()
-            rospy.loginfo("⏸️ TRAJECTORY PAUSED - time progression frozen")
+            rospy.loginfo(" TRAJECTORY PAUSED - time progression frozen")
 
     def resume(self):
         """Resume trajectory execution - continue time progression"""
@@ -628,7 +628,7 @@ class PolynomialTrajectory:
             self.total_pause_duration += pause_duration
             self.is_paused = False
             self.pause_start_time = None
-            rospy.loginfo(f"▶️ TRAJECTORY RESUMED - skipped {pause_duration:.2f}s during pause")
+            rospy.loginfo(f" TRAJECTORY RESUMED - skipped {pause_duration:.2f}s during pause")
 
     def is_trajectory_paused(self):
         """Check if trajectory is currently paused"""
@@ -671,16 +671,16 @@ class ValveRotationTrajectory:
             self.adaptive_duration_factor = 1.5  # 50% slower rotation
             self.adaptive_speed_limit = 0.6      # Max 60% speed
             rospy.loginfo(f"DEEP INSERTION detected ({insertion_depth*1000:.0f}mm) - using CONSERVATIVE rotation parameters")
-            rospy.loginfo(f"  Duration extended by 50%, max speed limited to 60%")
+            rospy.loginfo(f"Duration extended by 50%, max speed limited to 60%")
         elif insertion_depth > 0.15:  # Medium insertion (150-250mm)
             self.adaptive_duration_factor = 1.25 # 25% slower rotation
             self.adaptive_speed_limit = 0.8      # Max 80% speed
             rospy.loginfo(f"🚶 MEDIUM INSERTION detected ({insertion_depth*1000:.0f}mm) - using MODERATE rotation parameters")
-            rospy.loginfo(f"  Duration extended by 25%, max speed limited to 80%")
+            rospy.loginfo(f"Duration extended by 25%, max speed limited to 80%")
         else:  # Shallow insertion or free space (<150mm)
             self.adaptive_duration_factor = 1.0  # Normal rotation
             self.adaptive_speed_limit = 1.0      # Full speed allowed
-            rospy.loginfo(f"⚡ SHALLOW/FREE SPACE detected ({insertion_depth*1000:.0f}mm) - using STANDARD rotation parameters")
+            rospy.loginfo(f"SHALLOW/FREE SPACE detected ({insertion_depth*1000:.0f}mm) - using STANDARD rotation parameters")
         
         # Apply depth-adaptive duration adjustment
         self.rotation_duration = rotation_duration * self.adaptive_duration_factor
@@ -696,14 +696,14 @@ class ValveRotationTrajectory:
         
         if self.enable_adaptive_control:
             self.adaptive_controller = AdaptiveTrajectoryController(self, control_mode=control_mode)
-            mode_emoji = "🔄" if control_mode == 'disengagement' else "🔧"
-            rospy.loginfo(f"{mode_emoji} Adaptive control enabled for valve trajectory ({control_mode.upper()} mode)")
+            mode_str = "ROTATION" if control_mode == 'disengagement' else "MANIPULATION"
+            rospy.loginfo(f"{mode_str} Adaptive control enabled for valve trajectory ({control_mode.upper()} mode)")
         
         rospy.loginfo(f"Valve rotation trajectory initialized:")
-        rospy.loginfo(f"  End-effector rotation radius: {self.end_effector_rotation_radius:.3f}m")
-        rospy.loginfo(f"  Rotation angle: {self.rotation_angle:.3f}rad ({self.rotation_angle*180/pi:.1f}°)")
-        rospy.loginfo(f"  Duration: {self.rotation_duration:.1f}s")
-        rospy.loginfo(f"  Adaptive control: {'enabled' if self.enable_adaptive_control else 'disabled'}")
+        rospy.loginfo(f"End-effector rotation radius: {self.end_effector_rotation_radius:.3f}m")
+        rospy.loginfo(f"Rotation angle: {self.rotation_angle:.3f}rad ({self.rotation_angle*180/pi:.1f}°)")
+        rospy.loginfo(f"Duration: {self.rotation_duration:.1f}s")
+        rospy.loginfo(f"Adaptive control: {'enabled' if self.enable_adaptive_control else 'disabled'}")
     
     def _estimate_insertion_depth(self, grasp_height):
         """Estimate insertion depth from grasp height"""
@@ -815,8 +815,8 @@ class ValveRotationTrajectory:
             # FALLBACK: If grasp_height is None, use valve center Z minus offset
             # However, this should be avoided during valve rotation to prevent pitch errors
             uav_target_z = center_z - self.end_effector_offset_z
-            rospy.logwarn_once(f"⚠️ grasp_height is None during rotation - using fallback Z calculation")
-            rospy.logwarn_once(f"⚠️ This may cause pitch errors. Consider setting grasp_height explicitly.")
+            rospy.logwarn_once(f"grasp_height is None during rotation - using fallback Z calculation")
+            rospy.logwarn_once(f"This may cause pitch errors. Consider setting grasp_height explicitly.")
         
         # Calculate UAV target orientation (pointing toward valve center for end-effector engagement)
         dx_to_center = center_x - uav_target_x
@@ -987,11 +987,11 @@ def create_constant_distance_trajectory(current_uav_pos, current_uav_yaw, valve_
     start_angle = atan2(dy, dx)
     
     rospy.loginfo(f"Trajectory parameters:")
-    rospy.loginfo(f"  UAV position: {current_uav_pos}")
-    rospy.loginfo(f"  End-effector distance: {end_effector_distance:.3f}m")
-    rospy.loginfo(f"  Starting angle: {start_angle:.3f}rad ({start_angle*180/pi:.1f}°)")
-    rospy.loginfo(f"  Control mode: {control_mode.upper()}")
-    rospy.loginfo(f"  Adaptive control: {'enabled' if enable_adaptive_control else 'disabled'}")
+    rospy.loginfo(f"UAV position: {current_uav_pos}")
+    rospy.loginfo(f"End-effector distance: {end_effector_distance:.3f}m")
+    rospy.loginfo(f"Starting angle: {start_angle:.3f}rad ({start_angle*180/pi:.1f}°)")
+    rospy.loginfo(f"Control mode: {control_mode.upper()}")
+    rospy.loginfo(f"Adaptive control: {'enabled' if enable_adaptive_control else 'disabled'}")
     
     # Create trajectory with adaptive control
     trajectory = ValveRotationTrajectory(
@@ -1190,8 +1190,8 @@ class AdaptiveTrajectoryPlanner:
         new_intermediate = (intermediate_x, intermediate_y, intermediate_z)
         
         rospy.loginfo(f"Recalculated intermediate target from actual position:")
-        rospy.loginfo(f"  Original intermediate: {original_target}")
-        rospy.loginfo(f"  New intermediate: {new_intermediate}")
+        rospy.loginfo(f"Original intermediate: {original_target}")
+        rospy.loginfo(f"New intermediate: {new_intermediate}")
         
         return new_intermediate
     
@@ -1529,16 +1529,16 @@ class OnlineCircularTrajectoryGenerator:
     在线圆周轨迹生成器 - 专为Beetle倾转四旋翼设计
     
     基于Dragon控制理念但简化适配Beetle机械结构特点：
-    - 固定机体+末端执行器，无复杂多连杆结构
-    - 专注CoG轨迹规划，末端执行器通过几何偏移
+    - 固定机体+末端Execute器，无复杂多连杆结构
+    - 专注CoG轨迹规划，末端Execute器通过几何偏移
     - 恒定角速度的在线轨迹重规划
-    - 向心力补偿和扭矩前馈（简化版）
+    - 向心力补偿和扭矩前馈(简化版)
     - 半径自适应和锁定机制
     
     核心Dragon概念保留：
     1. 在线轨迹生成：delta_yaw = delta_t * turn_vel
     2. 恒定角速度控制
-    3. 半径锁定机制（80%目标角速度时锁定半径）
+    3. 半径锁定机制(80%目标角速度时锁定半径)
     4. 力矩前馈和向心力补偿
     """
     
@@ -1569,22 +1569,22 @@ class OnlineCircularTrajectoryGenerator:
         self.radius_locked = False  # 半径锁定状态
         self.total_rotation = 0.0  # 累计转动角度
         
-        # 轨迹参数（类似Dragon）
+        # 轨迹参数(类似Dragon)
         self.angular_velocity = 0.0  # 当前角速度
         self.radius_adaptation_rate = 0.1  # 半径自适应速率
         self.min_radius = initial_radius * 0.8  # 最小半径
         self.max_radius = initial_radius * 1.2  # 最大半径
         
-        # 力控制参数（简化的Beetle版本）
+        # 力控制参数(简化的Beetle版本)
         self.mass = 1.5  # Beetle质量 (kg)
         self.init_torque = 0.1  # 初始扭矩 (N·m)
         self.torque_limit = 3.0  # 扭矩限制 (N·m)
         self.current_torque = self.init_torque
         
-        # Z坐标管理（修复状态切换时的Z跳跃）
+        # Z坐标管理(修复状态切换时的Z跳跃)
         self.current_z = None  # 保存当前Z坐标，避免强制跳到valve_center[2]
         
-        # 半径锁定机制（Dragon概念）
+        # 半径锁定机制(Dragon概念)
         self.velocity_threshold_for_lock = 0.8  # 80%目标速度时锁定半径
         self.lock_radius_value = None
         
@@ -1592,7 +1592,7 @@ class OnlineCircularTrajectoryGenerator:
         self.start_time = rospy.Time.now().to_sec()
         self.last_update_time = self.start_time
         
-        rospy.loginfo("=== 在线圆周轨迹生成器（Beetle版）===")
+        rospy.loginfo("=== 在线圆周轨迹生成器(Beetle版)===")
         rospy.loginfo(f"阀门中心: ({valve_center[0]:.3f}, {valve_center[1]:.3f}, {valve_center[2]:.3f})")
         rospy.loginfo(f"初始半径: {initial_radius*1000:.1f}mm")
         rospy.loginfo(f"目标角速度: {math.degrees(target_angular_velocity):.1f}°/s")
@@ -1615,6 +1615,12 @@ class OnlineCircularTrajectoryGenerator:
         actual_dt = current_time - self.last_update_time
         self.last_update_time = current_time
         
+        # 🔧 CRITICAL FIX: 时间步限制防止积分爆炸
+        MAX_DT_LIMIT = 0.08  # 最大时间步限制为80ms (2倍于40ms标准控制周期)
+        safe_dt = min(actual_dt, MAX_DT_LIMIT)
+        if actual_dt > MAX_DT_LIMIT:
+            rospy.logwarn(f"⚠️  Time step clamped: actual_dt={actual_dt*1000:.1f}ms -> safe_dt={safe_dt*1000:.1f}ms")
+        
         # 计算当前实际位置相对阀门中心的角度和半径
         relative_pos = np.array(current_pos[:2]) - self.valve_center[:2]
         actual_radius = np.linalg.norm(relative_pos)
@@ -1628,7 +1634,7 @@ class OnlineCircularTrajectoryGenerator:
             # 接触阶段使用70%目标速度，确保平稳接触
             self.angular_velocity = self.target_angular_velocity * 0.7
         
-        # 🔧 速度安全限制：从控制层面确保安全运行
+        # MANIPULATION 速度安全限制：从控制层面确保安全运行
         SPEED_SAFETY_LIMIT = 0.1  # 0.1 rad/s ≈ 5.7°/s 安全上限
         if abs(self.angular_velocity) > SPEED_SAFETY_LIMIT:
             speed_sign = 1 if self.angular_velocity > 0 else -1
@@ -1636,12 +1642,12 @@ class OnlineCircularTrajectoryGenerator:
             if self.debug:
                 rospy.logwarn(f"速度安全限制启动: 角速度被限制到 {self.angular_velocity:.3f} rad/s ({math.degrees(abs(self.angular_velocity)):.1f}°/s)")
         
-        # 更新角度：核心Dragon公式
-        delta_angle = self.angular_velocity * actual_dt
+        # 🔧 FIXED: 使用安全时间步进行角度积分，防止积分爆炸
+        delta_angle = self.angular_velocity * safe_dt
         self.current_angle += delta_angle
         self.total_rotation += abs(delta_angle)
         
-        # 半径自适应逻辑（Dragon概念，Beetle简化）
+        # 半径自适应逻辑(Dragon概念，Beetle简化)
         if not self.radius_locked:
             # 根据实际半径进行自适应调整
             radius_error = actual_radius - self.current_radius
@@ -1652,7 +1658,7 @@ class OnlineCircularTrajectoryGenerator:
             self.current_radius = max(self.min_radius, 
                                     min(self.max_radius, self.current_radius))
             
-            # 检查是否需要锁定半径（Dragon机制），使用绝对值计算比例
+            # 检查是否需要锁定半径(Dragon机制)，使用绝对值计算比例
             velocity_ratio = abs(self.angular_velocity) / abs(self.target_angular_velocity) if self.target_angular_velocity != 0 else 0
             if velocity_ratio >= self.velocity_threshold_for_lock:
                 self.radius_locked = True
@@ -1664,9 +1670,9 @@ class OnlineCircularTrajectoryGenerator:
             # 半径已锁定，使用固定值
             self.current_radius = self.lock_radius_value
         
-        # 扭矩自适应（简化的力控制）
+        # 扭矩自适应(简化的力控制)
         if valve_angular_velocity > 0.05:
-            # 阀门转动中，根据阻力调整扭矩，使用绝对值计算阻力
+            # valve rotation中，根据阻力调整扭矩，使用绝对值计算阻力
             resistance_factor = max(0.5, min(2.0, abs(self.target_angular_velocity) / max(0.1, valve_angular_velocity)))
             self.current_torque = min(self.torque_limit, 
                                     self.init_torque * resistance_factor)
@@ -1689,19 +1695,19 @@ class OnlineCircularTrajectoryGenerator:
         Returns:
             dict: 包含位置、速度、扭矩的完整控制目标
         """
-        # 目标位置（CoG位置）
+        # Target position(CoG位置)
         target_x = self.valve_center[0] + self.current_radius * math.cos(self.current_angle)
         target_y = self.valve_center[1] + self.current_radius * math.sin(self.current_angle)
         # 修复：优先使用保存的Z坐标，避免状态切换时Z跳跃
         target_z = self.current_z if self.current_z is not None else self.valve_center[2]
         target_pos = np.array([target_x, target_y, target_z])
         
-        # 目标姿态（面向阀门中心）
+        # 目标姿态(面向阀门中心)
         target_yaw = self.current_angle + math.pi
         if target_yaw > math.pi:
             target_yaw -= 2 * math.pi
         
-        # 切向速度（Dragon核心概念）
+        # 切向速度(Dragon核心概念)
         tangential_speed = self.current_radius * self.angular_velocity
         tangential_angle = self.current_angle + math.pi/2  # 90度相位差
         
@@ -1710,21 +1716,21 @@ class OnlineCircularTrajectoryGenerator:
         target_vel_z = 0.0
         target_linear_vel = np.array([target_vel_x, target_vel_y, target_vel_z])
         
-        # 角速度（自转+公转）
+        # 角速度(自转+公转)
         target_angular_vel = self.angular_velocity
         
-        # 力和扭矩前馈（Beetle简化版）
+        # 力和扭矩前馈(Beetle简化版)
         # 向心力计算
         centripetal_force = self.mass * tangential_speed**2 / self.current_radius
         centripetal_force_x = -centripetal_force * math.cos(self.current_angle)
         centripetal_force_y = -centripetal_force * math.sin(self.current_angle)
         
-        # 重力补偿（简化）
+        # 重力补偿(简化)
         gravity_compensation_z = self.mass * 9.81 * 0.1  # 10%重力补偿
         
         target_force = np.array([centripetal_force_x, centripetal_force_y, gravity_compensation_z])
         
-        # 扭矩前馈（主要是Z轴扭矩）
+        # 扭矩前馈(主要是Z轴扭矩)
         target_torque = np.array([0.0, 0.0, self.current_torque])
         
         return {
@@ -1740,13 +1746,13 @@ class OnlineCircularTrajectoryGenerator:
     
     def is_motion_completed(self, target_rotation_angle):
         """
-        检查运动是否完成
+        检查运动是否Complete
         
         Args:
             target_rotation_angle: 目标旋转角度 (rad)
             
         Returns:
-            bool: 是否完成
+            bool: 是否Complete
         """
         return self.total_rotation >= abs(target_rotation_angle)
     

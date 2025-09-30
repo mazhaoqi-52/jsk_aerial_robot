@@ -85,8 +85,8 @@ class InsertionOptimizer:
         # OPTIMIZED: 10mm positioning allows end-effector much closer to valve center, maximizing insertion success rate
         # Reduced from 20mm to provide better center alignment and reduce XY positioning tolerance requirements
         
-        self.min_end_effector_to_valve_center_distance = 0.010  # OPTIMIZED: 10mm为最优位置，最大化插入成功率
-        self.min_uav_to_valve_outer_rim_distance = 0.175      # UAV COG ≥ 0.175m from valve outer rim (maintained)
+        self.min_end_effector_to_valve_center_distance = 0.020  # OPTIMIZED: 20mm为最优位置，最大化插入Success率
+        self.min_uav_to_valve_outer_rim_distance = 0.180      # UAV COG ≥ 0.180m from valve outer rim (增加5mm安全裕度)
         self.min_uav_to_valve_center_distance = 0.200        # ADJUSTED: 减少从240mm到200mm，减少几何约束冲突
         
         # Default rotation direction (for compatibility)
@@ -126,7 +126,7 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Claw radius with 10mm: √(10² + 75²) = {math.sqrt(10**2 + 75**2):.1f}mm")
         rospy.loginfo(f"  Valve interior margin: {100 - math.sqrt(10**2 + 75**2):.1f}mm (充足空间)")
         rospy.loginfo(f"OPTIMIZED SAFETY CONSTRAINTS:")
-        rospy.loginfo(f"  End-effector to valve center: ≥{self.min_end_effector_to_valve_center_distance:.3f}m (OPTIMIZED: 10mm最大化插入成功率)")
+        rospy.loginfo(f"  End-effector to valve center: ≥{self.min_end_effector_to_valve_center_distance:.3f}m (OPTIMIZED: 10mm最大化插入Success率)")
         rospy.loginfo(f"  UAV to valve outer rim: ≥{self.min_uav_to_valve_outer_rim_distance:.3f}m (MAINTAINED)")
         rospy.loginfo(f"  UAV to valve center: ≥{self.min_uav_to_valve_center_distance:.3f}m (ADJUSTED: UAV更接近阀门)")
         rospy.loginfo(f"  Z-axis safety margin: {self.insertion_safety_margin_z:.3f}m (UAV CoG比阀门中心高67.3mm)")
@@ -181,7 +181,7 @@ class InsertionOptimizer:
         
         rospy.loginfo(f"get_optimal_end_effector_distance() called:")
         rospy.loginfo(f"  Returning: {optimal_distance*1000:.1f}mm (configured optimal distance)")
-        rospy.loginfo(f"  Purpose: 使用配置的最优距离实现最大化插入成功率")
+        rospy.loginfo(f"  Purpose: 使用配置的最优距离实现最大化插入Success率")
         
         return optimal_distance
 
@@ -524,9 +524,9 @@ class InsertionOptimizer:
         }
         
         rospy.loginfo(f"=== SPOKE-ALIGNED DUAL-FANG STRATEGY RESULTS ===")
-        rospy.loginfo(f"Strategy feasible: {'✓ YES' if dual_fang_strategy['feasible'] else '✗ NO'}")
-        rospy.loginfo(f"Collision safe: {'✓ YES' if dual_fang_strategy['collision_safe'] else '✗ NO'}")
-        rospy.loginfo(f"Separation accurate: {'✓ YES' if dual_fang_strategy['separation_accurate'] else '✗ NO'}")
+        rospy.loginfo(f"Strategy feasible: {'YES' if dual_fang_strategy['feasible'] else 'NO'}")
+        rospy.loginfo(f"Collision safe: {'YES' if dual_fang_strategy['collision_safe'] else 'NO'}")
+        rospy.loginfo(f"Separation accurate: {'YES' if dual_fang_strategy['separation_accurate'] else 'NO'}")
         rospy.loginfo(f"UAV position: {dual_fang_strategy['optimal_uav_position']}")
         rospy.loginfo(f"UAV yaw: {math.degrees(dual_fang_strategy['optimal_uav_yaw']):.1f}°")
         
@@ -748,7 +748,7 @@ class InsertionOptimizer:
         rospy.loginfo(f"Radial depth utilized: {(outer_claw_radius - inner_claw_radius)*1000:.1f}mm")
         rospy.loginfo(f"Achieved separation: {asymmetric_separation*1000:.1f}mm")
         rospy.loginfo(f"Required separation: {self.claw_separation*1000:.1f}mm")
-        rospy.loginfo(f"Strategy feasible: {'✓ YES' if separation_adequate else '✗ NO'}")
+        rospy.loginfo(f"Strategy feasible: {'YES' if separation_adequate else 'NO'}")
         # Create geometrically optimal strategy result
         strategy_result = {
             'strategy': 'geometrically_optimal_radial_asymmetric',
@@ -776,17 +776,17 @@ class InsertionOptimizer:
         rospy.loginfo(f"Radial depth utilized: {(outer_claw_radius - inner_claw_radius)*1000:.1f}mm")
         rospy.loginfo(f"Achieved separation: {achieved_separation*1000:.1f}mm")
         rospy.loginfo(f"Required separation: {self.claw_separation*1000:.1f}mm")
-        rospy.loginfo(f"Strategy feasible: {'✓ YES' if geometrically_optimal else '✗ NO'}")
-        rospy.loginfo(f"Position validation: {'✓ VALID' if left_valid and right_valid else '✗ INVALID'}")
+        rospy.loginfo(f"Strategy feasible: {'YES' if geometrically_optimal else 'NO'}")
+        rospy.loginfo(f"Position validation: {'VALID' if left_valid and right_valid else 'INVALID'}")
         rospy.loginfo(f"Improvement over symmetric: {(achieved_separation - 2 * gap_radius * math.sin(math.pi/3))*1000:.1f}mm")
         
         # Final assessment for geometrically optimal strategy
         if geometry_valid and geometrically_optimal:
-            rospy.loginfo("✓ Geometrically optimal strategy: ACHIEVED - maximum possible within constraints")
+            rospy.loginfo("Geometrically optimal strategy: ACHIEVED - maximum possible within constraints")
         elif geometry_valid:
             rospy.logwarn("○ Geometrically optimal strategy: VALID but constrained by valve geometry")
         else:
-            rospy.logwarn("⚠ Geometrically optimal strategy: POSITION ERROR - needs adjustment")
+            rospy.logwarn("WARNING: Geometrically optimal strategy: POSITION ERROR - needs adjustment")
         
         return strategy_result
     
@@ -843,7 +843,7 @@ class InsertionOptimizer:
         geometry_ok = (abs(actual_claw_separation - self.claw_separation) < 0.001 and 
                       abs(dual_fang_distance - self.dual_fang_center_offset) < 0.001)
         
-        rospy.loginfo(f"  Geometry verification: {'✓ PASSED' if geometry_ok else '✗ FAILED'}")
+        rospy.loginfo(f"  Geometry verification: {'PASSED' if geometry_ok else 'FAILED'}")
         
         return {
             'dual_fang_center': (dual_fang_center_x, dual_fang_center_y, dual_fang_center_z),
@@ -983,7 +983,7 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Global constraint: {self.min_end_effector_to_valve_center_distance*1000:.1f}mm")
         rospy.loginfo(f"  Effective minimum: {min_end_effector_distance*1000:.1f}mm (直接使用设定值)")
         
-        rospy.loginfo(f"✓ Using direct setting: {self.min_end_effector_to_valve_center_distance*1000:.1f}mm for maximum insertion success rate")
+        rospy.loginfo(f"Using direct setting: {self.min_end_effector_to_valve_center_distance*1000:.1f}mm for maximum insertion success rate")
         
         # Maximum distance: valve interior constraint (claw_radius ≤ 100mm)
         valve_inner_radius = 0.100  # 100mm inner radius (已包含安全余量)
@@ -997,15 +997,15 @@ class InsertionOptimizer:
         rospy.loginfo(f"OPTIMIZED POSITIONING CONSTRAINTS (USING {optimal_end_effector_distance*1000:.1f}MM):")
         rospy.loginfo(f"  Valve interior constraint: √(distance² + {half_claw_separation*1000:.0f}²) ≤ {valve_inner_radius*1000:.0f}mm")
         rospy.loginfo(f"  Theoretical maximum: √({valve_inner_radius*1000:.0f}² - {half_claw_separation*1000:.0f}²) = {max_end_effector_distance*1000:.1f}mm")
-        rospy.loginfo(f"  Configured distance: {optimal_end_effector_distance*1000:.1f}mm (OPTIMIZED: 最大化插入成功率)")
+        rospy.loginfo(f"  Configured distance: {optimal_end_effector_distance*1000:.1f}mm (OPTIMIZED: 最大化插入Success率)")
         rospy.loginfo(f"  Valid range: [{min_end_effector_distance*1000:.1f}mm, {max_end_effector_distance*1000:.1f}mm]")
         rospy.loginfo(f"  Selected: {optimal_end_effector_distance*1000:.1f}mm (直接使用配置值)")
         rospy.loginfo(f"  安全裕度: {(max_end_effector_distance - optimal_end_effector_distance)*1000:.1f}mm to valve inner rim")
         
-        # 验证几何约束
+        # verify几何约束
         predicted_claw_radius = math.sqrt(optimal_end_effector_distance**2 + half_claw_separation**2)
-        rospy.loginfo(f"  验证claw半径: √({optimal_end_effector_distance*1000:.1f}² + {half_claw_separation*1000:.0f}²) = {predicted_claw_radius*1000:.1f}mm")
-        rospy.loginfo(f"  约束检查: {predicted_claw_radius*1000:.1f}mm ≤ {valve_inner_radius*1000:.0f}mm = {'✓ PASS' if predicted_claw_radius <= valve_inner_radius else '✗ FAIL'}")
+        rospy.loginfo(f"  verifyclaw半径: √({optimal_end_effector_distance*1000:.1f}² + {half_claw_separation*1000:.0f}²) = {predicted_claw_radius*1000:.1f}mm")
+        rospy.loginfo(f"  约束检查: {predicted_claw_radius*1000:.1f}mm ≤ {valve_inner_radius*1000:.0f}mm = {'PASS' if predicted_claw_radius <= valve_inner_radius else 'FAIL'}")
         rospy.loginfo(f"  安全裕度: {(valve_inner_radius - predicted_claw_radius)*1000:.1f}mm from valve inner rim (充足空间)")
         rospy.loginfo(f"OPTIMIZATION BENEFITS:")
         rospy.loginfo(f"  UAV距离减少: ~15mm closer to valve (更好的操作性)")
@@ -1045,7 +1045,7 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Actual end-effector distance: {actual_end_effector_distance*1000:.1f}mm")
         rospy.loginfo(f"  Left claw distance from valve center: {left_claw_distance*1000:.1f}mm")
         rospy.loginfo(f"  Right claw distance from valve center: {right_claw_distance*1000:.1f}mm")
-        rospy.loginfo(f"  Distance equality: {'✓ EQUAL' if abs(left_claw_distance - right_claw_distance) < 0.001 else '✗ UNEQUAL'}")
+        rospy.loginfo(f"  Distance equality: {'EQUAL' if abs(left_claw_distance - right_claw_distance) < 0.001 else 'UNEQUAL'}")
         
         # Ensure radius is within valve physical limits
         min_safe_radius = self.hub_radius + 0.005  # 5mm clearance from hub
@@ -1071,7 +1071,7 @@ class InsertionOptimizer:
         rospy.loginfo(f"  Right claw position: ({right_claw_target_x:.3f}, {right_claw_target_y:.3f})")
         rospy.loginfo(f"  Calculated separation: {calculated_separation*1000:.1f}mm")
         rospy.loginfo(f"  Required separation: {self.claw_separation*1000:.1f}mm")
-        rospy.loginfo(f"  Separation accuracy: {'✓ CORRECT' if abs(calculated_separation - self.claw_separation) < 0.001 else '✗ ERROR'}")
+        rospy.loginfo(f"  Separation accuracy: {'CORRECT' if abs(calculated_separation - self.claw_separation) < 0.001 else 'ERROR'}")
         rospy.loginfo(f"GEOMETRY: End-effector along spoke, claws perpendicular to spoke at equal distance from valve center")
         
         # Check clearance from all spokes
@@ -1092,7 +1092,7 @@ class InsertionOptimizer:
         safety_adequate = min_safety_margin > 0.015  # 15mm minimum clearance
         
         rospy.loginfo(f"  Minimum safety margin: {min_safety_margin*1000:.1f}mm")
-        rospy.loginfo(f"  Safety status: {'✓ ADEQUATE' if safety_adequate else '✗ INSUFFICIENT'}")
+        rospy.loginfo(f"  Safety status: {'ADEQUATE' if safety_adequate else 'INSUFFICIENT'}")
         
         # CORRECT UAV POSITIONING: 阀门中心 → end-effector中心 → UAV CoG
         # UAV CoG位于从阀门中心出发沿辐条方向延伸的射线上
@@ -1132,7 +1132,7 @@ class InsertionOptimizer:
         if actual_end_effector_distance < (min_end_effector_distance - tolerance):
             rospy.logwarn(f"End-effector距离{actual_end_effector_distance*1000:.1f}mm < 最小约束{min_end_effector_distance*1000:.1f}mm")
         else:
-            rospy.loginfo(f"✓ End-effector constraint satisfied: {actual_end_effector_distance*1000:.1f}mm ≥ {min_end_effector_distance*1000:.1f}mm")
+            rospy.loginfo(f"End-effector constraint satisfied: {actual_end_effector_distance*1000:.1f}mm ≥ {min_end_effector_distance*1000:.1f}mm")
         
         # Verify UAV distance constraint (now 245mm per Scheme A)
         if uav_to_valve_distance < self.min_uav_to_valve_center_distance:
@@ -1166,7 +1166,7 @@ class InsertionOptimizer:
             rospy.loginfo(f"ADJUSTED UAV distance: {uav_to_valve_distance*1000:.1f}mm (≥{self.min_uav_to_valve_center_distance*1000:.1f}mm satisfied)")
             rospy.loginfo(f"Spoke alignment maintained: UAV at {math.degrees(optimal_spoke_angle):.1f}° direction")
         else:
-            rospy.loginfo(f"✓ UAV distance constraint satisfied: {uav_to_valve_distance*1000:.1f}mm ≥ {self.min_uav_to_valve_center_distance*1000:.1f}mm")
+            rospy.loginfo(f"UAV distance constraint satisfied: {uav_to_valve_distance*1000:.1f}mm ≥ {self.min_uav_to_valve_center_distance*1000:.1f}mm")
         
         
         # Recalculate claw positions based on final end-effector center (if adjusted)
@@ -1198,8 +1198,8 @@ class InsertionOptimizer:
         uav_to_outer_rim_distance = final_uav_to_valve_distance - self.valve_outer_radius
         
         rospy.loginfo(f"FINAL CORRECTED GEOMETRY:")
-        rospy.loginfo(f"  End-effector distance: {final_end_effector_to_valve_distance*1000:.1f}mm ({min_end_effector_distance*1000:.1f}-{max_end_effector_distance*1000:.1f}mm: {'✓' if min_end_effector_distance <= final_end_effector_to_valve_distance <= max_end_effector_distance else '✗'})")
-        rospy.loginfo(f"  UAV distance: {final_uav_to_valve_distance*1000:.1f}mm (≥{self.min_uav_to_valve_center_distance*1000:.1f}mm: {'✓' if final_uav_to_valve_distance >= self.min_uav_to_valve_center_distance else '✗'})")
+        rospy.loginfo(f"  End-effector distance: {final_end_effector_to_valve_distance*1000:.1f}mm ({min_end_effector_distance*1000:.1f}-{max_end_effector_distance*1000:.1f}mm: {'PASS' if min_end_effector_distance <= final_end_effector_to_valve_distance <= max_end_effector_distance else 'FAIL'})")
+        rospy.loginfo(f"  UAV distance: {final_uav_to_valve_distance*1000:.1f}mm (≥{self.min_uav_to_valve_center_distance*1000:.1f}mm: {'PASS' if final_uav_to_valve_distance >= self.min_uav_to_valve_center_distance else 'FAIL'})")
         rospy.loginfo(f"  Geometry sequence: 阀门中心 → end-effector({final_end_effector_to_valve_distance*1000:.1f}mm) → UAV({self.dual_fang_center_offset*1000:.1f}mm)")
         rospy.loginfo(f"  UAV CONSTRAINT: Minimum distance ≥{self.min_uav_to_valve_center_distance*1000:.1f}mm (not fixed at {self.min_uav_to_valve_center_distance*1000:.1f}mm)")
         rospy.loginfo(f"  Left claw distance from valve center: {left_claw_distance*1000:.1f}mm")
@@ -1396,7 +1396,7 @@ class InsertionOptimizer:
         
         # === ENHANCED SAFETY CONSTRAINT ENFORCEMENT WITH RADIAL OPTIMIZATION ===
         if constraint_violations:
-            rospy.logwarn("⚠ SAFETY CONSTRAINTS VIOLATED - APPLYING RADIAL ADJUSTMENTS:")
+            rospy.logwarn("WARNING: SAFETY CONSTRAINTS VIOLATED - APPLYING RADIAL ADJUSTMENTS:")
             for violation in constraint_violations:
                 rospy.logwarn(f"  - {violation}")
         
@@ -1501,10 +1501,10 @@ class InsertionOptimizer:
         rospy.loginfo(f"Optimized end-effector center: ({safe_dual_fang_center_x:.3f}, {safe_dual_fang_center_y:.3f}, {safe_dual_fang_center_z:.3f})")
         rospy.loginfo(f"Radial adjustment: {radial_adjustment*1000:.1f}mm {adjustment_type}")
         rospy.loginfo(f"Final constraint verification:")
-        rospy.loginfo(f"  - End-effector to valve center: {safe_end_effector_to_valve_distance:.3f}m ≥ {self.min_end_effector_to_valve_center_distance:.3f}m ✓")
-        rospy.loginfo(f"  - UAV to valve center: {safe_uav_to_valve_distance:.3f}m ≥ {self.min_uav_to_valve_center_distance:.3f}m ✓")
-        rospy.loginfo(f"  - UAV to valve outer rim: {safe_uav_to_outer_rim_distance:.3f}m ≥ {self.min_uav_to_valve_outer_rim_distance:.3f}m ✓")
-        rospy.loginfo(f"  - INSERTION BLOCKING PREVENTION: ✓ ENSURED")
+        rospy.loginfo(f"  - End-effector to valve center: {safe_end_effector_to_valve_distance:.3f}m ≥ {self.min_end_effector_to_valve_center_distance:.3f}m ")
+        rospy.loginfo(f"  - UAV to valve center: {safe_uav_to_valve_distance:.3f}m ≥ {self.min_uav_to_valve_center_distance:.3f}m ")
+        rospy.loginfo(f"  - UAV to valve outer rim: {safe_uav_to_outer_rim_distance:.3f}m ≥ {self.min_uav_to_valve_outer_rim_distance:.3f}m ")
+        rospy.loginfo(f"  - INSERTION BLOCKING PREVENTION: ENSURED")
         
         final_uav_position = (safe_uav_x, safe_uav_y, safe_uav_z)
         final_end_effector_center = (safe_dual_fang_center_x, safe_dual_fang_center_y, safe_dual_fang_center_z)

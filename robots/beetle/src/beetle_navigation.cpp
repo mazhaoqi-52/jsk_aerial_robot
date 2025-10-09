@@ -148,8 +148,8 @@ void BeetleNavigator::joyStickControl(const sensor_msgs::JoyConstPtr & joy_msg)
   if(fabs(raw_y_cmd) < joy_stick_deadzone_) raw_y_cmd = 0;
   if(fabs(raw_yaw_cmd) < joy_stick_deadzone_) raw_yaw_cmd = 0;
 
-  setTargetPosCandX(getTargetPosCand().x() + raw_x_cmd * max_teleop_xy_vel_ * 0.02);
-  setTargetPosCandY(getTargetPosCand().y() + raw_y_cmd * max_teleop_xy_vel_ * 0.02);
+  setTargetPosCandX(getTargetPosCand().x() + raw_x_cmd * max_teleop_xy_vel_ * 0.01);
+  setTargetPosCandY(getTargetPosCand().y() + raw_y_cmd * max_teleop_xy_vel_ * 0.01);
   setTargetYaw(angles::normalize_angle(getTargetRPY().z() + raw_yaw_cmd * max_teleop_yaw_vel_ * 0.0001));
   setTargetOmegaZ(0);
 

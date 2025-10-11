@@ -57,7 +57,6 @@ class PolynomialTrajectory : public ReferenceBase {
   PolyType y_;
   PolyType z_;
   PolyType yaw_;
-  QuadState prev_constraint_;
 
   std::vector<QuadState> states_;
 

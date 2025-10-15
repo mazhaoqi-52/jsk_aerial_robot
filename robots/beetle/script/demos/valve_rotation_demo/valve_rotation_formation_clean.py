@@ -1741,7 +1741,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         )
 
         max_attempts = 3
-        xy_tolerance = 0.040  # 40mm (放宽标准以提高成功率)
+        xy_tolerance = 0.030  # 30mm (适中的收敛标准)
         z_tolerance = 0.015   # 15mm
 
         for attempt in range(1, max_attempts + 1):
@@ -1749,12 +1749,12 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             success = self.active_position_convergence(
                 target_ee_pos=xy_target,
                 target_yaw=maintain_yaw,
-                pos_threshold=0.040,  # 放宽到40mm
+                pos_threshold=0.030,  # 30mm收敛标准
                 yaw_threshold=0.06,
                 vel_threshold=0.015,
                 min_readings=3,
                 max_attempts=110,
-                timeout=22.0
+                timeout=5.0  # 5秒超时，快速尝试
             )
 
             if not success:

@@ -10,16 +10,18 @@ import rosgraph
 from geometry_msgs.msg import PoseStamped
 
 class MultiPublisher:
-    def __init__(self, topic1, topic2, topic3, topic4, data_class, queue_size=1):
+    def __init__(self, topic1, topic2, topic3, topic4, topic5, data_class, queue_size=1):
         self.pub1 = rospy.Publisher(topic1, data_class, queue_size=queue_size)
         self.pub2 = rospy.Publisher(topic2, data_class, queue_size=queue_size)
         self.pub3 = rospy.Publisher(topic3, data_class, queue_size=queue_size)
         self.pub4 = rospy.Publisher(topic4, data_class, queue_size=queue_size)
+        self.pub5 = rospy.Publisher(topic5, data_class, queue_size=queue_size)
     def publish(self, msg):
         self.pub1.publish(msg)
         self.pub2.publish(msg)
         self.pub3.publish(msg)
         self.pub4.publish(msg)
+        self.pub5.publish(msg)
 
 
 msg = """
@@ -81,7 +83,7 @@ if __name__=="__main__":
         yaw_vel  = rospy.get_param("yaw_vel", 0.02)
         z_vel = rospy.get_param("z_vel", 0.04)
 
-        motion_start_pub   = MultiPublisher('task_start', 'task_start', 'task_start', 'task_start', Empty, queue_size=1)
+        motion_start_pub   = MultiPublisher('task_start', 'task_start', 'task_start', 'task_start', 'task_start', Empty, queue_size=1)
         current_z_vel = 0.0
         try:
                 while(True):

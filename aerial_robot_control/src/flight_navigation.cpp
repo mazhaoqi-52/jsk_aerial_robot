@@ -839,6 +839,8 @@ void BaseNavigator::update()
 
         if(vel_based_waypoint_)
           {
+            // Recalculate delta to get current distance to target
+            delta = target_pos_ - curr_pos;
             delta.setZ(0); // we do not need z
             /* vel nav */
             if(delta.length() > vel_nav_threshold_)

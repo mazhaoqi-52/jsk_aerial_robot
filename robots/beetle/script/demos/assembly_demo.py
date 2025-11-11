@@ -10,52 +10,67 @@ from beetle.assembly import *
 class AssemblyDemo():
     def __init__(self):
         rospy.init_node("assembly_demo")
+        
+        # Read parameters from launch file or use defaults
+        self.follower = rospy.get_param('~follower', 'beetle1')
+        self.leader = rospy.get_param('~leader', 'beetle2')
+        
+        # Extract robot IDs from names (assuming format: beetleX)
+        self.follower_id = int(self.follower.replace('beetle', ''))
+        self.leader_id = int(self.leader.replace('beetle', ''))
+        
+        # Determine attach direction based on IDs
+        # If follower_id < leader_id: attach from left (dir = -1)
+        # If follower_id > leader_id: attach from right (dir = 1)
+        self.attach_dir = -1.0 if self.follower_id < self.leader_id else 1.0
+        
+        rospy.loginfo("Assembly Demo Configuration:")
+        rospy.loginfo("  Follower: %s (ID: %d)" % (self.follower, self.follower_id))
+        rospy.loginfo("  Leader: %s (ID: %d)" % (self.leader, self.leader_id))
+        rospy.loginfo("  Attach Direction: %.1f" % self.attach_dir)
 
     def main(self):
         sm_top = smach.StateMachine(outcomes=['succeeded','interupted'])
         with sm_top:
-            sm_sub1 = smach.StateMachine(outcomes=['succeeded_1_2','interupted_1_2']) # module1 depart from  module2
-            sm_sub2 = smach.StateMachine(outcomes=['succeeded_2_3','interupted_2_3']) # module2 depart from  module3
+            # Create a single state machine for the specified robot pair
+            smach.StateMachine.add('StandbyState',
+                                   StandbyState(robot_name = self.follower, 
+                                               robot_id = self.follower_id, 
+                                               leader = self.leader, 
+                                               leader_id = self.leader_id, 
+                                               attach_dir = self.attach_dir),
+                                   transitions={'done':'ApproachState', 
+                                               'in_process': 'StandbyState', 
+                                               'emergency':'interupted'})
 
-            with sm_sub1:
-                smach.StateMachine.add('StandbyState1_2',
-                                       StandbyState(robot_name = 'beetle1', robot_id = 1, leader = 'beetle2', leader_id = 2, attach_dir = -1.0),
-                                       transitions={'done':'ApproachState1_2', 'in_process': 'StandbyState1_2', 'emergency':'interupted_1_2'})
+            smach.StateMachine.add('ApproachState',
+                                   ApproachState(robot_name = self.follower, 
+                                                robot_id = self.follower_id, 
+                                                leader = self.leader, 
+                                                leader_id = self.leader_id, 
+                                                attach_dir = self.attach_dir),
+                                   transitions={'done':'AssemblyState', 
+                                               'in_process':'ApproachState', 
+                                               'fail':'StandbyState', 
+                                               'emergency':'interupted'})
 
-                smach.StateMachine.add('ApproachState1_2',
-                                       ApproachState(robot_name = 'beetle1', robot_id = 1, leader = 'beetle2', leader_id = 2, attach_dir = -1.0),
-                                       transitions={'done':'AssemblyState1_2', 'in_process':'ApproachState1_2', 'fail':'StandbyState1_2', 'emergency':'interupted_1_2'})
-
-                smach.StateMachine.add('AssemblyState1_2', AssemblyState(robot_name = 'beetle1', robot_id = 1, leader = 'beetle2', leader_id = 2, attach_dir = -1.0),
-                                       transitions={'done':'succeeded_1_2', 'emergency':'interupted_1_2'})
-
-            with sm_sub2:
-                smach.StateMachine.add('StandbyState2_3',
-                                       StandbyState(robot_name = 'beetle3', robot_id = 3, leader = 'beetle2', leader_id = 2, attach_dir = 1.0),
-                                       transitions={'done':'ApproachState2_3', 'in_process': 'StandbyState2_3', 'emergency':'interupted_2_3'})
-
-                smach.StateMachine.add('ApproachState2_3',
-                                       ApproachState(robot_name = 'beetle3', robot_id = 3, leader = 'beetle2', leader_id = 2, attach_dir = 1.0),
-                                       transitions={'done':'AssemblyState2_3', 'in_process':'ApproachState2_3', 'fail':'StandbyState2_3', 'emergency':'interupted_2_3'})
-
-                smach.StateMachine.add('AssemblyState2_3', AssemblyState(robot_name = 'beetle3', robot_id = 3, leader = 'beetle2', leader_id = 2, attach_dir = 1.0),
-                                       transitions={'done':'succeeded_2_3', 'emergency':'interupted_2_3'})
-
-            smach.StateMachine.add('SUB1',
-                                   sm_sub1,
-                                   transitions={'succeeded_1_2':'SUB2', 'interupted_1_2':'interupted'})
-
-            smach.StateMachine.add('SUB2',
-                                   sm_sub2,
-                                   transitions={'succeeded_2_3':'succeeded', 'interupted_2_3':'interupted'})
+            smach.StateMachine.add('AssemblyState', 
+                                   AssemblyState(robot_name = self.follower, 
+                                                robot_id = self.follower_id, 
+                                                leader = self.leader, 
+                                                leader_id = self.leader_id, 
+                                                attach_dir = self.attach_dir),
+                                   transitions={'done':'succeeded', 
+                                               'emergency':'interupted'})
 
         sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
         sis.start()
         outcome = sm_top.execute()
-        rospy.spin()
         sis.stop()
+        rospy.loginfo("Assembly demo completed with outcome: %s" % outcome)
+        
 if __name__ == '__main__':
     try:
-        demo = AssemblyDemo();
+        demo = AssemblyDemo()
         demo.main()
     except rospy.ROSInterruptException: pass

@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <launch>
-  <arg name = "follower" default="gimbalrotor1" />
-  <arg name = "leader" default="gimbalrotor2" />
-  <node pkg="gimbalrotor" type="assembly_demo.py" name="assemble_demo" output="screen" >
+  <arg name = "follower" default="beetle1" />
+  <arg name = "leader" default="beetle2" />
+  <node pkg="beetle" type="assembly_demo.py" name="assemble_demo" output="screen" >
     <param name="follower" value="$(arg follower)"/>
     <param name="leader" value="$(arg leader)"/>
   </node>

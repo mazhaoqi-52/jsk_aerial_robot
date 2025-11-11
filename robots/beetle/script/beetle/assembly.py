@@ -12,6 +12,9 @@ from diagnostic_msgs.msg import KeyValue
 from beetle.kondo_control import KondoControl
 import numpy as np
 import tf
+from beetle.gazebo_link_attacher import GazeboLinkAttacher
+from beetle.gazebo_link_detacher import GazeboLinkDetacher
+from gazebo_ros_link_attacher.srv import Attach, AttachRequest, AttachResponse
 
 #### state classes ####
 
@@ -107,6 +110,7 @@ class StandbyState(smach.State):
         self.att_error_tol = np.array([self.roll_tol, self.pitch_tol, self.yaw_tol]) # attitude error torelance
 
     def execute(self, userdata):
+        rospy.loginfo_throttle(2.0, "[%s StandbyState] Checking position..." % self.robot_name)
         if not self.follower_male_mech_activated:
             if self.real_machine:
                 self.kondo_servo.sendTargetAngle(self.lock_servo_angle_female)
@@ -118,11 +122,13 @@ class StandbyState(smach.State):
         #TODO: determine leader namespace dynamically
         try:
             leader_from_world = self.listener.lookupTransform('/world', self.leader+'/root', rospy.Time(0))
-        except (tf.LookupException, tf_from_neighboring.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(5.0, "[%s StandbyState] TF lookup failed for leader: %s" % (self.robot_name, str(e)))
             return 'in_process'
         try:
             follower_from_leader = self.listener.lookupTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(5.0, "[%s StandbyState] TF lookup failed for follower: %s" % (self.robot_name, str(e)))
             return 'in_process'
 
         # set target odom in leader coordinate
@@ -145,9 +151,12 @@ class StandbyState(smach.State):
         if(pos_error[0] * self.attach_dir > 0):
             pos_error[0] = 0.0
         att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
-        rospy.loginfo(pos_error)
+        rospy.loginfo_throttle(2.0, "[%s StandbyState] pos_error: [%.3f, %.3f, %.3f], att_error: [%.3f, %.3f, %.3f]" % 
+                               (self.robot_name, pos_error[0], pos_error[1], pos_error[2], 
+                                att_error[0], att_error[1], att_error[2]))
         #check if pos and att error are within the torrelance
         if np.all(np.less(np.abs(pos_error),self.pos_error_tol)) and np.all(np.less(np.abs(att_error),self.att_error_tol)):
+            rospy.loginfo("[%s StandbyState] Position reached! Transitioning to ApproachState" % self.robot_name)
             return 'done'
         elif self.emergency_flag:
             return 'emergency'
@@ -400,19 +409,35 @@ class AssemblyState(smach.State):
             return 'emergency'
         if self.real_machine:
             self.kondo_servo.sendTargetAngle(self.lock_servo_angle_male)
-        time.sleep(1.0)
+            time.sleep(1.0)
+        else:
+            # User Gazebo link attacher to physically lock the two robots first
+            rospy.sleep(2.0)
+            try:
+                link_attacher = GazeboLinkAttacher(self.robot_name, 'root', self.leader, 'root')
+                link_attacher.attach_links()  
+                rospy.loginfo("[%s] Gazebo link attachment completed" % self.robot_name)
+            except rospy.ServiceException as e:
+                rospy.logerr("[%s] Gazebo link attachment failed: %s" % (self.robot_name, str(e)))
+                return 'emergency'  
+            rospy.sleep(1.0)  
+        
+        # Change flight control mode to "combined mode"
         self.nav_msg.pos_xy_nav_mode= 6
         self.follower_nav_pub.publish(self.nav_msg)
         self.leader_nav_pub.publish(self.nav_msg)
         rospy.sleep(1.0)
+        
+        # Send assembly flags
         self.flag_msg.key = str(self.robot_id)
         self.flag_msg.value = '1'
         self.flag_pub.publish(self.flag_msg)
         self.flag_msg.key = str(self.leader_id)
         self.flag_msg.value = '1'
         self.flag_pub_leader.publish(self.flag_msg)
-        if not self.real_machine:
-            rospy.sleep(5.0)
+        rospy.loginfo("[%s] Assembly state completed: flags published" % self.robot_name)
+        rospy.sleep(1.0)
+        
         return 'done'
 
     def emergencyCb(self,msg):
@@ -440,8 +465,8 @@ class AssembleDemo():
         sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
         sis.start()
         outcome = sm_top.execute()
-        rospy.spin()
         sis.stop()
+        rospy.loginfo("Assembly demo completed with outcome: %s" % outcome)
 
 if __name__ == '__main__':
     try:

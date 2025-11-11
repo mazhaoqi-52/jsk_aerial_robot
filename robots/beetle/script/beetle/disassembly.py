@@ -11,7 +11,9 @@ from diagnostic_msgs.msg import KeyValue
 from beetle.kondo_control import KondoControl
 import numpy as np
 import tf
-
+from .gazebo_link_attacher import GazeboLinkAttacher
+from .gazebo_link_detacher import GazeboLinkDetacher
+from gazebo_ros_link_attacher.srv import Attach, AttachRequest, AttachResponse
 
 #### state classes ####
 
@@ -52,6 +54,14 @@ class SwitchState(smach.State):
         self.neighboring_id = neighboring_id
         self.female_servo_id = female_servo_id
         self.separate_dir = separate_dir
+
+        # Enable Dissassemble function using GazeboLinkDetacher in simulation
+        try:
+            link_detacher = GazeboLinkDetacher(self.robot_name, 'root', self.neighboring, 'root')
+            link_detacher.detach_links()
+        except rospy.ServiceException:
+            rospy.logerr("Disassembly failed")
+
 
         if(separate_dir > 0):
             self.kondo_servo = KondoControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)

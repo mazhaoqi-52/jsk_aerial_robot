@@ -36,6 +36,9 @@
     <include>
       <uri>model://ground_plane</uri>
     </include>
+    <!-- World plugin: Gazebo Link Attacher -->
+    <plugin name="link_attacher_plugin" filename="libgazebo_ros_link_attacher.so">
+    </plugin>
 
   </world>
 </sdf>

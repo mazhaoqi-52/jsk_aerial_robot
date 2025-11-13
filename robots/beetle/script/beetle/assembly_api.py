@@ -37,7 +37,7 @@ class StandbyState(smach.State):
                  unlock_servo_angle_male = 7000,
                  lock_servo_angle_male = 7580,###8800###
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 8000,###5600###
+                 lock_servo_angle_female = 5800,###5600###
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,

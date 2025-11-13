@@ -24,7 +24,7 @@ navigation:
 
   cmd_vel_lev2_gain : 2.0
   nav_vel_limit : 0.2
-  vel_nav_threshold : 0.4 #change from 0.05 to fit for real-world test
+  vel_nav_threshold : 0.15 #change from 0.05 to fit for real-world test
 
   gain_tunning_mode: 0
   max_target_tilt_angle: 0.2

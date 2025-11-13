@@ -24,7 +24,7 @@ navigation:
 
   cmd_vel_lev2_gain : 2.0
   nav_vel_limit : 0.2
-  vel_nav_threshold : 0.25  # Changed from 0.05 to 0.25 to match formation flight requirements
+  vel_nav_threshold : 0.15  # Changed from 0.05 to 0.15 to match formation flight requirements
 
   gain_tunning_mode: 0
   max_target_tilt_angle: 0.2

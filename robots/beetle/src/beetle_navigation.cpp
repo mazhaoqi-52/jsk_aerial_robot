@@ -631,11 +631,11 @@ void BeetleNavigator::convertTargetPosFromCoG2CoM()
     setTargetPosZ(target_cog_pos.z());
     
     // ROS_INFO_STREAM("[COG2COM-DEBUG-2c] After setTargetPos:"
-                    << "\n  target_pos_ = (" << getTargetPos().x() << ", " << getTargetPos().y() << ")");
-  } else {
+  //                   << "\n  target_pos_ = (" << getTargetPos().x() << ", " << getTargetPos().y() << ")");
+  // } else {
     // ROS_ERROR("[COG2COM-DEBUG-2b] ❌ NaviState check FAILED, NOT updating target_pos_");
     // ROS_ERROR_STREAM("  Current NaviState: " << getNaviState()
-                     << " (expected HOVER=" << HOVER_STATE << " or TAKEOFF=" << TAKEOFF_STATE << ")");
+  //                    << " (expected HOVER=" << HOVER_STATE << " or TAKEOFF=" << TAKEOFF_STATE << ")");
   }
 
   pre_target_pos_.setX(target_cog_pos.x());

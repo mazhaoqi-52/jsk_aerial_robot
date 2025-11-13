@@ -842,9 +842,21 @@ void BaseNavigator::update()
             // Recalculate delta to get current distance to target
             delta = target_pos_ - curr_pos;
             delta.setZ(0); // we do not need z
+            
+            // ===== DEBUG POINT 3: vel_based_waypoint_ EXIT CHECK =====
+            ROS_WARN_STREAM_THROTTLE(0.5, "[VEL-WAYPOINT-DEBUG-3a] EXIT CHECK:"
+                                     << "\n  target_pos_: (" << target_pos_.x() << ", " << target_pos_.y() << ")"
+                                     << "\n  curr_pos: (" << curr_pos.x() << ", " << curr_pos.y() << ")"
+                                     << "\n  delta: (" << delta.x() << ", " << delta.y() << ")"
+                                     << "\n  delta.length(): " << delta.length()
+                                     << "\n  vel_nav_threshold_: " << vel_nav_threshold_
+                                     << "\n  Check: " << delta.length() << " > " << vel_nav_threshold_ << " ?");
+            
             /* vel nav */
             if(delta.length() > vel_nav_threshold_)
               {
+                ROS_WARN_THROTTLE(1.0, "[VEL-WAYPOINT-DEBUG-3b] Still in VEL mode, delta too large");
+                
                 tf::Vector3 nav_vel = delta * vel_nav_gain_;
 
                 double speed = nav_vel.length();
@@ -855,6 +867,9 @@ void BaseNavigator::update()
               }
             else
               {
+                ROS_INFO("[VEL-WAYPOINT-DEBUG-3c] ✅ EXITING vel_based_waypoint_ mode!");
+                ROS_INFO_STREAM("  Final delta.length(): " << delta.length() << " <= " << vel_nav_threshold_);
+                
                 if(gps_waypoint_)
                   {
                     auto base_wp = estimator_->getCurrGpsPoint();

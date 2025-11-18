@@ -940,10 +940,10 @@ class FormationSingleUAVStateBase(smach.State):
             success = self.active_position_convergence(
                 (target_x, target_y, target_z),
                 target_yaw=final_yaw,
-                pos_threshold=0.03,
-                yaw_threshold=0.0175,
-                timeout=8.0,
-                min_readings=3
+                pos_threshold=0.080,  # RELAXED: 80mm (consistent with descent strategy)
+                yaw_threshold=0.087,  # RELAXED: 5 degrees (0.087 rad)
+                timeout=10.0,
+                min_readings=20  # INCREASED: 20 consecutive readings (2.0s) for stable small descent
             )
             achieved = self.get_end_effector_position() or (target_x, target_y, target_z)
             return success, achieved
@@ -962,7 +962,7 @@ class FormationSingleUAVStateBase(smach.State):
         progress_ratio = 0.0
         max_step_iterations = max(planned_steps * 6, planned_steps + 40)
         achieved_position = current_pos
-        contact_xy_tolerance = 0.022
+        contact_xy_tolerance = 0.080  # 80mm (RELAXED from 22mm for formation)
         contact_z_tolerance = 0.05
         plateau_z_tolerance = 0.25
         plateau_progress_threshold = 0.4
@@ -1018,31 +1018,20 @@ class FormationSingleUAVStateBase(smach.State):
 
             step_target = [target_x, target_y, current_z]
 
-            base_threshold = 0.05
-            final_threshold = final_descent_margin
+            # RELAXED: Formation control requires much larger XY tolerance during descent
+            base_threshold = 0.080  # 80mm base threshold (RELAXED from 50mm)
+            final_threshold = 0.080  # 80mm final threshold (keep consistent)
             step_pos_thresh = base_threshold - (base_threshold - final_threshold) * progress
-            step_pos_thresh = min(step_pos_thresh, max(step_size * 0.8, 0.020))
-            step_yaw_thresh = 0.0175
+            step_pos_thresh = max(step_pos_thresh, 0.080)  # Never go below 80mm
+            step_yaw_thresh = 0.087  # 5 degrees (relaxed from 1 degree)
             is_final_step = current_z <= target_z + 1e-4 or remaining_descent <= step_size + 1e-6
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3
 
-            # Progressive deceleration strategy
-            if is_final_step:
-                linear_vel = [0.0, 0.0, -0.02]
-                rospy.loginfo(f"  Final step: ultra-slow descent 0.02 m/s")
-            elif is_second_last_step:
-                slow_descent_speed = 0.025
-                linear_vel = [0.0, 0.0, -slow_descent_speed]
-                rospy.loginfo(f"  Second-last step: slow descent {slow_descent_speed:.3f} m/s")
-            elif is_third_last_step:
-                medium_descent_speed = 0.035
-                linear_vel = [0.0, 0.0, -medium_descent_speed]
-                rospy.loginfo(f"  Third-last step: medium descent {medium_descent_speed:.3f} m/s")
-            else:
-                effective_descent_speed = max(0.03, descent_speed * 0.3)
-                linear_vel = [0.0, 0.0, -effective_descent_speed]
-                rospy.loginfo(f"  Normal step: descent {effective_descent_speed:.3f} m/s")
+            # Unified descent speed strategy - proven 0.036 m/s works well for all steps
+            effective_descent_speed = max(0.03, descent_speed * 0.3)
+            linear_vel = [0.0, 0.0, -effective_descent_speed]
+            rospy.loginfo(f"  Descent speed: {effective_descent_speed:.3f} m/s")
 
             rospy.loginfo(
                 f"[Z Descent] Step {step_count}/{planned_steps} target=({step_target[0]:.3f}, {step_target[1]:.3f}, {step_target[2]:.3f}), "
@@ -1051,7 +1040,7 @@ class FormationSingleUAVStateBase(smach.State):
 
             self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=linear_vel, angular_vel=0.0)
 
-            # Extended timeout for final steps
+            # Extended timeout for final steps (keep longer timeout, but remove max_pos_step restriction)
             if is_final_step or is_second_last_step or is_third_last_step:
                 step_timeout = 17.0
                 step_max_attempts = 100
@@ -1060,28 +1049,18 @@ class FormationSingleUAVStateBase(smach.State):
                 step_timeout = 12.0
                 step_max_attempts = 80
 
-            # Selective Z-step control for final steps
-            if is_final_step or is_second_last_step or is_third_last_step:
-                step_converged = self.active_position_convergence(
-                    target_ee_pos=step_target,
-                    target_yaw=final_yaw,
-                    pos_threshold=step_pos_thresh,
-                    yaw_threshold=step_yaw_thresh,
-                    timeout=step_timeout,
-                    max_attempts=step_max_attempts,
-                    min_readings=3,
-                    max_pos_step=0.020
-                )
-            else:
-                step_converged = self.active_position_convergence(
-                    target_ee_pos=step_target,
-                    target_yaw=final_yaw,
-                    pos_threshold=step_pos_thresh,
-                    yaw_threshold=step_yaw_thresh,
-                    timeout=step_timeout,
-                    max_attempts=step_max_attempts,
-                    min_readings=3
-                )
+            # Unified convergence strategy for all steps (removed max_pos_step to prevent control instability)
+            step_converged = self.active_position_convergence(
+                target_ee_pos=step_target,
+                target_yaw=final_yaw,
+                pos_threshold=step_pos_thresh,
+                yaw_threshold=step_yaw_thresh,
+                timeout=step_timeout,
+                max_attempts=step_max_attempts,
+                min_readings=20  # INCREASED: 20 consecutive readings (2.0s) for stable descent
+                # NOTE: max_pos_step removed - it caused Step 8 divergence in testing
+                # The 20mm step limit prevented quick correction when coordinate transform fluctuates
+            )
 
             if not step_converged:
                 achieved_position = self.get_end_effector_position() or tuple(step_target)
@@ -1232,18 +1211,18 @@ class FormationSingleUAVStateBase(smach.State):
                 (current_pos[0] - step_target[0])**2 +
                 (current_pos[1] - step_target[1])**2
             )
-            if xy_error > 0.030:
+            if xy_error > 0.080:  # RELAXED: 80mm threshold (consistent with descent tolerance)
                 rospy.logwarn(f"[Formation Z Descent] XY error {xy_error*1000:.1f}mm, applying XY correction")
                 correction_target = [step_target[0], step_target[1], current_pos[2]]
                 self.send_assembly_command_from_end_effector(correction_target, final_yaw)
                 corrected = self.active_position_convergence(
                     target_ee_pos=correction_target,
                     target_yaw=final_yaw,
-                    pos_threshold=0.03,
-                    yaw_threshold=0.03,
-                    timeout=6.0,
-                    max_attempts=60,
-                    min_readings=3
+                    pos_threshold=0.080,  # RELAXED: 80mm convergence threshold
+                    yaw_threshold=0.087,  # RELAXED: 5 degrees (0.087 rad)
+                    timeout=8.0,
+                    max_attempts=80,
+                    min_readings=20  # INCREASED: 20 consecutive readings (2.0s) for XY correction
                 )
                 if not corrected:
                     rospy.logerr("[Formation Z Descent] XY correction failed")
@@ -1454,26 +1433,29 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"Valve pose: pos={self._format_vec(valve_pos)}, yaw={math.degrees(valve_yaw):.1f}°")
         rospy.loginfo(f"Optimizer target: pos={self._format_vec(safe_ee_pos)}, yaw={math.degrees(safe_ee_yaw):.1f}°")
 
-        # --- PHASE 1: YAW ADJUSTMENT TO VALVE HANDLE ---
-        valve_handle_yaw = valve_yaw
-        optimal_handle_yaw = self.calculate_shortest_yaw_path(current_yaw, valve_handle_yaw)
-        self._log_phase(1, "Align to valve handle", f"Target {math.degrees(optimal_handle_yaw):.1f}°")
-        if not self._execute_formation_phase1_yaw_adjustment(current_ee_pos, optimal_handle_yaw):
-            rospy.logerr("Phase 1 failed: Valve handle yaw alignment unsuccessful")
-            return 'failed'
-        rospy.loginfo("Phase 1 完成：航向与阀柄对齐")
-
-        # --- PHASE 2: XY MOVEMENT TO OPTIMIZER TARGET (maintain Z, handle yaw) ---
+        # --- PHASE 1: YAW ADJUSTMENT TO VALVE HANDLE (SKIPPED) ---
+        # Yaw adjustment removed: focus on XY positioning only
+        # Phase 3B will handle final yaw alignment if needed
+        rospy.loginfo("[Phase 1] Skipped: Yaw adjustment removed, focusing on XY positioning")
+        
+        # --- PHASE 2: XY MOVEMENT TO OPTIMIZER TARGET (maintain Z, current yaw) ---
         phase1_ee_pos = self.get_end_effector_position()
         if phase1_ee_pos is None:
-            rospy.logerr("Cannot get end-effector position after Phase 1")
+            rospy.logerr("Cannot get end-effector position before Phase 2")
             return 'failed'
+        
+        # Use current yaw since Phase 1 yaw adjustment is skipped
+        current_yaw_for_phase2 = self.get_end_effector_yaw()
+        if current_yaw_for_phase2 is None:
+            rospy.logwarn("Cannot get current yaw, using 0.0 as default")
+            current_yaw_for_phase2 = 0.0
+        
         xy_target_ee_pos = (safe_ee_pos[0], safe_ee_pos[1], phase1_ee_pos[2])
-        self._log_phase(2, "平移至安全XY", f"目标 {self._format_vec(xy_target_ee_pos)}")
-        if not self._execute_formation_phase2_xy_movement(xy_target_ee_pos, optimal_handle_yaw):
+        self._log_phase(2, "Move to safe XY", f"Target {self._format_vec(xy_target_ee_pos)}")
+        if not self._execute_formation_phase2_xy_movement(xy_target_ee_pos, current_yaw_for_phase2):
             rospy.logerr("Phase 2 failed: XY movement unsuccessful")
             return 'failed'
-        rospy.loginfo("Phase 2 完成：达到优化器XY位置")
+        rospy.loginfo("Phase 2 completed: Reached optimizer XY position")
 
         # --- PHASE 3: PRECISION XY & YAW (spoke alignment, maintain Z) ---
         phase2_ee_pos = self.get_end_effector_position()
@@ -1594,36 +1576,31 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         return optimal_target
         
     def _execute_formation_phase1_yaw_adjustment(self, current_ee_pos, target_yaw):
-        """Phase 1: Pure yaw adjustment using single-command approach (like Single UAV)"""
+        """Phase 1: Yaw adjustment with closed-loop control (continuous command sending)"""
         rospy.loginfo(
-            f"[Phase1] 保持末端位置 {self._format_vec(current_ee_pos)}，目标航向 {math.degrees(target_yaw):.1f}°"
+            f"[Phase1] Maintaining end-effector position {self._format_vec(current_ee_pos)}, target yaw {math.degrees(target_yaw):.1f} deg"
         )
         
         # Calculate initial yaw error for logging
         current_yaw = self.get_end_effector_yaw()
         if current_yaw is not None:
             initial_yaw_error = abs(self.normalize_angle(target_yaw - current_yaw))
-            rospy.loginfo(f"[Phase1] 初始航向误差 {math.degrees(initial_yaw_error):.2f}°")
+            rospy.loginfo(f"[Phase1] Initial yaw error: {math.degrees(initial_yaw_error):.2f} deg")
         
-        # Send single command (like Single UAV version) instead of continuous commands
-        rospy.loginfo("[Phase1] 发送航向调整指令")
-        self.send_assembly_command_from_end_effector(
-            target_end_effector_pos=current_ee_pos,
-            target_yaw=target_yaw,
-            linear_vel=None,  # No linear velocity for pure rotation
-            angular_vel=None  # Let system determine angular velocity
-        )
-        
-        # Wait for yaw convergence (similar to Single UAV approach)
-        success = self.wait_for_formation_yaw_convergence(
-            target_yaw=target_yaw,
-            yaw_thresh=0.0524,  # 3° threshold (same as Single UAV)
-            timeout=15.0,       # Generous timeout for formation
-            pos_threshold=0.05  # Allow 5cm position drift during yaw adjustment
+        # Use closed-loop convergence (reuse proven position control logic)
+        rospy.loginfo("[Phase1] Starting closed-loop yaw adjustment with continuous command sending")
+        success = self.active_position_convergence(
+            target_ee_pos=current_ee_pos,      # Maintain position
+            target_yaw=target_yaw,              # Adjust yaw
+            pos_threshold=0.050,                # RELAXED: 50mm position tolerance (consistent strategy)
+            yaw_threshold=0.087,                # RELAXED: 5 degrees (0.087 rad)
+            timeout=20.0,                       # 20s timeout
+            max_attempts=300,                   # Max 300 attempts (20s * 10Hz * 1.5)
+            min_readings=3                      # Require 3 consecutive good readings for stability
         )
         
         if success:
-            rospy.loginfo("Phase 1 completed successfully with single command approach")
+            rospy.loginfo("Phase 1 completed successfully with closed-loop control")
         else:
             rospy.logwarn("Phase 1 completed with convergence issues - proceeding anyway")
         
@@ -1650,8 +1627,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             return self.active_position_convergence(
                 target_ee_pos=xy_target_ee_pos,
                 target_yaw=maintain_yaw,
-                pos_threshold=0.02,
-                yaw_threshold=0.1,
+                pos_threshold=0.050,  # RELAXED: 50mm (consistent strategy)
+                yaw_threshold=0.087,  # RELAXED: 5 degrees (0.087 rad)
                 vel_threshold=0.01,
                 min_readings=3,
                 max_attempts=50,
@@ -1672,8 +1649,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             return self.active_position_convergence(
                 target_ee_pos=xy_target_ee_pos,
                 target_yaw=maintain_yaw,
-                pos_threshold=0.02,
-                yaw_threshold=0.1,
+                pos_threshold=0.050,  # RELAXED: 50mm (consistent strategy)
+                yaw_threshold=0.087,  # RELAXED: 5 degrees (0.087 rad)
                 vel_threshold=0.01,
                 min_readings=5,
                 max_attempts=100,
@@ -1689,8 +1666,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         final_success = self.active_position_convergence(
             target_ee_pos=xy_target_ee_pos,
             target_yaw=maintain_yaw,
-            pos_threshold=0.125,        # 真机优化：20mm -> 125mm (适应Assembly CoG与end-effector偏移)
-            yaw_threshold=0.05,         # Strict final yaw requirement
+            pos_threshold=0.050,        # Relaxed to 50mm for formation tolerance
+            yaw_threshold=0.087,        # Relaxed to 5 degrees (0.087 rad)
             vel_threshold=0.01,
             min_readings=5,             # Ensure stability
             max_attempts=50,
@@ -1770,7 +1747,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         )
 
         max_attempts = 3
-        xy_tolerance = 0.030  # 30mm (适中的收敛标准)
+        xy_tolerance = 0.050  # 50mm (RELAXED: practical positioning threshold)
         z_tolerance = 0.015   # 15mm
 
         for attempt in range(1, max_attempts + 1):
@@ -1778,12 +1755,12 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             success = self.active_position_convergence(
                 target_ee_pos=xy_target,
                 target_yaw=maintain_yaw,
-                pos_threshold=0.030,  # 30mm收敛标准
-                yaw_threshold=0.06,
+                pos_threshold=0.050,  # 50mm convergence threshold (RELAXED)
+                yaw_threshold=0.087,  # 5 degrees (0.087 rad) - relaxed for tolerance
                 vel_threshold=0.015,
                 min_readings=3,
                 max_attempts=110,
-                timeout=5.0  # 5秒超时，快速尝试
+                timeout=5.0  # 5s timeout for quick attempts
             )
 
             if not success:
@@ -1829,9 +1806,9 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         )
 
         max_attempts = 3
-        xy_tolerance = 0.015  # 15mm
+        xy_tolerance = 0.050  # 50mm (RELAXED for final check tolerance)
         z_tolerance = 0.015   # 15mm
-        yaw_tolerance = 0.0175  # ≈1°
+        yaw_tolerance = 0.087  # 5 degrees (0.087 rad) - relaxed tolerance
 
         for attempt in range(1, max_attempts + 1):
             current_yaw = self.get_end_effector_yaw()
@@ -1842,8 +1819,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             success = self.active_position_convergence(
                 target_ee_pos=(reference_xy[0], reference_xy[1], reference_z),
                 target_yaw=spoke_yaw,
-                pos_threshold=0.020,
-                yaw_threshold=yaw_tolerance,
+                pos_threshold=0.050,  # 50mm convergence threshold (RELAXED)
+                yaw_threshold=0.087,  # 5 degrees (0.087 rad) - relaxed threshold
                 vel_threshold=0.015,
                 min_readings=4,
                 max_attempts=160,
@@ -1945,8 +1922,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         final_success = self.active_position_convergence(
             target_ee_pos=convergence_target,
             target_yaw=final_yaw,
-            pos_threshold=0.03,
-            yaw_threshold=0.02,
+            pos_threshold=0.080,  # 80mm convergence threshold (RELAXED for formation)
+            yaw_threshold=0.087,  # 5 degrees (0.087 rad) - relaxed threshold
             timeout=12.0,
             max_attempts=80,
             min_readings=3

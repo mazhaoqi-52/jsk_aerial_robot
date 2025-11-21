@@ -37,6 +37,94 @@ from trajectory import OnlineCircularTrajectoryGenerator, PolynomialTrajectory
 from beetle_interface import BeetleInterface
 
 
+class WaitState(smach.State):
+    """
+    Simple wait state that pauses for a specified duration between state transitions.
+    Provides smooth transitions and better observability for state machine execution.
+    
+    Args:
+        wait_time (float): Duration to wait in seconds (default: 3.0)
+        state_name (str): Name of the next state for logging purposes
+    
+    Outcomes:
+        succeeded: Always returns after wait completes
+    
+    Example:
+        # Add 3 second wait before INITIALIZE state
+        smach.StateMachine.add(
+            'WAIT_BEFORE_INIT',
+            WaitState(wait_time=3.0, state_name="INITIALIZE"),
+            transitions={'succeeded': 'INITIALIZE'}
+        )
+    """
+    def __init__(self, wait_time=3.0, state_name=""):
+        smach.State.__init__(self, outcomes=['succeeded'])
+        self.wait_time = wait_time
+        self.state_name = state_name
+    
+    def execute(self, userdata):
+        if self.state_name:
+            rospy.loginfo(f"⏳ Waiting {self.wait_time}s before {self.state_name}...")
+        else:
+            rospy.loginfo(f"⏳ Waiting {self.wait_time}s...")
+        
+        rospy.sleep(self.wait_time)
+        
+        if self.state_name:
+            rospy.loginfo(f"✓ Wait complete, proceeding to {self.state_name}")
+        else:
+            rospy.loginfo(f"✓ Wait complete")
+        
+        return 'succeeded'
+
+
+class FormationUtils:
+    """Utility methods shared across formation control classes"""
+    
+    @staticmethod
+    def format_vec(vec):
+        """Format 3D vector as string"""
+        if vec is None:
+            return "None"
+        return f"({vec[0]:.3f}, {vec[1]:.3f}, {vec[2]:.3f})"
+    
+    @staticmethod
+    def normalize_angle(angle):
+        """Normalize angle to [-pi, pi]"""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+    
+    @staticmethod
+    def get_valve_yaw_safe(beetle_interface, fallback):
+        """Safe valve yaw getter with fallback"""
+        valve_yaw = beetle_interface.getValveYaw()
+        if valve_yaw is None:
+            rospy.logwarn_once("getValveYaw() returned None, using fallback")
+            return fallback
+        return valve_yaw
+    
+    @staticmethod
+    def monitor_valve_rotation(current_valve_yaw, initial_valve_yaw, last_valve_yaw, 
+                               last_check_time, current_time, update_interval=0.2):
+        """
+        Monitor valve rotation progress and calculate angular velocity
+        Returns: (valve_rotation, valve_angular_velocity, should_update, new_last_yaw, new_last_time)
+        """
+        valve_rotation = abs(current_valve_yaw - initial_valve_yaw)
+        valve_angular_velocity = 0.0
+        should_update = current_time > last_check_time + update_interval
+        
+        if should_update:
+            dt = current_time - last_check_time
+            valve_angular_velocity = abs(current_valve_yaw - last_valve_yaw) / dt
+            return valve_rotation, valve_angular_velocity, True, current_valve_yaw, current_time
+        
+        return valve_rotation, valve_angular_velocity, False, last_valve_yaw, last_check_time
+
+
 class FormationAdapter:
     """Dynamic adapter for multi-UAV formation with configurable module_ids"""
     
@@ -57,10 +145,7 @@ class FormationAdapter:
         self.follower_ids = self.tf_calculator.get_follower_ids()
         self.number_of_modules = len(self.module_ids)
         
-        rospy.loginfo(f"Formation configuration:")
-        rospy.loginfo(f"Module IDs: {self.module_ids}")
-        rospy.loginfo(f"Leader (end-effector): {self.leader_id}")
-        rospy.loginfo(f"Followers: {self.follower_ids}")
+        rospy.loginfo(f"Formation: Leader={self.leader_id}, Followers={self.follower_ids}, Total={self.number_of_modules} modules")
         
         self.uav_positions = {}
         self.uav_orientations = {}
@@ -79,12 +164,10 @@ class FormationAdapter:
             )
             rospy.loginfo(f"Subscribed to {topic} for module {module_id}")
         
-        # Assembly command publisher
         self.assembly_pub = rospy.Publisher(
             "/assembly/uav/nav", FlightNav, queue_size=1
         )
         
-        # Calculate and store offset parameters for assembly-to-end-effector transform
         self._calculate_offset_parameters()
         
         rospy.loginfo("FormationAdapter initialization complete")
@@ -99,10 +182,7 @@ class FormationAdapter:
         self.base_offset_y = assembly_to_leader['offset_y'] + leader_to_ee['y']
         self.total_offset_z = assembly_to_leader['offset_z'] + leader_to_ee['z']
         
-        rospy.loginfo(f"Assembly to End-effector offsets:")
-        rospy.loginfo(f"Base X offset: {self.base_offset_x:.3f}m")
-        rospy.loginfo(f"Base Y offset: {self.base_offset_y:.3f}m") 
-        rospy.loginfo(f"Z offset: {self.total_offset_z:.3f}m")
+        rospy.loginfo(f"Assembly→EE offsets: X={self.base_offset_x:.3f}m, Y={self.base_offset_y:.3f}m, Z={self.total_offset_z:.3f}m")
     
     def uav_callback(self, msg, module_id):
         """Receive individual UAV position from mocap (PoseStamped format)"""
@@ -211,15 +291,6 @@ class FormationAdapter:
         else:
             rospy.logerr(f"Formation not ready after {timeout}s timeout")
             return False
-    
-    def get_end_effector_position(self):
-        """Calculate current end-effector position using coordinate transformation"""
-        if self.assembly_pos is None:
-            return None
-        
-        return self.tf_calculator.transform_assembly_to_end_effector(
-            self.assembly_pos, self.assembly_yaw
-        )
     
     def get_end_effector_yaw(self):
         """End-effector yaw is same as assembly yaw"""
@@ -345,14 +416,6 @@ class FormationSingleUAVStateBase(smach.State):
     def get_end_effector_yaw(self):
         return self.formation_adapter.get_end_effector_yaw()
     
-    def normalize_angle(self, angle):
-        """Normalize angle to [-pi, pi] range"""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
-    
     def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None):
         """Formation-style active convergence with trajectory decomposition"""
         start_time = rospy.get_time()
@@ -426,9 +489,7 @@ class FormationSingleUAVStateBase(smach.State):
         consecutive_good_readings = 0
         required_consecutive = 8
         
-        rospy.loginfo(f"Formation active convergence: target=({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}), "
-                     f"yaw={math.degrees(target_yaw):.1f}°")
-        rospy.loginfo(f"Thresholds: pos={pos_thresh*1000:.1f}mm, yaw={math.degrees(yaw_thresh):.1f}°, consecutive={required_consecutive}")
+        rospy.loginfo(f"Active convergence: target={FormationUtils.format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f}°, thresh={pos_thresh*1000:.1f}mm/{math.degrees(yaw_thresh):.1f}°")
         
         while rospy.get_time() - start_time < timeout:
             current_pos = self.get_end_effector_position()
@@ -442,7 +503,7 @@ class FormationSingleUAVStateBase(smach.State):
                 continue
             
             pos_error = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
-            yaw_error = abs(self.normalize_angle(target_yaw - current_yaw))
+            yaw_error = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
             
             position_ok = pos_error < pos_thresh
             yaw_ok = yaw_error < yaw_thresh
@@ -450,8 +511,7 @@ class FormationSingleUAVStateBase(smach.State):
             if position_ok and yaw_ok:
                 consecutive_good_readings += 1
                 if consecutive_good_readings >= required_consecutive:
-                    rospy.loginfo(f"Formation active convergence successful: pos_err={pos_error*1000:.1f}mm, "
-                                f"yaw_err={math.degrees(yaw_error):.1f}°")
+                    rospy.loginfo(f"Convergence success: pos={pos_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f}°")
                     return True
             else:
                 consecutive_good_readings = 0
@@ -459,21 +519,21 @@ class FormationSingleUAVStateBase(smach.State):
                 # Apply max_yaw_step limitation like Formation version
                 command_yaw = target_yaw
                 if max_yaw_step is not None and max_yaw_step > 0.0:
-                    yaw_delta = self.normalize_angle(target_yaw - current_yaw)
+                    yaw_delta = FormationUtils.normalize_angle(target_yaw - current_yaw)
                     if abs(yaw_delta) > max_yaw_step:
                         yaw_delta = math.copysign(max_yaw_step, yaw_delta)
-                        command_yaw = self.normalize_angle(current_yaw + yaw_delta)
+                        command_yaw = FormationUtils.normalize_angle(current_yaw + yaw_delta)
                         elapsed = rospy.get_time() - start_time
                         if int(elapsed * 5.0) % 20 == 0:
                             rospy.loginfo(f"[Formation YawLimit] Step limited to {math.degrees(yaw_delta):.1f}° "
-                                        f"(remaining {math.degrees(abs(self.normalize_angle(target_yaw - current_yaw))):.1f}°)")
+                                        f"(remaining {math.degrees(abs(FormationUtils.normalize_angle(target_yaw - current_yaw))):.1f}°)")
                 
                 command_pos = target_pos
                 
                 max_angular_vel_limit = max_angular_vel if max_angular_vel is not None else 0.05
                 max_linear_vel_limit = max_linear_vel if max_linear_vel is not None else 0.08
                 
-                actual_yaw_error = abs(self.normalize_angle(command_yaw - current_yaw))
+                actual_yaw_error = abs(FormationUtils.normalize_angle(command_yaw - current_yaw))
                 
                 if actual_yaw_error > 0.52:
                     angular_divisor = 2.0
@@ -677,12 +737,8 @@ class FormationSingleUAVStateBase(smach.State):
             # Unified descent speed strategy - proven 0.036 m/s works well for all steps
             effective_descent_speed = max(0.03, descent_speed * 0.3)
             linear_vel = [0.0, 0.0, -effective_descent_speed]
-            rospy.loginfo(f"  Descent speed: {effective_descent_speed:.3f} m/s")
 
-            rospy.loginfo(
-                f"[Z Descent] Step {step_count}/{planned_steps} target=({step_target[0]:.3f}, {step_target[1]:.3f}, {step_target[2]:.3f}), "
-                f"threshold={step_pos_thresh*1000:.1f}mm (remaining {remaining_descent*1000:.1f}mm)"
-            )
+            rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm, speed={effective_descent_speed:.3f}m/s")
 
             self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=linear_vel, angular_vel=0.0)
 
@@ -783,12 +839,8 @@ class FormationSingleUAVStateBase(smach.State):
                 )
 
                 if within_contact_window or plateau_reached:
-                    contact_label = "Contact tolerance" if within_contact_window else "Plateau detection"
-                    hit_note = f"prox={proximity_hit_counter}, stagnation={stagnation_hit_counter}"
-                    rospy.logwarn(
-                        f"[Formation Z Descent] Step {step_count} {contact_label}: XY {xy_residual*1000:.1f}mm, "
-                        f"Z residual {z_residual*1000:.1f}mm, locking current height ({hit_note}, ΔZ threshold≤{stagnation_threshold*1000:.1f}mm)"
-                    )
+                    contact_label = "Contact" if within_contact_window else "Plateau"
+                    rospy.logwarn(f"[Z Descent] {contact_label} at step {step_count}: XY {xy_residual*1000:.1f}mm, Z {z_residual*1000:.1f}mm, locking height")
                     target_z = achieved_position[2]
                     previous_z = achieved_position[2]
                     proximity_hit_counter = 0
@@ -800,17 +852,10 @@ class FormationSingleUAVStateBase(smach.State):
                 xy_reasonable_success = xy_residual <= 0.030
                 
                 if z_tolerance_success and xy_reasonable_success:
-                    rospy.loginfo(
-                        f"[Z Descent] Tolerance success Step {step_count}: "
-                        f"XY {xy_residual*1000:.1f}mm ≤30mm, Z_err {abs(z_residual)*1000:.1f}mm ≤40mm"
-                    )
-                    rospy.loginfo(f"[Z Descent] Best feasible position reached Z={achieved_position[2]:.3f}m")
+                    rospy.loginfo(f"[Z Descent] Tolerance success at step {step_count}: XY={xy_residual*1000:.1f}mm, Z_err={abs(z_residual)*1000:.1f}mm, Z={achieved_position[2]:.3f}m")
                     return True, achieved_position
                 
-                rospy.logerr(
-                    f"[Z Descent] Step {step_count} convergence failed (XY {xy_residual*1000:.1f}mm, "
-                    f"Z_res {z_residual*1000:.1f}mm)"
-                )
+                rospy.logerr(f"[Z Descent] Step {step_count} failed: XY={xy_residual*1000:.1f}mm, Z_res={z_residual*1000:.1f}mm")
                 return False, achieved_position
 
             current_pos = self.get_end_effector_position() or tuple(step_target)
@@ -828,19 +873,10 @@ class FormationSingleUAVStateBase(smach.State):
                     current_z_error = abs(current_pos[2] - target_z)
                     
                     if current_xy_error <= 0.030:
-                        rospy.loginfo(
-                            f"[Z Descent] Physical contact stable: 2 small motions + XY {current_xy_error*1000:.1f}mm ≤30mm"
-                        )
-                        rospy.loginfo(
-                            f"[Z Descent] Cannot descend further, Z_err {current_z_error*1000:.1f}mm at contact position"
-                        )
-                        rospy.loginfo(f"[Z Descent] Stable insertion Z={current_pos[2]:.3f}m (target {target_z:.3f}m)")
+                        rospy.loginfo(f"[Z Descent] Contact stable: 2 small motions, XY {current_xy_error*1000:.1f}mm, Z={current_pos[2]:.3f}m")
                         return True, current_pos
                     else:
-                        rospy.logwarn(
-                            f"[Z Descent] Small motion but XY insufficient: XY {current_xy_error*1000:.1f}mm>30mm, "
-                            f"Z {current_z_error*1000:.1f}mm"
-                        )
+                        rospy.logwarn(f"[Z Descent] Small motion but XY={current_xy_error*1000:.1f}mm>30mm, Z_err={current_z_error*1000:.1f}mm")
             else:
                 if step_converged:
                     consecutive_small_motions = 0
@@ -908,7 +944,7 @@ class FormationSingleUAVStateBase(smach.State):
                     pos_error = ((target_pos[0] - current_pos[0])**2 + 
                                 (target_pos[1] - current_pos[1])**2 + 
                                 (target_pos[2] - current_pos[2])**2)**0.5
-                    yaw_error = abs(self.normalize_angle(target_yaw - current_yaw))
+                    yaw_error = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
                     rospy.loginfo(f"  Progress: {elapsed:.1f}s, pos_err={pos_error*1000:.1f}mm, yaw_err={math.degrees(yaw_error):.1f}°")
             
             rate.sleep()
@@ -917,12 +953,22 @@ class FormationSingleUAVStateBase(smach.State):
 
     # 已删除 convert_wrench_to_list 方法 - 直接使用轨迹生成器的numpy格式输出
     
-    def generate_polynomial_trajectory(self, start_pos, target_pos, target_yaw, num_points=15):
+    def generate_polynomial_trajectory(self, start_pos, target_pos, target_yaw, num_points=15, lock_yaw=False):
         """
         Generate smooth polynomial trajectory using PolynomialTrajectory class (Formation version)
         Shared method for all formation states
+        
+        Args:
+            start_pos: Starting position [x, y, z]
+            target_pos: Target position [x, y, z]
+            target_yaw: Target yaw angle (radians)
+            num_points: Number of trajectory points to generate
+            lock_yaw: If True, all trajectory points use target_yaw instead of smooth transition
+                     If False (default), yaw smoothly transitions from current_yaw to target_yaw
         """
         rospy.loginfo(f"=== Generating Formation Polynomial Trajectory: {num_points} points ===")
+        if lock_yaw:
+            rospy.loginfo(f"[Lock Yaw] All trajectory points will use target_yaw={math.degrees(target_yaw):.1f}°")
         
         # Get current state for trajectory planning
         current_yaw = self.get_end_effector_yaw()
@@ -931,7 +977,7 @@ class FormationSingleUAVStateBase(smach.State):
         
         # Calculate total distance and trajectory time
         total_distance = math.sqrt(sum((target_pos[i] - start_pos[i])**2 for i in range(3)))
-        yaw_change = abs(self.normalize_angle(target_yaw - current_yaw))
+        yaw_change = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
         
         # Calculate trajectory time based on formation parameters
         time_for_distance = total_distance / self.average_linear_velocity
@@ -974,10 +1020,18 @@ class FormationSingleUAVStateBase(smach.State):
         traj_z.start_value = start_pos[2]
         traj_z.target_value = target_pos[2]
         
-        traj_yaw.is_scalar = True
-        traj_yaw.coeffs_scalar = traj_yaw.compute_coefficients(current_yaw, target_yaw)
-        traj_yaw.start_value = current_yaw
-        traj_yaw.target_value = target_yaw
+        # Yaw trajectory: lock or smooth transition based on lock_yaw parameter
+        if lock_yaw:
+            # Lock yaw: all points use target_yaw (no polynomial trajectory needed)
+            traj_yaw = None
+            rospy.loginfo(f"[Lock Yaw] Yaw fixed at {math.degrees(target_yaw):.1f}° for all points")
+        else:
+            # Smooth transition: polynomial trajectory from current_yaw to target_yaw
+            traj_yaw = PolynomialTrajectory(duration=trajectory_duration)
+            traj_yaw.is_scalar = True
+            traj_yaw.coeffs_scalar = traj_yaw.compute_coefficients(current_yaw, target_yaw)
+            traj_yaw.start_value = current_yaw
+            traj_yaw.target_value = target_yaw
         
         trajectory_points = []
         
@@ -988,7 +1042,12 @@ class FormationSingleUAVStateBase(smach.State):
             pos_x = traj_x.evaluate_at_time(elapsed_time)
             pos_y = traj_y.evaluate_at_time(elapsed_time)
             pos_z = traj_z.evaluate_at_time(elapsed_time)
-            yaw = traj_yaw.evaluate_at_time(elapsed_time)
+            
+            # Yaw: use target_yaw if locked, otherwise evaluate polynomial
+            if lock_yaw:
+                yaw = target_yaw
+            else:
+                yaw = traj_yaw.evaluate_at_time(elapsed_time)
             
             # Calculate velocity
             normalized_time = elapsed_time / trajectory_duration
@@ -1036,59 +1095,34 @@ class FormationSingleUAVStateBase(smach.State):
         Shared method for all formation states
         """
         rospy.loginfo(f"Executing Formation Polynomial Trajectory: {len(trajectory_points)} points")
-        
         total_points = len(trajectory_points)
         
         for i, (pos, yaw, velocity, vel_magnitude) in enumerate(trajectory_points):
+            is_final = (i >= total_points - 2)
+            
+            # Log progress
             if i % 3 == 0 or i == total_points - 1:
-                rospy.loginfo(f"Trajectory point {i+1}/{total_points}: "
-                             f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}], "
-                             f"yaw={math.degrees(yaw):.1f}°")
+                mode = "precision" if is_final else "trajectory"
+                rospy.loginfo(f"Point {i+1}/{total_points} ({mode}): pos={FormationUtils.format_vec(pos)}, yaw={math.degrees(yaw):.1f}°")
             
-            is_final_precision_point = (i >= total_points - 2)
+            # Converge to point with appropriate thresholds
+            pos_thresh, yaw_thresh, timeout = (0.125, 0.08, 15.0) if is_final else (0.08, 0.15, 3.0)
+            success = self.active_position_convergence(pos, yaw, pos_thresh, yaw_thresh, timeout)
             
-            # Use base class active_position_convergence (compatible with both versions)
-            if is_final_precision_point:
-                if i % 3 == 0:
-                    rospy.loginfo(f"  Using precision convergence mode (point {i+1})")
-                point_success = self.active_position_convergence(
-                    target_pos=pos,
-                    target_yaw=yaw,
-                    pos_thresh=0.125,
-                    yaw_thresh=0.08,
-                    timeout=15.0
-                )
-            else:
-                if i % 3 == 0:
-                    rospy.loginfo(f"  Using trajectory following mode (point {i+1})")
-                point_success = self.active_position_convergence(
-                    target_pos=pos,
-                    target_yaw=yaw,
-                    pos_thresh=0.08,
-                    yaw_thresh=0.15,
-                    timeout=3.0
-                )
+            if not success:
+                rospy.logwarn(f"Point {i+1} convergence issue - continuing")
             
-            if not point_success:
-                rospy.logwarn(f"Trajectory point {i+1} convergence issues - continuing")
-            else:
-                if i % 3 == 0 or i == total_points - 1:
-                    rospy.loginfo(f"Trajectory point {i+1} completed")
-            
-            # Continuous send for precision points
-            if is_final_precision_point:
-                rospy.loginfo(f"  Stabilizing point {i+1} for 2s")
-                stabilize_end_time = rospy.Time.now().to_sec() + 2.0
-                stabilize_rate = rospy.Rate(10)
-                while rospy.Time.now().to_sec() < stabilize_end_time and not rospy.is_shutdown():
+            # Stabilize precision points
+            if is_final:
+                rospy.loginfo(f"Stabilizing point {i+1} for 2s")
+                stabilize_end = rospy.Time.now().to_sec() + 2.0
+                rate = rospy.Rate(10)
+                while rospy.Time.now().to_sec() < stabilize_end and not rospy.is_shutdown():
                     self.send_assembly_command_from_end_effector(pos, yaw)
-                    stabilize_rate.sleep()
+                    rate.sleep()
             
             # Dynamic pause
-            if is_final_precision_point:
-                rospy.sleep(0.2)
-            else:
-                rospy.sleep(0.067)
+            rospy.sleep(0.2 if is_final else 0.067)
         
         rospy.loginfo("Polynomial trajectory execution completed")
         return True
@@ -1166,31 +1200,13 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         
         # Formation-specific safety margins (more conservative than single)
         self.formation_safety_factor = 0.8  # 20% safety margin for formation coordination
-
-    # ------------------------------
-    # Logging helpers
-    # ------------------------------
-    @staticmethod
-    def _format_vec(vec):
-        return f"({vec[0]:.3f}, {vec[1]:.3f}, {vec[2]:.3f})"
-
-    def _log_header(self, title):
-        rospy.loginfo("")
-        rospy.loginfo(f"=== {title} ===")
-
-    def _log_phase(self, phase_idx, title, detail=None):
-        base = f"[Phase {phase_idx}] {title}"
-        if detail:
-            base = f"{base} | {detail}"
-        rospy.loginfo(base)
     
     def execute(self, userdata):
         """Execute 4-phase movement using optimizer-driven targets (single UAV logic)"""
-        self._log_header("Formation Move-To-Valve (Optimizer Guided)")
+        rospy.loginfo("=== Formation Move-To-Valve (Optimizer Guided) ===")
         valve_pos = userdata.valve_position
         valve_yaw = userdata.valve_yaw
 
-        # Get current end-effector position
         current_ee_pos = self.get_end_effector_position()
         if current_ee_pos is None:
             rospy.logerr("Cannot get current end-effector position")
@@ -1198,7 +1214,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
         current_yaw = self.get_end_effector_yaw() or 0.0
 
-        # --- OPTIMIZER STRATEGY: Use same-side insertion as single UAV ---
+        # OPTIMIZER STRATEGY: Same-side insertion
         strategy = self.optimizer.calculate_same_side_insertion_strategy(
             valve_pos=valve_pos,
             valve_yaw=valve_yaw,
@@ -1245,37 +1261,30 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         
         # Share target Z for Contact phase consistency
         FormationSingleUAVStateBase._shared_target_z = safe_ee_pos[2]
-        rospy.loginfo(f"Z continuity: saved target Z={safe_ee_pos[2]:.3f}m")
+        rospy.loginfo(f"Current: {FormationUtils.format_vec(current_ee_pos)}, yaw={math.degrees(current_yaw):.1f}°")
+        rospy.loginfo(f"Target: {FormationUtils.format_vec(safe_ee_pos)}, yaw={math.degrees(safe_ee_yaw):.1f}°, valve_yaw={math.degrees(valve_yaw):.1f}°")
 
-        rospy.loginfo(f"Current EE: {self._format_vec(current_ee_pos)}, yaw={math.degrees(current_yaw):.1f}°")
-        rospy.loginfo(f"Valve pose: pos={self._format_vec(valve_pos)}, yaw={math.degrees(valve_yaw):.1f}°")
-        rospy.loginfo(f"Optimizer target: pos={self._format_vec(safe_ee_pos)}, yaw={math.degrees(safe_ee_yaw):.1f}°")
-
-        # --- PHASE 1: YAW ADJUSTMENT TO VALVE HANDLE (SKIPPED) ---
-        # Yaw adjustment removed: focus on XY positioning only
-        # Phase 3B will handle final yaw alignment if needed
-        rospy.loginfo("[Phase 1] Skipped: Yaw adjustment removed, focusing on XY positioning")
+        rospy.loginfo("[Phase 1] Skipped: Focusing on XY positioning only")
         
-        # --- PHASE 2: XY MOVEMENT TO OPTIMIZER TARGET (maintain Z, current yaw) ---
+        # PHASE 2: XY MOVEMENT TO OPTIMIZER TARGET
         phase1_ee_pos = self.get_end_effector_position()
         if phase1_ee_pos is None:
             rospy.logerr("Cannot get end-effector position before Phase 2")
             return 'failed'
         
-        # Use current yaw since Phase 1 yaw adjustment is skipped
         current_yaw_for_phase2 = self.get_end_effector_yaw()
         if current_yaw_for_phase2 is None:
-            rospy.logwarn("Cannot get current yaw, using 0.0 as default")
+            rospy.logwarn("Cannot get current yaw, using 0.0")
             current_yaw_for_phase2 = 0.0
         
         xy_target_ee_pos = (safe_ee_pos[0], safe_ee_pos[1], phase1_ee_pos[2])
-        self._log_phase(2, "Move to safe XY", f"Target {self._format_vec(xy_target_ee_pos)}")
+        rospy.loginfo(f"[Phase 2] Move to safe XY: Target {FormationUtils.format_vec(xy_target_ee_pos)}")
         if not self._execute_formation_phase2_xy_movement(xy_target_ee_pos, current_yaw_for_phase2):
             rospy.logerr("Phase 2 failed: XY movement unsuccessful")
             return 'failed'
         rospy.loginfo("Phase 2 completed: Reached optimizer XY position")
 
-        # --- PHASE 3: PRECISION XY & YAW (spoke alignment, maintain Z) ---
+        # PHASE 3: PRECISION XY & YAW (spoke alignment)
         phase2_ee_pos = self.get_end_effector_position()
         phase2_yaw = self.get_end_effector_yaw()
         if phase2_ee_pos is None or phase2_yaw is None:
@@ -1284,37 +1293,25 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
         # PHASE 3A: XY precision positioning (keep Z, do not descend yet)
         phase3a_target_pos = (safe_ee_pos[0], safe_ee_pos[1], phase2_ee_pos[2])
-        self._log_phase(3, "Precision XY", f"Lock Z {phase3a_target_pos[2]:.3f}m")
+        rospy.loginfo(f"[Phase 3A] Precision XY: Lock Z {phase3a_target_pos[2]:.3f}m")
         if not self._execute_formation_phase3a_xy_positioning(phase3a_target_pos, phase2_yaw):
-            rospy.logerr("Phase 3A failed: XY precision positioning unsuccessful")
+            rospy.logerr("Phase 3A failed")
             return 'failed'
-        rospy.loginfo("  Phase 3A complete: XY precision achieved")
+        rospy.loginfo("Phase 3A complete: XY precision achieved")
 
-        # PHASE 3B: Spoke-aligned yaw (use optimizer's safe_ee_yaw)
+        # PHASE 3B: Spoke-aligned yaw
         phase3a_ee_pos = self.get_end_effector_position()
         if phase3a_ee_pos is None:
-            rospy.logerr("Cannot get end-effector position after Phase 3A")
+            rospy.logerr("Cannot get position after Phase 3A")
             return 'failed'
-        valve_xy_error = math.sqrt(
-            (phase3a_ee_pos[0] - valve_pos[0])**2 +
-            (phase3a_ee_pos[1] - valve_pos[1])**2
-        )
-        rospy.loginfo(f"Phase 3A end-effector to valve center: {valve_xy_error*1000:.1f}mm")
+            
         optimal_spoke_yaw = self.calculate_shortest_yaw_path(phase2_yaw, safe_ee_yaw)
-        rospy.loginfo(f"Phase 3B spoke alignment target yaw: {math.degrees(safe_ee_yaw):.1f}°")
         if not self._execute_formation_phase3b_spoke_alignment(phase3a_ee_pos, optimal_spoke_yaw, phase3a_target_pos):
-            rospy.logerr("Phase 3B failed: Spoke alignment unsuccessful")
+            rospy.logerr("Phase 3B failed")
             return 'failed'
-        rospy.loginfo("  Phase 3B complete: Yaw locked to spoke gap")
-        phase3b_ee_pos = self.get_end_effector_position()
-        if phase3b_ee_pos is not None:
-            phase3b_xy_error = math.sqrt(
-                (phase3b_ee_pos[0] - valve_pos[0])**2 +
-                (phase3b_ee_pos[1] - valve_pos[1])**2
-            )
-            rospy.loginfo(f"  · Phase 3B 末端距阀心 {phase3b_xy_error*1000:.1f}mm")
+        rospy.loginfo("Phase 3B complete: Spoke alignment achieved")
 
-        # --- PHASE 4: Z DESCENT TO OPTIMIZER HEIGHT (keep XY, spoke yaw) ---
+        # PHASE 4: Z DESCENT TO OPTIMIZER HEIGHT
         final_target_pos = (safe_ee_pos[0], safe_ee_pos[1], safe_ee_pos[2])
 
         final_yaw = self.get_end_effector_yaw()
@@ -1340,11 +1337,11 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             current_ee_yaw = self.get_end_effector_yaw()
             rospy.logdebug("=" * 80)
             rospy.logdebug(f"[PHASE4_COMPLETE] Formation insertion complete:")
-            rospy.logdebug(f"  Optimizer target (end-effector): {self._format_vec(final_target_pos)}")
-            rospy.logdebug(f"  Current end-effector: {self._format_vec(current_ee_pos) if current_ee_pos else 'None'}")
-            rospy.logdebug(f"  Current Assembly CoG: {self._format_vec(current_assembly_pos) if current_assembly_pos else 'None'}")
+            rospy.logdebug(f"  Optimizer target (end-effector): {FormationUtils.format_vec(final_target_pos)}")
+            rospy.logdebug(f"  Current end-effector: {FormationUtils.format_vec(current_ee_pos) if current_ee_pos else 'None'}")
+            rospy.logdebug(f"  Current Assembly CoG: {FormationUtils.format_vec(current_assembly_pos) if current_assembly_pos else 'None'}")
             rospy.logdebug(f"  Current yaw: {math.degrees(current_ee_yaw):.1f}°" if current_ee_yaw is not None else "  Current yaw: None")
-            rospy.logdebug(f"  Passed to Contact phase: {self._format_vec(phase4_pose)}")
+            rospy.logdebug(f"  Passed to Contact phase: {FormationUtils.format_vec(phase4_pose)}")
             contact_yaw = self.get_end_effector_yaw() or final_yaw
             rospy.logdebug(f"  Contact phase yaw: {math.degrees(contact_yaw):.1f}°" if contact_yaw is not None else "  Contact yaw: None")
             if current_ee_pos and current_assembly_pos:
@@ -1352,27 +1349,23 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
                 rospy.logdebug(f"  EE-Assembly offset: ({ee_assembly_diff[0]:.1f}, {ee_assembly_diff[1]:.1f}, {ee_assembly_diff[2]:.1f})mm")
             rospy.logdebug("=" * 80)
 
-        # Use Phase4 converged position for stabilization
+        # Post-insertion stabilization
         if hasattr(self, '_last_phase4_contact_position') and self._last_phase4_contact_position is not None:
-            target_pos = self._last_phase4_contact_position
-            target_yaw = final_yaw
-            rospy.loginfo("Starting 5s active stabilization using Phase4 position...")
-            rospy.loginfo(f"  Target: pos={self._format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f}°")
-            self.active_stabilization_wait(target_pos, target_yaw, 5.0, 
-                                          "Post-insertion stabilization")
+            rospy.loginfo(f"5s stabilization at {FormationUtils.format_vec(self._last_phase4_contact_position)}, yaw={math.degrees(final_yaw):.1f}°")
+            self.active_stabilization_wait(self._last_phase4_contact_position, final_yaw, 5.0, "Post-insertion")
         else:
-            rospy.logwarn("Phase4 converged position not found, using current position...")
+            rospy.logwarn("Phase4 position not found, using current position")
             current_ee_pos = self.get_end_effector_position()
             current_ee_yaw = self.get_end_effector_yaw()
             if current_ee_pos and current_ee_yaw is not None:
-                self.active_stabilization_wait(current_ee_pos, current_ee_yaw, 5.0, 
-                                              "Formation插入完成后稳定")
+                self.active_stabilization_wait(current_ee_pos, current_ee_yaw, 5.0, "Post-insertion")
             else:
-                rospy.logwarn("无法获取当前end-effector位置，使用被动等待...")
+                rospy.logwarn("Cannot get position, passive wait")
                 rospy.sleep(5.0)
 
-        rospy.loginfo("=== Formation move-to-valve 完成：编队已就位，准备插入阀门 ===")
+        rospy.loginfo("=== Formation move-to-valve complete ===")
         return 'succeeded'
+        
     def calculate_shortest_yaw_path(self, current_yaw, target_yaw):
         """Calculate the shortest yaw rotation path to avoid reverse direction rotation (from single UAV)"""
         # Calculate the difference
@@ -1386,90 +1379,103 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         
         # Return the shortest path target
         optimal_target = current_yaw + diff
+        rospy.loginfo(f"[YawPath] {math.degrees(current_yaw):.1f}°→{math.degrees(target_yaw):.1f}° (Δ{math.degrees(diff):.1f}°)")
+        return optimal_target
+    
+    def _check_positioning_error(self, target_pos, target_yaw=None, pos_thresh=0.050, yaw_thresh=None):
+        """Check current position/yaw error against target. Returns (pos_ok, yaw_ok, xy_err, z_err, yaw_err)"""
+        current_pos = self.get_end_effector_position()
+        if not current_pos:
+            return False, False, None, None, None
         
-        rospy.loginfo(
-            f"[YawPath] current={math.degrees(current_yaw):.1f}°, target={math.degrees(target_yaw):.1f}°, "
-            f"shortest={math.degrees(optimal_target):.1f}°, delta={math.degrees(diff):.1f}°"
+        xy_error = math.sqrt((current_pos[0] - target_pos[0])**2 + (current_pos[1] - target_pos[1])**2)
+        z_error = abs(current_pos[2] - target_pos[2])
+        pos_ok = (xy_error <= pos_thresh and z_error <= 0.015)
+        
+        yaw_ok = True
+        yaw_error = None
+        if target_yaw is not None and yaw_thresh is not None:
+            current_yaw = self.get_end_effector_yaw()
+            if current_yaw is not None:
+                yaw_error = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
+                yaw_ok = (yaw_error <= yaw_thresh)
+        
+        return pos_ok, yaw_ok, xy_error, z_error, yaw_error
+    
+    def _execute_xy_positioning(self, target_pos, target_yaw, phase_name="XY", 
+                                use_trajectory=True, pos_thresh=0.050, yaw_thresh=0.087, 
+                                timeout=15.0, num_traj_points=12):
+        """
+        Generic XY positioning method used by Phase 2, 3A, 3B
+        Reduces code duplication by parametrizing behavior
+        """
+        rospy.loginfo(f"[{phase_name}] Target: {FormationUtils.format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f}°")
+        
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"[{phase_name}] Cannot get current position")
+            return False
+        
+        xy_distance = math.sqrt((target_pos[0] - current_pos[0])**2 + (target_pos[1] - current_pos[1])**2)
+        rospy.loginfo(f"[{phase_name}] XY distance: {xy_distance*1000:.1f}mm")
+        
+        # Direct convergence for small movements
+        if xy_distance < 0.01 or not use_trajectory:
+            rospy.loginfo(f"[{phase_name}] Using direct convergence")
+            return self.active_position_convergence(
+                target_pos=target_pos, target_yaw=target_yaw,
+                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout
+            )
+        
+        # Trajectory-based movement for larger distances
+        rospy.loginfo(f"[{phase_name}] Using polynomial trajectory ({num_traj_points} points)")
+        trajectory_points = self.generate_polynomial_trajectory(
+            start_pos=current_pos, target_pos=target_pos,
+            target_yaw=target_yaw, num_points=num_traj_points
         )
         
-        return optimal_target
+        if not trajectory_points:
+            rospy.logwarn(f"[{phase_name}] Trajectory generation failed, using direct convergence")
+            return self.active_position_convergence(
+                target_pos=target_pos, target_yaw=target_yaw,
+                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout * 1.5
+            )
+        
+        # Execute trajectory
+        self.execute_polynomial_trajectory(trajectory_points)
+        
+        # Final convergence check
+        rospy.loginfo(f"[{phase_name}] Final convergence check")
+        final_success = self.active_position_convergence(
+            target_pos=target_pos, target_yaw=target_yaw,
+            pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout
+        )
+        
+        # Stabilization for final position
+        rospy.loginfo(f"[{phase_name}] Stabilizing for 2s")
+        stabilize_end = rospy.Time.now().to_sec() + 2.0
+        rate = rospy.Rate(10)
+        while rospy.Time.now().to_sec() < stabilize_end and not rospy.is_shutdown():
+            self.send_assembly_command_from_end_effector(target_pos, target_yaw)
+            rate.sleep()
+        
+        return final_success
         
     def _execute_formation_phase2_xy_movement(self, xy_target_ee_pos, maintain_yaw):
         """Phase 2: Pure XY movement using polynomial trajectory (Formation version)"""
-        rospy.loginfo(
-            f"[Phase2] 规划至 {self._format_vec(xy_target_ee_pos)}，保持航向 {math.degrees(maintain_yaw):.1f}°"
-        )
-
-        # Get current position for trajectory start
-        current_pos = self.get_end_effector_position()
-        if current_pos is None:
-            rospy.logerr("Cannot get current position for Phase 2")
-            return False
-
-        xy_distance = math.sqrt(sum((xy_target_ee_pos[i] - current_pos[i])**2 for i in [0, 1]))
-        rospy.loginfo(f"[Phase2] XY 距离 {xy_distance*1000:.1f}mm")
-
-        # Check if movement is significant enough for trajectory
-        if xy_distance < 0.01:  # Less than 10mm
-            rospy.loginfo("[Phase2] 位移<10mm，直接进入收敛模式")
-            return self.active_position_convergence(
-                target_pos=xy_target_ee_pos,
-                target_yaw=maintain_yaw,
-                pos_thresh=0.050,  # RELAXED: 50mm (consistent strategy)
-                yaw_thresh=0.087,  # RELAXED: 5 degrees (0.087 rad)
-                timeout=15.0
-            )
-
-        # Generate polynomial trajectory for smooth XY movement
-        rospy.loginfo("[Phase2] 生成多项式平滑轨迹")
-        trajectory_points = self.generate_polynomial_trajectory(
-            start_pos=current_pos,
-            target_pos=xy_target_ee_pos,
-            target_yaw=maintain_yaw,
-            num_points=12  # Formation uses fewer points than single UAV for stability
+        return self._execute_xy_positioning(
+            target_pos=xy_target_ee_pos, target_yaw=maintain_yaw,
+            phase_name="Phase2", use_trajectory=True,
+            pos_thresh=0.050, yaw_thresh=0.087, timeout=15.0, num_traj_points=12
         )
 
         if not trajectory_points:
             rospy.logerr("Failed to generate polynomial trajectory - falling back to direct convergence")
-            return self.active_position_convergence(
-                target_pos=xy_target_ee_pos,
-                target_yaw=maintain_yaw,
-                pos_thresh=0.050,  # RELAXED: 50mm (consistent strategy)
-                yaw_thresh=0.087,  # RELAXED: 5 degrees (0.087 rad)
-                timeout=20.0
+            return self._execute_xy_positioning(
+                target_pos=xy_target_ee_pos, target_yaw=maintain_yaw,
+                phase_name="Phase2", use_trajectory=False,
+                pos_thresh=0.050, yaw_thresh=0.087, timeout=20.0
             )
-
-        # Execute polynomial trajectory
-        rospy.loginfo("[Phase2] 执行多项式轨迹")
-        trajectory_success = self.execute_polynomial_trajectory(trajectory_points)
-
-        # Final convergence check to ensure precision
-        rospy.loginfo("[Phase2] 进行末端精度收敛检查")
-        final_success = self.active_position_convergence(
-            target_pos=xy_target_ee_pos,
-            target_yaw=maintain_yaw,
-            pos_thresh=0.050,           # Relaxed to 50mm for formation tolerance
-            yaw_thresh=0.087,           # Relaxed to 5 degrees (0.087 rad)
-            timeout=15.0
-        )
-
-        # Real machine optimization: Phase2 final position continuous send for 2s to ensure stable convergence
-        rospy.loginfo("[Phase2] 最终位置稳定发送2秒")
-        final_stabilize_end = rospy.Time.now().to_sec() + 2.0
-        final_stabilize_rate = rospy.Rate(10)  # 10Hz持续发送
-        while rospy.Time.now().to_sec() < final_stabilize_end and not rospy.is_shutdown():
-            self.send_assembly_command_from_end_effector(xy_target_ee_pos, maintain_yaw)
-            final_stabilize_rate.sleep()
-        rospy.loginfo("[Phase2] 最终稳定发送完成")
-
-        overall_success = trajectory_success and final_success
-
-        if overall_success:
-            rospy.loginfo("Phase 2 完成：轨迹执行与收敛均成功")
-        else:
-            rospy.logwarn("Phase 2 completed but has convergence warnings")
-
-        return overall_success
     
     def _calculate_spoke_alignment_yaw(self, current_ee_pos, valve_pos):
         """
@@ -1503,141 +1509,70 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         return spoke_yaw
     
     def _execute_formation_phase3a_xy_positioning(self, target_ee_pos, maintain_yaw):
-        """
-        Phase 3A: XY 精准对齐，保持当前高度与航向。
-        多次尝试并在每次尝试后验证XY/Z误差，确保不会提前下沉。
-        """
+        """Phase 3A: XY precision positioning with Z locked"""
         current_state = self.get_end_effector_position()
         if current_state is None:
-            rospy.logerr("Phase 3A 无法获取末端执行器位置")
+            rospy.logerr("Phase 3A: Cannot get current position")
             return False
 
-        locked_z = target_ee_pos[2]
-        if locked_z is None:
-            locked_z = current_state[2]
-
-        z_delta = current_state[2] - locked_z
-        if abs(z_delta) > 0.02:
-            rospy.logwarn(f"Phase 3A 当前高度与目标差值 {z_delta*1000:.1f}mm，将在本阶段回正")
-
+        locked_z = target_ee_pos[2] if target_ee_pos[2] else current_state[2]
         xy_target = (target_ee_pos[0], target_ee_pos[1], locked_z)
-        rospy.loginfo(
-            f"[Phase3A] 目标XY {self._format_vec(xy_target)}, 锁高 {locked_z:.3f}m，保持航向 {math.degrees(maintain_yaw):.1f}°"
-        )
-
-        max_attempts = 3
-        xy_tolerance = 0.050  # 50mm (RELAXED: practical positioning threshold)
-        z_tolerance = 0.015   # 15mm
-
-        for attempt in range(1, max_attempts + 1):
-            rospy.loginfo(f"[Phase3A] 尝试 {attempt}/{max_attempts}")
-            success = self.active_position_convergence(
-                target_pos=xy_target,
-                target_yaw=maintain_yaw,
-                pos_thresh=0.050,  # 50mm convergence threshold (RELAXED)
-                yaw_thresh=0.087,  # 5 degrees (0.087 rad) - relaxed for tolerance
-                timeout=5.0  # 5s timeout for quick attempts
+        
+        # Multiple attempts with verification
+        for attempt in range(1, 4):
+            rospy.loginfo(f"[Phase3A] Attempt {attempt}/3")
+            success = self._execute_xy_positioning(
+                target_pos=xy_target, target_yaw=maintain_yaw,
+                phase_name=f"Phase3A-{attempt}", use_trajectory=False,
+                pos_thresh=0.050, yaw_thresh=0.087, timeout=5.0
             )
-
-            if not success:
-                rospy.logwarn("Phase 3A 收敛失败，准备重试")
-                continue
-
-            final_pos = self.get_end_effector_position()
-            final_yaw = self.get_end_effector_yaw()
-            if final_pos is None or final_yaw is None:
-                rospy.logwarn("Phase 3A 收敛后丢失姿态信息，重试")
-                continue
-
-            xy_error = math.sqrt((final_pos[0] - xy_target[0])**2 + (final_pos[1] - xy_target[1])**2)
-            z_error = abs(final_pos[2] - locked_z)
-            yaw_error = abs(self.normalize_angle(final_yaw - maintain_yaw))
-
-            rospy.loginfo(
-                f"[Phase3A] 结果: XY误差 {xy_error*1000:.1f}mm, Z误差 {z_error*1000:.1f}mm, 航向误差 {math.degrees(yaw_error):.2f}°"
-            )
-
-            if xy_error <= xy_tolerance and z_error <= z_tolerance:
-                if yaw_error > 0.07:
-                    rospy.logwarn("Phase 3A yaw deviation slightly large, will re-lock in subsequent stages")
-                rospy.loginfo("Phase 3A XY precise positioning successful")
-                return True
-
-            rospy.logwarn("[Phase3A] Error still exceeds threshold, preparing retry")
-        rospy.logerr("Phase 3A failed to achieve accuracy after multiple attempts")
+            
+            if success:
+                pos_ok, _, xy_error, z_error, _ = self._check_positioning_error(
+                    (xy_target[0], xy_target[1], locked_z), pos_thresh=0.050
+                )
+                if pos_ok:
+                    rospy.loginfo(f"Phase 3A successful: XY={xy_error*1000:.1f}mm, Z={z_error*1000:.1f}mm")
+                    return True
+        
+        rospy.logerr("Phase 3A failed after 3 attempts")
         return False
 
     def _execute_formation_phase3b_spoke_alignment(self, current_ee_pos, spoke_yaw, target_pos=None):
-        """
-        Phase 3B: Spoke insertion yaw alignment.
-        Rotate yaw while maintaining Phase 3A locked XY/Z position with automatic drift correction.
-        """
-        reference_xy = (
-            target_pos[0],
-            target_pos[1]
-        ) if target_pos is not None else (current_ee_pos[0], current_ee_pos[1])
-        reference_z = target_pos[2] if target_pos is not None else current_ee_pos[2]
-        rospy.loginfo(
-            f"[Phase3B] Target yaw {math.degrees(spoke_yaw):.1f}°, locked position {self._format_vec((reference_xy[0], reference_xy[1], reference_z))}"
-        )
-
-        max_attempts = 3
-        xy_tolerance = 0.050  # 50mm (RELAXED for final check tolerance)
-        z_tolerance = 0.015   # 15mm
-        yaw_tolerance = 0.087  # 5 degrees (0.087 rad) - relaxed tolerance
-
-        for attempt in range(1, max_attempts + 1):
-            current_yaw = self.get_end_effector_yaw()
-            if current_yaw is not None:
-                yaw_error = abs(self.normalize_angle(spoke_yaw - current_yaw))
-                rospy.loginfo(f"[Phase3B] 尝试 {attempt}/{max_attempts}，预计旋转 {math.degrees(yaw_error):.2f}°")
-
+        """Phase 3B: Spoke yaw alignment with XY/Z locked"""
+        reference_xy = (target_pos[0], target_pos[1]) if target_pos else (current_ee_pos[0], current_ee_pos[1])
+        reference_z = target_pos[2] if target_pos else current_ee_pos[2]
+        locked_pos = (reference_xy[0], reference_xy[1], reference_z)
+        
+        for attempt in range(1, 4):
+            rospy.loginfo(f"[Phase3B] Attempt {attempt}/3 - Yaw to {math.degrees(spoke_yaw):.1f}°")
+            
             success = self.active_position_convergence(
-                target_pos=(reference_xy[0], reference_xy[1], reference_z),
-                target_yaw=spoke_yaw,
-                pos_thresh=0.050,  # 50mm convergence threshold (RELAXED)
-                yaw_thresh=0.087,  # 5 degrees (0.087 rad) - relaxed threshold
-                timeout=35.0,
+                target_pos=locked_pos, target_yaw=spoke_yaw,
+                pos_thresh=0.050, yaw_thresh=0.087, timeout=35.0,
                 max_yaw_step=math.radians(3.0)
             )
-
-            final_pos = self.get_end_effector_position()
-            final_yaw = self.get_end_effector_yaw()
-
-            if not success or final_pos is None or final_yaw is None:
-                rospy.logwarn("Phase 3B 收敛失败或姿态不可用，重新尝试")
-                correction_yaw = spoke_yaw if spoke_yaw is not None else current_yaw
-                self._execute_formation_phase3a_xy_positioning(
-                    (reference_xy[0], reference_xy[1], reference_z),
-                    correction_yaw
+            
+            if success:
+                pos_ok, yaw_ok, xy_error, z_error, yaw_error = self._check_positioning_error(
+                    locked_pos, spoke_yaw, pos_thresh=0.050, yaw_thresh=0.087
                 )
-                continue
-
-            xy_error = math.sqrt((final_pos[0] - reference_xy[0])**2 + (final_pos[1] - reference_xy[1])**2)
-            z_error = abs(final_pos[2] - reference_z)
-            yaw_error = abs(self.normalize_angle(spoke_yaw - final_yaw))
-
-            rospy.loginfo(
-                f"[Phase3B] 结果: XY误差 {xy_error*1000:.1f}mm, Z误差 {z_error*1000:.1f}mm, 航向误差 {math.degrees(yaw_error):.2f}°"
-            )
-
-            if xy_error <= xy_tolerance and z_error <= z_tolerance and yaw_error <= yaw_tolerance:
-                rospy.loginfo("Phase 3B 辐条航向对齐完成")
-                return True
-
-            # 若XY漂移超限，先补偿一次再重试
-            if xy_error > xy_tolerance or z_error > z_tolerance:
-                rospy.logwarn("[Phase3B] 旋转导致位置漂移，执行XY回正")
-                correction_pos = (reference_xy[0], reference_xy[1], reference_z)
-                self._execute_formation_phase3a_xy_positioning(correction_pos, final_yaw)
-
-        rospy.logerr("Phase 3B 辐条对齐在多次尝试后仍未满足精度")
+                if pos_ok and yaw_ok:
+                    rospy.loginfo(f"Phase 3B successful: XY={xy_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f}°")
+                    return True
+                
+                if not pos_ok:
+                    rospy.logwarn(f"[Phase3B] Position drift, correcting...")
+                    final_yaw = self.get_end_effector_yaw()
+                    self._execute_formation_phase3a_xy_positioning(locked_pos, final_yaw)
+        
+        rospy.logerr("Phase 3B failed after 3 attempts")
         return False
         
     def _execute_formation_phase4_z_descent(self, final_ee_pos, final_yaw):
         """Phase 4: Pure Z descent to insertion height (Formation version)"""
         rospy.loginfo(
-            f"[Phase4] 当前→目标 {self._format_vec(final_ee_pos)}, 保持航向 {math.degrees(final_yaw):.1f}°"
+            f"[Phase4] 当前→目标 {FormationUtils.format_vec(final_ee_pos)}, 保持航向 {math.degrees(final_yaw):.1f}°"
         )
 
         # Reset cached contact pose for this attempt
@@ -1672,11 +1607,9 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
                 f"[Phase4] Contact depth locked at {achieved_pos[2]:.3f}m (planned {final_target_pos[2]:.3f}m)"
             )
 
+        
         convergence_target = achieved_pos
-        rospy.loginfo(
-            f"[Phase4] Lock current position as final convergence target {self._format_vec(convergence_target)}"
-        )
-
+        rospy.loginfo(f"[Phase4] Final convergence target: {FormationUtils.format_vec(convergence_target)}")
         self._last_phase4_contact_position = convergence_target
 
         rospy.loginfo("[Phase4] Performing final insertion pose convergence")
@@ -1737,27 +1670,6 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         self.control_rate = 25.0
         self.max_linear_speed = 0.035
 
-    @staticmethod
-    def _format_vec(vec):
-        """Format 3D vector as string"""
-        return f"({vec[0]:.3f}, {vec[1]:.3f}, {vec[2]:.3f})"
-
-    @staticmethod
-    def _normalize(self, angle):
-        """Normalize angle to [-pi, pi]"""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
-
-    def _get_valve_yaw(self, fallback):
-        valve_yaw = self.beetle.getValveYaw()
-        if valve_yaw is None:
-            rospy.logwarn("getValveYaw() returned None, using fallback")
-            return fallback
-        return valve_yaw
-
     def execute(self, userdata):
         rospy.loginfo("=== Formation Contact and Rotate Valve State (Unified) ===")
         
@@ -1788,19 +1700,16 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             rospy.logerr("Failed to get current end-effector position")
             return 'failed'
 
-        rospy.loginfo(f"Current end-effector position: ({current_ee_pos[0]:.3f}, {current_ee_pos[1]:.3f}, {current_ee_pos[2]:.3f})")
-        
-        rospy.loginfo("SKIPPING Phase 1 & 2: FormationMoveToValveState Phase 4 already completed insertion positioning")
+        rospy.loginfo(f"Current EE pos: {FormationUtils.format_vec(current_ee_pos)}")
+        rospy.loginfo("SKIPPING Phase 1 & 2: Phase 4 insertion already completed")
         
         # Phase 3: Circular Contact Establishment  
-        # Use Assembly CoG coordinate system, avoid mixing with single UAV coordinate system
         current_assembly_pos = self.get_assembly_position()
         if current_assembly_pos is None:
-            rospy.logerr("Cannot get Assembly CoG position, Contact phase failed")
+            rospy.logerr("Cannot get Assembly CoG position")
             return 'failed'
             
-        rospy.loginfo(f"Contact phase based on Assembly CoG coordinates: ({current_assembly_pos[0]:.3f}, {current_assembly_pos[1]:.3f}, {current_assembly_pos[2]:.3f})")
-        rospy.loginfo(f"End-effector position used for trajectory calculation: ({current_ee_pos[0]:.3f}, {current_ee_pos[1]:.3f}, {current_ee_pos[2]:.3f})")
+        rospy.loginfo(f"Assembly CoG: {FormationUtils.format_vec(current_assembly_pos)}, EE: {FormationUtils.format_vec(current_ee_pos)}")
         contact_result = self._execute_circular_contact_phase(userdata, current_assembly_pos, valve_pos, valve_yaw)
         if not contact_result:
             return 'failed'
@@ -1818,8 +1727,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         angle_diffs = [abs(angle - approach_angle) for angle in spoke_angles]
         selected_spoke = spoke_angles[angle_diffs.index(min(angle_diffs))]
         
-        rospy.loginfo(f"Selected spoke angle: {selected_spoke:.3f} rad ({math.degrees(selected_spoke):.1f}°)")
-        rospy.loginfo(f"Approach angle: {approach_angle:.3f} rad ({math.degrees(approach_angle):.1f}°)")
+        rospy.loginfo(f"Spoke selection: approach={math.degrees(approach_angle):.1f}°, selected={math.degrees(selected_spoke):.1f}°")
 
         contact_radius = math.sqrt((current_ee_pos[0] - valve_pos[0])**2 + 
                                  (current_ee_pos[1] - valve_pos[1])**2)
@@ -1828,119 +1736,77 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         if contact_radius > 0.025:
             rospy.logwarn(f"Distance to valve center too large: {contact_radius*1000:.1f}mm")
 
-        final_contact_pos = current_assembly_pos
-
-        rospy.loginfo("Using current position without optimization (simplified for unified state)")
-
-        cached_phase4_pose = phase4_contact_pos or self.get_end_effector_position()
-        
         self.contact_radius = contact_radius
         self.contact_angle = selected_spoke
         self.valve_center = valve_pos
         self.initial_valve_yaw = valve_yaw
-        self.rotation_start_position = final_contact_pos
+        self.rotation_start_position = current_assembly_pos
 
-        rospy.loginfo("Position verification passed - ready for valve rotation")
-        rospy.loginfo(f"Baseline contact torque set to [0.0, 0.0, 0.1] (fixed positive value like Single UAV)")
-        
+        rospy.loginfo("Contact phase complete - ready for rotation")
         return 'succeeded'
 
     def _execute_circular_contact_phase(self, userdata, current_pos, valve_pos, initial_valve_yaw):
-        """
-        Circular contact establishment phase - adapted from single UAV version
-        Executes circular motion to establish physical contact with valve before rotation
-        """
+        """Circular contact establishment - adapted from single UAV"""
         rospy.loginfo(">>> Starting circular contact establishment")
         
-        # Calculate current radius from valve center
+        # Calculate current radius
         relative_pos = np.array(current_pos[:2]) - np.array(valve_pos[:2])
         current_radius = np.linalg.norm(relative_pos)
+        rospy.loginfo(f"Valve: {FormationUtils.format_vec(valve_pos)}, radius={current_radius*1000:.1f}mm, yaw={math.degrees(initial_valve_yaw):.1f}°")
         
-        rospy.loginfo(f"Valve center: ({valve_pos[0]:.3f}, {valve_pos[1]:.3f}, {valve_pos[2]:.3f})")
-        rospy.loginfo(f"Current radius: {current_radius*1000:.1f}mm")
-        rospy.loginfo(f"Initial valve angle: {math.degrees(initial_valve_yaw):.1f}°")
+        contact_angular_velocity = 0.1  # 0.1 rad/s ≈ 5.7°/s
         
-        # ===== SINGLE UAV COMPATIBILITY: Correct valve_center in Contact phase =====
-        contact_angular_velocity = 0.1  # 0.1 rad/s ≈ 5.7°/s, consistent with single UAV version
-        
-        # CRITICAL FIX: Correct valve_center Z coordinate to insertion depth in Contact phase, eliminate Z coordinate discontinuity
-        original_valve_z = valve_pos[2]
+        # Correct valve Z to insertion depth
         if FormationSingleUAVStateBase._shared_target_z is not None:
-            corrected_valve_pos = [valve_pos[0], valve_pos[1], FormationSingleUAVStateBase._shared_target_z]
-            rospy.loginfo(f"Contact phase valve_center correction: Z {original_valve_z:.3f}m → {FormationSingleUAVStateBase._shared_target_z:.3f}m (eliminate {abs(original_valve_z - FormationSingleUAVStateBase._shared_target_z)*1000:.0f}mm discontinuity)")
-            valve_pos = corrected_valve_pos
+            valve_pos = [valve_pos[0], valve_pos[1], FormationSingleUAVStateBase._shared_target_z]
+            rospy.loginfo(f"Valve Z corrected to {FormationSingleUAVStateBase._shared_target_z:.3f}m")
         else:
-            rospy.logwarn(f"Saved insertion Z coordinate not found, using original valve_center (Z={valve_pos[2]:.3f}m)")
+            rospy.logwarn(f"Using original valve Z={valve_pos[2]:.3f}m")
         
-        # Fix: Use Assembly CoG coordinate system, avoid mixing end-effector coordinates
-        # Get current Assembly CoG position as trajectory basis
+        # Use Assembly CoG as trajectory basis
         current_assembly_pos = self.get_assembly_position()
         if current_assembly_pos is None:
-            rospy.logerr("Cannot get Assembly CoG position, Contact phase failed")
+            rospy.logerr("Cannot get Assembly CoG position")
             return False
-            
-        rospy.loginfo(f"Contact阶段基于Assembly CoG坐标: ({current_assembly_pos[0]:.3f}, {current_assembly_pos[1]:.3f}, {current_assembly_pos[2]:.3f})")
-        rospy.loginfo(f"使用原始valve_center: ({valve_pos[0]:.3f}, {valve_pos[1]:.3f}, {valve_pos[2]:.3f})")
         
-        # 计算当前end-effector相对于阀门中心的位置（用于轨迹初始化）
-        current_ee_pos = self.get_end_effector_position()
-        if current_ee_pos:
-            rospy.loginfo(f"当前end-effector位置: ({current_ee_pos[0]:.3f}, {current_ee_pos[1]:.3f}, {current_ee_pos[2]:.3f})")
-        
-        # Initialize trajectory generator for contact phase
+        # Initialize trajectory generator
         trajectory_generator = OnlineCircularTrajectoryGenerator(
-            valve_center=valve_pos,  # Use original valve_pos to avoid coordinate system mixing
+            valve_center=valve_pos,
             initial_radius=current_radius,
             target_angular_velocity=contact_angular_velocity,
             control_rate=self.control_rate
         )
-        
-        # Initialize trajectory generator with Assembly CoG position to avoid Z coordinate jumps
-        rospy.loginfo("Trajectory generator init: using Assembly CoG position for Z coordinate consistency")
-        rospy.loginfo(f"   Assembly CoG: ({current_assembly_pos[0]:.3f}, {current_assembly_pos[1]:.3f}, {current_assembly_pos[2]:.3f})")
-        rospy.loginfo(f"   End-effector: ({current_ee_pos[0]:.3f}, {current_ee_pos[1]:.3f}, {current_ee_pos[2]:.3f})" if current_ee_pos else "   End-effector: N/A")
         trajectory_generator.initialize_from_current_position(current_assembly_pos)
         
         contact_threshold = 0.1
-        rospy.loginfo(f"Contact establishment - target: {math.degrees(contact_threshold):.1f}° valve rotation")
+        rospy.loginfo(f"Target: {math.degrees(contact_threshold):.1f}° valve rotation, timeout=20s")
         
         max_contact_time = 20.0
         target_valve_rotation = contact_threshold
         min_valve_rotation = math.radians(1.0)
         contact_start_time = rospy.Time.now().to_sec()
         
-        # Initialize contact monitoring
-        start_valve_yaw = self._get_valve_yaw_safe(initial_valve_yaw)
+        start_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, initial_valve_yaw)
         last_valve_yaw = start_valve_yaw
         last_valve_check_time = contact_start_time
         max_detected_rotation = 0.0
-        
-        # Initialize valve angular velocity tracking (like Single UAV)
-        last_control_time = contact_start_time
         
         # Main contact establishment loop
         while not rospy.is_shutdown():
             current_time = rospy.Time.now().to_sec()
             contact_duration = current_time - contact_start_time
             
-            # Get current valve state
-            current_valve_yaw = self._get_valve_yaw_safe(start_valve_yaw)
-            valve_rotation = abs(current_valve_yaw - start_valve_yaw)
+            current_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, start_valve_yaw)
+            valve_rotation, valve_angular_velocity, updated, last_valve_yaw, last_valve_check_time = \
+                FormationUtils.monitor_valve_rotation(
+                    current_valve_yaw, start_valve_yaw, last_valve_yaw, 
+                    last_valve_check_time, current_time, update_interval=0.2
+                )
             max_detected_rotation = max(max_detected_rotation, valve_rotation)
             
-            # Calculate valve angular velocity (Dragon logic from Single UAV)
-            valve_angular_velocity = 0.0
-            if current_time > last_control_time + 0.1:
-                if hasattr(self, '_last_valve_yaw'):
-                    dt = current_time - last_control_time
-                    valve_angular_velocity = abs(current_valve_yaw - self._last_valve_yaw) / dt
-                self._last_valve_yaw = current_valve_yaw
-                last_control_time = current_time
-            
-            # Fix: Get Assembly CoG position for trajectory update, consistent with initialization
             current_assembly_pos_loop = self.get_assembly_position()
-            current_yaw = self.get_end_effector_yaw()  # Yaw still uses end-effector
-            current_ee_pos_loop = self.get_end_effector_position()  # Only for debug comparison
+            current_yaw = self.get_end_effector_yaw()
+            current_ee_pos_loop = self.get_end_effector_position()
             
             if current_assembly_pos_loop is None or current_yaw is None:
                 rospy.logwarn("Formation pose information lost, continuing to wait")
@@ -2011,14 +1877,6 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         rospy.logerr(f"Contact establishment failed: max valve movement {math.degrees(max_detected_rotation):.2f}°")
         return False
     
-    def _get_valve_yaw_safe(self, fallback):
-        """Safe valve yaw getter with fallback"""
-        valve_yaw = self.beetle.getValveYaw()
-        if valve_yaw is None:
-            rospy.logwarn("getValveYaw() returned None, using fallback")
-            return fallback
-        return valve_yaw
-    
     def _execute_rotation_phase(self, userdata):
         """Rotation execution phase - reuse trajectory generator instance from contact phase"""
         
@@ -2045,7 +1903,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 rospy.loginfo(f"Rotation phase Z correction: ({original_valve_center[2]:.3f}) → ({insertion_depth_z:.3f}) [source: {z_source}]")
         
         # Get current state information
-        current_valve_yaw_now = self._get_valve_yaw_safe(self.initial_valve_yaw)
+        current_valve_yaw_now = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
         
         rospy.loginfo(f"Starting rotation from baseline, contact achieved: {math.degrees(abs(current_valve_yaw_now - self.initial_valve_yaw)):.1f}°")
         rospy.loginfo(f"Rotation start position: {self.rotation_start_position}")
@@ -2066,39 +1924,19 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         
         while not rospy.is_shutdown():
             elapsed = rospy.Time.now().to_sec() - rotation_start_time
+            current_time = rospy.Time.now().to_sec()
             
-            # Get current valve state
-            current_valve_yaw = self._get_valve_yaw_safe(initial_valve_yaw)
-            valve_rotation = abs(current_valve_yaw - initial_valve_yaw)
+            current_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, initial_valve_yaw)
+            valve_rotation, valve_angular_velocity, updated, last_valve_yaw, last_valve_check_time = \
+                FormationUtils.monitor_valve_rotation(
+                    current_valve_yaw, initial_valve_yaw, last_valve_yaw,
+                    last_valve_check_time, current_time, update_interval=0.2
+                )
             max_rotation_detected = max(max_rotation_detected, valve_rotation)
-            
-            # Calculate valve angular velocity (fully adopt single UAV logic)
-            valve_angular_velocity = 0.0
-            if rospy.Time.now().to_sec() > last_valve_check_time + 0.2:  # Update every 200ms
-                dt = rospy.Time.now().to_sec() - last_valve_check_time
-                valve_angular_velocity = abs(current_valve_yaw - last_valve_yaw) / dt
-                last_valve_yaw = current_valve_yaw
-                last_valve_check_time = rospy.Time.now().to_sec()
 
-            # DEBUG: Output detailed valve status every 5 seconds (after valve_angular_velocity calculation)
-            if int(elapsed) % 5 == 0 and (elapsed - int(elapsed)) < 0.1:
-                rospy.logwarn("VALVE & CONTACT STATUS DEBUG:")
-                rospy.logwarn(f"  current_valve_yaw: {math.degrees(current_valve_yaw):.2f}°")
-                rospy.logwarn(f"  initial_valve_yaw: {math.degrees(initial_valve_yaw):.2f}°")
-                rospy.logwarn(f"  raw_difference: {math.degrees(current_valve_yaw - initial_valve_yaw):.2f}°")
-                rospy.logwarn(f"  valve_rotation (abs): {math.degrees(valve_rotation):.2f}°")
-                rospy.logwarn(f"  target_rotation: {math.degrees(self.target_rotation):.2f}°")
-                rospy.logwarn(f"  valve_angular_velocity: {math.degrees(valve_angular_velocity):.3f}°/s")
-                
-                # Contact state detection (use dynamic Z coordinate to avoid pitch issues)
-                current_pos_raw = self.get_end_effector_position()[:3]
-                current_pos = (current_pos_raw[0], current_pos_raw[1], current_pos_raw[2])
-                distance_to_valve = math.sqrt((current_pos[0] - self.valve_center[0])**2 + 
-                                            (current_pos[1] - self.valve_center[1])**2)
-                if distance_to_valve > self.contact_radius * 1.2:
-                    rospy.logwarn(f"Contact distance: {distance_to_valve*1000:.0f}mm (expected {self.contact_radius*1000:.0f}mm)")
-                elif abs(valve_angular_velocity) < 0.005:
-                    rospy.logwarn(f"Valve rotation: {math.degrees(valve_rotation):.1f}° (stagnant)")
+            # Periodic status logging
+            rospy.loginfo_throttle(5.0, f"Rotation: {math.degrees(valve_rotation):.1f}°/{math.degrees(self.target_rotation):.1f}°, "
+                                   f"ω={math.degrees(valve_angular_velocity):.2f}°/s")
             
             # Check rotation complete
             if valve_rotation >= self.target_rotation:
@@ -2175,14 +2013,6 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         rospy.logerr(f"Valve rotation failed: achieved {math.degrees(max_rotation_detected):.1f}° "
                     f"of {math.degrees(self.target_rotation):.1f}° target")
         return 'failed'
-    
-    def _get_valve_yaw_safe(self, fallback):
-        """Safe valve yaw getter with fallback"""
-        valve_yaw = self.beetle.getValveYaw()
-        if valve_yaw is None:
-            rospy.logwarn("getValveYaw() returned None, using fallback")
-            return fallback
-        return valve_yaw
 
         valve_pos = getattr(userdata, 'valve_position', None)
         if valve_pos is None:
@@ -2258,24 +2088,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         # CRITICAL FIX: Consistent with single UAV version, always use positive angular velocity
         angular_velocity = abs(self.nominal_angular_velocity)  # Force positive, consistent with single UAV
         
-        # ENHANCED DEBUG: Output all key parameters
-        rospy.logwarn("=" * 60)
-        rospy.logwarn("ROTATION DEBUG - All key parameters:")
-        rospy.logwarn(f"  Trajectory Generator Parameters:")
-        rospy.logwarn(f"    nominal_angular_velocity: {self.nominal_angular_velocity:.4f} rad/s ({math.degrees(self.nominal_angular_velocity):.2f}°/s)")
-        rospy.logwarn(f"    effective_rotation_direction: {effective_rotation_direction:+d}")
-        rospy.logwarn(f"    FINAL angular_velocity: {angular_velocity:.4f} rad/s ({math.degrees(angular_velocity):.2f}°/s)")
-        rospy.logwarn(f"  Valve Position & Orientation:")
-        rospy.logwarn(f"    initial_valve_yaw (baseline): {math.degrees(initial_valve_yaw):.2f}°")
-        rospy.logwarn(f"    current_valve_yaw_now: {math.degrees(current_valve_yaw_now):.2f}°")
-        rospy.logwarn(f"    valve_center: {valve_pos}")
-        rospy.logwarn(f"    rotation_radius: {initial_radius*1000:.1f}mm")
-        rospy.logwarn(f"  Expected Behavior:")
-        if angular_velocity > 0:
-            rospy.logwarn(f"    UAV will move: COUNTER-CLOCKWISE (positive angle increase)")
-        else:
-            rospy.logwarn(f"    UAV will move: CLOCKWISE (negative angle decrease)")
-        rospy.logwarn("=" * 60)
+        rospy.loginfo(f"Rotation params: ω={math.degrees(angular_velocity):.2f}°/s, radius={initial_radius*1000:.1f}mm")
         
         # CRITICAL FIX: Directly reuse Contact phase trajectory generator state, avoid reinitialization
         contact_state = getattr(userdata, 'trajectory_state', {}) or {}
@@ -2352,49 +2165,27 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 rate.sleep()
                 continue
             
-            # Adopt single UAV calculation method: directly calculate valve rotation angle (no normalize, consistent with single UAV)
-            valve_rotation = abs(current_valve_yaw - initial_valve_yaw)
+            valve_rotation, valve_angular_velocity, updated, last_valve_yaw, last_valve_check_time = \
+                FormationUtils.monitor_valve_rotation(
+                    current_valve_yaw, initial_valve_yaw, last_valve_yaw,
+                    last_valve_check_time, current_time, update_interval=0.2
+                )
             max_valve_rotation_achieved = max(max_valve_rotation_achieved, valve_rotation)
-            rotation_progress = valve_rotation  # Maintain compatibility
+            rotation_progress = valve_rotation
 
-            # Calculate valve angular velocity (fully adopt single UAV logic)
-            valve_angular_velocity = 0.0
-            if current_time > last_valve_check_time + 0.2:  # Update every 200ms
-                dt = current_time - last_valve_check_time
-                valve_angular_velocity = abs(current_valve_yaw - last_valve_yaw) / dt
-                last_valve_yaw = current_valve_yaw
-                last_valve_check_time = current_time
-
-            # DEBUG: Output detailed valve status every 5 seconds (after valve_angular_velocity calculation)
-            if int(elapsed) % 5 == 0 and (elapsed - int(elapsed)) < 0.1:
-                rospy.logwarn("VALVE & CONTACT STATUS DEBUG:")
-                rospy.logwarn(f"  current_valve_yaw: {math.degrees(current_valve_yaw):.2f}°")
-                rospy.logwarn(f"  initial_valve_yaw: {math.degrees(initial_valve_yaw):.2f}°")
-                rospy.logwarn(f"  raw_difference: {math.degrees(current_valve_yaw - initial_valve_yaw):.2f}°")
-                rospy.logwarn(f"  valve_rotation (abs): {math.degrees(valve_rotation):.2f}°")
-                rospy.logwarn(f"  target_rotation: {math.degrees(self.target_rotation):.2f}°")
-                rospy.logwarn(f"  valve_angular_velocity: {math.degrees(valve_angular_velocity):.3f}°/s")
-                
-                # Contact state detection
-                distance_to_valve = math.sqrt((current_pos[0] - valve_pos[0])**2 + 
-                                            (current_pos[1] - valve_pos[1])**2)
-                rospy.logwarn(f"  CONTACT STATUS:")
-                rospy.logwarn(f"    distance_to_valve: {distance_to_valve*1000:.1f}mm")
-                rospy.logwarn(f"    expected_radius: {initial_radius*1000:.1f}mm")
-                if distance_to_valve > initial_radius * 1.2:
-                    rospy.logwarn(f"    CONTACT LOST! UAV too far from valve")
-                elif abs(valve_angular_velocity) < 0.005:
-                    rospy.logwarn(f"    VALVE NOT MOVING! Possibly lost contact")
-                
-                # Detect valve motion stall (improved logic)
-                # Only start detecting stall after running for 5 seconds to ensure stable contact established
-                if elapsed > 5.0:
-                    if valve_angular_velocity < 0.008:  # < 0.5°/s considered stalled (more lenient)
-                        valve_motion_stalled_time += dt
-                    else:
-                        valve_motion_stalled_time = 0.0
+            # Periodic status logging
+            rospy.loginfo_throttle(5.0, f"Rotation: {math.degrees(valve_rotation):.1f}°/{math.degrees(self.target_rotation):.1f}°, "
+                                   f"ω={math.degrees(valve_angular_velocity):.2f}°/s")
+            
+            # Detect valve motion stall (improved logic)
+            # Only start detecting stall after running for 5 seconds to ensure stable contact established
+            if elapsed > 5.0:
+                if valve_angular_velocity < 0.008:  # < 0.5°/s considered stalled (more lenient)
+                    valve_motion_stalled_time += dt
                 else:
-                    valve_motion_stalled_time = 0.0  # 前5秒不检测停滞
+                    valve_motion_stalled_time = 0.0
+            else:
+                valve_motion_stalled_time = 0.0
 
             try:
                 state_info = trajectory_gen.update_state(current_pos, current_yaw, valve_angular_velocity)
@@ -2425,21 +2216,9 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 linear_vel_vec[:2] *= scale_xy
                 rospy.loginfo(f"XY speed further limited: {speed_xy_after:.3f}→{speed_xy_after*scale_xy:.3f}m/s")
 
-            # DEBUG: Output trajectory generator status every 5 seconds
-            if int(elapsed) % 5 == 0 and (elapsed - int(elapsed)) < 0.1:
-                rospy.logwarn("TRAJECTORY DEBUG:")
-                rospy.logwarn(f"  current_pos: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
-                rospy.logwarn(f"  target_pos: [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
-                rospy.logwarn(f"  position_diff: [{target_pos[0]-current_pos[0]:.4f}, {target_pos[1]-current_pos[1]:.4f}, {target_pos[2]-current_pos[2]:.4f}]")
-                rospy.logwarn(f"  current_yaw: {math.degrees(current_yaw):.2f}° -> target_yaw: {math.degrees(target_yaw):.2f}°")
-                rospy.logwarn(f"  linear_vel: [{linear_vel_vec[0]:.4f}, {linear_vel_vec[1]:.4f}, {linear_vel_vec[2]:.4f}] m/s")
-                rospy.logwarn(f"  angular_vel: {target_state.get('angular_velocity', 0.0):.4f} rad/s ({math.degrees(target_state.get('angular_velocity', 0.0)):.2f}°/s)")
-                rospy.logwarn(f"  speed_total: {speed_total:.4f} m/s")
-                
-                # Check trajectory generator internal state
-                if hasattr(trajectory_gen, 'current_angle'):
-                    rospy.logwarn(f"  trajectory_angle: {math.degrees(trajectory_gen.current_angle):.2f}°")
-                    rospy.logwarn(f"  expected_angular_velocity: {math.degrees(trajectory_gen.target_angular_velocity):.2f}°/s")
+            # Periodic trajectory monitoring
+            rospy.logdebug_throttle(5.0, f"Traj: pos_diff=[{target_pos[0]-current_pos[0]:.3f}, {target_pos[1]-current_pos[1]:.3f}, {target_pos[2]-current_pos[2]:.3f}], "
+                                    f"vel={speed_total:.3f}m/s")
 
             self.send_assembly_command_from_end_effector(
                 target_pos,
@@ -2549,36 +2328,39 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         start_assembly_pos = getattr(userdata, 'start_position', None)
         trajectory_state = getattr(userdata, 'trajectory_state', {}) or {}
         
-        # Get current position
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
         if current_pos is None or current_yaw is None:
             rospy.logerr("Unable to get current pose for disengage")
             return 'failed'
         
-        rospy.loginfo(f"Current position: {self._format_vec(current_pos)}, yaw={math.degrees(current_yaw):.1f}°")
+        rospy.loginfo(f"Current: {FormationUtils.format_vec(current_pos)}, yaw={math.degrees(current_yaw):.1f}°")
         
-        # === Phase 1: Reverse circular motion to disengage from valve ===
-        rospy.loginfo("[Phase 1] Reverse circular motion (self-rotation + revolution)")
+        # Phase 1: Reverse circular motion with same radius
+        rospy.loginfo("[Phase 1] Reverse 8° circular motion with same radius")
         
-        # Get rotation parameters from trajectory state
+        # Get rotation parameters
         generator_center = trajectory_state.get('valve_center', valve_pos)
         generator_radius = trajectory_state.get('current_radius')
         if generator_radius is None:
             generator_radius = math.sqrt((current_pos[0] - generator_center[0])**2 +
                                         (current_pos[1] - generator_center[1])**2)
         
-        # Reverse rotation: -15° to disengage
-        reverse_angle = math.radians(15.0)
-        reverse_velocity = -0.05  # Reverse direction, half speed for safety (2.9°/s)
+        # Use same radius (no reduction)
+        disengagement_radius = generator_radius  # Keep radius unchanged
+        if disengagement_radius < 0.01:  # Safety check: minimum 10mm radius
+            disengagement_radius = 0.01
+            rospy.logwarn(f"Radius too small, clamping to minimum 10mm")
         
-        rospy.loginfo(f"Reverse parameters: angle={math.degrees(reverse_angle):.1f}°, "
-                     f"velocity={math.degrees(reverse_velocity):.1f}°/s, radius={generator_radius*1000:.1f}mm")
+        reverse_angle = math.radians(8.0)  # Changed from 5° to 8°
+        reverse_velocity = -0.05  # -2.9°/s (negative for reverse)
+        rospy.loginfo(f"Reverse: {math.degrees(reverse_angle):.1f}° @ {math.degrees(reverse_velocity):.1f}°/s")
+        rospy.loginfo(f"  Radius: {disengagement_radius*1000:.1f}mm (unchanged from contact)")
         
         try:
             reverse_generator = OnlineCircularTrajectoryGenerator(
                 valve_center=generator_center,
-                initial_radius=generator_radius,
+                initial_radius=disengagement_radius,  # Use same radius as contact
                 target_angular_velocity=reverse_velocity,
                 control_rate=25.0
             )
@@ -2614,14 +2396,14 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             rospy.loginfo("Reverse motion completed")
             
         except Exception as e:
-            rospy.logwarn(f"Reverse motion failed: {e}, continuing to next phase")
+            rospy.logwarn(f"Reverse motion failed: {e}, continuing")
         
-        # Stabilize after reverse
+        # Phase 2: Ascend to start height
         rospy.sleep(1.0)
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
         
-        # === Phase 2: Ascend to start height ===
+        # Phase 2: Ascend to start height
         rospy.loginfo("[Phase 2] Ascending to start height")
         
         # Determine target Z height
@@ -2655,7 +2437,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
         
-        # === Phase 3: Return to start XY position ===
+        # Phase 3: Return to start XY position
         rospy.loginfo("[Phase 3] Returning to start XY position")
         
         if start_assembly_pos is not None:
@@ -2708,7 +2490,8 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
                     start_pos=current_pos,
                     target_pos=return_target,
                     target_yaw=0.0,  # Keep yaw locked at 0° during return
-                    num_points=num_points
+                    num_points=num_points,
+                    lock_yaw=True  # ✅ Force all trajectory points to use yaw=0°, prevent oscillation
                 )
                 
                 if trajectory_points:
@@ -2763,20 +2546,8 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         final_pos = self.get_end_effector_position()
         userdata.disengagement_position = final_pos
         
-        rospy.loginfo(f"=== Disengagement complete: {self._format_vec(final_pos)} ===")
+        rospy.loginfo(f"=== Disengagement complete: {FormationUtils.format_vec(final_pos)} ===")
         return 'succeeded'
-    
-    @staticmethod
-    def _format_vec(vec):
-        """Format 3D vector for logging"""
-        if vec is None:
-            return "None"
-        return f"({vec[0]:.3f}, {vec[1]:.3f}, {vec[2]:.3f})"
-    
-    @staticmethod
-    def _normalize_angle(angle):
-        """Normalize angle to [-pi, pi]"""
-        return math.atan2(math.sin(angle), math.cos(angle))
 
 
 # Main execution function

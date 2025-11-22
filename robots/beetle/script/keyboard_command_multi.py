@@ -2,6 +2,7 @@
 
 from __future__ import print_function # for print function in python2
 import sys, select, termios, tty
+import socket
 
 import rospy
 from std_msgs.msg import Empty
@@ -10,17 +11,20 @@ import rosgraph
 from geometry_msgs.msg import PoseStamped
 
 class MultiPublisher:
-    def __init__(self, topic1, topic2, topic3, topic4, data_class, queue_size=1):
-        self.pub1 = rospy.Publisher(topic1, data_class, queue_size=queue_size)
-        self.pub2 = rospy.Publisher(topic2, data_class, queue_size=queue_size)
-        self.pub3 = rospy.Publisher(topic3, data_class, queue_size=queue_size)
-        self.pub4 = rospy.Publisher(topic4, data_class, queue_size=queue_size)
-
+    def __init__(self, topics, data_class, queue_size=1):
+        """
+        Initialize multiple publishers for a list of topics.
+        Args:
+            topics: List of topic names
+            data_class: ROS message class
+            queue_size: Queue size for publishers
+        """
+        self.publishers = [rospy.Publisher(topic, data_class, queue_size=queue_size) for topic in topics]
+    
     def publish(self, msg):
-        self.pub1.publish(msg)
-        self.pub2.publish(msg)
-        self.pub3.publish(msg)
-        self.pub4.publish(msg)
+        """Publish message to all topics."""
+        for pub in self.publishers:
+            pub.publish(msg)
 
 
 msg = """
@@ -58,32 +62,70 @@ def printMsg(msg, msg_len = 50):
 
 if __name__=="__main__":
         settings = termios.tcgetattr(sys.stdin)
-        rospy.init_node("keyboard_command")
-        robot_ns_1 = "beetle1"
-        robot_ns_2 = "beetle2"
-        robot_ns_3 = "beetle3"
-        robot_ns_4 = "beetle4"
-        robot_ns_assemble = "assembly"
+        rospy.init_node("keyboard_command_multi")
+        
+        # Get robot namespaces from parameter
+        robot_namespaces = rospy.get_param("~robot_namespaces", [])
+        
+        # If no parameter is set, try to auto-detect robot namespaces
+        if not robot_namespaces:
+                rospy.loginfo("No robot_namespaces parameter found, attempting auto-detection...")
+                try:
+                        master = rosgraph.Master('/rostopic')
+                        _, subs, _ = master.getSystemState()
+                        
+                        # Find all topics with 'teleop_command/start'
+                        teleop_topics = [topic[0] for topic in subs if 'teleop_command/start' in topic[0]]
+                        
+                        # Extract robot namespaces from topics
+                        robot_namespaces = []
+                        for topic in teleop_topics:
+                                # Extract namespace: /namespace/teleop_command/start -> namespace
+                                ns = topic.split('/teleop_command')[0].strip('/')
+                                if ns and ns not in robot_namespaces:
+                                        robot_namespaces.append(ns)
+                        
+                        if robot_namespaces:
+                                rospy.loginfo("Auto-detected robot namespaces: %s" % str(robot_namespaces))
+                        else:
+                                # If auto-detection fails, use default values
+                                robot_namespaces = ["beetle1", "beetle2", "assembly"]
+                                rospy.logwarn("Auto-detection failed, using default namespaces: %s" % str(robot_namespaces))
+                
+                except socket.error:
+                        rospy.logerr("Unable to communicate with ROS master!")
+                        robot_namespaces = ["beetle1", "beetle2", "assembly"]
+                        rospy.logwarn("Using default namespaces: %s" % str(robot_namespaces))
+        else:
+                rospy.loginfo("Using configured robot namespaces: %s" % str(robot_namespaces))
+        
         print(msg)
 
-        ns_1 = robot_ns_1 + "/teleop_command"
-        ns_2 = robot_ns_2 + "/teleop_command"
-        ns_3 = robot_ns_3 + "/teleop_command"
-        ns_4 = robot_ns_4 + "/teleop_command"
-        ns_assemble = robot_ns_assemble + "/teleop_command"
-        land_pub = MultiPublisher(ns_1 + '/land', ns_2 + '/land', ns_3 + '/land', ns_4 + '/land', Empty, queue_size=1)
-        halt_pub = MultiPublisher(ns_1 + '/halt', ns_2 +'/halt', ns_3 +'/halt', ns_4 + '/halt', Empty, queue_size=1)
-        start_pub = MultiPublisher(ns_1 + '/start', ns_2 + '/start',ns_3 + '/start', ns_4 + '/start', Empty, queue_size=1)
-        takeoff_pub = MultiPublisher(ns_1 + '/takeoff', ns_2 + '/takeoff', ns_3 + '/takeoff', ns_4 + '/takeoff', Empty, queue_size=1)
-        force_landing_pub = MultiPublisher(ns_1 + '/force_landing', ns_2 + '/force_landing', ns_3 + '/force_landing', ns_4 + '/force_landing', Empty, queue_size=1)
-        nav_pub = MultiPublisher(robot_ns_1 + '/uav/nav', robot_ns_2 + '/uav/nav', robot_ns_3 + '/uav/nav', robot_ns_4 + '/uav/nav', FlightNav, queue_size=1)
+        # Build topic lists dynamically based on robot namespaces
+        land_topics = [ns + "/teleop_command/land" for ns in robot_namespaces]
+        halt_topics = [ns + "/teleop_command/halt" for ns in robot_namespaces]
+        start_topics = [ns + "/teleop_command/start" for ns in robot_namespaces]
+        takeoff_topics = [ns + "/teleop_command/takeoff" for ns in robot_namespaces]
+        force_landing_topics = [ns + "/teleop_command/force_landing" for ns in robot_namespaces]
+        nav_topics = [ns + "/uav/nav" for ns in robot_namespaces]
+        
+        # Create multi-publishers
+        land_pub = MultiPublisher(land_topics, Empty, queue_size=1)
+        halt_pub = MultiPublisher(halt_topics, Empty, queue_size=1)
+        start_pub = MultiPublisher(start_topics, Empty, queue_size=1)
+        takeoff_pub = MultiPublisher(takeoff_topics, Empty, queue_size=1)
+        force_landing_pub = MultiPublisher(force_landing_topics, Empty, queue_size=1)
+        nav_pub = MultiPublisher(nav_topics, FlightNav, queue_size=1)
 
-        xy_vel   = rospy.get_param("xy_vel", 0.04)
-        yaw_vel  = rospy.get_param("yaw_vel", 0.02)
-        z_vel = rospy.get_param("z_vel", 0.04)
+        xy_vel   = rospy.get_param("~xy_vel", 0.04)
+        yaw_vel  = rospy.get_param("~yaw_vel", 0.02)
+        z_vel = rospy.get_param("~z_vel", 0.04)
 
-        motion_start_pub   = MultiPublisher('task_start', 'task_start', 'task_start', 'task_start', Empty, queue_size=1)
+        motion_start_pub = MultiPublisher(['task_start'], Empty, queue_size=1)
         current_z_vel = 0.0
+        
+        rospy.loginfo("Keyboard command multi started. Press keys to control %d robots." % len(robot_namespaces))
+        
         try:
                 while(True):
                         nav_msg = FlightNav()

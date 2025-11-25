@@ -31,7 +31,8 @@
   <!-- friction -->
   <xacro:macro name="damping_factor" params="link">
     <gazebo reference="main_body">
-      <dampingFactor>0.00</dampingFactor>
+      <!-- 增加阻尼来抑制漂移，原值0.00 -->
+      <dampingFactor>0.01</dampingFactor>
     </gazebo>
   </xacro:macro>
 
@@ -140,7 +141,8 @@
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
-        <box size="0.3525 0.26 0.092" />
+        <!--Fix the size of collision box -->
+        <box size="0.3525 0.35 0.19" />
       </geometry>
     </collision>
   </link>

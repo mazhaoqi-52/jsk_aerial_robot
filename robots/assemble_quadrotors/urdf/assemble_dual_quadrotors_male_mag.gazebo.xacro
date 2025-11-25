@@ -14,6 +14,10 @@
   <gazebo reference="main_body">
     <mu1>0.1</mu1>
     <mu2>0.1</mu2>
+    <!-- Using damping factor to stop drifting -->
+    <dampingFactor>0.01</dampingFactor>
+    <kp>1000000.0</kp>
+    <kd>1.0</kd>
   </gazebo>
 
   <!-- gazebo plugin for docking mech -->

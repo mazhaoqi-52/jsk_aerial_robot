@@ -350,14 +350,35 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
             target_cog_pos -= cog2cp_tf.getOrigin();
           }
 
+        // ===== DEBUG POINT 1: assemblyNavCallback POS_MODE =====
+        // ROS_WARN_STREAM("[ASSEMBLY-DEBUG-1a] Message received:"
+        //                 << "\n  New target: (" << target_cog_pos.x() << ", " << target_cog_pos.y() << ")"
+        //                 << "\n  Current target_pos_: (" << getTargetPos().x() << ", " << getTargetPos().y() << ")"
+        //                 << "\n  Current target_pos_candidate_: (" << getTargetPosCand().x() << ", " << getTargetPosCand().y() << ")"
+        //                 << "\n  vel_based_waypoint_: " << (vel_based_waypoint_ ? "TRUE" : "FALSE")
+        //                 << "\n  NaviState: " << getNaviState());
+
         tf::Vector3 target_delta = getTargetPos() - target_cog_pos;
         target_delta.setZ(0);
 
+        // ROS_WARN_STREAM("[ASSEMBLY-DEBUG-1b] target_delta calculation:"
+        //                 << "\n  target_delta = (" << target_delta.x() << ", " << target_delta.y() << ")"
+        //                 << "\n  target_delta.length() = " << target_delta.length()
+        //                 << "\n  vel_nav_threshold_ = " << vel_nav_threshold_
+        //                 << "\n  Check: " << target_delta.length() << " > " << vel_nav_threshold_ << " ?");
+
         if(target_delta.length() > vel_nav_threshold_)
           {
+            // ROS_ERROR("[ASSEMBLY-DEBUG-1c] ❌ TRIGGERING vel_based_waypoint_ = TRUE");
+            // ROS_ERROR_STREAM("  Reason: " << target_delta.length() << " > " << vel_nav_threshold_);
             ROS_WARN("start vel nav control for waypoint");
             vel_based_waypoint_ = true;
             xy_control_mode_ = VEL_CONTROL_MODE;
+          }
+        else
+          {
+            // ROS_INFO("[ASSEMBLY-DEBUG-1c] ✅ NOT triggering vel_based_waypoint_");
+            // ROS_INFO_STREAM("  Reason: " << target_delta.length() << " <= " << vel_nav_threshold_);
           }
 
         if(!vel_based_waypoint_)
@@ -365,6 +386,11 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
 
         setTargetPosCandX(target_cog_pos.x());
         setTargetPosCandY(target_cog_pos.y());
+
+        // ROS_WARN_STREAM("[ASSEMBLY-DEBUG-1d] After setTargetPosCand:"
+        //                 << "\n  target_pos_candidate_ = (" << getTargetPosCand().x() << ", " << getTargetPosCand().y() << ")"
+        //                 << "\n  target_pos_ = (" << getTargetPos().x() << ", " << getTargetPos().y() << ")"
+        //                 << "\n  vel_based_waypoint_ = " << (vel_based_waypoint_ ? "TRUE" : "FALSE"));
 
         setTargetVelX(0);
         setTargetVelY(0);
@@ -590,11 +616,26 @@ void BeetleNavigator::convertTargetPosFromCoG2CoM()
   tf::Vector3 target_cog_pos = getTargetPosCand();
   target_cog_pos -=  com_conversion;
 
+  // ===== DEBUG POINT 2: convertTargetPosFromCoG2CoM =====
+  // ROS_WARN_STREAM("[COG2COM-DEBUG-2a] convertTargetPosFromCoG2CoM called:"
+  //                 << "\n  NaviState: " << getNaviState() << " (HOVER=" << HOVER_STATE << ", TAKEOFF=" << TAKEOFF_STATE << ")"
+  //                 << "\n  target_pos_candidate_: (" << getTargetPosCand().x() << ", " << getTargetPosCand().y() << ")"
+  //                 << "\n  target_cog_pos (after CoM): (" << target_cog_pos.x() << ", " << target_cog_pos.y() << ")"
+  //                 << "\n  Current target_pos_: (" << getTargetPos().x() << ", " << getTargetPos().y() << ")");
+
   if( getNaviState() == HOVER_STATE ||
       getNaviState() == TAKEOFF_STATE){
+    // ROS_INFO("[COG2COM-DEBUG-2b] ✅ NaviState check PASSED, updating target_pos_");
     setTargetPosX(target_cog_pos.x());
     setTargetPosY(target_cog_pos.y());
     setTargetPosZ(target_cog_pos.z());
+    
+    // ROS_INFO_STREAM("[COG2COM-DEBUG-2c] After setTargetPos:"
+  //                   << "\n  target_pos_ = (" << getTargetPos().x() << ", " << getTargetPos().y() << ")");
+  // } else {
+    // ROS_ERROR("[COG2COM-DEBUG-2b] ❌ NaviState check FAILED, NOT updating target_pos_");
+    // ROS_ERROR_STREAM("  Current NaviState: " << getNaviState()
+  //                    << " (expected HOVER=" << HOVER_STATE << " or TAKEOFF=" << TAKEOFF_STATE << ")");
   }
 
   pre_target_pos_.setX(target_cog_pos.x());

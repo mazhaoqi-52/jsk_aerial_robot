@@ -89,5 +89,53 @@
     </include>
   </group>
 
+  <!-- for 6th Beetle -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 5)">
+    <include file="$(find beetle)/launch/bringup.launch">
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[5])"/>
+      <arg name="real_machine"  value="false"/>
+      <arg name="simulation"    value="true"/>
+      <arg name="headless"      value="$(arg headless)"/>
+      <arg name="launch_gazebo" value="false"/>
+      <arg name="estimate_mode" value="1"/>
+      <arg name="spawn_x"       value="$(eval ( (5 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-5)*float(arg('dx')) ))"/>
+      <arg name="spawn_y"       value="$(arg spawn_y)"/>
+      <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 6)"/>
+    </include>
+  </group>
+
+  <!-- for 7th Beetle -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 6)">
+    <include file="$(find beetle)/launch/bringup.launch">
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[6])"/>
+      <arg name="real_machine"  value="false"/>
+      <arg name="simulation"    value="true"/>
+      <arg name="headless"      value="$(arg headless)"/>
+      <arg name="launch_gazebo" value="false"/>
+      <arg name="estimate_mode" value="1"/>
+      <arg name="spawn_x"       value="$(eval ( (6 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-6)*float(arg('dx')) ))"/>
+      <arg name="spawn_y"       value="$(arg spawn_y)"/>
+      <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 7)"/>
+    </include>
+  </group>
+
+  <!-- for 8th Beetle -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 7)">
+    <include file="$(find beetle)/launch/bringup.launch">
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[7])"/>
+      <arg name="real_machine"  value="false"/>
+      <arg name="simulation"    value="true"/>
+      <arg name="headless"      value="$(arg headless)"/>
+      <arg name="launch_gazebo" value="false"/>
+      <arg name="estimate_mode" value="1"/>
+      <arg name="spawn_x"       value="$(eval ( (7 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-7)*float(arg('dx')) ))"/>
+      <arg name="spawn_y"       value="$(arg spawn_y)"/>
+      <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
+      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 8)"/>
+    </include>
+  </group>
+
 <!-- just copy more Beetle as needed -->
 </launch>

@@ -851,6 +851,7 @@ void BeetleNavigator::rosParamInit()
 {
   ros::NodeHandle nh(nh_, "navigation");
   getParam<double>(nh, "max_target_roll_pitch_rate", max_target_roll_pitch_rate_, 0.0);
+  getParam<int>(nh, "max_modules_num", max_modules_num_, 8);
   GimbalrotorNavigator::rosParamInit();
 
   nh_.getParam("robot_id", my_id_);

@@ -23,7 +23,6 @@ sys.path.insert(0, os.path.join(current_dir, '../..'))
 sys.path.insert(0, os.path.join(current_dir, '..'))
 sys.path.insert(0, current_dir)
 
-from task.assembly_motion import AssemblyDemo
 from n_modules_tf import NModuleTFCalculator
 from valve_rotation_fang_single import (
     SingleUAVStateBase, 
@@ -341,36 +340,54 @@ class FormationAdapter:
             return False
 
 
-class FormationAssembleState(smach.State):
-    """Execute physical assembly of two UAVs"""
+class FormationTakeoffState(smach.State):
+    """
+    Wait for formation ready and takeoff (ground assembly already completed).
+    This replaces FormationAssembleState as the assembly is done manually on ground.
+    """
     
     def __init__(self):
         smach.State.__init__(self, outcomes=['succeeded', 'failed'])
         
         modules_str = rospy.get_param("~module_ids", "1,2")
-        real_machine = rospy.get_param("~real_machine", False)
-        modules = []
+        self.modules = []
         if modules_str:
-            modules = [int(x) for x in modules_str.split(',')]
+            self.modules = [int(x) for x in modules_str.split(',')]
         else:
             rospy.logerr("No module ID is designated!")
         
-        rospy.loginfo(f"Formation assembly configured for modules: {modules}, real_machine: {real_machine}")
+        rospy.loginfo(f"FormationTakeoffState configured for modules: {self.modules}")
+        rospy.loginfo("Ground assembly assumed complete - will wait for position data and takeoff")
         
-        self.assemble_demo = AssemblyDemo(module_ids=modules, real_machine=real_machine)
-        rospy.loginfo("Assembly demo loaded from task.assembly_motion")
+        # Formation adapter to wait for position data
+        self.formation_adapter = FormationAdapter(modules_str)
     
     def execute(self, userdata):
-        rospy.loginfo("=== ASSEMBLING UAVs ===")
+        rospy.loginfo("=== FORMATION TAKEOFF (Ground Assembly Complete) ===")
+        rospy.loginfo("Waiting for all UAV positions to be received...")
+        
         try:
-            self.assemble_demo.main()
-            rospy.loginfo("Assembly completed successfully")
+            # Wait for formation position data to be ready
+            if not self.formation_adapter.wait_for_formation_ready(timeout=30.0):
+                rospy.logerr("Timeout waiting for formation position data")
+                return 'failed'
+            
+            rospy.loginfo("✓ All UAV positions received")
+            rospy.loginfo(f"Assembly CoG position: {self.formation_adapter.get_assembly_position()}")
+            rospy.loginfo(f"Assembly yaw: {self.formation_adapter.get_assembly_yaw():.3f} rad")
+            
+            # Give a brief moment for the system to stabilize
+            rospy.loginfo("System ready for flight operations")
+            rospy.sleep(1.0)
+            
+            rospy.loginfo("Formation takeoff state completed successfully")
             return 'succeeded'
+            
         except rospy.ROSInterruptException:
-            rospy.logerr("Assembly process interrupted")
+            rospy.logerr("Takeoff state interrupted")
             return 'failed'
         except Exception as e:
-            rospy.logerr(f"Assembly process failed: {e}")
+            rospy.logerr(f"Takeoff state failed: {e}")
             return 'failed'
 
 
@@ -2595,9 +2612,9 @@ def main():
         sm = smach.StateMachine(outcomes=['success', 'failure'])
         
         with sm:
-            # Step 1: Assemble the formation (physical connection)
-            smach.StateMachine.add('FORMATION_ASSEMBLE',
-                                   FormationAssembleState(),
+            # Step 1: Wait for formation ready and prepare for takeoff (ground assembly already done)
+            smach.StateMachine.add('FORMATION_TAKEOFF',
+                                   FormationTakeoffState(),
                                    transitions={'succeeded': 'FORMATION_INITIALIZE',
                                                'failed': 'failure'})
             

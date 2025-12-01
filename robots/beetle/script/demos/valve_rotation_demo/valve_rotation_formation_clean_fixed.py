@@ -433,19 +433,27 @@ class FormationSingleUAVStateBase(smach.State):
     def get_end_effector_yaw(self):
         return self.formation_adapter.get_end_effector_yaw()
     
-    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, adjustment_pos_thresh=None):
+    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, adjustment_pos_thresh=None, yaw_adjustment_thresh=None):
         """Formation-style active convergence with trajectory decomposition
         
         Args:
             pos_thresh: Convergence success threshold (default: 25mm)
             adjustment_pos_thresh: Threshold to trigger position adjustment (default: same as pos_thresh)
                                    Smaller value = more aggressive correction
+            yaw_thresh: Yaw convergence success threshold (for determining if converged)
+            yaw_adjustment_thresh: Threshold to trigger yaw adjustment (default: 0.5°)
+                                   Smaller value = more aggressive yaw correction
         """
         start_time = rospy.get_time()
         
         # Dual-threshold: adjustment_pos_thresh triggers correction, pos_thresh determines success
         if adjustment_pos_thresh is None:
             adjustment_pos_thresh = pos_thresh
+        
+        # Dual-threshold for yaw: yaw_adjustment_thresh triggers correction, yaw_thresh determines success
+        # Default: adjust when yaw error > 0.5° (0.00873 rad)
+        if yaw_adjustment_thresh is None:
+            yaw_adjustment_thresh = 0.00873  # 0.5 degrees - always actively correct yaw
         
         current_pos = self.get_end_effector_position()
         if current_pos is None:
@@ -517,7 +525,8 @@ class FormationSingleUAVStateBase(smach.State):
         required_consecutive = 8
         
         rospy.loginfo(f"Active convergence: target={FormationUtils.format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f}°, "
-                      f"conv_thresh={pos_thresh*1000:.1f}mm, adj_thresh={adjustment_pos_thresh*1000:.1f}mm, yaw_thresh={math.degrees(yaw_thresh):.1f}°")
+                      f"conv_thresh={pos_thresh*1000:.1f}mm, adj_thresh={adjustment_pos_thresh*1000:.1f}mm, "
+                      f"yaw_thresh={math.degrees(yaw_thresh):.1f}°, yaw_adj_thresh={math.degrees(yaw_adjustment_thresh):.1f}°")
         
         while rospy.get_time() - start_time < timeout:
             current_pos = self.get_end_effector_position()
@@ -533,10 +542,12 @@ class FormationSingleUAVStateBase(smach.State):
             pos_error = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
             yaw_error = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
             
-            # Dual-threshold: converged_ok for success, needs_adjustment for correction
+            # Dual-threshold for position: converged_ok for success, needs_adjustment for correction
             converged_ok = pos_error < pos_thresh
             needs_adjustment = pos_error >= adjustment_pos_thresh
-            yaw_ok = yaw_error < yaw_thresh
+            # Dual-threshold for yaw: yaw_ok for success判定, yaw_needs_adjustment for correction
+            yaw_ok = yaw_error < yaw_thresh  # Success判定: 8° (relaxed)
+            yaw_needs_adjustment = yaw_error >= yaw_adjustment_thresh  # Adjustment trigger: 0.5° (aggressive)
             
             if converged_ok and yaw_ok:
                 consecutive_good_readings += 1
@@ -546,8 +557,8 @@ class FormationSingleUAVStateBase(smach.State):
             else:
                 consecutive_good_readings = 0
             
-            # Only apply adjustment if position needs correction OR yaw is not ok
-            if needs_adjustment or not yaw_ok:
+            # Apply adjustment if position needs correction OR yaw needs adjustment (>0.5°)
+            if needs_adjustment or yaw_needs_adjustment:
                 command_yaw = target_yaw
                 if max_yaw_step is not None and max_yaw_step > 0.0:
                     yaw_delta = FormationUtils.normalize_angle(target_yaw - current_yaw)
@@ -759,7 +770,9 @@ class FormationSingleUAVStateBase(smach.State):
             # Dual-threshold: 30mm triggers adjustment, 80mm for convergence success
             step_pos_thresh = 0.080
             step_adjustment_thresh = 0.030
-            step_yaw_thresh = 0.087
+            # Relaxed yaw threshold for Z descent: formation has coupling effects during descent
+            # Changed from 0.087 (5°) to 0.14 (~8°) to accommodate yaw drift during Z motion
+            step_yaw_thresh = 0.14
             is_final_step = current_z <= target_z + 1e-4 or remaining_descent <= step_size + 1e-6
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3

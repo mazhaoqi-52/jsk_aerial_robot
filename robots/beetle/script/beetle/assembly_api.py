@@ -486,7 +486,7 @@ class AssemblyState(smach.State):
                 link_attacher.attach_links()
             except rospy.ServiceException:
                 rospy.loginfo("Attacher failed")        
-        rospy.sleep(4.0)
+        rospy.sleep(2.0)
 
         return 'done'
 

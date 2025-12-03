@@ -87,7 +87,7 @@ def validate_module_ids(module_ids_str):
     return True, module_ids
 
 
-def create_n_module_state_machine(module_ids_str):
+def create_n_module_state_machine(module_ids_str, rotation_direction=1):
     """
     Create SMACH state machine for n-module valve rotation task
     
@@ -97,6 +97,7 @@ def create_n_module_state_machine(module_ids_str):
     
     Args:
         module_ids_str (str): Comma-separated module IDs
+        rotation_direction (int): 1 for counter-clockwise, -1 for clockwise
         
     Returns:
         smach.StateMachine: Configured state machine
@@ -184,7 +185,7 @@ def create_n_module_state_machine(module_ids_str):
         # State 4: Contact and rotate valve (unified state)
         smach.StateMachine.add(
             'ROTATE_VALVE',
-            FormationRotateValveState(rotation_direction=1),
+            FormationRotateValveState(rotation_direction=rotation_direction),
             transitions={
                 'succeeded': 'WAIT_AFTER_ROTATE',
                 'failed': 'mission_failed',
@@ -267,7 +268,22 @@ def main():
     real_machine = rospy.get_param("~real_machine", False)
     simulation = rospy.get_param("~simulation", True)
     
+    # Get rotation direction parameter
+    direction_param = rospy.get_param("~valve_rotation_direction", "counterclockwise")
+    direction_normalized = direction_param.strip().lower()
+    if direction_normalized in ["clockwise", "cw"]:
+        rotation_direction = -1
+        direction_label = "Clockwise"
+    elif direction_normalized in ["counterclockwise", "counter-clockwise", "ccw"]:
+        rotation_direction = 1
+        direction_label = "Counter-clockwise"
+    else:
+        rotation_direction = 1
+        direction_label = f"Counter-clockwise (fallback for '{direction_param}')"
+        rospy.logwarn(f"Unknown valve rotation direction '{direction_param}', defaulting to counter-clockwise")
+    
     rospy.loginfo(f"  Rotation angle: {rotation_angle:.3f} rad ({rotation_angle * 180 / 3.14159:.1f}°)")
+    rospy.loginfo(f"  Rotation direction: {direction_label}")
     rospy.loginfo(f"  Approach height: {approach_height:.3f} m")
     rospy.loginfo(f"  Real machine: {real_machine}")
     rospy.loginfo(f"  Simulation: {simulation}")
@@ -305,7 +321,7 @@ def main():
     # Create and execute state machine
     try:
         rospy.loginfo("Creating SMACH state machine...")
-        sm = create_n_module_state_machine(module_ids_str)
+        sm = create_n_module_state_machine(module_ids_str, rotation_direction)
         
         rospy.loginfo("State machine created successfully")
         rospy.loginfo("State sequence (with 3s waits) - Ground assembly workflow:")

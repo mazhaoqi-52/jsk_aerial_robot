@@ -8,6 +8,7 @@
   <arg name="module_ids" default="1,2" />
   <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
   <arg name="approach_height" default="0.48" /> <!-- Adjusted for end-effector offset compensation -->
+  <arg name="valve_rotation_direction" default="counterclockwise" /> <!-- clockwise/cw or counterclockwise/ccw -->
   
   <!-- Valve parameters -->
   <arg name="valve_ns" default="valve"/>
@@ -55,5 +56,6 @@
     <param name="simulation" value="$(arg simulation)" />
     <param name="real_machine" value="$(arg real_machine)" />
     <param name="debug" value="$(arg debug)" />
+    <param name="valve_rotation_direction" value="$(arg valve_rotation_direction)" />
   </node>
 </launch>

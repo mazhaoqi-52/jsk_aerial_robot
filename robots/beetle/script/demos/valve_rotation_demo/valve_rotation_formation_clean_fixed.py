@@ -788,13 +788,35 @@ class FormationSingleUAVStateBase(smach.State):
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3
 
-            # Unified descent speed strategy - proven 0.036 m/s works well for all steps
-            effective_descent_speed = max(0.03, descent_speed * 0.3)
-            linear_vel = [0.0, 0.0, -effective_descent_speed]
+            rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm")
 
-            rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm, speed={effective_descent_speed:.3f}m/s")
-
-            self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=linear_vel, angular_vel=0.0)
+            # NEW STRATEGY: Two-phase approach to prevent oscillation
+            # Phase A: Stabilize XY first at current Z (if needed)
+            # Phase B: Descend to target Z while maintaining XY
+            
+            current_ee_pos = self.get_end_effector_position()
+            if current_ee_pos is not None:
+                xy_offset = math.sqrt((current_ee_pos[0] - step_target[0])**2 + (current_ee_pos[1] - step_target[1])**2)
+                
+                # Phase A: If XY error > 20mm, stabilize XY first at current Z
+                if xy_offset > 0.020:
+                    xy_stable_target = [step_target[0], step_target[1], current_ee_pos[2]]
+                    # Send zero-velocity position command to stabilize
+                    self.send_assembly_command_from_end_effector(xy_stable_target, final_yaw, linear_vel=[0.0, 0.0, 0.0], angular_vel=0.0)
+                    
+                    # Brief convergence for XY only (faster, just reduce the offset)
+                    xy_converged = self.active_position_convergence(
+                        target_pos=xy_stable_target,
+                        target_yaw=final_yaw,
+                        pos_thresh=0.025,  # 25mm XY threshold
+                        yaw_thresh=step_yaw_thresh,
+                        timeout=2.0,  # Short timeout for XY stabilization
+                        adjustment_pos_thresh=0.020
+                    )
+            
+            # Phase B: Now descend to target Z (XY should be stable)
+            # Send position command WITHOUT velocity - let convergence handle it smoothly
+            self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=[0.0, 0.0, 0.0], angular_vel=0.0)
 
             # Extended timeout for final steps (keep longer timeout, but remove max_pos_step restriction)
             if is_final_step or is_second_last_step or is_third_last_step:
@@ -1375,6 +1397,10 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.logerr("Phase 3B failed")
             return 'failed'
         rospy.loginfo("Phase 3B complete: Spoke alignment achieved")
+
+        # Stabilization before Z descent to reduce pitch oscillation
+        rospy.loginfo("[Pre-Descent] Stabilizing 2s before Z descent...")
+        rospy.sleep(2.0)
 
         # PHASE 4: Z DESCENT TO OPTIMIZER HEIGHT
         final_target_pos = (safe_ee_pos[0], safe_ee_pos[1], safe_ee_pos[2])
@@ -2015,7 +2041,8 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                     'current_radius': self.contact_radius,
                     'current_angle': getattr(self, 'contact_angle', 0),
                     'radius_locked': True,
-                    'valve_center': self.valve_center
+                    'valve_center': self.valve_center,
+                    'rotation_direction': self.rotation_direction
                 }
                 userdata.contact_final_torque = [0.0, 0.0, 0.1]
                 
@@ -2407,8 +2434,8 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"Start EE (saved): {FormationUtils.format_vec(start_ee_pos)}")
         rospy.loginfo(f"Start Assembly (saved): {FormationUtils.format_vec(start_assembly_pos)}")
         
-        # Phase 1: Reverse circular motion with same radius
-        rospy.loginfo("[Phase 1] Reverse 8° circular motion with same radius")
+        # Phase 1: Reverse circular motion to disengage from valve
+        rospy.loginfo("[Phase 1] Reverse 15° circular motion to disengage")
         
         # Get rotation parameters
         generator_center = trajectory_state.get('valve_center', valve_pos)
@@ -2417,21 +2444,22 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             generator_radius = math.sqrt((current_pos[0] - generator_center[0])**2 +
                                         (current_pos[1] - generator_center[1])**2)
         
-        # Use same radius (no reduction)
-        disengagement_radius = generator_radius  # Keep radius unchanged
-        if disengagement_radius < 0.01:  # Safety check: minimum 10mm radius
-            disengagement_radius = 0.01
-            rospy.logwarn(f"Radius too small, clamping to minimum 10mm")
+        disengagement_radius = max(generator_radius, 0.01)  # Minimum 10mm radius
         
-        reverse_angle = math.radians(8.0)  # Changed from 5° to 8°
-        reverse_velocity = -0.05  # -2.9°/s (negative for reverse)
-        rospy.loginfo(f"Reverse: {math.degrees(reverse_angle):.1f}° @ {math.degrees(reverse_velocity):.1f}°/s")
-        rospy.loginfo(f"  Radius: {disengagement_radius*1000:.1f}mm (unchanged from contact)")
+        # Reverse direction: opposite to rotation direction
+        rotation_direction = trajectory_state.get('rotation_direction', 1)
+        reverse_angle = math.radians(25.0)  # 25° reverse to fully disengage
+        # For clockwise rotation (direction=-1), reverse should be counterclockwise (positive velocity)
+        # For counterclockwise rotation (direction=+1), reverse should be clockwise (negative velocity)
+        # So: reverse_velocity = -rotation_direction * speed
+        reverse_velocity = -rotation_direction * 0.033  # Opposite to rotation direction, ~1.9°/s (1/3 faster)
+        rospy.loginfo(f"Reverse: {math.degrees(reverse_angle):.1f}° @ {math.degrees(reverse_velocity):.1f}°/s, radius={disengagement_radius*1000:.1f}mm")
+        rospy.loginfo(f"  rotation_direction={rotation_direction}, reverse is {'CCW(+)' if reverse_velocity > 0 else 'CW(-)'}")
         
         try:
             reverse_generator = OnlineCircularTrajectoryGenerator(
                 valve_center=generator_center,
-                initial_radius=disengagement_radius,  # Use same radius as contact
+                initial_radius=disengagement_radius,
                 target_angular_velocity=reverse_velocity,
                 control_rate=25.0
             )
@@ -2466,46 +2494,81 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             
             rospy.loginfo("Reverse motion completed")
             
+            # CRITICAL: Send stop command to prevent continued rotation
+            final_pos = self.get_end_effector_position()
+            final_yaw = self.get_end_effector_yaw()
+            if final_pos is not None and final_yaw is not None:
+                rospy.loginfo("[Phase 1] Sending stop command to lock position")
+                # Send zero velocity command to halt motion
+                for _ in range(5):  # Send multiple times to ensure it's received
+                    self.send_assembly_command_from_end_effector(
+                        final_pos,
+                        final_yaw,
+                        linear_vel=[0.0, 0.0, 0.0],
+                        angular_vel=0.0
+                    )
+                    rospy.sleep(0.04)
+            
+            # Phase 1.5: Radial retreat - move 15mm away from valve center
+            rospy.loginfo("[Phase 1.5] Radial retreat 15mm from valve center")
+            current_pos = self.get_end_effector_position()
+            if current_pos is not None:
+                # Calculate radial direction (from valve center to current position)
+                dx = current_pos[0] - generator_center[0]
+                dy = current_pos[1] - generator_center[1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                if dist > 0.001:  # Avoid division by zero
+                    # Normalize and scale to 20mm retreat
+                    retreat_dist = 0.020  # 20mm
+                    retreat_x = current_pos[0] + (dx / dist) * retreat_dist
+                    retreat_y = current_pos[1] + (dy / dist) * retreat_dist
+                    retreat_target = (retreat_x, retreat_y, current_pos[2])
+                    
+                    rospy.loginfo(f"  Radial direction: ({dx/dist:.3f}, {dy/dist:.3f})")
+                    rospy.loginfo(f"  Retreat target: {FormationUtils.format_vec(retreat_target)}")
+                    
+                    # Execute radial retreat with convergence
+                    self.active_position_convergence(
+                        target_pos=retreat_target,
+                        target_yaw=final_yaw,
+                        pos_thresh=0.020,
+                        yaw_thresh=0.1,
+                        timeout=3.0
+                    )
+                    rospy.loginfo("[Phase 1.5] Radial retreat completed")
+            
         except Exception as e:
             rospy.logwarn(f"Reverse motion failed: {e}, continuing")
         
         # Phase 2: Ascend to start height
-        rospy.sleep(1.0)
+        rospy.loginfo("[Phase 1→2] Stabilizing before ascent...")
+        rospy.sleep(1.5)  # Increased stabilization time
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
         
-        # Phase 2: Ascend to start height
-        rospy.loginfo("[Phase 2] Ascending to start height")
+        # Phase 2: Step-by-step ascent (15mm per step) to avoid pitch instability
+        rospy.loginfo("[Phase 2] Step-by-step ascent to start height")
         
-        # Determine target Z height using end-effector coordinate (fixed: was using assembly CoG)
         if start_ee_pos is not None:
             target_z = start_ee_pos[2] + 0.1  # 10cm above start EE position
-            rospy.loginfo(f"[Phase 2] Using start_ee_pos Z={start_ee_pos[2]:.3f}m as reference")
         else:
             target_z = current_pos[2] + 0.15  # 15cm up as fallback
-            rospy.logwarn("[Phase 2] start_ee_pos not available, using fallback +15cm")
         
-        ascent_target = (current_pos[0], current_pos[1], target_z)
-        z_distance = abs(target_z - current_pos[2])
-        rospy.loginfo(f"Ascending to Z={target_z:.3f}m (distance: {z_distance*1000:.1f}mm)")
-        rospy.loginfo(f"[Phase 2] Ascent with XY locked at ({current_pos[0]:.3f}, {current_pos[1]:.3f})")
+        z_distance = target_z - current_pos[2]
+        rospy.loginfo(f"[Phase 2] Ascending {z_distance*1000:.1f}mm in 15mm steps, XY locked")
         
-        # Use direct convergence with very slow speed and locked XY position
-        # Simpler and more reliable than polynomial trajectory for pure vertical motion
-        rospy.loginfo("[Phase 2] Using slow vertical convergence (XY locked)")
-        success = self.active_position_convergence(
-            ascent_target,
-            target_yaw=current_yaw,  # Maintain current yaw during ascent
-            pos_thresh=0.05,         # 50mm threshold
-            yaw_thresh=0.1,          # 5.7° yaw tolerance (not critical during ascent)
-            timeout=30.0,
-            max_linear_vel=0.033,    # Ascent speed: 33mm/s (reduced from 50mm/s)
-            max_angular_vel=0.02     # Minimal rotation during ascent
-        )
+        step_size = 0.015  # 15mm per step (was 20mm)
+        locked_xy = (current_pos[0], current_pos[1])
+        current_z = current_pos[2]
         
-        if not success:
-            rospy.logwarn("Ascent convergence incomplete, but continuing")
+        while current_z < target_z and not rospy.is_shutdown():
+            current_z = min(current_z + step_size, target_z)
+            step_target = (locked_xy[0], locked_xy[1], current_z)
+            # Slower ascent: 20mm/s (was 30mm/s), longer wait
+            self.send_assembly_command_from_end_effector(step_target, current_yaw, linear_vel=[0, 0, 0.02])
+            rospy.sleep(0.35)  # Longer wait for stabilization (was 0.25)
         
+        rospy.loginfo("[Phase 2] Ascent complete")
         rospy.sleep(1.0)
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()

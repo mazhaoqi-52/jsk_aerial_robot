@@ -788,35 +788,13 @@ class FormationSingleUAVStateBase(smach.State):
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3
 
-            rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm")
+            # Unified descent speed strategy - proven 0.036 m/s works well for all steps
+            effective_descent_speed = max(0.03, descent_speed * 0.3)
+            linear_vel = [0.0, 0.0, -effective_descent_speed]
 
-            # NEW STRATEGY: Two-phase approach to prevent oscillation
-            # Phase A: Stabilize XY first at current Z (if needed)
-            # Phase B: Descend to target Z while maintaining XY
-            
-            current_ee_pos = self.get_end_effector_position()
-            if current_ee_pos is not None:
-                xy_offset = math.sqrt((current_ee_pos[0] - step_target[0])**2 + (current_ee_pos[1] - step_target[1])**2)
-                
-                # Phase A: If XY error > 20mm, stabilize XY first at current Z
-                if xy_offset > 0.020:
-                    xy_stable_target = [step_target[0], step_target[1], current_ee_pos[2]]
-                    # Send zero-velocity position command to stabilize
-                    self.send_assembly_command_from_end_effector(xy_stable_target, final_yaw, linear_vel=[0.0, 0.0, 0.0], angular_vel=0.0)
-                    
-                    # Brief convergence for XY only (faster, just reduce the offset)
-                    xy_converged = self.active_position_convergence(
-                        target_pos=xy_stable_target,
-                        target_yaw=final_yaw,
-                        pos_thresh=0.025,  # 25mm XY threshold
-                        yaw_thresh=step_yaw_thresh,
-                        timeout=2.0,  # Short timeout for XY stabilization
-                        adjustment_pos_thresh=0.020
-                    )
-            
-            # Phase B: Now descend to target Z (XY should be stable)
-            # Send position command WITHOUT velocity - let convergence handle it smoothly
-            self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=[0.0, 0.0, 0.0], angular_vel=0.0)
+            rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm, speed={effective_descent_speed:.3f}m/s")
+
+            self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=linear_vel, angular_vel=0.0)
 
             # Extended timeout for final steps (keep longer timeout, but remove max_pos_step restriction)
             if is_final_step or is_second_last_step or is_third_last_step:
@@ -2546,7 +2524,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
         
-        # Phase 2: Step-by-step ascent (15mm per step) to avoid pitch instability
+        # Phase 2: Step-by-step ascent (20mm per step) to avoid pitch instability
         rospy.loginfo("[Phase 2] Step-by-step ascent to start height")
         
         if start_ee_pos is not None:
@@ -2555,18 +2533,17 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             target_z = current_pos[2] + 0.15  # 15cm up as fallback
         
         z_distance = target_z - current_pos[2]
-        rospy.loginfo(f"[Phase 2] Ascending {z_distance*1000:.1f}mm in 15mm steps, XY locked")
+        rospy.loginfo(f"[Phase 2] Ascending {z_distance*1000:.1f}mm in 20mm steps, XY locked")
         
-        step_size = 0.015  # 15mm per step (was 20mm)
+        step_size = 0.02  # 20mm per step
         locked_xy = (current_pos[0], current_pos[1])
         current_z = current_pos[2]
         
         while current_z < target_z and not rospy.is_shutdown():
             current_z = min(current_z + step_size, target_z)
             step_target = (locked_xy[0], locked_xy[1], current_z)
-            # Slower ascent: 20mm/s (was 30mm/s), longer wait
-            self.send_assembly_command_from_end_effector(step_target, current_yaw, linear_vel=[0, 0, 0.02])
-            rospy.sleep(0.35)  # Longer wait for stabilization (was 0.25)
+            self.send_assembly_command_from_end_effector(step_target, current_yaw, linear_vel=[0, 0, 0.03])
+            rospy.sleep(0.25)  # Wait for stabilization
         
         rospy.loginfo("[Phase 2] Ascent complete")
         rospy.sleep(1.0)

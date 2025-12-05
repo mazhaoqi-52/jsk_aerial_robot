@@ -87,7 +87,7 @@ def validate_module_ids(module_ids_str):
     return True, module_ids
 
 
-def create_n_module_state_machine(module_ids_str, rotation_direction=1):
+def create_n_module_state_machine(module_ids_str, rotation_direction=1, rotation_angle=1.571):
     """
     Create SMACH state machine for n-module valve rotation task
     
@@ -98,6 +98,7 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1):
     Args:
         module_ids_str (str): Comma-separated module IDs
         rotation_direction (int): 1 for counter-clockwise, -1 for clockwise
+        rotation_angle (float): Target valve rotation angle in radians (default: 90°)
         
     Returns:
         smach.StateMachine: Configured state machine
@@ -170,8 +171,8 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1):
             remapping={
                 'valve_position': 'valve_position',
                 'valve_yaw': 'valve_yaw',
-                'phase4_contact_pose': 'phase4_contact_pose',
-                'phase4_contact_yaw': 'phase4_contact_yaw'
+                'insertion_contact_pose': 'insertion_contact_pose',
+                'insertion_contact_yaw': 'insertion_contact_yaw'
             }
         )
         
@@ -185,7 +186,7 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1):
         # State 4: Contact and rotate valve (unified state)
         smach.StateMachine.add(
             'ROTATE_VALVE',
-            FormationRotateValveState(rotation_direction=rotation_direction),
+            FormationRotateValveState(rotation_direction=rotation_direction, target_rotation=rotation_angle),
             transitions={
                 'succeeded': 'WAIT_AFTER_ROTATE',
                 'failed': 'mission_failed',
@@ -194,8 +195,8 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1):
             remapping={
                 'valve_position': 'valve_position',
                 'valve_yaw': 'valve_yaw',
-                'phase4_contact_pose': 'phase4_contact_pose',
-                'phase4_contact_yaw': 'phase4_contact_yaw',
+                'insertion_contact_pose': 'insertion_contact_pose',
+                'insertion_contact_yaw': 'insertion_contact_yaw',
                 'trajectory_state': 'trajectory_state',
                 'contact_final_torque': 'contact_final_torque'
             }
@@ -321,7 +322,7 @@ def main():
     # Create and execute state machine
     try:
         rospy.loginfo("Creating SMACH state machine...")
-        sm = create_n_module_state_machine(module_ids_str, rotation_direction)
+        sm = create_n_module_state_machine(module_ids_str, rotation_direction, rotation_angle)
         
         rospy.loginfo("State machine created successfully")
         rospy.loginfo("State sequence (with 3s waits) - Ground assembly workflow:")

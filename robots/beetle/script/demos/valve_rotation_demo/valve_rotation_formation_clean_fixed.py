@@ -42,21 +42,21 @@ class WaitState(smach.State):
     Provides smooth transitions and better observability for state machine execution.
     
     Args:
-        wait_time (float): Duration to wait in seconds (default: 3.0)
+        wait_time (float): Duration to wait in seconds (default: 1.0)
         state_name (str): Name of the next state for logging purposes
     
     Outcomes:
         succeeded: Always returns after wait completes
     
     Example:
-        # Add 3 second wait before INITIALIZE state
+        # Add 1 second wait before INITIALIZE state
         smach.StateMachine.add(
             'WAIT_BEFORE_INIT',
-            WaitState(wait_time=3.0, state_name="INITIALIZE"),
+            WaitState(wait_time=1.0, state_name="INITIALIZE"),
             transitions={'succeeded': 'INITIALIZE'}
         )
     """
-    def __init__(self, wait_time=3.0, state_name=""):
+    def __init__(self, wait_time=1.0, state_name=""):
         smach.State.__init__(self, outcomes=['succeeded'])
         self.wait_time = wait_time
         self.state_name = state_name
@@ -489,7 +489,7 @@ class FormationSingleUAVStateBase(smach.State):
     def get_end_effector_yaw(self):
         return self.formation_adapter.get_end_effector_yaw()
     
-    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, adjustment_pos_thresh=None, yaw_adjustment_thresh=None):
+    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, adjustment_pos_thresh=None, yaw_adjustment_thresh=None, lock_z=False):
         """Formation-style active convergence with trajectory decomposition
         
         Args:
@@ -499,6 +499,7 @@ class FormationSingleUAVStateBase(smach.State):
             yaw_thresh: Yaw convergence success threshold (for determining if converged)
             yaw_adjustment_thresh: Threshold to trigger yaw adjustment (default: 0.5°)
                                    Smaller value = more aggressive yaw correction
+            lock_z: If True, lock Z velocity to 0 and only correct XY (prevents pitch oscillation during XY correction)
         """
         start_time = rospy.get_time()
         
@@ -530,17 +531,18 @@ class FormationSingleUAVStateBase(smach.State):
                 decomp_linear_vel_limit = max_linear_vel if max_linear_vel is not None else 0.08
                 decomp_angular_vel_limit = max_angular_vel if max_angular_vel is not None else 0.05
                 
-                # Lock Z to target if XY-dominant movement (Z change < 30mm and XY > 3x Z change)
+                # Determine if Z should be locked during decomposition
+                # Use parameter lock_z if provided, otherwise auto-detect based on motion pattern
                 z_change = abs(target_pos[2] - current_pos[2])
                 xy_change = math.sqrt((target_pos[0] - current_pos[0])**2 + (target_pos[1] - current_pos[1])**2)
-                lock_z = z_change < 0.03 and xy_change > z_change * 3
+                decomp_lock_z = lock_z or (z_change < 0.03 and xy_change > z_change * 3)
                 
                 for i in range(1, num_steps):
                     alpha = i / num_steps
                     intermediate_pos = (
                         current_pos[0] + alpha * (target_pos[0] - current_pos[0]),
                         current_pos[1] + alpha * (target_pos[1] - current_pos[1]),
-                        target_pos[2] if lock_z else current_pos[2] + alpha * (target_pos[2] - current_pos[2])
+                        target_pos[2] if decomp_lock_z else current_pos[2] + alpha * (target_pos[2] - current_pos[2])
                     )
                     
                     # Calculate velocity direction from current actual position to target
@@ -549,10 +551,12 @@ class FormationSingleUAVStateBase(smach.State):
                     
                     if step_distance > 0.001:
                         step_direction = step_vector / step_distance
+                        # When lock_z is True, force Z velocity to 0
+                        z_vel_component = 0.0 if decomp_lock_z else step_direction[2] * decomp_linear_vel_limit
                         controlled_linear_vel = [
                             step_direction[0] * decomp_linear_vel_limit,
                             step_direction[1] * decomp_linear_vel_limit,
-                            step_direction[2] * decomp_linear_vel_limit
+                            z_vel_component
                         ]
                     else:
                         controlled_linear_vel = None
@@ -659,9 +663,11 @@ class FormationSingleUAVStateBase(smach.State):
                     direction_norm = np.linalg.norm(direction)
                     if direction_norm > 0.001:
                         direction = direction / direction_norm
+                        # CRITICAL: When lock_z=True, force Z velocity to 0 to prevent pitch oscillation
+                        z_vel = 0.0 if lock_z else direction[2] * speed_magnitude
                         smooth_linear_vel = [direction[0] * speed_magnitude, 
                                            direction[1] * speed_magnitude, 
-                                           direction[2] * speed_magnitude]
+                                           z_vel]
                     else:
                         smooth_linear_vel = None
                 else:
@@ -794,6 +800,9 @@ class FormationSingleUAVStateBase(smach.State):
         consecutive_small_motions = 0
         small_motion_threshold = 0.005  # Reduced from 8mm to 5mm to avoid false triggers
         max_consecutive_small_motions = 3  # Increased from 2 to 3 for more robust detection
+        
+        # One-time stabilization flag at 50% progress
+        stabilization_50_done = False
 
         while previous_z - target_z > 1e-4:
             if step_count >= max_step_iterations:
@@ -845,9 +854,9 @@ class FormationSingleUAVStateBase(smach.State):
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3
 
-            # Unified descent speed strategy - slower speed reduces XY oscillation during descent
-            # Reduced from 0.036 to 0.024 m/s to allow XY correction to stabilize
-            effective_descent_speed = max(0.02, descent_speed * 0.2)
+            # Unified descent speed strategy - proven 0.036 m/s works well for stability
+            # Reverted from 0.05 m/s which caused rapid descent issues
+            effective_descent_speed = max(0.03, descent_speed * 0.3)  # ≈ 0.036 m/s
             linear_vel = [0.0, 0.0, -effective_descent_speed]
 
             rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm, speed={effective_descent_speed:.3f}m/s")
@@ -1004,28 +1013,70 @@ class FormationSingleUAVStateBase(smach.State):
                 )
             stagnation_hit_counter = 0
             proximity_hit_counter = 0
+            
+            # Post-step XY verification (following single UAV pattern)
             xy_error = math.sqrt(
                 (current_pos[0] - step_target[0])**2 +
                 (current_pos[1] - step_target[1])**2
             )
-            if xy_error > 0.030:  # Trigger XY correction at 30mm
-                rospy.logwarn(f"[Formation Z Descent] XY error {xy_error*1000:.1f}mm, applying XY correction")
-                correction_target = [step_target[0], step_target[1], current_pos[2]]
-                self.send_assembly_command_from_end_effector(correction_target, final_yaw)
-                corrected = self.active_position_convergence(
-                    target_pos=correction_target,
+            if xy_error > 0.025:  # 25mm XY error threshold (matching single UAV)
+                rospy.logwarn(f"[Formation Z Descent] XY error {xy_error*1000:.1f}mm > 25mm, performing XY correction...")
+                
+                # XY correction: Lock Z and yaw, only correct XY (following single UAV pattern)
+                # Use current Z position, not step target Z
+                xy_correction_target = [step_target[0], step_target[1], current_pos[2]]
+                self.send_assembly_command_from_end_effector(
+                    xy_correction_target, 
+                    final_yaw,
+                    linear_vel=None,  # Use default controller (like single UAV)
+                    angular_vel=0.0   # Lock yaw
+                )
+                
+                # Wait for XY correction convergence with strict XY tolerance
+                xy_corrected = self.active_position_convergence(
+                    target_pos=xy_correction_target,
                     target_yaw=final_yaw,
-                    pos_thresh=0.080,
+                    pos_thresh=0.015,  # Strict 15mm XY tolerance (like single UAV)
                     yaw_thresh=0.087,
                     timeout=8.0,
-                    adjustment_pos_thresh=0.030
+                    adjustment_pos_thresh=0.015
+                    # Note: No lock_z - let controller handle Z naturally
                 )
-                if not corrected:
-                    rospy.logerr("[Formation Z Descent] XY correction failed")
-                    return False, current_pos
                 
-                # Stabilization after XY correction to reduce oscillation
-                rospy.sleep(0.15)
+                if xy_corrected:
+                    rospy.loginfo("✓ XY correction successful")
+                else:
+                    rospy.logwarn("⚠ XY correction timeout, but continuing")
+                    # Don't fail - continue with descent (like single UAV behavior)
+
+            # One-time stabilization at 50% progress with XY correction (not every step)
+            if not stabilization_50_done and progress_ratio >= 0.5:
+                rospy.loginfo(f"[Z Descent] 50% progress reached ({progress_ratio*100:.0f}%), performing XY correction + 3s stabilization")
+                
+                # XY correction target: use target XY with current Z
+                correction_target = [target_x, target_y, current_pos[2]]
+                
+                # First do XY correction convergence
+                xy_corrected = self.active_position_convergence(
+                    target_pos=correction_target,
+                    target_yaw=final_yaw,
+                    pos_thresh=0.020,  # 20mm strict tolerance
+                    yaw_thresh=0.087,
+                    timeout=5.0,
+                    adjustment_pos_thresh=0.015
+                )
+                if xy_corrected:
+                    rospy.loginfo("✓ 50% XY correction successful")
+                else:
+                    rospy.logwarn("⚠ 50% XY correction timeout")
+                
+                # Then 3s active stabilization at corrected position
+                stabilization_target = [target_x, target_y, current_pos[2]]
+                self.active_stabilization_wait(stabilization_target, final_yaw, 3.0, "50% progress XY stabilization")
+                
+                # Update current position after stabilization
+                current_pos = self.get_end_effector_position() or current_pos
+                stabilization_50_done = True
 
             previous_z = current_pos[2]
             achieved_position = current_pos
@@ -1260,8 +1311,8 @@ class FormationInitializeStartPositionState(FormationSingleUAVStateBase):
     def execute(self, userdata):
         rospy.loginfo("=== Formation Initialize Start Position State ===")
         
-        # Wait for position data
-        rospy.sleep(2.0)
+        # Wait for position data (reduced from 2.0s to 1.0s)
+        rospy.sleep(1.0)
         
         # Get formation positions
         assembly_pos = self.get_assembly_position()
@@ -1426,11 +1477,14 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.logerr("[YAW_ALIGN] Failed")
             return 'failed'
 
-        # Active stabilization before Z descent (prevents oscillation)
-        stab_pos = self.get_end_effector_position()
+        # Brief stabilization before Z descent (reduced from 10s to 2s to match original)
+        # Use XY from optimizer target but Z from current position to prevent unwanted descent
+        current_pos_for_stab = self.get_end_effector_position()
         stab_yaw = self.get_end_effector_yaw() or optimal_spoke_yaw
-        rospy.loginfo(f"[STABILIZE] 10s active stabilization before Z descent...")
-        self.active_stabilization_wait(stab_pos, stab_yaw, 10.0, "Pre-Z-descent stabilization")
+        # CRITICAL: Lock current Z during stabilization, only stabilize XY toward target
+        stab_pos = (safe_ee_pos[0], safe_ee_pos[1], current_pos_for_stab[2])
+        rospy.loginfo(f"[STABILIZE] 2s stabilization before Z descent (Z locked at {current_pos_for_stab[2]:.3f}m)...")
+        self.active_stabilization_wait(stab_pos, stab_yaw, 2.0, "Pre-Z-descent stabilization")
 
         # Z_DESCENT: Descend to insertion height
         final_target = (safe_ee_pos[0], safe_ee_pos[1], safe_ee_pos[2])
@@ -1448,12 +1502,12 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         userdata.insertion_contact_pose = insertion_pose
         userdata.insertion_contact_yaw = self.get_end_effector_yaw() or final_yaw
 
-        # Post-insertion stabilization
+        # Post-insertion stabilization (reduced from 5s to 1.5s)
         if insertion_pose is not None:
-            rospy.loginfo(f"5s stabilization at {FormationUtils.format_vec(insertion_pose)}")
-            self.active_stabilization_wait(insertion_pose, final_yaw, 5.0, "Post-insertion")
+            rospy.loginfo(f"1.5s stabilization at {FormationUtils.format_vec(insertion_pose)}")
+            self.active_stabilization_wait(insertion_pose, final_yaw, 1.5, "Post-insertion")
         else:
-            rospy.sleep(5.0)
+            rospy.sleep(1.5)
 
         rospy.loginfo("=== Formation move-to-valve complete ===")
         return 'succeeded'
@@ -2291,13 +2345,13 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         
         rospy.loginfo("[ASCENT] Complete")
         
-        # 3-second stabilization at current position after ascent
+        # 1.5-second stabilization at current position after ascent (reduced from 3s)
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
-        rospy.loginfo(f"[POST_ASCENT_STABILIZE] 3s stabilization at {FormationUtils.format_vec(current_pos)}")
+        rospy.loginfo(f"[POST_ASCENT_STABILIZE] 1.5s stabilization at {FormationUtils.format_vec(current_pos)}")
         
         stabilize_start = rospy.Time.now().to_sec()
-        while (rospy.Time.now().to_sec() - stabilize_start) < 3.0 and not rospy.is_shutdown():
+        while (rospy.Time.now().to_sec() - stabilize_start) < 1.5 and not rospy.is_shutdown():
             self.send_assembly_command_from_end_effector(
                 current_pos, current_yaw, linear_vel=[0, 0, 0]
             )

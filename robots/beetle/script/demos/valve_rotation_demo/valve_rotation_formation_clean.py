@@ -416,19 +416,9 @@ class FormationSingleUAVStateBase(smach.State):
     def get_end_effector_yaw(self):
         return self.formation_adapter.get_end_effector_yaw()
     
-    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, adjustment_pos_thresh=None):
-        """Formation-style active convergence with trajectory decomposition
-        
-        Args:
-            pos_thresh: Convergence success threshold (default: 25mm)
-            adjustment_pos_thresh: Threshold to trigger position adjustment (default: same as pos_thresh)
-                                   Smaller value = more aggressive correction
-        """
+    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None):
+        """Formation-style active convergence with trajectory decomposition"""
         start_time = rospy.get_time()
-        
-        # Dual-threshold: adjustment_pos_thresh triggers correction, pos_thresh determines success
-        if adjustment_pos_thresh is None:
-            adjustment_pos_thresh = pos_thresh
         
         current_pos = self.get_end_effector_position()
         if current_pos is None:
@@ -499,8 +489,7 @@ class FormationSingleUAVStateBase(smach.State):
         consecutive_good_readings = 0
         required_consecutive = 8
         
-        rospy.loginfo(f"Active convergence: target={FormationUtils.format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f}°, "
-                      f"conv_thresh={pos_thresh*1000:.1f}mm, adj_thresh={adjustment_pos_thresh*1000:.1f}mm, yaw_thresh={math.degrees(yaw_thresh):.1f}°")
+        rospy.loginfo(f"Active convergence: target={FormationUtils.format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f}°, thresh={pos_thresh*1000:.1f}mm/{math.degrees(yaw_thresh):.1f}°")
         
         while rospy.get_time() - start_time < timeout:
             current_pos = self.get_end_effector_position()
@@ -516,21 +505,18 @@ class FormationSingleUAVStateBase(smach.State):
             pos_error = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
             yaw_error = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
             
-            # Dual-threshold: converged_ok for success, needs_adjustment for correction
-            converged_ok = pos_error < pos_thresh
-            needs_adjustment = pos_error >= adjustment_pos_thresh
+            position_ok = pos_error < pos_thresh
             yaw_ok = yaw_error < yaw_thresh
             
-            if converged_ok and yaw_ok:
+            if position_ok and yaw_ok:
                 consecutive_good_readings += 1
                 if consecutive_good_readings >= required_consecutive:
                     rospy.loginfo(f"Convergence success: pos={pos_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f}°")
                     return True
             else:
                 consecutive_good_readings = 0
-            
-            # Only apply adjustment if position needs correction OR yaw is not ok
-            if needs_adjustment or not yaw_ok:
+                
+                # Apply max_yaw_step limitation like Formation version
                 command_yaw = target_yaw
                 if max_yaw_step is not None and max_yaw_step > 0.0:
                     yaw_delta = FormationUtils.normalize_angle(target_yaw - current_yaw)
@@ -661,10 +647,9 @@ class FormationSingleUAVStateBase(smach.State):
             success = self.active_position_convergence(
                 (target_x, target_y, target_z),
                 target_yaw=final_yaw,
-                pos_thresh=0.080,
-                yaw_thresh=0.087,
-                timeout=10.0,
-                adjustment_pos_thresh=0.030  # 30mm triggers adjustment
+                pos_thresh=0.080,  # RELAXED: 80mm (consistent with descent strategy)
+                yaw_thresh=0.087,  # RELAXED: 5 degrees (0.087 rad)
+                timeout=10.0
             )
             achieved = self.get_end_effector_position() or (target_x, target_y, target_z)
             return success, achieved
@@ -739,10 +724,12 @@ class FormationSingleUAVStateBase(smach.State):
 
             step_target = [target_x, target_y, current_z]
 
-            # Dual-threshold: 30mm triggers adjustment, 80mm for convergence success
-            step_pos_thresh = 0.080
-            step_adjustment_thresh = 0.030
-            step_yaw_thresh = 0.087
+            # RELAXED: Formation control requires much larger XY tolerance during descent
+            base_threshold = 0.080  # 80mm base threshold (RELAXED from 50mm)
+            final_threshold = 0.080  # 80mm final threshold (keep consistent)
+            step_pos_thresh = base_threshold - (base_threshold - final_threshold) * progress
+            step_pos_thresh = max(step_pos_thresh, 0.080)  # Never go below 80mm
+            step_yaw_thresh = 0.087  # 5 degrees (relaxed from 1 degree)
             is_final_step = current_z <= target_z + 1e-4 or remaining_descent <= step_size + 1e-6
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3
@@ -764,14 +751,15 @@ class FormationSingleUAVStateBase(smach.State):
                 step_timeout = 12.0
                 step_max_attempts = 80
 
-            # Unified convergence with dual-threshold (30mm adjustment, 80mm success)
+            # Unified convergence strategy for all steps (removed max_pos_step to prevent control instability)
             step_converged = self.active_position_convergence(
                 target_pos=step_target,
                 target_yaw=final_yaw,
                 pos_thresh=step_pos_thresh,
                 yaw_thresh=step_yaw_thresh,
-                timeout=step_timeout,
-                adjustment_pos_thresh=step_adjustment_thresh
+                timeout=step_timeout
+                # NOTE: max_pos_step removed - it caused Step 8 divergence in testing
+                # The 20mm step limit prevented quick correction when coordinate transform fluctuates
             )
 
             if not step_converged:
@@ -880,21 +868,15 @@ class FormationSingleUAVStateBase(smach.State):
                     rospy.loginfo(f"[Z Descent] Small motion on success {consecutive_small_motions}/2: dZ={actual_descent*1000:.1f}mm")
                 
                 if consecutive_small_motions >= max_consecutive_small_motions:
-                    # Check minimum descent progress before considering contact
-                    descent_completed = max(0.0, start_z - current_pos[2])
-                    min_descent_for_contact = total_z_descent * 0.5  # At least 50% descended
+                    # Physical contact stable - 2 consecutive small motions
+                    current_xy_error = math.sqrt((current_pos[0] - target_x)**2 + (current_pos[1] - target_y)**2)
+                    current_z_error = abs(current_pos[2] - target_z)
                     
-                    if descent_completed < min_descent_for_contact:
-                        rospy.loginfo(f"[Z Descent] Small motion but only {descent_completed*1000:.1f}mm/{total_z_descent*1000:.1f}mm descended, ignoring")
-                        consecutive_small_motions = 0
+                    if current_xy_error <= 0.030:
+                        rospy.loginfo(f"[Z Descent] Contact stable: 2 small motions, XY {current_xy_error*1000:.1f}mm, Z={current_pos[2]:.3f}m")
+                        return True, current_pos
                     else:
-                        # Physical contact stable - 2 consecutive small motions with sufficient progress
-                        current_xy_error = math.sqrt((current_pos[0] - target_x)**2 + (current_pos[1] - target_y)**2)
-                        if current_xy_error <= 0.030:
-                            rospy.loginfo(f"[Z Descent] Contact stable: 2 small motions, XY {current_xy_error*1000:.1f}mm, Z={current_pos[2]:.3f}m")
-                            return True, current_pos
-                        else:
-                            rospy.logwarn(f"[Z Descent] Small motion but XY={current_xy_error*1000:.1f}mm>30mm")
+                        rospy.logwarn(f"[Z Descent] Small motion but XY={current_xy_error*1000:.1f}mm>30mm, Z_err={current_z_error*1000:.1f}mm")
             else:
                 if step_converged:
                     consecutive_small_motions = 0
@@ -909,17 +891,16 @@ class FormationSingleUAVStateBase(smach.State):
                 (current_pos[0] - step_target[0])**2 +
                 (current_pos[1] - step_target[1])**2
             )
-            if xy_error > 0.030:  # Trigger XY correction at 30mm
+            if xy_error > 0.080:  # RELAXED: 80mm threshold (consistent with descent tolerance)
                 rospy.logwarn(f"[Formation Z Descent] XY error {xy_error*1000:.1f}mm, applying XY correction")
                 correction_target = [step_target[0], step_target[1], current_pos[2]]
                 self.send_assembly_command_from_end_effector(correction_target, final_yaw)
                 corrected = self.active_position_convergence(
                     target_pos=correction_target,
                     target_yaw=final_yaw,
-                    pos_thresh=0.080,
-                    yaw_thresh=0.087,
-                    timeout=8.0,
-                    adjustment_pos_thresh=0.030
+                    pos_thresh=0.080,  # RELAXED: 80mm convergence threshold
+                    yaw_thresh=0.087,  # RELAXED: 5 degrees (0.087 rad)
+                    timeout=8.0
                 )
                 if not corrected:
                     rospy.logerr("[Formation Z Descent] XY correction failed")
@@ -1423,8 +1404,11 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
     
     def _execute_xy_positioning(self, target_pos, target_yaw, phase_name="XY", 
                                 use_trajectory=True, pos_thresh=0.050, yaw_thresh=0.087, 
-                                timeout=15.0, num_traj_points=12, adjustment_pos_thresh=None):
-        """Generic XY positioning method used by Phase 2, 3A, 3B"""
+                                timeout=15.0, num_traj_points=12):
+        """
+        Generic XY positioning method used by Phase 2, 3A, 3B
+        Reduces code duplication by parametrizing behavior
+        """
         rospy.loginfo(f"[{phase_name}] Target: {FormationUtils.format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f}°")
         
         current_pos = self.get_end_effector_position()
@@ -1440,8 +1424,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.loginfo(f"[{phase_name}] Using direct convergence")
             return self.active_position_convergence(
                 target_pos=target_pos, target_yaw=target_yaw,
-                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout,
-                adjustment_pos_thresh=adjustment_pos_thresh
+                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout
             )
         
         # Trajectory-based movement for larger distances
@@ -1455,8 +1438,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.logwarn(f"[{phase_name}] Trajectory generation failed, using direct convergence")
             return self.active_position_convergence(
                 target_pos=target_pos, target_yaw=target_yaw,
-                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout * 1.5,
-                adjustment_pos_thresh=adjustment_pos_thresh
+                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout * 1.5
             )
         
         # Execute trajectory
@@ -1466,8 +1448,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"[{phase_name}] Final convergence check")
         final_success = self.active_position_convergence(
             target_pos=target_pos, target_yaw=target_yaw,
-            pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout,
-            adjustment_pos_thresh=adjustment_pos_thresh
+            pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout
         )
         
         # Stabilization for final position
@@ -1637,8 +1618,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             target_yaw=final_yaw,
             pos_thresh=0.080,  # 80mm convergence threshold (RELAXED for formation)
             yaw_thresh=0.087,  # 5 degrees (0.087 rad) - relaxed threshold
-            timeout=12.0,
-            adjustment_pos_thresh=0.050  # 50mm triggers more aggressive adjustment
+            timeout=12.0
         )
 
         # CRITICAL: Regardless of final_success, always save the actual insertion depth Z coordinate reached

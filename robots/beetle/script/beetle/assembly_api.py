@@ -131,11 +131,15 @@ class StandbyState(smach.State):
         #TODO: determine leader namespace dynamically
         try:
             leader_from_world = self.listener.lookupTransform('/world', self.leader+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logerr_once("[StandbyState] TF lookup failed: /world -> %s/root: %s" % (self.leader, str(e)))
+            self.run_rate.sleep()
             return 'in_process'
         try:
             follower_from_leader = self.listener.lookupTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logerr_once("[StandbyState] TF lookup failed: %s/root -> %s/root: %s" % (self.leader, self.robot_name, str(e)))
+            self.run_rate.sleep()
             return 'in_process'
 
         # set target odom in leader coordinate
@@ -148,8 +152,11 @@ class StandbyState(smach.State):
 
         # convert target position from leader coord to world coord
         try:
+            self.listener.waitForTransform('/world', '/follower_target_odom', rospy.Time(0), rospy.Duration(0.1))
             homo_transformed_target_odom = self.listener.lookupTransform('/world', '/follower_target_odom', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
+            rospy.logerr_once("[StandbyState] TF lookup failed: /world -> /follower_target_odom: %s" % str(e))
+            self.run_rate.sleep()
             return 'in_process'
         target_pos = homo_transformed_target_odom[0]
         target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])

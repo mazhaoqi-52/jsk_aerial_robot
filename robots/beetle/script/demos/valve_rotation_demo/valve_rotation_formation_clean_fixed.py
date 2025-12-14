@@ -844,6 +844,15 @@ class FormationSingleUAVStateBase(smach.State):
 
             step_target = [target_x, target_y, current_z]
 
+            # Log first step Z transition for debugging
+            if step_count == 1:
+                rospy.loginfo(f"[Z_DESCENT_STEP1] Previous Z={previous_z:.3f}m → Step target Z={current_z:.3f}m (Δ={-(current_z - previous_z)*1000:.1f}mm)")
+                current_ee = self.get_end_effector_position()
+                if current_ee:
+                    rospy.loginfo(f"[Z_DESCENT_STEP1] Current EE: ({current_ee[0]:.3f}, {current_ee[1]:.3f}, {current_ee[2]:.3f})")
+                    initial_3d_dist = math.sqrt((step_target[0]-current_ee[0])**2 + (step_target[1]-current_ee[1])**2 + (step_target[2]-current_ee[2])**2)
+                    rospy.loginfo(f"[Z_DESCENT_STEP1] 3D distance to step1 target: {initial_3d_dist*1000:.1f}mm")
+
             # Dual-threshold: 30mm triggers adjustment, 80mm for convergence success
             step_pos_thresh = 0.080
             step_adjustment_thresh = 0.030
@@ -1091,6 +1100,7 @@ class FormationSingleUAVStateBase(smach.State):
     def active_stabilization_wait(self, target_pos, target_yaw, duration, description="position stabilization"):
         """
         Active stabilization: continuously send target commands during wait period.
+        Uses POS_VEL_MODE with zero velocity to maintain control mode consistency.
         
         Args:
             target_pos: Target end-effector position (x, y, z)
@@ -1105,7 +1115,12 @@ class FormationSingleUAVStateBase(smach.State):
         rate = rospy.Rate(10)
         
         while rospy.get_time() - start_time < duration and not rospy.is_shutdown():
-            self.send_assembly_command_from_end_effector(target_pos, target_yaw)
+            # Use zero velocity to maintain POS_VEL_MODE consistency with Z_DESCENT
+            self.send_assembly_command_from_end_effector(
+                target_pos, target_yaw,
+                linear_vel=[0.0, 0.0, 0.0],
+                angular_vel=0.0
+            )
             
             # Log progress every second
             elapsed = rospy.get_time() - start_time
@@ -1477,18 +1492,25 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.logerr("[YAW_ALIGN] Failed")
             return 'failed'
 
-        # Brief stabilization before Z descent (reduced from 10s to 2s to match original)
+        # Brief stabilization before Z descent (increased to 5s for better stability after YAW alignment)
         # Use XY from optimizer target but Z from current position to prevent unwanted descent
         current_pos_for_stab = self.get_end_effector_position()
         stab_yaw = self.get_end_effector_yaw() or optimal_spoke_yaw
         # CRITICAL: Lock current Z during stabilization, only stabilize XY toward target
         stab_pos = (safe_ee_pos[0], safe_ee_pos[1], current_pos_for_stab[2])
-        rospy.loginfo(f"[STABILIZE] 2s stabilization before Z descent (Z locked at {current_pos_for_stab[2]:.3f}m)...")
-        self.active_stabilization_wait(stab_pos, stab_yaw, 2.0, "Pre-Z-descent stabilization")
+        rospy.loginfo(f"[STABILIZE] 5s stabilization before Z descent (Z locked at {current_pos_for_stab[2]:.3f}m)...")
+        self.active_stabilization_wait(stab_pos, stab_yaw, 5.0, "Pre-Z-descent stabilization")
 
         # Z_DESCENT: Descend to insertion height
         final_target = (safe_ee_pos[0], safe_ee_pos[1], safe_ee_pos[2])
         final_yaw = self.get_end_effector_yaw() or safe_ee_yaw
+        
+        # Log Z target transition for debugging oscillation issues
+        current_pos_before_descent = self.get_end_effector_position()
+        if current_pos_before_descent:
+            z_jump = current_pos_before_descent[2] - final_target[2]
+            rospy.loginfo(f"[Z_TARGET_TRANSITION] STABILIZE Z={stab_pos[2]:.3f}m → Z_DESCENT target Z={final_target[2]:.3f}m")
+            rospy.loginfo(f"[Z_TARGET_TRANSITION] Current EE Z={current_pos_before_descent[2]:.3f}m, total descent={z_jump*1000:.1f}mm")
 
         if not self._execute_z_descent(final_target, final_yaw):
             rospy.logerr("[Z_DESCENT] Failed")

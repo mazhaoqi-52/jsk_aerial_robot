@@ -779,6 +779,7 @@ class FormationSingleUAVStateBase(smach.State):
 
         current_pos = start_pos
         previous_z = current_pos[2]
+        planned_z = current_pos[2]  # Track planned trajectory Z (never regresses)
         total_descent_completed = 0.0
         step_count = 0
         progress_ratio = 0.0
@@ -804,7 +805,7 @@ class FormationSingleUAVStateBase(smach.State):
         # One-time stabilization flag at 50% progress
         stabilization_50_done = False
 
-        while previous_z - target_z > 1e-4:
+        while planned_z - target_z > 1e-4:
             if step_count >= max_step_iterations:
                 # Check if within tolerance despite timeout
                 current_pos = self.get_end_effector_position() or achieved_position
@@ -821,7 +822,8 @@ class FormationSingleUAVStateBase(smach.State):
                 rospy.logerr("[Z Descent] Exceeded safety iteration limit")
                 return False, achieved_position
 
-            remaining_descent = max(0.0, previous_z - target_z)
+            # Use planned_z for step calculation (never regresses)
+            remaining_descent = max(0.0, planned_z - target_z)
             if remaining_descent <= final_descent_margin:
                 rospy.loginfo(f"[Z Descent] Remaining {remaining_descent*1000:.1f}mm within margin")
                 break
@@ -835,7 +837,7 @@ class FormationSingleUAVStateBase(smach.State):
                 adaptive_step_size = fixed_step_size
             
             step_size = min(adaptive_step_size, max_single_step, remaining_descent)
-            current_z = previous_z - step_size
+            current_z = planned_z - step_size  # Use planned_z instead of previous_z
             if current_z < target_z:
                 current_z = target_z
 
@@ -846,7 +848,7 @@ class FormationSingleUAVStateBase(smach.State):
 
             # Log first step Z transition for debugging
             if step_count == 1:
-                rospy.loginfo(f"[Z_DESCENT_STEP1] Previous Z={previous_z:.3f}m → Step target Z={current_z:.3f}m (Δ={-(current_z - previous_z)*1000:.1f}mm)")
+                rospy.loginfo(f"[Z_DESCENT_STEP1] Planned Z={planned_z:.3f}m → Step target Z={current_z:.3f}m (Δ={-(current_z - planned_z)*1000:.1f}mm)")
                 current_ee = self.get_end_effector_position()
                 if current_ee:
                     rospy.loginfo(f"[Z_DESCENT_STEP1] Current EE: ({current_ee[0]:.3f}, {current_ee[1]:.3f}, {current_ee[2]:.3f})")
@@ -1087,9 +1089,13 @@ class FormationSingleUAVStateBase(smach.State):
                 current_pos = self.get_end_effector_position() or current_pos
                 stabilization_50_done = True
 
-            previous_z = current_pos[2]
+            # Update tracking variables
+            # planned_z: follows planned trajectory (never regresses) - for step calculation
+            # previous_z: actual position - for safety checks and motion detection
+            planned_z = step_target[2]  # Planned trajectory Z (never regresses)
+            previous_z = current_pos[2]  # Actual Z for safety checks
             achieved_position = current_pos
-            total_descent_completed = max(0.0, start_z - previous_z)
+            total_descent_completed = max(0.0, start_z - planned_z)
             progress_ratio = 0.0 if total_z_descent <= 1e-6 else min(1.0, total_descent_completed / total_z_descent)
 
         achieved_position = self.get_end_effector_position() or achieved_position

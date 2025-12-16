@@ -134,7 +134,7 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1, rotation
         # Wait after takeoff
         smach.StateMachine.add(
             'WAIT_AFTER_TAKEOFF',
-            WaitState(wait_time=3.0, state_name="INITIALIZE"),
+            WaitState(wait_time=1.0, state_name="INITIALIZE"),
             transitions={'succeeded': 'INITIALIZE'}
         )
         
@@ -156,7 +156,7 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1, rotation
         # Wait after initialization
         smach.StateMachine.add(
             'WAIT_AFTER_INITIALIZE',
-            WaitState(wait_time=3.0, state_name="MOVE_TO_VALVE"),
+            WaitState(wait_time=1.0, state_name="MOVE_TO_VALVE"),
             transitions={'succeeded': 'MOVE_TO_VALVE'}
         )
         
@@ -179,7 +179,7 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1, rotation
         # Wait after moving to valve
         smach.StateMachine.add(
             'WAIT_AFTER_MOVE',
-            WaitState(wait_time=3.0, state_name="ROTATE_VALVE"),
+            WaitState(wait_time=1.0, state_name="ROTATE_VALVE"),
             transitions={'succeeded': 'ROTATE_VALVE'}
         )
         
@@ -205,7 +205,7 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1, rotation
         # Wait after rotation
         smach.StateMachine.add(
             'WAIT_AFTER_ROTATE',
-            WaitState(wait_time=3.0, state_name="DISENGAGE"),
+            WaitState(wait_time=1.0, state_name="DISENGAGE"),
             transitions={'succeeded': 'DISENGAGE'}
         )
         

@@ -489,7 +489,7 @@ class FormationSingleUAVStateBase(smach.State):
     def get_end_effector_yaw(self):
         return self.formation_adapter.get_end_effector_yaw()
     
-    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, adjustment_pos_thresh=None, yaw_adjustment_thresh=None, lock_z=False):
+    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, adjustment_pos_thresh=None, yaw_adjustment_thresh=None, lock_z=False, decomposition_threshold=None):
         """Formation-style active convergence with trajectory decomposition
         
         Args:
@@ -500,6 +500,7 @@ class FormationSingleUAVStateBase(smach.State):
             yaw_adjustment_thresh: Threshold to trigger yaw adjustment (default: 0.5°)
                                    Smaller value = more aggressive yaw correction
             lock_z: If True, lock Z velocity to 0 and only correct XY (prevents pitch oscillation during XY correction)
+            decomposition_threshold: Distance threshold for trajectory decomposition (default: 0.08m for Z descent, 0.04m for XY)
         """
         start_time = rospy.get_time()
         
@@ -518,7 +519,19 @@ class FormationSingleUAVStateBase(smach.State):
         
         if current_pos is not None:
             initial_distance = np.linalg.norm(np.array(target_pos) - np.array(current_pos))
-            VEL_NAV_THRESHOLD = 0.04  # 40mm threshold (lowered for smoother motion)
+            
+            # Use provided decomposition_threshold or auto-detect based on motion pattern
+            if decomposition_threshold is None:
+                # Auto-detect: Z descent (large Z change) uses 80mm, XY motion uses 40mm
+                z_change = abs(target_pos[2] - current_pos[2])
+                xy_change = math.sqrt((target_pos[0] - current_pos[0])**2 + (target_pos[1] - current_pos[1])**2)
+                if z_change > xy_change * 0.5:  # Primarily Z motion
+                    VEL_NAV_THRESHOLD = 0.08  # 80mm for Z descent
+                else:  # Primarily XY motion
+                    VEL_NAV_THRESHOLD = 0.04  # 40mm for XY approach
+            else:
+                VEL_NAV_THRESHOLD = decomposition_threshold
+            
             SAFE_STEP_SIZE = 0.03  # 30mm per step for finer control
             
             if initial_distance > VEL_NAV_THRESHOLD:
@@ -568,8 +581,8 @@ class FormationSingleUAVStateBase(smach.State):
                         angular_vel=decomp_angular_vel_limit
                     )
                     
-                    # Fixed wait time for consistent motion
-                    rospy.sleep(0.15)
+                    # No fixed wait - let controller naturally converge
+                    # rospy.sleep(0.15)  # REMOVED: Causes jerky motion
                     
                     current_pos = self.get_end_effector_position()
                     if current_pos is None:
@@ -797,10 +810,10 @@ class FormationSingleUAVStateBase(smach.State):
         final_descent_margin = 0.03
         
         # Motion tracking for contact detection
-        # Stricter thresholds to prevent false positives with slower descent speed
+        # Single detection is sufficient - robot is stable enough for immediate response
         consecutive_small_motions = 0
-        small_motion_threshold = 0.005  # Reduced from 8mm to 5mm to avoid false triggers
-        max_consecutive_small_motions = 3  # Increased from 2 to 3 for more robust detection
+        small_motion_threshold = 0.005  # 5mm threshold for contact detection
+        max_consecutive_small_motions = 1  # Reduced from 3 to 1 - single detection sufficient
         
         # One-time stabilization flag at 50% progress
         stabilization_50_done = False
@@ -857,7 +870,7 @@ class FormationSingleUAVStateBase(smach.State):
 
             # Dual-threshold: 30mm triggers adjustment, 80mm for convergence success
             step_pos_thresh = 0.080
-            step_adjustment_thresh = 0.030
+            step_adjustment_thresh = 0.050  # Relaxed from 30mm to 50mm for smoother motion
             # Relaxed yaw threshold for Z descent: formation has coupling effects during descent
             # Changed from 0.087 (5°) to 0.14 (~8°) to accommodate yaw drift during Z motion
             step_yaw_thresh = 0.14
@@ -890,7 +903,8 @@ class FormationSingleUAVStateBase(smach.State):
                 pos_thresh=step_pos_thresh,
                 yaw_thresh=step_yaw_thresh,
                 timeout=step_timeout,
-                adjustment_pos_thresh=step_adjustment_thresh
+                adjustment_pos_thresh=step_adjustment_thresh,
+                decomposition_threshold=0.08  # Force 80mm threshold for Z descent
             )
 
             if not step_converged:
@@ -1001,19 +1015,26 @@ class FormationSingleUAVStateBase(smach.State):
                 if consecutive_small_motions >= max_consecutive_small_motions:
                     # Check minimum descent progress before considering contact
                     descent_completed = max(0.0, start_z - current_pos[2])
-                    min_descent_for_contact = total_z_descent * 0.7  # At least 70% descended (was 50%)
+                    min_descent_for_contact = total_z_descent * 0.90  # Increased from 70% to 90% for stricter validation
+                    z_residual = current_pos[2] - target_z
                     
+                    # Three-level validation to prevent false contact detection
                     if descent_completed < min_descent_for_contact:
-                        rospy.loginfo(f"[Z Descent] Small motion but only {descent_completed*1000:.1f}mm/{total_z_descent*1000:.1f}mm ({descent_completed/total_z_descent*100:.0f}%) descended, need 70%, ignoring")
+                        rospy.loginfo(f"[Z Descent] Small motion but only {descent_completed*1000:.1f}mm/{total_z_descent*1000:.1f}mm ({descent_completed/total_z_descent*100:.0f}%) descended, need 90%, ignoring")
+                        consecutive_small_motions = 0
+                    elif z_residual > 0.030:  # NEW: Z residual check - must be within 30mm of target
+                        rospy.loginfo(f"[Z Descent] Small motion but Z residual {z_residual*1000:.1f}mm > 30mm, continue descent")
                         consecutive_small_motions = 0
                     else:
-                        # Physical contact stable - 3 consecutive small motions with sufficient progress
+                        # Physical contact confirmed - all criteria met:
+                        # 1. 90%+ progress  2. Z residual ≤30mm  3. XY precision ≤30mm
                         current_xy_error = math.sqrt((current_pos[0] - target_x)**2 + (current_pos[1] - target_y)**2)
                         if current_xy_error <= 0.030:
-                            rospy.loginfo(f"[Z Descent] Contact stable: {max_consecutive_small_motions} small motions, XY {current_xy_error*1000:.1f}mm, Z={current_pos[2]:.3f}m, progress={descent_completed/total_z_descent*100:.0f}%")
+                            rospy.loginfo(f"[Z Descent] Contact confirmed: progress={descent_completed/total_z_descent*100:.0f}%, z_res={z_residual*1000:.1f}mm, xy={current_xy_error*1000:.1f}mm, Z={current_pos[2]:.3f}m")
                             return True, current_pos
                         else:
                             rospy.logwarn(f"[Z Descent] Small motion but XY={current_xy_error*1000:.1f}mm>30mm")
+                            consecutive_small_motions = 0
             else:
                 if step_converged:
                     consecutive_small_motions = 0
@@ -1025,68 +1046,89 @@ class FormationSingleUAVStateBase(smach.State):
             stagnation_hit_counter = 0
             proximity_hit_counter = 0
             
-            # Post-step XY verification (following single UAV pattern)
-            xy_error = math.sqrt(
-                (current_pos[0] - step_target[0])**2 +
-                (current_pos[1] - step_target[1])**2
-            )
-            if xy_error > 0.025:  # 25mm XY error threshold (matching single UAV)
-                rospy.logwarn(f"[Formation Z Descent] XY error {xy_error*1000:.1f}mm > 25mm, performing XY correction...")
-                
-                # XY correction: Lock Z and yaw, only correct XY (following single UAV pattern)
-                # Use current Z position, not step target Z
-                xy_correction_target = [step_target[0], step_target[1], current_pos[2]]
-                self.send_assembly_command_from_end_effector(
-                    xy_correction_target, 
-                    final_yaw,
-                    linear_vel=None,  # Use default controller (like single UAV)
-                    angular_vel=0.0   # Lock yaw
+            # Post-step XY verification at specific progress milestones only (20%, 40%, 60%, 80%)
+            # Removed per-step checking to maintain descent continuity
+            progress_milestones = [0.2, 0.4, 0.6, 0.8]
+            milestone_tolerance = 0.05  # ±5% tolerance for milestone detection
+            should_check_xy = any(abs(progress_ratio - m) <= milestone_tolerance for m in progress_milestones)
+            
+            if should_check_xy:
+                xy_error = math.sqrt(
+                    (current_pos[0] - step_target[0])**2 +
+                    (current_pos[1] - step_target[1])**2
                 )
+                xy_check_threshold = 0.045  # Relaxed from 25mm to 45mm
                 
-                # Wait for XY correction convergence with strict XY tolerance
-                xy_corrected = self.active_position_convergence(
-                    target_pos=xy_correction_target,
-                    target_yaw=final_yaw,
-                    pos_thresh=0.015,  # Strict 15mm XY tolerance (like single UAV)
-                    yaw_thresh=0.087,
-                    timeout=8.0,
-                    adjustment_pos_thresh=0.015
-                    # Note: No lock_z - let controller handle Z naturally
-                )
-                
-                if xy_corrected:
-                    rospy.loginfo("✓ XY correction successful")
+                if xy_error > xy_check_threshold:
+                    rospy.logwarn(f"[Formation Z Descent] Progress {progress_ratio*100:.0f}%, XY error {xy_error*1000:.1f}mm > {xy_check_threshold*1000:.0f}mm, performing XY correction...")
+                    
+                    # XY correction: Lock Z and yaw, only correct XY (following single UAV pattern)
+                    # Use current Z position, not step target Z
+                    xy_correction_target = [step_target[0], step_target[1], current_pos[2]]
+                    self.send_assembly_command_from_end_effector(
+                        xy_correction_target, 
+                        final_yaw,
+                        linear_vel=None,  # Use default controller (like single UAV)
+                        angular_vel=0.0   # Lock yaw
+                    )
+                    
+                    # Wait for XY correction convergence with strict XY tolerance
+                    xy_corrected = self.active_position_convergence(
+                        target_pos=xy_correction_target,
+                        target_yaw=final_yaw,
+                        pos_thresh=0.015,  # Strict 15mm XY tolerance (like single UAV)
+                        yaw_thresh=0.087,
+                        timeout=8.0,
+                        adjustment_pos_thresh=0.015
+                        # Note: No lock_z - let controller handle Z naturally
+                    )
+                    
+                    if xy_corrected:
+                        rospy.loginfo(f"✓ XY correction successful at {progress_ratio*100:.0f}% progress")
+                    else:
+                        rospy.logwarn(f"⚠ XY correction timeout at {progress_ratio*100:.0f}% progress, but continuing")
+                        # Don't fail - continue with descent (like single UAV behavior)
                 else:
-                    rospy.logwarn("⚠ XY correction timeout, but continuing")
-                    # Don't fail - continue with descent (like single UAV behavior)
+                    rospy.loginfo(f"[Formation Z Descent] Progress {progress_ratio*100:.0f}%, XY error {xy_error*1000:.1f}mm acceptable")
 
-            # One-time stabilization at 50% progress with XY correction (not every step)
+            # One-time stabilization at 50% progress with XY correction (only if needed)
             if not stabilization_50_done and progress_ratio >= 0.5:
-                rospy.loginfo(f"[Z Descent] 50% progress reached ({progress_ratio*100:.0f}%), performing XY correction + 3s stabilization")
-                
-                # XY correction target: use target XY with current Z
-                correction_target = [target_x, target_y, current_pos[2]]
-                
-                # First do XY correction convergence
-                xy_corrected = self.active_position_convergence(
-                    target_pos=correction_target,
-                    target_yaw=final_yaw,
-                    pos_thresh=0.020,  # 20mm strict tolerance
-                    yaw_thresh=0.087,
-                    timeout=5.0,
-                    adjustment_pos_thresh=0.015
+                # Check if XY correction is actually needed
+                xy_error_50 = math.sqrt(
+                    (current_pos[0] - target_x)**2 +
+                    (current_pos[1] - target_y)**2
                 )
-                if xy_corrected:
-                    rospy.loginfo("✓ 50% XY correction successful")
+                xy_correction_threshold = 0.030  # 30mm threshold
+                
+                if xy_error_50 > xy_correction_threshold:
+                    rospy.loginfo(f"[Z Descent] 50% progress reached ({progress_ratio*100:.0f}%), XY error {xy_error_50*1000:.1f}mm > 30mm, performing XY correction + 3s stabilization")
+                    
+                    # XY correction target: use target XY with current Z
+                    correction_target = [target_x, target_y, current_pos[2]]
+                    
+                    # First do XY correction convergence
+                    xy_corrected = self.active_position_convergence(
+                        target_pos=correction_target,
+                        target_yaw=final_yaw,
+                        pos_thresh=0.020,  # 20mm strict tolerance
+                        yaw_thresh=0.087,
+                        timeout=5.0,
+                        adjustment_pos_thresh=0.015
+                    )
+                    if xy_corrected:
+                        rospy.loginfo("✓ 50% XY correction successful")
+                    else:
+                        rospy.logwarn("⚠ 50% XY correction timeout")
+                    
+                    # Then 3s active stabilization at corrected position
+                    stabilization_target = [target_x, target_y, current_pos[2]]
+                    self.active_stabilization_wait(stabilization_target, final_yaw, 3.0, "50% progress XY stabilization")
+                    
+                    # Update current position after stabilization
+                    current_pos = self.get_end_effector_position() or current_pos
                 else:
-                    rospy.logwarn("⚠ 50% XY correction timeout")
+                    rospy.loginfo(f"[Z Descent] 50% progress reached ({progress_ratio*100:.0f}%), XY error {xy_error_50*1000:.1f}mm ≤ 30mm, skipping stabilization for continuity")
                 
-                # Then 3s active stabilization at corrected position
-                stabilization_target = [target_x, target_y, current_pos[2]]
-                self.active_stabilization_wait(stabilization_target, final_yaw, 3.0, "50% progress XY stabilization")
-                
-                # Update current position after stabilization
-                current_pos = self.get_end_effector_position() or current_pos
                 stabilization_50_done = True
 
             # Update tracking variables
@@ -1523,19 +1565,15 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             return 'failed'
         rospy.loginfo("[Z_DESCENT] Complete")
 
-        # Share insertion pose with subsequent states
-        insertion_pose = getattr(self, '_last_z_descent_contact_position', None)
-        if insertion_pose is None:
-            insertion_pose = self.get_end_effector_position() or final_target
+        # CRITICAL FIX: Use valve height (final_target) for stabilization, NOT contact position
+        # This ensures consistent Z throughout insertion and rotation phases
+        insertion_pose = final_target  # Use valve height directly
         userdata.insertion_contact_pose = insertion_pose
         userdata.insertion_contact_yaw = self.get_end_effector_yaw() or final_yaw
 
-        # Post-insertion stabilization (reduced from 5s to 1.5s)
-        if insertion_pose is not None:
-            rospy.loginfo(f"1.5s stabilization at {FormationUtils.format_vec(insertion_pose)}")
-            self.active_stabilization_wait(insertion_pose, final_yaw, 1.5, "Post-insertion")
-        else:
-            rospy.sleep(1.5)
+        # Post-insertion stabilization at valve height
+        rospy.loginfo(f"1.5s stabilization at valve height {FormationUtils.format_vec(insertion_pose)}")
+        self.active_stabilization_wait(insertion_pose, final_yaw, 1.5, "Post-insertion")
 
         rospy.loginfo("=== Formation move-to-valve complete ===")
         return 'succeeded'
@@ -1596,7 +1634,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             return self.active_position_convergence(
                 target_pos=target_pos, target_yaw=target_yaw,
                 pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout,
-                adjustment_pos_thresh=adjustment_pos_thresh
+                adjustment_pos_thresh=adjustment_pos_thresh,
+                decomposition_threshold=0.04  # Force 40mm threshold for XY motion
             )
         
         # Trajectory-based movement for larger distances
@@ -1622,7 +1661,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         final_success = self.active_position_convergence(
             target_pos=target_pos, target_yaw=target_yaw,
             pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout,
-            adjustment_pos_thresh=adjustment_pos_thresh
+            adjustment_pos_thresh=adjustment_pos_thresh,
+            decomposition_threshold=0.04  # Force 40mm threshold for XY motion
         )
         
         # Stabilization for final position
@@ -1753,15 +1793,26 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             achieved_pos = self.get_end_effector_position() or final_ee_pos
 
         self._last_z_descent_contact_position = achieved_pos
-        FormationSingleUAVStateBase._shared_target_z = achieved_pos[2]
+        
+        # CRITICAL FIX: Use target height (valve height), NOT achieved height
+        # achieved_pos may be higher due to early contact detection
+        # Use final_ee_pos[2] which is the optimizer's target (valve height)
+        FormationSingleUAVStateBase._shared_target_z = final_ee_pos[2]
+        rospy.loginfo(f"[Z_DESCENT] Saved target Z={final_ee_pos[2]:.3f}m (valve height), achieved Z={achieved_pos[2]:.3f}m (contact position)")
 
+        # CRITICAL FIX 2: Use valve height for convergence, NOT contact position
+        # This ensures UAV converges to correct insertion depth, not where contact was detected
+        final_convergence_target = (final_ee_pos[0], final_ee_pos[1], final_ee_pos[2])
+        rospy.loginfo(f"[Z_DESCENT] Converging to valve height: {FormationUtils.format_vec(final_convergence_target)}")
+        
         final_success = self.active_position_convergence(
-            target_pos=achieved_pos,
+            target_pos=final_convergence_target,  # Use valve height, NOT achieved_pos
             target_yaw=final_yaw,
             pos_thresh=0.080,
             yaw_thresh=0.087,
             timeout=12.0,
-            adjustment_pos_thresh=0.050
+            adjustment_pos_thresh=0.050,
+            decomposition_threshold=0.08  # Force 80mm for Z convergence
         )
 
         if not final_success:

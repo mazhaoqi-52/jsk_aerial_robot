@@ -1597,14 +1597,15 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             return 'failed'
         rospy.loginfo("[Z_DESCENT] Complete")
 
-        # CRITICAL FIX: Use valve height (final_target) for stabilization, NOT contact position
-        # This ensures consistent Z throughout insertion and rotation phases
-        insertion_pose = final_target  # Use valve height directly
+        # CRITICAL FIX: Use ROTATION height (valve + 100mm) for stabilization
+        # This ensures UAV stays at the elevated rotation height set in final convergence
+        rotation_height_pose = (final_target[0], final_target[1], FormationSingleUAVStateBase._shared_target_z)
+        insertion_pose = rotation_height_pose  # Use rotation height (valve_z + 100mm)
         userdata.insertion_contact_pose = insertion_pose
         userdata.insertion_contact_yaw = self.get_end_effector_yaw() or final_yaw
 
-        # Post-insertion stabilization at valve height
-        rospy.loginfo(f"1.5s stabilization at valve height {FormationUtils.format_vec(insertion_pose)}")
+        # Post-insertion stabilization at ROTATION height
+        rospy.loginfo(f"1.5s stabilization at ROTATION height {FormationUtils.format_vec(insertion_pose)}")
         self.active_stabilization_wait(insertion_pose, final_yaw, 1.5, "Post-insertion")
 
         rospy.loginfo("=== Formation move-to-valve complete ===")
@@ -1830,23 +1831,23 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         detected_contact_z = achieved_pos[2]
         valve_z = final_ee_pos[2]
         
-        # Rotation height logic: use valve_z + 10mm, but if detected contact is lower, use detected
-        rotation_target_z = valve_z + 0.010  # Default: valve_z + 10mm
-        if detected_contact_z < rotation_target_z:
-            rotation_target_z = detected_contact_z
-            rospy.loginfo(f"[Z_DESCENT] Using detected contact Z={detected_contact_z:.3f}m (< valve_z+10mm={valve_z+0.010:.3f}m)")
-        else:
-            rospy.loginfo(f"[Z_DESCENT] Using valve_z+10mm={rotation_target_z:.3f}m for rotation (detected={detected_contact_z:.3f}m)")
+        # Smart height selection: compare valve+50mm vs detected_contact+20mm, use the lower one
+        valve_based_height = valve_z + 0.050  # valve_z + 50mm
+        contact_based_height = detected_contact_z + 0.020  # detected_contact_z + 20mm
+        rotation_target_z = min(valve_based_height, contact_based_height)
+        
+        rospy.loginfo(f"[Z_DESCENT] Height selection: valve+50mm={valve_based_height:.3f}m, contact+20mm={contact_based_height:.3f}m")
+        rospy.loginfo(f"[Z_DESCENT] Selected rotation height: {rotation_target_z:.3f}m (clearance from valve: {1000*(rotation_target_z-valve_z):.1f}mm)")
         
         FormationSingleUAVStateBase._shared_target_z = rotation_target_z
-        rospy.loginfo(f"[Z_DESCENT] Rotation height set to Z={rotation_target_z:.3f}m (valve={valve_z:.3f}m, detected={detected_contact_z:.3f}m)")
+        rospy.loginfo(f"[Z_DESCENT] Rotation height set to Z={rotation_target_z:.3f}m (valve={valve_z:.3f}m, clearance={1000*(rotation_target_z-valve_z):.1f}mm)")
 
-        # Converge to valve height for insertion
-        final_convergence_target = (final_ee_pos[0], final_ee_pos[1], final_ee_pos[2])
-        rospy.loginfo(f"[Z_DESCENT] Converging to valve height: {FormationUtils.format_vec(final_convergence_target)}")
+        # Converge to ROTATION height (NOT valve height!)
+        final_convergence_target = (final_ee_pos[0], final_ee_pos[1], rotation_target_z)
+        rospy.loginfo(f"[Z_DESCENT] Converging to ROTATION height Z={rotation_target_z:.3f}m: {FormationUtils.format_vec(final_convergence_target)}")
         
         final_success = self.active_position_convergence(
-            target_pos=final_convergence_target,  # Use valve height, NOT achieved_pos
+            target_pos=final_convergence_target,  # Use ROTATION height (valve_z + 100mm)
             target_yaw=final_yaw,
             pos_thresh=0.080,
             yaw_thresh=0.087,
@@ -2220,6 +2221,15 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 rospy.loginfo(f"Valve rotation completed: {math.degrees(valve_rotation):.1f}° "
                              f"(target: {math.degrees(self.target_rotation):.1f}°) in {elapsed:.1f}s")
                 
+                # [DEBUG] Record end-effector to valve center distance at rotation completion
+                final_ee_pos = self.get_end_effector_position()
+                if final_ee_pos and hasattr(self, 'valve_center') and self.valve_center:
+                    xy_dist_to_valve = math.sqrt(
+                        (final_ee_pos[0] - self.valve_center[0])**2 + 
+                        (final_ee_pos[1] - self.valve_center[1])**2
+                    )
+                    rospy.loginfo(f"[ROTATION_END_DEBUG] EE to valve center XY distance: {xy_dist_to_valve*1000:.1f}mm")
+                
                 # Restore trajectory_state save for Disengage phase use
                 userdata.trajectory_state = {
                     'current_radius': self.contact_radius,
@@ -2337,14 +2347,25 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"Current: {FormationUtils.format_vec(current_pos)}, yaw={math.degrees(current_yaw):.1f}°")
         rospy.loginfo(f"Start: {FormationUtils.format_vec(start_ee_pos)}")
         
+        # Store valve_center as instance attribute for ASCENT phase
+        generator_center = trajectory_state.get('valve_center', valve_pos)
+        self.valve_center = generator_center  # Make available for ASCENT phase
+        rospy.loginfo(f"[DISENGAGE] Valve center stored: {FormationUtils.format_vec(generator_center)}")
+        
         # REVERSE_ROTATE
         rospy.loginfo("[REVERSE_ROTATE] Reverse 40° to disengage")
         
-        generator_center = trajectory_state.get('valve_center', valve_pos)
         generator_radius = trajectory_state.get('current_radius')
         if generator_radius is None:
             generator_radius = math.sqrt((current_pos[0] - generator_center[0])**2 +
                                         (current_pos[1] - generator_center[1])**2)
+        
+        # [DEBUG] Record XY distance to valve center before REVERSE_ROTATE
+        initial_xy_to_valve = math.sqrt(
+            (current_pos[0] - generator_center[0])**2 + 
+            (current_pos[1] - generator_center[1])**2
+        )
+        rospy.loginfo(f"[REVERSE_ROTATE_DEBUG] Initial EE to valve XY: {initial_xy_to_valve*1000:.1f}mm")
         
         disengagement_radius = max(generator_radius, 0.01)
         rotation_direction = trajectory_state.get('rotation_direction', 1)
@@ -2415,8 +2436,16 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             
             rospy.loginfo("[REVERSE_ROTATE] Complete")
             
-            # Stop command
+            # [DEBUG] Record XY distance to valve center after REVERSE_ROTATE
             final_pos = self.get_end_effector_position()
+            if final_pos and generator_center:
+                final_xy_to_valve = math.sqrt(
+                    (final_pos[0] - generator_center[0])**2 + 
+                    (final_pos[1] - generator_center[1])**2
+                )
+                rospy.loginfo(f"[REVERSE_ROTATE_DEBUG] Final EE to valve XY: {final_xy_to_valve*1000:.1f}mm")
+            
+            # Stop command
             final_yaw = self.get_end_effector_yaw()
             if final_pos is not None and final_yaw is not None:
                 for _ in range(5):
@@ -2428,8 +2457,11 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         except Exception as e:
             rospy.logwarn(f"Reverse motion failed: {e}")
         
-        # ASCENT: Direct pure Z ascent from current position
-        # No XY movement needed - just lock current XY and rise vertically
+        # ============================================================
+        # ASCENT: Two-phase ascent strategy
+        # Phase 1: Oblique ascent (Z + XY toward valve center)
+        # Phase 2: Pure Z ascent to final height
+        # ============================================================
         rospy.sleep(1.0)
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
@@ -2438,34 +2470,153 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             rospy.logerr("Cannot get current pose for ascent")
             return 'failed'
         
-        # Lock XY at current position for pure Z ascent
-        locked_xy = (current_pos[0], current_pos[1])
+        # Get valve center for XY targeting
+        valve_center_xy = None
+        if hasattr(self, 'valve_center') and self.valve_center is not None:
+            valve_center_xy = (self.valve_center[0], self.valve_center[1])
+        
         rospy.loginfo(f"[ASCENT] Starting from EE: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
-        rospy.loginfo(f"[ASCENT] XY locked at: ({locked_xy[0]:.3f}, {locked_xy[1]:.3f}) for pure Z ascent")
         
-        target_z = (start_ee_pos[2] + 0.1) if start_ee_pos else (current_pos[2] + 0.15)
-        z_distance = target_z - current_pos[2]
-        rospy.loginfo(f"[ASCENT] Pure Z ascent: {z_distance*1000:.1f}mm (XY locked, Z speed 5mm/s)")
+        # Calculate XY distance to valve center
+        if valve_center_xy is not None:
+            xy_distance_to_valve = math.sqrt(
+                (current_pos[0] - valve_center_xy[0])**2 + 
+                (current_pos[1] - valve_center_xy[1])**2
+            )
+            rospy.loginfo(f"[ASCENT] Initial XY distance to valve center: {xy_distance_to_valve*1000:.1f}mm")
+        else:
+            xy_distance_to_valve = 0.0
+            rospy.logwarn("[ASCENT] Valve center not available, using pure Z ascent")
         
-        # Smaller steps and slower speed for formation stability
-        step_size = 0.01  # Reduced from 20mm to 10mm per step
+        target_z_final = (start_ee_pos[2] + 0.1) if start_ee_pos else (current_pos[2] + 0.15)
+        total_z_distance = target_z_final - current_pos[2]
+        
+        # Phase 1: Oblique ascent (only if XY distance > 10mm)
+        # Conservative approach: only move 5mm toward valve center (from starting position)
+        phase1_enabled = valve_center_xy is not None and xy_distance_to_valve > 0.010
+        
+        if phase1_enabled:
+            rospy.loginfo("[ASCENT_PHASE1] Gentle oblique ascent: Z+XY (max 5mm closer)")
+            
+            # Phase 1 target: rise 50mm while moving XY toward valve center by MAX 5mm
+            phase1_z_rise = min(0.050, total_z_distance * 0.4)  # 50mm or 40% of total, whichever is smaller
+            phase1_target_z = current_pos[2] + phase1_z_rise
+            
+            # Calculate target XY: move 5mm toward valve center (NOT to 15mm from center!)
+            # This prevents squeezing end-effector against valve beam during ascent
+            direction_x = valve_center_xy[0] - current_pos[0]
+            direction_y = valve_center_xy[1] - current_pos[1]
+            norm = math.sqrt(direction_x**2 + direction_y**2)
+            
+            # Move 5mm toward valve center from current position
+            xy_approach_distance = min(0.005, xy_distance_to_valve - 0.010)  # Max 5mm, but stop at 10mm from valve
+            if xy_approach_distance > 0:
+                phase1_target_xy = (
+                    current_pos[0] + (direction_x / norm) * xy_approach_distance,
+                    current_pos[1] + (direction_y / norm) * xy_approach_distance
+                )
+            else:
+                # Already close enough, no XY movement
+                phase1_target_xy = (current_pos[0], current_pos[1])
+                rospy.loginfo("[ASCENT_PHASE1] Already within 10mm of valve center, skipping XY movement")
+                phase1_enabled = False  # Skip Phase 1 if no XY movement needed
+            
+            if phase1_enabled:
+                phase1_xy_distance = math.sqrt(
+                    (phase1_target_xy[0] - current_pos[0])**2 + 
+                    (phase1_target_xy[1] - current_pos[1])**2
+                )
+                
+                final_distance_to_valve = math.sqrt(
+                    (phase1_target_xy[0] - valve_center_xy[0])**2 + 
+                    (phase1_target_xy[1] - valve_center_xy[1])**2
+                )
+                
+                rospy.loginfo(f"[ASCENT_PHASE1] Target: XY=({phase1_target_xy[0]:.3f}, {phase1_target_xy[1]:.3f}), Z={phase1_target_z:.3f}m")
+                rospy.loginfo(f"[ASCENT_PHASE1] XY approach: {phase1_xy_distance*1000:.1f}mm (will be {final_distance_to_valve*1000:.1f}mm from valve)")
+                rospy.loginfo(f"[ASCENT_PHASE1] Z rise: {phase1_z_rise*1000:.1f}mm")
+            
+                # Execute Phase 1: use small steps with coordinated XY+Z movement
+                step_size_z = 0.01  # 10mm per step in Z
+                num_steps = int(phase1_z_rise / step_size_z) + 1
+            
+            for step in range(1, num_steps + 1):
+                if rospy.is_shutdown():
+                    break
+                
+                # Linear interpolation for both XY and Z
+                progress = float(step) / num_steps
+                current_step_xy = (
+                    current_pos[0] + (phase1_target_xy[0] - current_pos[0]) * progress,
+                    current_pos[1] + (phase1_target_xy[1] - current_pos[1]) * progress
+                )
+                current_step_z = current_pos[2] + phase1_z_rise * progress
+                
+                self.send_assembly_command_from_end_effector(
+                    (current_step_xy[0], current_step_xy[1], current_step_z),
+                    current_yaw,
+                    linear_vel=[0.005, 0.005, 0.005]  # Slow coordinated movement
+                )
+                rospy.sleep(1.0)
+                
+                # Debug log every 3 steps
+                if step % 3 == 0:
+                    actual_pos = self.get_end_effector_position()
+                    if actual_pos:
+                        actual_xy_to_valve = math.sqrt(
+                            (actual_pos[0] - valve_center_xy[0])**2 + 
+                            (actual_pos[1] - valve_center_xy[1])**2
+                        )
+                        rospy.loginfo(f"[ASCENT_PHASE1] Step {step}/{num_steps}, Z={actual_pos[2]:.3f}m, XY_to_valve={actual_xy_to_valve*1000:.1f}mm")
+            
+            rospy.loginfo("[ASCENT_PHASE1] Complete")
+            
+            # Brief stabilization
+            rospy.sleep(0.5)
+            current_pos = self.get_end_effector_position()
+            if current_pos is None:
+                rospy.logerr("[ASCENT] Cannot get position after Phase 1")
+                return 'failed'
+            
+            # Verify Phase 1 result
+            phase1_xy_to_valve = math.sqrt(
+                (current_pos[0] - valve_center_xy[0])**2 + 
+                (current_pos[1] - valve_center_xy[1])**2
+            )
+            rospy.loginfo(f"[ASCENT_PHASE1] Result: XY_to_valve={phase1_xy_to_valve*1000:.1f}mm, Z={current_pos[2]:.3f}m")
+        else:
+            rospy.loginfo("[ASCENT_PHASE1] Skipped (already close to valve center or no valve center info)")
+        
+        # Phase 2: Pure Z ascent to final height
+        rospy.loginfo("[ASCENT_PHASE2] Pure Z ascent to final height")
+        
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr("[ASCENT] Cannot get position for Phase 2")
+            return 'failed'
+        
+        # Lock XY at current position for Phase 2
+        locked_xy = (current_pos[0], current_pos[1])
+        remaining_z = target_z_final - current_pos[2]
+        rospy.loginfo(f"[ASCENT_PHASE2] XY locked at: ({locked_xy[0]:.3f}, {locked_xy[1]:.3f})")
+        rospy.loginfo(f"[ASCENT_PHASE2] Pure Z ascent: {remaining_z*1000:.1f}mm to Z={target_z_final:.3f}m")
+        
+        step_size = 0.01  # 10mm per step
         current_z = current_pos[2]
         step_count = 0
         
-        while current_z < target_z and not rospy.is_shutdown():
-            current_z = min(current_z + step_size, target_z)
+        while current_z < target_z_final and not rospy.is_shutdown():
+            current_z = min(current_z + step_size, target_z_final)
             step_count += 1
             
             # Active XY correction during ascent to prevent drift
-            # Check if XY has drifted from locked position
             current_actual_pos = self.get_end_effector_position()
             if current_actual_pos is not None:
                 xy_drift = math.sqrt((current_actual_pos[0] - locked_xy[0])**2 + 
                                     (current_actual_pos[1] - locked_xy[1])**2)
                 
                 if xy_drift > 0.030:  # 30mm drift threshold
-                    rospy.logwarn(f"[ASCENT] XY drift detected: {xy_drift*1000:.1f}mm, correcting...")
-                    # Brief XY correction with Z locked at current altitude
+                    rospy.logwarn(f"[ASCENT_PHASE2] XY drift detected: {xy_drift*1000:.1f}mm, correcting...")
                     correction_target = (locked_xy[0], locked_xy[1], current_actual_pos[2])
                     self.active_position_convergence(
                         target_pos=correction_target,
@@ -2480,17 +2631,27 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             self.send_assembly_command_from_end_effector(
                 (locked_xy[0], locked_xy[1], current_z), 
                 current_yaw, 
-                linear_vel=[0.0, 0.0, 0.005]  # Reduced Z velocity: 10mm/s → 5mm/s, XY=0
+                linear_vel=[0.0, 0.0, 0.005]  # Pure Z velocity: 5mm/s
             )
-            rospy.sleep(1.0)  # Increased from 0.5s to 1.0s per step for extra stability
+            rospy.sleep(1.0)
             
-            # Log progress every 5 steps
+            # Log progress every 5 steps (with valve center distance debug)
             if step_count % 5 == 0:
-                rospy.loginfo(f"[ASCENT] Step {step_count}, Z={current_z:.3f}m")
+                if valve_center_xy:
+                    actual_pos = self.get_end_effector_position()
+                    if actual_pos:
+                        xy_to_valve = math.sqrt(
+                            (actual_pos[0] - valve_center_xy[0])**2 + 
+                            (actual_pos[1] - valve_center_xy[1])**2
+                        )
+                        rospy.loginfo(f"[ASCENT_PHASE2] Step {step_count}, Z={current_z:.3f}m, XY_to_valve={xy_to_valve*1000:.1f}mm")
+                else:
+                    rospy.loginfo(f"[ASCENT_PHASE2] Step {step_count}, Z={current_z:.3f}m")
         
-        rospy.loginfo("[ASCENT] Complete")
+        rospy.loginfo("[ASCENT_PHASE2] Complete")
+        rospy.loginfo("[ASCENT] Two-phase ascent complete")
         
-        # 1.5-second stabilization at current position after ascent (reduced from 3s)
+        # 1.5-second stabilization at current position after ascent
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
         rospy.loginfo(f"[POST_ASCENT_STABILIZE] 1.5s stabilization at {FormationUtils.format_vec(current_pos)}")

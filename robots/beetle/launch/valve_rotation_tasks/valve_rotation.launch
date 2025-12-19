@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="module_ids" default=""/>
+  <arg name="real_machine" default="true"/>
+  <arg name="simulation" default="true"/>   
+  <arg name="valve_ns" default="valve"/>
+  <arg name="valve_id" default="1"/>
+  <arg name="valve_x" default="3"/>
+  <arg name="valve_y" default="0"/>
+  <arg name="valve_yaw" default="0"/>
+
+  <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
+    <arg name="real_machine" value="$(arg real_machine)" />
+    <arg name="simulation" value="$(arg simulation)" />
+    <arg name="robot_ns" value="$(arg valve_ns)" />
+    <arg name="robot_id" value="$(arg valve_id)"/>
+    <arg name="valve_x" value="$(arg valve_x)" />
+    <arg name="valve_y" value="$(arg valve_y)" />
+    <arg name="valve_yaw" value="$(arg valve_yaw)" />
+  </include>
+
+  <!-- <node pkg="beetle" type="valve_rotation_smach_test.py" name="valve_rotation_smach_test" output="screen"> -->
+  <node pkg="beetle" type="valve_rotation_states_test.py" name="valve_rotation_states_test" output="screen">
+    <param name="simulation" value="$(arg simulation)"/>
+    <param name="module_ids" value="$(arg module_ids)"/>
+    <param name="real_machine" value="$(arg real_machine)"/>
+  </node>
+
+
+</launch>

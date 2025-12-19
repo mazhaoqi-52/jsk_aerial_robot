@@ -8,10 +8,12 @@ from std_msgs.msg import Empty, String, Bool
 from aerial_robot_msgs.msg import FlightNav
 from spinal.msg import ServoControlCmd
 from diagnostic_msgs.msg import KeyValue
-from beetle.kondo_control import KondoControl
+from beetle.kondo_control_api import KondoControl
 import numpy as np
 import tf
-
+from beetle.gazebo_link_attacher import GazeboLinkAttacher
+from beetle.gazebo_link_detacher import GazeboLinkDetacher
+from gazebo_ros_link_attacher.srv import Attach, AttachRequest, AttachResponse
 
 #### state classes ####
 
@@ -31,9 +33,9 @@ class SwitchState(smach.State):
                  male_servo_id = 5,
                  real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 8300,
+                 lock_servo_angle_male = 7580,###8300###modify
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 5600,
+                 lock_servo_angle_female = 8000,###5600###
                  neighboring = 'beetle2',
                  neighboring_id = 2,
                  female_servo_id = 6,
@@ -52,7 +54,6 @@ class SwitchState(smach.State):
         self.neighboring_id = neighboring_id
         self.female_servo_id = female_servo_id
         self.separate_dir = separate_dir
-
         if(separate_dir > 0):
             self.kondo_servo = KondoControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
             self.kondo_servo_neighboring = KondoControl(self.neighboring,self.neighboring_id,self.male_servo_id,self.real_machine)
@@ -74,6 +75,15 @@ class SwitchState(smach.State):
         time.sleep(0.5)
 
     def execute(self, userdata):
+        if not self.real_machine:
+            try:
+                link_detacher = GazeboLinkDetacher(self.neighboring, 'root', self.robot_name, 'root')
+                # link_detacher = GazeboLinkDetacher(self.robot_name, 'root', self.neighboring, 'root')
+
+                link_detacher.detach_links()
+            except rospy.ServiceException:
+                rospy.loginfo("Dettacher failed")  
+        time.sleep(1)  
         self.flag_msg.key = str(self.robot_id)
         self.flag_msg.value = '0'
         self.flag_pub.publish(self.flag_msg)
@@ -147,7 +157,9 @@ class SeparateState(smach.State):
 #### main class ####
 class DisassembleDemo():
     def __init__(self):
-        rospy.init_node("disassemble_demo")
+        # rospy.init_node("disassemble_demo")
+        if not rospy.core.is_initialized():  # 检查是否已初始化
+            rospy.init_node("disassemble_demo")
 
     def main(self):
         sm_top = smach.StateMachine(outcomes=['succeeded'])
@@ -159,8 +171,13 @@ class DisassembleDemo():
         sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
         sis.start()
         outcome = sm_top.execute()
-        rospy.spin()
-        sis.stop()
+        # rospy.spin()
+        # sis.stop()
+        # 保持ROS节点运行
+        while not rospy.is_shutdown() and outcome not in ['succeeded', 'interupted']:
+            rospy.sleep(0.1)  
+            sis.stop()
+            return outcome  
 
 if __name__ == '__main__':
     try:

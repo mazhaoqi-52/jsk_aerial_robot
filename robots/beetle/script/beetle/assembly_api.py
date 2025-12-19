@@ -13,6 +13,10 @@ from beetle.kondo_control_api import KondoControl
 from beetle.utils import coordTransformer
 import numpy as np
 import tf
+from beetle.gazebo_link_attacher import GazeboLinkAttacher
+from beetle.gazebo_link_detacher import GazeboLinkDetacher
+from gazebo_ros_link_attacher.srv import Attach, AttachRequest, AttachResponse
+
 
 #### state classes ####
 
@@ -29,11 +33,11 @@ class StandbyState(smach.State):
                  robot_id = 1,
                  male_servo_id = 5,
                  female_servo_id = 6,
-                 real_machine = True,
+                 real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 8800,
+                 lock_servo_angle_male = 7580,###8800###
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 5600,
+                 lock_servo_angle_female = 4600,###5600###
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,
@@ -127,11 +131,15 @@ class StandbyState(smach.State):
         #TODO: determine leader namespace dynamically
         try:
             leader_from_world = self.listener.lookupTransform('/world', self.leader+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: /world -> %s/root: %s" % (self.leader, str(e)))
+            self.run_rate.sleep()
             return 'in_process'
         try:
             follower_from_leader = self.listener.lookupTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: %s/root -> %s/root: %s" % (self.leader, self.robot_name, str(e)))
+            self.run_rate.sleep()
             return 'in_process'
 
         # set target odom in leader coordinate
@@ -144,8 +152,11 @@ class StandbyState(smach.State):
 
         # convert target position from leader coord to world coord
         try:
+            self.listener.waitForTransform('/world', '/follower_target_odom', rospy.Time(0), rospy.Duration(0.5))
             homo_transformed_target_odom = self.listener.lookupTransform('/world', '/follower_target_odom', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
+            rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: /world -> /follower_target_odom: %s" % str(e))
+            self.run_rate.sleep()
             return 'in_process'
         target_pos = homo_transformed_target_odom[0]
         target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])
@@ -219,11 +230,11 @@ class ApproachState(smach.State):
                  robot_id = 1,
                  male_servo_id = 5,
                  female_servo_id = 6,
-                 real_machine = True,
+                 real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 8800,
+                 lock_servo_angle_male = 7400,###8800###
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 5600,
+                 lock_servo_angle_female = 8000,##5600##
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,
@@ -232,7 +243,7 @@ class ApproachState(smach.State):
                  z_offset = 0,
                  x_tol = 0.02,
                  y_tol = 0.02,
-                 z_tol = 0.02,
+                 z_tol = 0.01,#0.02
                  roll_tol = 0.08,
                  pitch_tol = 0.08,
                  yaw_tol = 0.08,
@@ -407,11 +418,11 @@ class AssemblyState(smach.State):
                  robot_id = 1,
                  male_servo_id = 5,
                  female_servo_id = 6,
-                 real_machine = True,
+                 real_machine = False,
                  unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 8800,
+                 lock_servo_angle_male = 7700,###8800###
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 5600,
+                 lock_servo_angle_female = 8000,###5600###
                  leader = 'beetle2',
                  leader_id = 2,
                  attach_dir = -1.0):
@@ -429,6 +440,7 @@ class AssemblyState(smach.State):
         self.leader = leader
         self.leader_id = leader_id
         self.attach_dir = attach_dir
+        self.is_simulation = rospy.get_param("~simlation", True)
 
         # flags
         self.emergency_flag = False
@@ -474,7 +486,15 @@ class AssemblyState(smach.State):
         self.flag_msg.key = str(self.leader_id)
         self.flag_msg.value = '1'
         self.flag_pub_leader.publish(self.flag_msg)
-        rospy.sleep(5.0)
+        rospy.sleep(0.3)
+        if not self.real_machine:
+            try:
+                link_attacher = GazeboLinkAttacher(self.robot_name, 'root', self.leader, 'root')
+                link_attacher.attach_links()
+            except rospy.ServiceException:
+                rospy.loginfo("Attacher failed")        
+        rospy.sleep(2.0)
+
         return 'done'
 
     def emergencyCb(self,msg):
@@ -493,7 +513,8 @@ class AssemblyState(smach.State):
 #### main class ####
 class AssembleDemo():
     def __init__(self):
-        rospy.init_node("assemble_demo")
+        if not rospy.core.is_initialized():  # 检查是否已初始化
+            rospy.init_node("assemble_demo")
 
     def main(self):
         sm_top = smach.StateMachine(outcomes=['succeeded','interupted'])
@@ -505,8 +526,13 @@ class AssembleDemo():
         sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
         sis.start()
         outcome = sm_top.execute()
-        rospy.spin()
-        sis.stop()
+        # rospy.spin() #为了确保状态机的正常运行，故注释
+        # sis.stop()
+        # 保持ROS节点运行
+        while not rospy.is_shutdown() and outcome not in ['succeeded', 'interupted']:
+            rospy.sleep(0.1)  
+            sis.stop()
+            return outcome  
 
 if __name__ == '__main__':
     try:

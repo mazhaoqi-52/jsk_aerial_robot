@@ -381,6 +381,40 @@ void BeetleNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & 
       setTargetPosZ(target_cog_pos.z());
       setTargetVelZ(msg->target_vel_z);
     }
+
+  /* pitch control */
+  if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setY(msg->target_pitch);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+    }
+  if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_VEL_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setY(msg->target_pitch);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+      
+      trajectory_mode_ = true;
+      trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
+    }
+
+  /* roll control */
+  if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setX(msg->target_roll);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+    }
+  if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_VEL_MODE)
+    {
+      tf::Vector3 target_roll_pitch = getFinalTargetBaselinkRot();
+      target_roll_pitch.setX(msg->target_roll);
+      setFinalTargetBaselinkRot(target_roll_pitch);
+      
+      trajectory_mode_ = true;
+      trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
+    }
 }
 
 
@@ -552,8 +586,11 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
   if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::VEL_MODE)
     {
       /* special */
-      addTargetPosZ(msg->target_pos_diff_z);
-      setTargetVelZ(0);
+      // addTargetPosZ(msg->target_pos_diff_z);
+      // setTargetVelZ(0);
+      // Support VEL control for Z axis in  assembly mode
+      setTargetVelZ(msg->target_vel_z);
+      teleop_reset_time_ = teleop_reset_duration_ + ros::Time::now().toSec();
     }
   else if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
     {
@@ -673,6 +710,15 @@ void BeetleNavigator::calcCenterOfMoving()
     module_state_ = FOLLOWER;
   }
 
+  //define a module on the right edge as leader
+  // std::sort(assembled_modules_ids_.begin(), assembled_modules_ids_.end());
+  // int leader_index = std::round((assembled_modules_ids_.size())) -1;
+  // if(!leader_fix_flag_) leader_id_ = assembled_modules_ids_[leader_index];
+  // if(my_id_ == leader_id_ && control_flag_){
+  //   module_state_ = LEADER;
+  // }else if(control_flag_){
+  //   module_state_ = FOLLOWER;
+  // }
 
   center_of_moving = center_of_moving / assembled_module;
 
@@ -796,6 +842,7 @@ void BeetleNavigator::rosParamInit()
 {
   ros::NodeHandle nh(nh_, "navigation");
   getParam<double>(nh, "max_target_roll_pitch_rate", max_target_roll_pitch_rate_, 0.0);
+  getParam<int>(nh, "max_modules_num", max_modules_num_, 8);
   GimbalrotorNavigator::rosParamInit();
 
   nh_.getParam("robot_id", my_id_);

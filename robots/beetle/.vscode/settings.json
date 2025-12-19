@@ -1,0 +1,16 @@
+{
+    "files.associations": {
+      "deque": "cpp",
+      "list": "cpp",
+      "string": "cpp",
+      "vector": "cpp",
+      "chrono": "cpp"
+    },
+    // settings.json
+      // other settings
+   "urdf-visualizer.packages": {
+    "beetle": "/home/ma/ros/jsk_aerial_robot_ws/src/jsk_aerial_robot/robots/beetle/"
+  },
+  // other settings
+}
+

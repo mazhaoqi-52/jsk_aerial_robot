@@ -69,6 +69,33 @@ Visualization Manager:
       Update Interval: 0
       Value: true
       Visual Enabled: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: TrajectoryPreview
+      Namespace: trajectory_preview
+      Topic: /beetle1/trajectory_preview
+      Queue Size: 10
+      Color: 0; 0; 255
+      Alpha: 1.0
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Name: ValvePreview
+      Namespace: valve_preview
+      Topic: /beetle1/valve_preview
+      Queue Size: 10
+      Color: 255; 0; 0
+      Alpha: 1.0
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Name: UAVStartPreview
+      Namespace: uav_start_preview
+      Topic: /beetle1/uav_start_preview
+      Queue Size: 10
+      Color: 255; 255; 0
+      Alpha: 1.0
+      Value: true
     - Class: rviz/TF
       Enabled: true
       Filter (blacklist): ""

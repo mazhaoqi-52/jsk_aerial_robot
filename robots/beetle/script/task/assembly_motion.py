@@ -41,13 +41,23 @@ class AssemblyDemo():
                 else:
                     smach.StateMachine.add('SUB'+str(i),
                                            sub_sm,
-                                           transitions={'succeeded_'+motion_prefix:'SUB1'+str(i+1), 'interupted_'+motion_prefix:'interupted'})
+                                           transitions={'succeeded_'+motion_prefix:'SUB'+str(i+1), 'interupted_'+motion_prefix:'interupted'})
 
         sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
         sis.start()
-        outcome = sm_top.execute()
-        rospy.spin()
-        sis.stop()
+        
+        try:
+            outcome = sm_top.execute()
+            rospy.loginfo(f"Assembly demo state machine completed with outcome: {outcome}")
+            return outcome
+        except Exception as e:
+            rospy.logerr(f"Error during assembly demo execution: {e}")
+            return 'interupted'
+        finally:
+            try:
+                sis.stop()
+            except:
+                pass  
 if __name__ == '__main__':
     rospy.init_node("assembly_motion")
     modules_str = rospy.get_param("module_ids", default="")

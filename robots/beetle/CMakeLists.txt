@@ -70,3 +70,31 @@ install(DIRECTORY script
 # catkin_install_python(PROGRAMS script/beetle/kondo_control.py
 #   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 #   )
+catkin_install_python(PROGRAMS
+  script/demos/valve_rotation_demo/valve_rotation_smach_test.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+catkin_install_python(PROGRAMS
+  script/demos/valve_rotation_demo/valve_rotation_states_test.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+catkin_install_python(PROGRAMS
+  script/demos/valve_rotation_demo/valve_rotation_fang_single.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+catkin_install_python(PROGRAMS
+  script/demos/valve_rotation_demo/valve_rotation_formation_clean.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+catkin_install_python(PROGRAMS
+  script/demos/valve_rotation_demo/valve_rotation_formation_n_module.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+catkin_install_python(PROGRAMS
+  script/demos/valve_rotation_demo/valve_rotation_formation_clean_fixed.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+catkin_install_python(PROGRAMS
+  script/demos/valve_rotation_demo/valve_rotation_formation_n_module_fixed.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

@@ -230,6 +230,9 @@ namespace aerial_robot_navigation
     static constexpr int PS4_AXIS_GYRO_YAW                = 12;
     static constexpr int PS4_AXIS_GYRO_PITCH              = 13;
 
+    static constexpr int MA_BUTTONS                  = 13;
+    static constexpr int MA_AXES     = 8;
+
     static const sensor_msgs::Joy ps4joyToPs3joyConvert(const sensor_msgs::Joy& ps4_joy_msg);
 
   protected:

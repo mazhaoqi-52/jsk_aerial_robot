@@ -1,0 +1,87 @@
+<?xml version="1.0" ?>
+<sdf version='1.6'>
+  <model name="barrier_with_belt_1">
+    <static>true</static> <!-- Static model -->
+
+    <!-- Base Plate -->
+    <link name="base1">
+      <visual name="base1_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.155</radius> <!-- Diameter: 31 cm -->
+            <length>0.04</length> <!-- Thickness: 4 cm -->
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.5 0.5 0.5 1</ambient> <!-- Grey color -->
+        </material>
+      </visual>
+      <collision name="base1_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.155</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <pose>0 0 0.02 0 0 0</pose> <!-- Base at ground level -->
+    </link>
+
+    <!-- Pillar -->
+    <link name="cylinder1">
+      <visual name="cylinder1_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius> <!-- Radius: 5 cm -->
+            <length>0.89</length> <!-- Height: 89 cm -->
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.5 0.5 0.5 1</ambient> <!-- Grey color -->
+        </material>
+      </visual>
+      <collision name="cylinder1_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.89</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <pose>0 0 0.46 0 0 0</pose> <!-- Placed on top of the base -->
+    </link>
+
+    <!-- Belt -->
+    <link name="tape">
+      <visual name="tape_visual">
+        <geometry>
+          <box>
+            <size>1.0 0.048 0.01</size> <!-- Length, Width, Thickness -->
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 0 0 1</ambient> <!-- Red color -->
+        </material>
+      </visual>
+      <collision name="tape_collision">
+        <geometry>
+          <box>
+            <size>1.0 0.048 0.01</size>
+          </box>
+        </geometry>
+      </collision>
+      <pose>0.50 0 0.84 1.571 0 0</pose> <!-- Aligned with the pillar -->
+    </link>
+
+    <!-- Fixed Joints -->
+    <joint name="cylinder1_to_base" type="fixed">
+      <parent>base1</parent>
+      <child>cylinder1</child>
+    </joint>
+    <joint name="cylinder1_to_tape" type="fixed">
+      <parent>cylinder1</parent>
+      <child>tape</child>
+    </joint>
+
+  </model>
+</sdf>

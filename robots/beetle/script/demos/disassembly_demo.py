@@ -5,7 +5,7 @@ import smach
 import smach_ros
 import math
 import numpy as np
-from beetle.disassembly import * 
+from beetle.disassembly_api import * 
 
 class DisassemblyDemo():
     def __init__(self):

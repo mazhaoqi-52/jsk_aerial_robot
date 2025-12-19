@@ -80,7 +80,7 @@ namespace aerial_robot_navigation
     tf2_ros::TransformListener tfListener_;
     tf2_ros::Buffer tfBuffer_;
     tf2_ros::TransformBroadcaster br_;
-    int max_modules_num_ = 4; //TODO: get the value from rosparam
+    int max_modules_num_;
     int pre_assembled_modules_;
     int my_id_;
     std::string my_name_;

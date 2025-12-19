@@ -1,0 +1,128 @@
+<?xml version="1.0" ?>
+<sdf version='1.4'>
+  <world name='default'>
+
+    <physics type='ode'>
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+      <magnetic_field>34 0 -36</magnetic_field>
+      <gravity>0 0 -9.8</gravity>
+    </physics>
+
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <latitude_deg>0</latitude_deg>
+      <longitude_deg>0</longitude_deg>
+      <elevation>0</elevation>
+      <heading_deg>0</heading_deg>
+    </spherical_coordinates>
+
+
+    <!-- A global light source -->
+   <scene>
+      <sky>
+        <clouds>
+          <speed>12</speed>
+        </clouds>
+      </sky>
+   </scene>
+
+   <include>
+     <uri>model://sun</uri>
+   </include>
+
+    <!-- A ground plane -->
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- A paltform for drone with manipulator to take off -->
+    <model name="take off platorm">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>1 0.2 0.6</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>1 0.2 0.6</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+      <pose>0 0 0 0 0 0</pose>
+    </model>
+
+    <!-- A maze made of barrier with belt -->
+    <include>
+      <uri>model://barrier_with_belt_1</uri>
+      <name>barrier_with_belt_1_entrance_1</name> 
+      <pose>1 0 0 0 0 0</pose> 
+    </include>
+
+    <include>
+      <uri>model://barrier_with_belt_1</uri>
+      <name>barrier_with_belt_1_entrance_2</name> 
+      <pose>1 1 0 0 0 0</pose> 
+    </include>
+
+    <include>
+      <uri>model://barrier_with_belt_1</uri>
+      <name>barrier_with_belt_1_entrance_3</name> 
+      <pose>1 -1 0 0 0 0</pose> 
+    </include>
+
+    <include>
+      <uri>model://barrier_with_belt_1_dual</uri>
+      <name>barrier_with_belt_1_entrance_4</name> 
+      <pose>2 2 0 0 0 -1.5708</pose> 
+    </include>
+
+    <include>
+      <uri>model://barrier_with_belt_1_dual</uri>
+      <name>barrier_with_belt_1_middle_1</name>
+      <pose>4 2 0 0 0 3.1415926</pose> 
+    </include>
+ 
+     <include>
+      <uri>model://barrier_with_belt_1_dual</uri>
+      <name>barrier_with_belt_1_entrance_5</name>
+      <pose>2 -2 0 0 0 0</pose> 
+    </include>
+
+    <include>
+      <uri>model://barrier_with_belt_1_dual</uri>
+      <name>barrier_with_belt_1_middle_2</name>
+      <pose>4 -2 0 0 0 1.5708</pose> 
+    </include>
+
+    <!-- <include>
+      <uri>model://barrier_with_belt_1</uri>
+      <name>barrier_with_belt_1_exit_1</name> 
+      <pose>4 0 0 0 0 0</pose> 
+    </include> -->
+
+    <include>
+      <uri>model://barrier_with_belt_1</uri>
+      <name>barrier_with_belt_1_exit_2</name> 
+      <pose>4 1 0 0 0 0</pose> 
+    </include>
+
+    <include>
+      <uri>model://barrier_with_belt_1</uri>
+      <name>barrier_with_belt_1_exit_3</name> 
+      <pose>4 -1 0 0 0 0</pose> 
+    </include>
+
+    <!-- World plugin: Link attacher -->
+    <plugin name="link_attacher_plugin" filename="libgazebo_ros_link_attacher.so">
+    </plugin>
+
+  </world>
+</sdf>

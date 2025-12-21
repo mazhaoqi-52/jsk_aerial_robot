@@ -1873,12 +1873,12 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         detected_contact_z = achieved_pos[2]
         valve_z = final_ee_pos[2]
         
-        # Smart height selection: compare valve+40mm vs detected_contact+10mm, use the lower one
-        valve_based_height = valve_z + 0.040  # valve_z + 40mm
-        contact_based_height = detected_contact_z + 0.010  # detected_contact_z + 10mm
+        # Smart height selection: compare valve+25mm vs detected_contact, use the lower one
+        valve_based_height = valve_z + 0.025  # valve_z + 25mm
+        contact_based_height = detected_contact_z  # Use detected contact height directly (no offset)
         rotation_target_z = min(valve_based_height, contact_based_height)
         
-        rospy.loginfo(f"[Z_DESCENT] Height selection: valve+40mm={valve_based_height:.3f}m, contact+10mm={contact_based_height:.3f}m")
+        rospy.loginfo(f"[Z_DESCENT] Height selection: valve+25mm={valve_based_height:.3f}m, contact={contact_based_height:.3f}m")
         rospy.loginfo(f"[Z_DESCENT] Selected rotation height: {rotation_target_z:.3f}m (clearance from valve: {1000*(rotation_target_z-valve_z):.1f}mm)")
         
         FormationSingleUAVStateBase._shared_target_z = rotation_target_z

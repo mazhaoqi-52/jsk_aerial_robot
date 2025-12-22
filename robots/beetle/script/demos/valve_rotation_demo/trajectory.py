@@ -898,7 +898,10 @@ class OnlineCircularTrajectoryGenerator:
     
     def update_state(self, current_pos, current_yaw, valve_angular_velocity=0.0):
         """
-        Update trajectory state with online replanning.
+        Update trajectory state based on actual position (not blind integration).
+        
+        Key change: Target angle is computed as actual_angle + small_step,
+        preventing cumulative error when UAV lags due to valve resistance.
         
         Args:
             current_pos: Current UAV position [x, y, z]
@@ -912,30 +915,50 @@ class OnlineCircularTrajectoryGenerator:
         actual_dt = current_time - self.last_update_time
         self.last_update_time = current_time
         
-        # Limit time step to prevent integration blowup
+        # Limit time step
         MAX_DT_LIMIT = 0.08
         safe_dt = min(actual_dt, MAX_DT_LIMIT)
         
-        # Calculate actual angle and radius
+        # Calculate actual angle and radius from current position
         relative_pos = np.array(current_pos[:2]) - self.valve_center[:2]
         actual_radius = np.linalg.norm(relative_pos)
         actual_angle = math.atan2(relative_pos[1], relative_pos[0])
         
-        # Set angular velocity based on valve state
-        if valve_angular_velocity > 0.1:
-            self.angular_velocity = self.target_angular_velocity
-        else:
-            self.angular_velocity = self.target_angular_velocity * 0.7
+        # FIXED: Always use target angular velocity for trajectory generation
+        # Do NOT reduce speed when valve is slow - this creates a vicious cycle
+        # If valve resistance is high, the torque adaptation will handle it
+        self.angular_velocity = self.target_angular_velocity
         
-        # Speed safety limit
-        SPEED_SAFETY_LIMIT = 0.1
+        # Speed safety limit (0.15 rad/s ≈ 8.6°/s max)
+        SPEED_SAFETY_LIMIT = 0.15
         if abs(self.angular_velocity) > SPEED_SAFETY_LIMIT:
             self.angular_velocity = SPEED_SAFETY_LIMIT * (1 if self.angular_velocity > 0 else -1)
         
-        # Update angle
-        delta_angle = self.angular_velocity * safe_dt
-        self.current_angle += delta_angle
-        self.total_rotation += abs(delta_angle)
+        # KEY FIX: Target angle based on actual position + small lead
+        # Lead angle provides push force but should not be too large
+        # Normal step: ω × dt ≈ 0.05 × 0.04 = 0.002 rad ≈ 0.11°
+        # Minimum lead: ensure some push even if dt is small
+        MIN_LEAD_ANGLE = 0.01   # ~0.57° minimum lead (reduced for slower speed)
+        MAX_LEAD_ANGLE = 0.025  # ~1.4° maximum lead (prevents overshoot)
+        
+        target_delta = self.angular_velocity * safe_dt
+        target_delta = max(target_delta, MIN_LEAD_ANGLE)  # At least minimum lead
+        target_delta = min(target_delta, MAX_LEAD_ANGLE)  # Cap maximum lead
+        self.current_angle = actual_angle + target_delta  # Lead ahead of actual position
+        
+        # Track total rotation using actual angle changes (handles ±π wrap)
+        if not hasattr(self, '_last_actual_angle'):
+            self._last_actual_angle = actual_angle
+        
+        angle_change = actual_angle - self._last_actual_angle
+        # Handle angle wrapping at ±π
+        if angle_change > math.pi:
+            angle_change -= 2 * math.pi
+        elif angle_change < -math.pi:
+            angle_change += 2 * math.pi
+        
+        self.total_rotation += abs(angle_change)
+        self._last_actual_angle = actual_angle
         
         # Radius adaptation
         if not self.radius_locked:
@@ -943,7 +966,6 @@ class OnlineCircularTrajectoryGenerator:
             self.current_radius += radius_error * self.radius_adaptation_rate
             self.current_radius = max(self.min_radius, min(self.max_radius, self.current_radius))
             
-            # Lock radius when velocity reaches threshold
             velocity_ratio = abs(self.angular_velocity) / abs(self.target_angular_velocity) if self.target_angular_velocity != 0 else 0
             if velocity_ratio >= self.velocity_threshold_for_lock:
                 self.radius_locked = True
@@ -951,10 +973,16 @@ class OnlineCircularTrajectoryGenerator:
         else:
             self.current_radius = self.lock_radius_value
         
-        # Torque adaptation
-        if valve_angular_velocity > 0.05:
-            resistance_factor = max(0.5, min(2.0, abs(self.target_angular_velocity) / max(0.1, valve_angular_velocity)))
+        # Torque adaptation - increase torque when valve is slow (high resistance)
+        # When valve_angular_velocity is low, we need MORE torque, not less
+        if valve_angular_velocity < 0.02:  # Valve nearly stalled
+            self.current_torque = self.torque_limit  # Maximum torque
+        elif valve_angular_velocity < 0.1:  # Valve moving slowly
+            # Linear interpolation: slower valve = more torque
+            resistance_factor = 1.5 + (0.1 - valve_angular_velocity) / 0.08 * 0.5
             self.current_torque = min(self.torque_limit, self.init_torque * resistance_factor)
+        else:
+            self.current_torque = self.init_torque  # Normal torque
         
         return {
             'current_angle': self.current_angle, 'current_radius': self.current_radius,

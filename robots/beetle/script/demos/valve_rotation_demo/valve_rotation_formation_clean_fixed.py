@@ -1924,7 +1924,8 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         )
         self.rotation_direction = rotation_direction
         self.target_rotation = target_rotation if target_rotation is not None else math.radians(90.0)
-        self.nominal_angular_velocity = 0.1  # rad/s = 5.7°/s
+        # SLOWED DOWN: Reduced angular velocity for safer valve rotation
+        self.nominal_angular_velocity = 0.05  # rad/s ≈ 2.9°/s (was 5.7°/s)
         # Dynamic timeout: base time + time for rotation + buffer
         # Formula: (target_angle / angular_velocity) * safety_factor + contact_time
         estimated_rotation_time = abs(self.target_rotation) / self.nominal_angular_velocity
@@ -2021,7 +2022,8 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"Valve: {FormationUtils.format_vec(valve_pos)}, radius={current_radius*1000:.1f}mm, yaw={math.degrees(initial_valve_yaw):.1f}°")
         
         # Use rotation_direction to control angular velocity sign
-        contact_angular_velocity = self.rotation_direction * 0.1  # 0.1 rad/s ≈ 5.7°/s
+        # SLOWED DOWN: Contact phase uses slower speed for safer valve engagement
+        contact_angular_velocity = self.rotation_direction * 0.05  # 0.05 rad/s ≈ 2.9°/s (was 5.7°/s)
         
         # Correct valve Z to insertion depth
         if FormationSingleUAVStateBase._shared_target_z is not None:
@@ -2160,20 +2162,31 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             
         rospy.loginfo("Reusing trajectory generator from contact phase")
         
-        # CRITICAL FIX: Correct valve_center Z coordinate in rotation phase, use saved insertion depth to avoid Z jumps
-        current_pos = self.get_end_effector_position()
-        if current_pos is not None:
-            # Use saved insertion depth to avoid Z coordinate jumps in Contact→Rotation transition
-            insertion_depth_z = FormationSingleUAVStateBase._shared_target_z or current_pos[2]
+        # CRITICAL FIX: Correct valve_center Z coordinate and trajectory current_z
+        # The trajectory generator operates in Assembly CoG coordinate frame
+        current_assembly_pos = self.get_assembly_position()
+        current_ee_pos = self.get_end_effector_position()
+        
+        if current_assembly_pos is not None and current_ee_pos is not None:
+            # Get the Z offset between Assembly CoG and End-Effector
+            z_offset = current_ee_pos[2] - current_assembly_pos[2]  # EE is higher than Assembly CoG
+            
+            # insertion_depth_z is in End-Effector frame, convert to Assembly CoG frame
+            ee_target_z = FormationSingleUAVStateBase._shared_target_z or current_ee_pos[2]
+            assembly_target_z = ee_target_z - z_offset  # Convert to Assembly CoG Z
+            
             original_valve_center = self.valve_center
-            corrected_valve_center = [original_valve_center[0], original_valve_center[1], insertion_depth_z]
+            # valve_center should use Assembly CoG Z for trajectory generation
+            corrected_valve_center = [original_valve_center[0], original_valve_center[1], assembly_target_z]
             
             # Update trajectory generator valve_center
             if hasattr(self.trajectory_generator, 'valve_center'):
                 self.trajectory_generator.valve_center = np.array(corrected_valve_center)
                 self.valve_center = corrected_valve_center
+                # CRITICAL FIX: current_z must be in Assembly CoG frame (same as trajectory input)
+                self.trajectory_generator.current_z = assembly_target_z
                 z_source = "saved_target_z" if FormationSingleUAVStateBase._shared_target_z else "current_pos"
-                rospy.loginfo(f"Rotation phase Z correction: ({original_valve_center[2]:.3f}) → ({insertion_depth_z:.3f}) [source: {z_source}]")
+                rospy.loginfo(f"Rotation phase Z correction: EE_Z={ee_target_z:.3f}m → Assembly_Z={assembly_target_z:.3f}m [source: {z_source}]")
         
         # Get current state information
         current_valve_yaw_now = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
@@ -2290,14 +2303,15 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 break
             
             # Execute trajectory commands - update state first then generate target  
-            # Solution A fix: Use real position for state update, consistent with single UAV version
-            current_pos = self.get_end_effector_position()[:3]
+            # CRITICAL: Use Assembly CoG position (same as contact phase), NOT end-effector
+            # The trajectory generator's valve_center is relative to Assembly CoG coordinate frame
+            current_pos = self.get_assembly_position()[:3]
             current_yaw = self.get_end_effector_yaw() or 0.0
             
             self.trajectory_generator.update_state(current_pos, current_yaw, valve_angular_velocity)
             target_state = self.trajectory_generator.generate_target_state()
             
-            # Solution A monitoring: Rotation phase trajectory output check
+            # Monitoring: Rotation phase trajectory output check
             if target_state and elapsed > 1.0:  # Avoid initial noise
                 target_pos = target_state.get('position', [0, 0, 0])
                 pos_diff = [(target_pos[i] - current_pos[i]) * 1000 for i in range(3)]

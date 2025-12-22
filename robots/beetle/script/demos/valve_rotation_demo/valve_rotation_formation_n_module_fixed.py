@@ -88,36 +88,13 @@ def validate_module_ids(module_ids_str):
 
 
 def create_n_module_state_machine(module_ids_str, rotation_direction=1, rotation_angle=1.571):
-    """
-    Create SMACH state machine for n-module valve rotation task
-    
-    This function creates the same state machine structure as the dual-UAV version,
-    but configured for n modules. The state classes (FormationAssembleState, etc.)
-    already support n modules through FormationAdapter.
-    
-    Args:
-        module_ids_str (str): Comma-separated module IDs
-        rotation_direction (int): 1 for counter-clockwise, -1 for clockwise
-        rotation_angle (float): Target valve rotation angle in radians (default: 90°)
-        
-    Returns:
-        smach.StateMachine: Configured state machine
-    """
-    # Validate module IDs
+    """Create SMACH state machine for n-module valve rotation task."""
     is_valid, result = validate_module_ids(module_ids_str)
     if not is_valid:
-        rospy.logerr(f"Module ID validation failed: {result}")
         raise ValueError(f"Invalid module_ids: {result}")
     
-    module_ids = result
-    rospy.loginfo(f"Creating state machine for {len(module_ids)} modules: {module_ids}")
-    rospy.loginfo(f"Leader (end-effector carrier): {max(module_ids)}")
-    rospy.loginfo(f"Followers: {[mid for mid in module_ids if mid != max(module_ids)]}")
-    
-    # Set module_ids as ROS parameter for state classes to read
     rospy.set_param("~module_ids", module_ids_str)
     
-    # Create top-level state machine
     sm = smach.StateMachine(outcomes=['mission_complete', 'mission_failed'])
     
     with sm:
@@ -228,139 +205,69 @@ def create_n_module_state_machine(module_ids_str, rotation_direction=1, rotation
 
 
 def main():
-    """
-    Main entry point for n-module valve rotation task
-    """
-    # Initialize ROS node
+    """Main entry point for n-module valve rotation task."""
     rospy.init_node('formation_valve_rotation_n_module', anonymous=False)
     
-    rospy.loginfo("=" * 80)
     rospy.loginfo("Formation Valve Rotation - N-Module Version")
-    rospy.loginfo("=" * 80)
     
     # Get module_ids parameter
     module_ids_str = rospy.get_param("~module_ids", "")
     
     if not module_ids_str:
         rospy.logerr("No module_ids parameter specified!")
-        rospy.logerr("Usage: roslaunch beetle valve_rotation_formation_n_module.launch module_ids:=\"1,2,3\"")
         return 1
     
-    # Validate and parse module IDs
     is_valid, result = validate_module_ids(module_ids_str)
     if not is_valid:
-        rospy.logerr(f"Invalid module_ids parameter: {result}")
-        rospy.logerr("Example: module_ids:=\"1,2,3\" for 3 UAVs")
+        rospy.logerr(f"Invalid module_ids: {result}")
         return 1
     
     module_ids = result
     n_modules = len(module_ids)
     
-    # Log configuration
-    rospy.loginfo(f"Configuration:")
-    rospy.loginfo(f"  Module IDs: {module_ids}")
-    rospy.loginfo(f"  Number of modules: {n_modules}")
-    rospy.loginfo(f"  Leader (end-effector): UAV {max(module_ids)}")
-    rospy.loginfo(f"  Followers: {sorted([mid for mid in module_ids if mid != max(module_ids)])}")
+    rospy.loginfo(f"Modules: {module_ids}, Leader: UAV {max(module_ids)}")
     
-    # Get other parameters
-    rotation_angle = rospy.get_param("~rotation_angle", 1.571)  # 90 degrees
-    approach_height = rospy.get_param("~approach_height", 0.48)
-    real_machine = rospy.get_param("~real_machine", False)
-    simulation = rospy.get_param("~simulation", True)
-    
-    # Get rotation direction parameter
+    # Get parameters
+    rotation_angle = rospy.get_param("~rotation_angle", 1.571)
     direction_param = rospy.get_param("~valve_rotation_direction", "counterclockwise")
     direction_normalized = direction_param.strip().lower()
-    if direction_normalized in ["clockwise", "cw"]:
-        rotation_direction = -1
-        direction_label = "Clockwise"
-    elif direction_normalized in ["counterclockwise", "counter-clockwise", "ccw"]:
-        rotation_direction = 1
-        direction_label = "Counter-clockwise"
-    else:
-        rotation_direction = 1
-        direction_label = f"Counter-clockwise (fallback for '{direction_param}')"
-        rospy.logwarn(f"Unknown valve rotation direction '{direction_param}', defaulting to counter-clockwise")
-    
-    rospy.loginfo(f"  Rotation angle: {rotation_angle:.3f} rad ({rotation_angle * 180 / 3.14159:.1f}°)")
-    rospy.loginfo(f"  Rotation direction: {direction_label}")
-    rospy.loginfo(f"  Approach height: {approach_height:.3f} m")
-    rospy.loginfo(f"  Real machine: {real_machine}")
-    rospy.loginfo(f"  Simulation: {simulation}")
-    rospy.loginfo("=" * 80)
+    rotation_direction = -1 if direction_normalized in ["clockwise", "cw"] else 1
     
     # Test coordinate transformation
     try:
-        rospy.loginfo("Testing n-module coordinate transformation...")
         from n_modules_tf import NModuleTFCalculator
-        
         tf_calculator = NModuleTFCalculator(module_ids_str)
         if not tf_calculator.validate_module_configuration():
             rospy.logerr("Module configuration validation failed!")
             return 1
-        
-        # Test transform
-        test_assembly_pos = (2.5, 0.0, 1.5)
-        test_assembly_yaw = 0.0
-        test_ee_pos = tf_calculator.transform_assembly_to_end_effector(
-            test_assembly_pos, test_assembly_yaw
-        )
-        
-        rospy.loginfo(f"Coordinate transform test:")
-        rospy.loginfo(f"  Test assembly CoG: {test_assembly_pos}")
-        rospy.loginfo(f"  Calculated end-effector: {test_ee_pos}")
-        rospy.loginfo(f"  Transform offset: {[test_ee_pos[i] - test_assembly_pos[i] for i in range(3)]}")
-        rospy.loginfo("Coordinate transformation validated!")
-        
     except Exception as e:
         rospy.logerr(f"Coordinate transformation test failed: {e}")
         return 1
     
-    rospy.loginfo("=" * 80)
-    
     # Create and execute state machine
     try:
-        rospy.loginfo("Creating SMACH state machine...")
         sm = create_n_module_state_machine(module_ids_str, rotation_direction, rotation_angle)
         
-        rospy.loginfo("State machine created successfully")
-        rospy.loginfo("State sequence (with 3s waits) - Ground assembly workflow:")
-        rospy.loginfo("  TAKEOFF -> [wait 3s] -> INITIALIZE -> [wait 3s] -> MOVE_TO_VALVE")
-        rospy.loginfo("  -> [wait 3s] -> ROTATE_VALVE -> [wait 3s] -> DISENGAGE -> mission_complete")
-        rospy.loginfo("=" * 80)
-        
-        # Create and start introspection server for visualization
         sis = smach_ros.IntrospectionServer('formation_valve_rotation_n_module', sm, '/SM_ROOT')
         sis.start()
-        rospy.loginfo("SMACH introspection server started at /SM_ROOT")
         
-        # Execute state machine
-        rospy.loginfo("Starting valve rotation task execution...")
-        rospy.loginfo("=" * 80)
-        
+        rospy.loginfo("Starting valve rotation task...")
         outcome = sm.execute()
         
-        # Stop introspection server
         sis.stop()
         
-        # Report result
-        rospy.loginfo("=" * 80)
         if outcome == 'mission_complete':
-            rospy.loginfo("MISSION COMPLETED SUCCESSFULLY!")
-            rospy.loginfo(f"All {n_modules} UAVs coordinated to complete valve rotation")
+            rospy.loginfo(f"MISSION COMPLETED: {n_modules} UAVs completed valve rotation")
             return 0
         else:
-            rospy.logerr(f"MISSION FAILED with outcome: {outcome}")
+            rospy.logerr(f"MISSION FAILED: {outcome}")
             return 1
             
     except rospy.ROSInterruptException:
-        rospy.logwarn("Task interrupted by user")
+        rospy.logwarn("Task interrupted")
         return 1
     except Exception as e:
-        rospy.logerr(f"Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
+        rospy.logerr(f"Error: {e}")
         return 1
 
 

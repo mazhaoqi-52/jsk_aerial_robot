@@ -881,8 +881,8 @@ class OnlineCircularTrajectoryGenerator:
         
         # Force control parameters
         self.mass = 1.5  # kg
-        self.init_torque = 0.1  # N·m
-        self.torque_limit = 3.0  # N·m
+        self.init_torque = 0.1  # N·m (minimum torque for normal rotation)
+        self.torque_limit = 6.0  # N·m (maximum torque when valve is stuck)
         self.current_torque = self.init_torque
         
         # Z coordinate management
@@ -998,14 +998,24 @@ class OnlineCircularTrajectoryGenerator:
         
         # Torque adaptation - increase torque when valve is slow (high resistance)
         # When valve_angular_velocity is low, we need MORE torque, not less
-        if valve_angular_velocity < 0.02:  # Valve nearly stalled
-            self.current_torque = self.torque_limit  # Maximum torque
-        elif valve_angular_velocity < 0.1:  # Valve moving slowly
-            # Linear interpolation: slower valve = more torque
-            resistance_factor = 1.5 + (0.1 - valve_angular_velocity) / 0.08 * 0.5
-            self.current_torque = min(self.torque_limit, self.init_torque * resistance_factor)
+        # Adaptive torque: init_torque (0.1Nm) → torque_limit (6Nm)
+        VALVE_SPEED_HIGH = 0.08   # Above this: normal torque
+        VALVE_SPEED_LOW = 0.01    # Below this: maximum torque
+        TORQUE_WARMUP_ROTATION = 0.7  # ~40° warmup phase
+        
+        # During warmup phase (first 40° of rotation), use minimum torque
+        # This prevents excessive force during initial contact
+        if self.total_rotation < TORQUE_WARMUP_ROTATION:
+            self.current_torque = self.init_torque  # Fixed minimum torque (0.1Nm)
+        elif valve_angular_velocity < VALVE_SPEED_LOW:  # Valve nearly stalled
+            self.current_torque = self.torque_limit  # Maximum torque (6Nm)
+        elif valve_angular_velocity < VALVE_SPEED_HIGH:  # Valve moving slowly
+            # Smooth interpolation: slower valve = more torque
+            # Map valve_speed [0.01, 0.08] → torque [6.0, 0.1]
+            t = (valve_angular_velocity - VALVE_SPEED_LOW) / (VALVE_SPEED_HIGH - VALVE_SPEED_LOW)
+            self.current_torque = self.torque_limit - t * (self.torque_limit - self.init_torque)
         else:
-            self.current_torque = self.init_torque  # Normal torque
+            self.current_torque = self.init_torque  # Normal torque (0.1Nm)
         
         return {
             'current_angle': self.current_angle, 'current_radius': self.current_radius,

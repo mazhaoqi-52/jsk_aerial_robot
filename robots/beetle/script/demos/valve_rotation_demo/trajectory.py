@@ -945,12 +945,29 @@ class OnlineCircularTrajectoryGenerator:
         elif angle_error < -math.pi:
             angle_error += 2 * math.pi
         
-        # Step 3: Saturate error to prevent excessive force
-        MAX_ANGLE_ERROR = 0.2  # ~11.5° ≈ 100mm at 500mm radius
-        if abs(angle_error) > MAX_ANGLE_ERROR:
+        # Step 3: ADAPTIVE error saturation based on valve resistance
+        # If valve is slow/stuck, allow larger error to generate more push force
+        BASE_MAX_ERROR = 0.2    # ~11.5° normal operation
+        HIGH_MAX_ERROR = 0.35   # ~20° when valve is stuck (increased push force)
+        WARMUP_ROTATION = 0.7   # ~40° warmup phase (before contact with valve)
+        
+        # During warmup phase (first 40° of rotation), use conservative error limit
+        # This prevents excessive initial speed before UAV contacts the valve
+        if self.total_rotation < WARMUP_ROTATION:
+            adaptive_max_error = BASE_MAX_ERROR
+        elif valve_angular_velocity < 0.02:  # Valve nearly stalled - maximum push
+            adaptive_max_error = HIGH_MAX_ERROR
+        elif valve_angular_velocity < 0.05:  # Valve moving slowly - increased push
+            # Linear interpolation between HIGH and BASE
+            t = (valve_angular_velocity - 0.02) / (0.05 - 0.02)
+            adaptive_max_error = HIGH_MAX_ERROR - t * (HIGH_MAX_ERROR - BASE_MAX_ERROR)
+        else:  # Valve moving normally
+            adaptive_max_error = BASE_MAX_ERROR
+        
+        if abs(angle_error) > adaptive_max_error:
             # Clamp target to actual + max_error
             sign = 1 if angle_error > 0 else -1
-            self.current_angle = actual_angle + sign * MAX_ANGLE_ERROR
+            self.current_angle = actual_angle + sign * adaptive_max_error
         
         # Track total rotation using actual angle changes (handles ±π wrap)
         if not hasattr(self, '_last_actual_angle'):

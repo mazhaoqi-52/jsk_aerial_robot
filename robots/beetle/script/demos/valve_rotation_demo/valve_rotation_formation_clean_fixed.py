@@ -1924,8 +1924,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         )
         self.rotation_direction = rotation_direction
         self.target_rotation = target_rotation if target_rotation is not None else math.radians(90.0)
-        # SLOWED DOWN: Reduced angular velocity for safer valve rotation
-        self.nominal_angular_velocity = 0.05  # rad/s ≈ 2.9°/s (was 5.7°/s)
+        self.nominal_angular_velocity = 0.1  # rad/s ≈ 5.7°/s
         # Dynamic timeout: base time + time for rotation + buffer
         # Formula: (target_angle / angular_velocity) * safety_factor + contact_time
         estimated_rotation_time = abs(self.target_rotation) / self.nominal_angular_velocity
@@ -2022,8 +2021,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"Valve: {FormationUtils.format_vec(valve_pos)}, radius={current_radius*1000:.1f}mm, yaw={math.degrees(initial_valve_yaw):.1f}°")
         
         # Use rotation_direction to control angular velocity sign
-        # SLOWED DOWN: Contact phase uses slower speed for safer valve engagement
-        contact_angular_velocity = self.rotation_direction * 0.05  # 0.05 rad/s ≈ 2.9°/s (was 5.7°/s)
+        contact_angular_velocity = self.rotation_direction * 0.1  # 0.1 rad/s ≈ 5.7°/s
         
         # Correct valve Z to insertion depth
         if FormationSingleUAVStateBase._shared_target_z is not None:

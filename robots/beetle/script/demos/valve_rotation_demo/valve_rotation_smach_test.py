@@ -16,8 +16,35 @@ from tf.transformations import euler_from_quaternion
 from task.assembly_motion import *
 from task.disassembly_motion import *
 from trajectory import PolynomialTrajectory
-from unified_motion_controller import UnifiedMotionController
 from base_UAV_state import SeperatedMotionStateBase, AssemblyMotionStateBase
+
+
+def execute_poly_motion_pose_async(pub, start, target, avg_speed):
+    """Execute polynomial trajectory asynchronously (helper function)."""
+    def motion_thread():
+        distance = math.sqrt(sum((target[i] - start[i])**2 for i in range(3)))
+        duration = max(1.0, distance / avg_speed)
+        traj = PolynomialTrajectory(start, target, duration)
+        rate = rospy.Rate(20)
+        start_time = rospy.Time.now().to_sec()
+        while not rospy.is_shutdown():
+            elapsed = rospy.Time.now().to_sec() - start_time
+            if elapsed >= duration:
+                break
+            pos = traj.get_position(elapsed)
+            nav_msg = FlightNav()
+            nav_msg.header.stamp = rospy.Time.now()
+            nav_msg.pos_xy_nav_mode = FlightNav.POS_MODE
+            nav_msg.pos_z_nav_mode = FlightNav.POS_MODE
+            nav_msg.target_pos_x = pos[0]
+            nav_msg.target_pos_y = pos[1]
+            nav_msg.target_pos_z = pos[2]
+            pub.publish(nav_msg)
+            rate.sleep()
+    t = threading.Thread(target=motion_thread)
+    t.start()
+    return t
+
 
 class SeparatedMoveToGateState(SeperatedMotionStateBase):
     def __init__(self,
@@ -50,9 +77,9 @@ class SeparatedMoveToGateState(SeperatedMotionStateBase):
         target2 = [target_x, target_y - self.maze_offset_y, target_z]
         rospy.loginfo("Moving UAVs to target positions: UAV1: {}, UAV2: {}".format(target1, target2))
         threads = []
-        t1 = UnifiedMotionController.execute_poly_motion_pose_async(self.beetle1_pub, start1, target1, self.avg_speed)
+        t1 = execute_poly_motion_pose_async(self.beetle1_pub, start1, target1, self.avg_speed)
         threads.append(t1)
-        t2 = UnifiedMotionController.execute_poly_motion_pose_async(self.beetle2_pub, start2, target2, self.avg_speed)
+        t2 = execute_poly_motion_pose_async(self.beetle2_pub, start2, target2, self.avg_speed)
         threads.append(t2)
         for t in threads:
             t.join()
@@ -124,7 +151,7 @@ class SeparatedMoveToValveState(SeperatedMotionStateBase):
             (self.beetle1_pub, start1, [start1[0], start1[1], safe_altitude]),
             (self.beetle2_pub, start2, [start2[0], start2[1], safe_altitude])
         ]:
-            t = UnifiedMotionController.execute_poly_motion_pose_async(pub, start, target, self.avg_speed)
+            t = execute_poly_motion_pose_async(pub, start, target, self.avg_speed)
             threads.append(t)
         for t in threads:
             t.join()
@@ -139,7 +166,7 @@ class SeparatedMoveToValveState(SeperatedMotionStateBase):
             (self.beetle1_pub, current1, horiz_target1),
             (self.beetle2_pub, current2, horiz_target2)
         ]:
-            t = UnifiedMotionController.execute_poly_motion_pose_async(pub, current, target, self.avg_speed)
+            t = execute_poly_motion_pose_async(pub, current, target, self.avg_speed)
             threads.append(t)
         for t in threads:
             t.join()
@@ -152,7 +179,7 @@ class SeparatedMoveToValveState(SeperatedMotionStateBase):
             (self.beetle1_pub, horiz_target1, final_target1),
             (self.beetle2_pub, horiz_target2, final_target2)
         ]:
-            t = UnifiedMotionController.execute_poly_motion_pose_async(pub, current, target, self.avg_speed)
+            t = execute_poly_motion_pose_async(pub, current, target, self.avg_speed)
             threads.append(t)
         for t in threads:
             t.join()

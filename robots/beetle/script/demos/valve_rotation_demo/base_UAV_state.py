@@ -17,7 +17,6 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from tf.transformations import euler_from_quaternion
 from valve_rotation_demo.trajectory import PolynomialTrajectory
-from valve_rotation_demo.unified_motion_controller import UnifiedMotionController
 from task.assembly_motion import AssemblyDemo
 
 class SeperatedMotionStateBase(smach.State):

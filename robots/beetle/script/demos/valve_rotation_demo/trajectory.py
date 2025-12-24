@@ -898,10 +898,10 @@ class OnlineCircularTrajectoryGenerator:
     
     def update_state(self, current_pos, current_yaw, valve_angular_velocity=0.0):
         """
-        Update trajectory state based on actual position (not blind integration).
+        Update trajectory state using saturated cumulative integration.
         
-        Key change: Target angle is computed as actual_angle + small_step,
-        preventing cumulative error when UAV lags due to valve resistance.
+        Strategy: Accumulate target angle like old version for push force,
+        but clamp the error between target and actual to prevent excessive force.
         
         Args:
             current_pos: Current UAV position [x, y, z]
@@ -924,9 +924,7 @@ class OnlineCircularTrajectoryGenerator:
         actual_radius = np.linalg.norm(relative_pos)
         actual_angle = math.atan2(relative_pos[1], relative_pos[0])
         
-        # FIXED: Always use target angular velocity for trajectory generation
-        # Do NOT reduce speed when valve is slow - this creates a vicious cycle
-        # If valve resistance is high, the torque adaptation will handle it
+        # Always use target angular velocity
         self.angular_velocity = self.target_angular_velocity
         
         # Speed safety limit (0.15 rad/s ≈ 8.6°/s max)
@@ -934,17 +932,25 @@ class OnlineCircularTrajectoryGenerator:
         if abs(self.angular_velocity) > SPEED_SAFETY_LIMIT:
             self.angular_velocity = SPEED_SAFETY_LIMIT * (1 if self.angular_velocity > 0 else -1)
         
-        # KEY FIX: Target angle based on actual position + small lead
-        # Lead angle provides push force but should not be too large
-        # Normal step: ω × dt ≈ 0.05 × 0.04 = 0.002 rad ≈ 0.11°
-        # Minimum lead: ensure some push even if dt is small
-        MIN_LEAD_ANGLE = 0.01   # ~0.57° minimum lead (reduced for slower speed)
-        MAX_LEAD_ANGLE = 0.025  # ~1.4° maximum lead (prevents overshoot)
+        # SATURATED CUMULATIVE INTEGRATION
+        # Step 1: Accumulate target angle (like old version, provides push force)
+        delta_angle = self.angular_velocity * safe_dt
+        self.current_angle += delta_angle
         
-        target_delta = self.angular_velocity * safe_dt
-        target_delta = max(target_delta, MIN_LEAD_ANGLE)  # At least minimum lead
-        target_delta = min(target_delta, MAX_LEAD_ANGLE)  # Cap maximum lead
-        self.current_angle = actual_angle + target_delta  # Lead ahead of actual position
+        # Step 2: Calculate error between target and actual
+        angle_error = self.current_angle - actual_angle
+        # Handle angle wrapping
+        if angle_error > math.pi:
+            angle_error -= 2 * math.pi
+        elif angle_error < -math.pi:
+            angle_error += 2 * math.pi
+        
+        # Step 3: Saturate error to prevent excessive force
+        MAX_ANGLE_ERROR = 0.2  # ~11.5° ≈ 100mm at 500mm radius
+        if abs(angle_error) > MAX_ANGLE_ERROR:
+            # Clamp target to actual + max_error
+            sign = 1 if angle_error > 0 else -1
+            self.current_angle = actual_angle + sign * MAX_ANGLE_ERROR
         
         # Track total rotation using actual angle changes (handles ±π wrap)
         if not hasattr(self, '_last_actual_angle'):

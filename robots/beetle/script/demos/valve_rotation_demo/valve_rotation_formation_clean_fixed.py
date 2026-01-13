@@ -1677,7 +1677,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         
         xy_error = math.sqrt((current_pos[0] - target_pos[0])**2 + (current_pos[1] - target_pos[1])**2)
         z_error = abs(current_pos[2] - target_pos[2])
-        pos_ok = (xy_error <= pos_thresh and z_error <= 0.015)
+        pos_ok = (xy_error <= pos_thresh and z_error <= 0.060)  # Z阈值从15mm放宽到60mm
         
         yaw_ok = True
         yaw_error = None

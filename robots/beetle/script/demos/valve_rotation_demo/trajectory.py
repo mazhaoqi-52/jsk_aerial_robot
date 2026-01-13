@@ -922,7 +922,20 @@ class OnlineCircularTrajectoryGenerator:
         # Calculate actual angle and radius from current position
         relative_pos = np.array(current_pos[:2]) - self.valve_center[:2]
         actual_radius = np.linalg.norm(relative_pos)
-        actual_angle = math.atan2(relative_pos[1], relative_pos[0])
+        raw_actual_angle = math.atan2(relative_pos[1], relative_pos[0])  # [-π, π]
+        
+        # CRITICAL FIX: Continuize actual_angle to be on the same branch as current_angle
+        # This prevents current_angle from jumping when crossing the ±π boundary
+        # Example: if current_angle = +3.2 and raw_actual_angle = -3.0 (just crossed +π)
+        #          angle_diff = -3.0 - 3.2 = -6.2, normalized to +0.08
+        #          actual_angle = 3.2 + 0.08 = 3.28 (continuous, not jumping to -3.0)
+        angle_diff = raw_actual_angle - self.current_angle
+        # Normalize angle_diff to [-π, π]
+        while angle_diff > math.pi:
+            angle_diff -= 2 * math.pi
+        while angle_diff < -math.pi:
+            angle_diff += 2 * math.pi
+        actual_angle = self.current_angle + angle_diff  # Continuized actual_angle
         
         # Always use target angular velocity
         self.angular_velocity = self.target_angular_velocity
@@ -969,16 +982,12 @@ class OnlineCircularTrajectoryGenerator:
             sign = 1 if angle_error > 0 else -1
             self.current_angle = actual_angle + sign * adaptive_max_error
         
-        # Track total rotation using actual angle changes (handles ±π wrap)
+        # Track total rotation using continuized actual_angle (no ±π wrap issues now)
         if not hasattr(self, '_last_actual_angle'):
             self._last_actual_angle = actual_angle
         
+        # Since actual_angle is now continuized, angle_change is simply the difference
         angle_change = actual_angle - self._last_actual_angle
-        # Handle angle wrapping at ±π
-        if angle_change > math.pi:
-            angle_change -= 2 * math.pi
-        elif angle_change < -math.pi:
-            angle_change += 2 * math.pi
         
         self.total_rotation += abs(angle_change)
         self._last_actual_angle = actual_angle
@@ -1031,9 +1040,12 @@ class OnlineCircularTrajectoryGenerator:
         target_z = self.current_z if self.current_z is not None else self.valve_center[2]
         target_pos = np.array([target_x, target_y, target_z])
         
+        # Normalize target_yaw to [-π, π] (handles both > π and < -π cases)
         target_yaw = self.current_angle + math.pi
-        if target_yaw > math.pi:
+        while target_yaw > math.pi:
             target_yaw -= 2 * math.pi
+        while target_yaw < -math.pi:
+            target_yaw += 2 * math.pi
         
         # Tangential velocity
         tangential_speed = self.current_radius * self.angular_velocity

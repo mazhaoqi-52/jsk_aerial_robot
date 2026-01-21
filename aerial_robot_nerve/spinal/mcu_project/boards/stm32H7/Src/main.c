@@ -261,9 +261,6 @@ int main(void)
 #elif NERVE_COMM
   Spine::init(&hfdcan1, &nh_, &estimator_, LED1_GPIO_Port, LED1_Pin);
   Spine::useRTOS(&canMsgMailHandle); // use RTOS for CAN in spianl
-  controller_.init(&htim1, &htim4, &estimator_, NULL, NULL, &battery_status_, &nh_, &flightControlMutexHandle);
-#else
-  controller_.init(&htim1, &htim4, &estimator_, NULL, NULL, &battery_status_, &nh_, &flightControlMutexHandle);
 #endif
   
   /* USER CODE END 2 */

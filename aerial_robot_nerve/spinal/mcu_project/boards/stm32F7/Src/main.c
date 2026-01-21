@@ -71,7 +71,6 @@
 
 /* Extra Servo */
 #include "extra_servo/extra_servo.h"
-#include "kondo_servo/kondo_servo.h"
 
 
 /* Internal Communication System */
@@ -257,15 +256,6 @@ static void MX_NVIC_Init(void);
   }
 #endif
 
-  void kondoServoTaskCallback(void const * argument)
-  {
-	  for(;;)
-	  {
-		  kondo_servo_.update();
-		  osDelay(KONDO_SERVO_UPDATE_INTERVAL);
-	  }
-  }
-
 }
 
 /* USER CODE END PFP */
@@ -368,7 +358,6 @@ int main(void)
 
   /* Extra Servo Control */
   extra_servo_.init(&htim3, &htim5, &nh_);
-  kondo_servo_.init(&huart3, &nh_);
 
   /* Magnetic Encoder */
   encoder_.init(&hi2c2, &nh_);
@@ -382,7 +371,7 @@ int main(void)
   /* BATTERY_STATUS */
   battery_status_.init(&hadc2, &nh_);
   /* Start Attitude Control */
-  controller_.init(&htim4, &htim8, &estimator_, &kondo_servo_, &battery_status_, &nh_, &flightControlMutexHandle);
+  controller_.init(&htim4, &htim8, &estimator_, &battery_status_, &nh_, &flightControlMutexHandle);
 
 #if NERVE_COMM
   controller_.setUavModel(Spine::getUavModel());

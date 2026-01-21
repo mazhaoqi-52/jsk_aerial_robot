@@ -52,7 +52,6 @@ controller:
     limit_p: 20.0
     limit_i: 10.0
     limit_d: 20.0
-
     start_rp_integration_height: 0.01
 
   pitch:

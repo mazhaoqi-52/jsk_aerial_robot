@@ -9,7 +9,7 @@ from aerial_robot_msgs.msg import FlightNav
 from spinal.msg import DesireCoord
 from geometry_msgs.msg import PoseStamped
 from diagnostic_msgs.msg import KeyValue
-from beetle.kondo_control_api import KondoControl
+from beetle.dynamixel_control_api import DynamixelControl
 from beetle.utils import coordTransformer
 import numpy as np
 import tf
@@ -31,13 +31,13 @@ class StandbyState(smach.State):
     def __init__(self,
                  robot_name = 'beetle1',
                  robot_id = 1,
-                 male_servo_id = 5,
+                 male_servo_id = 8,
                  female_servo_id = 6,
                  real_machine = False,
-                 unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 7580,###8800###
+                 unlock_servo_angle_male = 2300,
+                 lock_servo_angle_male = 4050,
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 4600,###5600###
+                 lock_servo_angle_female = 4600,
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,
@@ -97,10 +97,10 @@ class StandbyState(smach.State):
         self.follower_att_pub = rospy.Publisher(self.robot_name+"/final_target_baselink_rot", DesireCoord, queue_size=10)
         if(self.attach_dir < 0):
             self.follower_docking_pub = rospy.Publisher(self.robot_name+"/docking_cmd", Bool, queue_size=10)
-            self.kondo_servo = KondoControl(self.leader,self.leader_id,self.female_servo_id,self.real_machine)
+            self.dynamixel_servo = DynamixelControl(self.leader,self.leader_id,self.female_servo_id,self.real_machine)
         else:
             self.follower_docking_pub = rospy.Publisher(self.leader+"/docking_cmd", Bool, queue_size=10)
-            self.kondo_servo = KondoControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
+            self.dynamixel_servo = DynamixelControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
             
         # subscriber
         self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
@@ -122,7 +122,7 @@ class StandbyState(smach.State):
     def execute(self, userdata):
         if not self.follower_male_mech_activated:
             if self.real_machine:
-                self.kondo_servo.sendTargetAngle(self.lock_servo_angle_female)
+                self.dynamixel_servo.sendTargetAngle(self.lock_servo_angle_female)
             else:
                 self.docking_msg.data = True
                 self.follower_docking_pub.publish(self.docking_msg)
@@ -228,13 +228,13 @@ class ApproachState(smach.State):
     def __init__(self,
                  robot_name = 'beetle1',
                  robot_id = 1,
-                 male_servo_id = 5,
+                 male_servo_id = 8,
                  female_servo_id = 6,
                  real_machine = False,
-                 unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 7400,###8800###
+                 unlock_servo_angle_male = 2300,
+                 lock_servo_angle_male = 4050,
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 8000,##5600##
+                 lock_servo_angle_female = 4600,
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,
@@ -416,13 +416,13 @@ class AssemblyState(smach.State):
     def __init__(self,
                  robot_name = 'beetle1',
                  robot_id = 1,
-                 male_servo_id = 5,
+                 male_servo_id = 8,
                  female_servo_id = 6,
                  real_machine = False,
-                 unlock_servo_angle_male = 7000,
-                 lock_servo_angle_male = 7700,###8800###
+                 unlock_servo_angle_male = 2300,
+                 lock_servo_angle_male = 4050,
                  unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 8000,###5600###
+                 lock_servo_angle_female = 4600,
                  leader = 'beetle2',
                  leader_id = 2,
                  attach_dir = -1.0):
@@ -451,9 +451,9 @@ class AssemblyState(smach.State):
         self.leader_nav_pub = rospy.Publisher(self.leader+"/uav/nav", FlightNav, queue_size=10)
         self.assembly_nav_pub = rospy.Publisher("/assembly/uav/nav", FlightNav, queue_size=10)
         if(self.attach_dir < 0):
-            self.kondo_servo = KondoControl(self.robot_name,self.robot_id,self.male_servo_id,self.real_machine)
+            self.dynamixel_servo = DynamixelControl(self.robot_name,self.robot_id,self.male_servo_id,self.real_machine)
         else:
-            self.kondo_servo = KondoControl(self.leader,self.leader_id,self.male_servo_id,self.real_machine)
+            self.dynamixel_servo = DynamixelControl(self.leader,self.leader_id,self.male_servo_id,self.real_machine)
         self.flag_pub = rospy.Publisher('/' + self.robot_name + '/assembly_flag', KeyValue, queue_size = 1)
         self.flag_pub_leader = rospy.Publisher('/' + self.leader + '/assembly_flag', KeyValue, queue_size = 1)
 
@@ -471,7 +471,7 @@ class AssemblyState(smach.State):
         if self.emergency_flag:
             return 'emergency'
         if self.real_machine:
-            self.kondo_servo.sendTargetAngle(self.lock_servo_angle_male)
+            self.dynamixel_servo.sendTargetAngle(self.lock_servo_angle_male)
         time.sleep(1.0)
         if not self.real_machine:
             rospy.sleep(1.0)

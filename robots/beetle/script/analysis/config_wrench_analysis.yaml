@@ -1,0 +1,29 @@
+# Wrench Analysis Configuration
+# Copy this file and modify as needed
+
+# Analysis mode: "force" or "torque"
+mode: "torque"
+
+# Number of modules in the assembled configuration
+n_modules: 1
+
+# Distance between adjacent module centers [m]
+module_spacing: 0.52
+
+# Resolution of yaw/pitch angles in degrees (smaller = finer but slower)
+resolution: 10
+
+# Tilt angle limit in degrees (±limit from vertical)
+# 90 means full 180° range (-90° to +90°)
+tilt_limit: 90
+
+# Maximum thrust per rotor [N]
+thrust_max: 21.37
+
+# Coordinate frame: "body" or "world"
+# - body: pure force/torque output capability
+# - world: considers gravity compensation for combined mass
+frame: "body"
+
+# Save results to .npz file
+save_to_npz: false

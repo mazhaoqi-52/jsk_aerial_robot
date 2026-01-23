@@ -18,7 +18,7 @@ import time
 class ServoMotionTest():
     def __init__(self):
         # Servo configuration
-        self.servo_ids = [1, 2, 3, 4, 5, 6]  # 6 servos
+        self.servo_ids = [0, 1, 2, 3, 4, 5]  # 6 servos
         self.robot_name = "beetle2"
         
         # Dynamixel position parameters
@@ -82,8 +82,8 @@ class ServoMotionTest():
             # Convert to Dynamixel position
             target_position = self.rad_to_dynamixel_position(target_angle_rad)
             
-            # Apply same angle to all 6 servos
-            self.servo_cmd_msg.angles = [target_angle_rad] * len(self.servo_ids)
+            # Apply same position to all 6 servos
+            self.servo_cmd_msg.angles = [target_position] * len(self.servo_ids)
             
             # Publish command
             self.servo_pub.publish(self.servo_cmd_msg)

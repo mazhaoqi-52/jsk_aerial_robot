@@ -186,6 +186,89 @@ def get_alloc_mtx_single():
     return get_alloc_mtx_assembled(n_modules=1, module_spacing=0.0)
 
 
+def get_end_effector_position(ee_module, ee_offset, n_modules, module_spacing=DEFAULT_MODULE_SPACING):
+    """
+    Calculate the End Effector position in the combined body frame (CoG at origin).
+    
+    The EE position is determined by:
+    1. The module where EE is attached (ee_module)
+    2. The offset from that module's CoG (ee_offset)
+    
+    Parameters:
+        ee_module: Index of the module where EE is attached (0 to n_modules-1)
+        ee_offset: [x, y, z] offset from the host module's CoG [m]
+                   - From URDF: contact_point is at (0.26, 0, 0) relative to base_link
+        n_modules: Total number of modules in the assembly
+        module_spacing: Distance between adjacent module centers [m]
+        
+    Returns:
+        numpy array [x, y, z] of EE position in combined body frame
+        
+    Example:
+        For a 3-module assembly with EE on module 2 (last module):
+        - Module 2 offset from combined CoG: +0.52m (along X)
+        - EE offset from module 2: (0.26, 0, 0)
+        - EE position in combined frame: (0.52 + 0.26, 0, 0) = (0.78, 0, 0)
+    """
+    if ee_module < 0 or ee_module >= n_modules:
+        raise ValueError(f"ee_module ({ee_module}) must be in range [0, {n_modules-1}]")
+    
+    # Get the offset of the host module's center from combined CoG
+    module_offset_x = (ee_module - (n_modules - 1) / 2.0) * module_spacing
+    
+    # EE position = module center position + EE offset relative to module
+    ee_position = np.array([
+        module_offset_x + ee_offset[0],
+        ee_offset[1],
+        ee_offset[2]
+    ])
+    
+    return ee_position
+
+
+def get_ee_wrench_to_cog_wrench_matrix(r_ee):
+    """
+    Generate the transformation matrix from wrench at EE to equivalent wrench at CoG.
+    
+    Given:
+        - F_ee: Force applied at End Effector
+        - τ_ee: Torque applied at End Effector
+        - r_ee: Position vector from CoG to EE
+        
+    The equivalent wrench at CoG is:
+        F_cog = F_ee  (force is invariant under translation)
+        τ_cog = τ_ee + r_ee × F_ee  (torque is shifted by moment arm)
+        
+    In matrix form:
+        [F_cog]   [  I    0  ] [F_ee]
+        [τ_cog] = [[r_ee×] I ] [τ_ee]
+        
+    Where [r_ee×] is the skew-symmetric matrix of r_ee.
+    
+    Parameters:
+        r_ee: [x, y, z] position of EE in body frame (from CoG)
+        
+    Returns:
+        6×6 transformation matrix
+    """
+    rx, ry, rz = r_ee
+    
+    # Skew-symmetric matrix for cross product: [r×] such that [r×]v = r × v
+    skew = np.array([
+        [0, -rz, ry],
+        [rz, 0, -rx],
+        [-ry, rx, 0]
+    ])
+    
+    # Build the 6×6 transformation matrix
+    T = np.zeros((6, 6))
+    T[0:3, 0:3] = np.eye(3)  # F_cog = F_ee
+    T[3:6, 0:3] = skew       # τ_cog += r × F_ee
+    T[3:6, 3:6] = np.eye(3)  # τ_cog += τ_ee
+    
+    return T
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing allocation matrix for assembled configurations")
@@ -222,3 +305,43 @@ if __name__ == "__main__":
         print(f"Module {mod_idx}:")
         for i, pos in enumerate(positions):
             print(f"  Rotor {i+1}: {pos}")
+    
+    # Test End Effector position calculation
+    print("\n" + "=" * 60)
+    print("Testing End Effector Position Calculation")
+    print("=" * 60)
+    
+    # Default EE offset from URDF (contact_point)
+    ee_offset = [0.26, 0.0, 0.0]
+    
+    # Single module: EE on module 0
+    print("\n--- Single Module, EE on Module 0 ---")
+    ee_pos_1 = get_end_effector_position(ee_module=0, ee_offset=ee_offset, n_modules=1)
+    print(f"EE position in body frame: {ee_pos_1}")
+    
+    # 2 modules: EE on module 0 (front)
+    print("\n--- 2 Modules, EE on Module 0 (front) ---")
+    ee_pos_2_front = get_end_effector_position(ee_module=0, ee_offset=ee_offset, n_modules=2)
+    print(f"EE position in body frame: {ee_pos_2_front}")
+    
+    # 2 modules: EE on module 1 (back)
+    print("\n--- 2 Modules, EE on Module 1 (back) ---")
+    ee_pos_2_back = get_end_effector_position(ee_module=1, ee_offset=ee_offset, n_modules=2)
+    print(f"EE position in body frame: {ee_pos_2_back}")
+    
+    # 3 modules: EE on module 2 (last)
+    print("\n--- 3 Modules, EE on Module 2 (last) ---")
+    ee_pos_3_last = get_end_effector_position(ee_module=2, ee_offset=ee_offset, n_modules=3)
+    print(f"EE position in body frame: {ee_pos_3_last}")
+    
+    # Test wrench transformation matrix
+    print("\n--- Wrench Transformation Matrix for EE at (0.78, 0, 0) ---")
+    T = get_ee_wrench_to_cog_wrench_matrix(ee_pos_3_last)
+    print(f"Transformation matrix:\n{T}")
+    
+    # Example: force at EE -> wrench at CoG
+    F_ee = np.array([10, 0, 0, 0, 0, 0])  # 10N force in X direction at EE
+    W_cog = T @ F_ee
+    print(f"\nApplying 10N in X at EE:")
+    print(f"  Force at CoG: {W_cog[0:3]}")
+    print(f"  Torque at CoG: {W_cog[3:6]}")

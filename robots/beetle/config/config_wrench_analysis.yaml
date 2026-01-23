@@ -5,13 +5,13 @@
 mode: "torque"
 
 # Number of modules in the assembled configuration
-n_modules: 2
+n_modules: 3
 
 # Distance between adjacent module centers [m]
 module_spacing: 0.52
 
 # Resolution of yaw/pitch angles in degrees (smaller = finer but slower)
-resolution: 5
+resolution: 10
 
 # Tilt angle limit in degrees (±limit from vertical)
 # Physical servo limit: ±90° (servo can rotate from -90° to +90°)
@@ -27,3 +27,18 @@ frame: "body"
 
 # Save results to .npz file
 save_to_npz: false
+
+# -------------------------
+# End Effector Configuration
+# -------------------------
+# end_effector_module: Index of module where EE is attached (0 to n_modules-1)
+#   - For single module: always 0
+#   - For n modules: 0 = first module, n-1 = last module
+end_effector_module: 0
+
+# end_effector_offset: EE position relative to its host module's CoG [m]
+#   - Extracted from URDF: contact_point is at (0.26, 0, 0) relative to base_link
+end_effector_offset:
+  x: 0.26
+  y: 0.0
+  z: 0.0

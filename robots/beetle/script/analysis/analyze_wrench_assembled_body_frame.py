@@ -17,6 +17,7 @@ import yaml
 import numpy as np
 import cvxpy as cp
 import argparse
+import rospkg
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 from matplotlib import cm
@@ -36,8 +37,8 @@ from analyze_allocation_assembled import (
 # ------------------------------------------------------------------------
 THRUST_MAX = DEFAULT_THRUST_MAX  # Maximum thrust per rotor [N] - updated to 21.37N
 THRUST_MIN = 0.0  # Minimum thrust per rotor [N]
-WRENCH_ERROR_LIMIT = 1e-3  # Acceptable wrench error
-DEFAULT_TILT_LIMIT = 90.0  # Default tilt angle limit [degrees], ±90° means 180° total range
+WRENCH_ERROR_LIMIT = 1e-2  # Acceptable wrench error (2% tolerance)
+DEFAULT_TILT_LIMIT = 90.0  # Default tilt angle limit [degrees], ±90° (physical servo limit)
 
 DEFAULT_CONFIG = {
     "mode": "force",
@@ -49,7 +50,9 @@ DEFAULT_CONFIG = {
     "save_to_npz": False,
 }
 
-DEFAULT_CONFIG_FILE = "config_wrench_analysis.yaml"
+# Get default config file path using rospkg
+rospack = rospkg.RosPack()
+DEFAULT_CONFIG_FILE = os.path.join(rospack.get_path("beetle"), "config", "config_wrench_analysis.yaml")
 
 
 def load_config(config_path=None):

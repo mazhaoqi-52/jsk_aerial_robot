@@ -1,5 +1,6 @@
 """
 Created by li-jinjie on 25-6-1.
+Modified by Zhaoqi-MA on 26-1-23
 Extended for n-module assembled configuration.
 
 This module provides allocation matrix generation for n-module assembled Beetle robots

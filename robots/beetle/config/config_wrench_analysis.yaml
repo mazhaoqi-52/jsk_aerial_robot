@@ -5,16 +5,16 @@
 mode: "torque"
 
 # Number of modules in the assembled configuration
-n_modules: 1
+n_modules: 2
 
 # Distance between adjacent module centers [m]
 module_spacing: 0.52
 
 # Resolution of yaw/pitch angles in degrees (smaller = finer but slower)
-resolution: 10
+resolution: 5
 
 # Tilt angle limit in degrees (±limit from vertical)
-# 90 means full 180° range (-90° to +90°)
+# Physical servo limit: ±90° (servo can rotate from -90° to +90°)
 tilt_limit: 90
 
 # Maximum thrust per rotor [N]

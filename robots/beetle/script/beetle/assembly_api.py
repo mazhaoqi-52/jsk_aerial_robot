@@ -34,8 +34,8 @@ class StandbyState(smach.State):
                  male_servo_id = 8,
                  female_servo_id = 6,
                  real_machine = False,
-                 unlock_servo_angle_male = 2300,
-                 lock_servo_angle_male = 4050,
+                 unlock_servo_angle_male = 2000,
+                 lock_servo_angle_male = 1550,
                  unlock_servo_angle_female = 11000,
                  lock_servo_angle_female = 4600,
                  leader = 'beetle2',
@@ -86,6 +86,7 @@ class StandbyState(smach.State):
         # flags
         self.emergency_flag = False
         self.follower_male_mech_activated = False
+        self.male_servo_initialized = False  # flag for male servo unlock initialization
 
         # tf listener and broadcaster
         self.listener = tf.TransformListener()
@@ -98,9 +99,13 @@ class StandbyState(smach.State):
         if(self.attach_dir < 0):
             self.follower_docking_pub = rospy.Publisher(self.robot_name+"/docking_cmd", Bool, queue_size=10)
             self.dynamixel_servo = DynamixelControl(self.leader,self.leader_id,self.female_servo_id,self.real_machine)
+            # male servo control for unlock initialization
+            self.dynamixel_servo_male = DynamixelControl(self.robot_name, self.robot_id, self.male_servo_id, self.real_machine)
         else:
             self.follower_docking_pub = rospy.Publisher(self.leader+"/docking_cmd", Bool, queue_size=10)
             self.dynamixel_servo = DynamixelControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
+            # male servo control for unlock initialization
+            self.dynamixel_servo_male = DynamixelControl(self.leader, self.leader_id, self.male_servo_id, self.real_machine)
             
         # subscriber
         self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
@@ -120,6 +125,15 @@ class StandbyState(smach.State):
         self.att_error_tol = np.array([self.roll_tol, self.pitch_tol, self.yaw_tol]) # attitude error torelance
 
     def execute(self, userdata):
+        # Initialize male servo to unlock angle (only once at the beginning)
+        if not self.male_servo_initialized:
+            rospy.loginfo("[StandbyState] Initializing male servo to unlock angle")
+            if self.real_machine:
+                self.dynamixel_servo_male.sendTargetAngle(self.unlock_servo_angle_male)
+                rospy.loginfo("[StandbyState] Male servo set to unlock angle: %d" % self.unlock_servo_angle_male)
+            self.male_servo_initialized = True
+        
+        # Initialize female servo (only once)
         if not self.follower_male_mech_activated:
             if self.real_machine:
                 self.dynamixel_servo.sendTargetAngle(self.lock_servo_angle_female)

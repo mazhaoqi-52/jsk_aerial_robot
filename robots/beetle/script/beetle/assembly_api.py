@@ -50,7 +50,7 @@ class StandbyState(smach.State):
                  roll_tol = 0.08,
                  pitch_tol = 0.08,
                  yaw_tol = 0.08,
-                 root_fc_dis = [0,0,0.129947],
+                 root_fc_dis = [0,0,0.06747],  # Updated to match current fc_joint z
                  attach_dir = -1.0,
                  approach_mode = 'nav',
                  run_rate = 40):
@@ -179,7 +179,14 @@ class StandbyState(smach.State):
         if(pos_error[0] * self.attach_dir > 0):
             pos_error[0] = 0.0
         att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
-        rospy.loginfo(pos_error)
+        
+        # DEBUG: 详细日志
+        rospy.loginfo_throttle(1.0, "[StandbyState] target_offset: %s, root_fc_dis: %s" % (self.target_offset, self.root_fc_dis))
+        rospy.loginfo_throttle(1.0, "[StandbyState] follower_from_leader: pos=%s" % (follower_from_leader[0],))
+        rospy.loginfo_throttle(1.0, "[StandbyState] target_pos (world): %s" % (target_pos,))
+        rospy.loginfo_throttle(1.0, "[StandbyState] pos_error: %s, att_error: %s" % (pos_error, att_error))
+        rospy.loginfo_throttle(1.0, "[StandbyState] pos_tol: %s, att_tol: %s" % (self.pos_error_tol, self.att_error_tol))
+        
         #check if pos and att error are within the torrelance
         if np.all(np.less(np.abs(pos_error),self.pos_error_tol)) and np.all(np.less(np.abs(att_error),self.att_error_tol)):
             return 'done'
@@ -261,7 +268,7 @@ class ApproachState(smach.State):
                  roll_tol = 0.08,
                  pitch_tol = 0.08,
                  yaw_tol = 0.08,
-                 root_fc_dis = [0,0,0.129947],
+                 root_fc_dis = [0,0,0.06747],  # Updated to match current fc_joint z
                  x_danger_thre = 0.02,
                  y_danger_thre = 0.1,
                  z_danger_thre = 0.1,

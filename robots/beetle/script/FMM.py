@@ -102,7 +102,7 @@ class FMM():
         self.y_offset = 0
         self.z_offset = 0
         self.target_offset = np.array([self.frame_size/2.0 + self.x_offset, self.y_offset, self.z_offset])
-        self.root_fc_dis = 0.129947
+        self.root_fc_dis = 0.06747  # Updated to match current fc_joint z
         self.leader = "beetle2"
         #heap
         self.heap = Labeled_Heap()

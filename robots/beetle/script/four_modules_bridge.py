@@ -108,7 +108,7 @@ class StandbyState(smach.State):
         self.roll_tol = 0.08
         self.pich_tol = 0.08
         self.yaw_tol = 0.08
-        self.root_fc_dis = 0.129947 #set from urdf
+        self.root_fc_dis = 0.06747  # Updated to match current fc_joint z
         self.target_offset = np.array([-(self.frame_size + self.x_offset), self.y_offset, self.z_offset]) # position offset while StandbyState
         self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol]) # position error torelance
         self.att_error_tol = np.array([self.roll_tol, self.pich_tol, self.yaw_tol]) # attitude error torelance
@@ -195,7 +195,7 @@ class ApproachState(smach.State):
         self.roll_tol = 0.5
         self.pich_tol = 0.5
         self.yaw_tol = 0.5
-        self.root_fc_dis = 0.129947
+        self.root_fc_dis = 0.06747  # Updated to match current fc_joint z
         self.x_danger_thre = 0.02
         self.y_danger_thre = 0.05
         self.z_danger_thre = 0.05

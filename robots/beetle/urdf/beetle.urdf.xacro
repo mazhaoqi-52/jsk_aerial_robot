@@ -33,11 +33,11 @@
       <visual>
         <origin xyz="0 0 0" rpy="0 0 3.141592"/>
         <geometry>
-          <mesh filename="package://beetle/urdf/mesh/base_link.dae"/>
+          <mesh filename="package://beetle/urdf/mesh/base_link_hyper.dae"/>
         </geometry>
       </visual>
       <collision>
-        <origin xyz="0 0 0.1205" rpy="0 0 0"/>
+        <origin xyz="0 0 0.0575" rpy="0 0 0"/>
         <geometry>
           <box size="0.52 0.52 0.241"/>
         </geometry>
@@ -59,7 +59,7 @@
     <joint name="fc_joint" type="fixed">
       <child link="fc"/>
       <parent link="base_link"/>
-      <origin rpy="0 0 0" xyz="0 0 0.12947"/>
+      <origin rpy="0 0 0" xyz="0 0 0.06747"/>
       <axis xyz="0 0 1"/>
     </joint>
 
@@ -86,10 +86,10 @@
     </xacro:macro>
 
     ## dummy rotor arms
-    <xacro:dummy_rotor_arm id = "${child1}" x = "0.12129" y="0.12150" z = "0.1185" yaw = "${pi/4.0}"/>
-    <xacro:dummy_rotor_arm id = "${child2}" x = "-0.12129" y="0.12150" z = "0.1185" yaw = "${pi*3.0/4.0}"/>
-    <xacro:dummy_rotor_arm id = "${child3}" x = "-0.12129" y="-0.12150" z = "0.1185" yaw = "${pi*5.0/4.0}"/>
-    <xacro:dummy_rotor_arm id = "${child4}" x = "0.12129" y="-0.12150" z = "0.1185" yaw = "${-pi/4.0}"/>
+    <xacro:dummy_rotor_arm id = "${child1}" x = "0.12129" y="0.12150" z = "0.0555" yaw = "${pi/4.0}"/>
+    <xacro:dummy_rotor_arm id = "${child2}" x = "-0.12129" y="0.12150" z = "0.0555" yaw = "${pi*3.0/4.0}"/>
+    <xacro:dummy_rotor_arm id = "${child3}" x = "-0.12129" y="-0.12150" z = "0.0555" yaw = "${pi*5.0/4.0}"/>
+    <xacro:dummy_rotor_arm id = "${child4}" x = "0.12129" y="-0.12150" z = "0.0555" yaw = "${-pi/4.0}"/>
 
     ## dummy link for the contact point coordinate
       <link name="contact_point">
@@ -124,7 +124,7 @@
             ixy="0.00000001" ixz="0.00000084" iyz="0.00000001"/>
       </inertial>
       <collision>
-        <origin xyz="0.0 0 0" rpy="0 0 0"/>
+        <origin xyz="0.022 0 0" rpy="0 0 0"/>
         <geometry>
           <cylinder radius="0.02" length="0.033"/>
         </geometry>

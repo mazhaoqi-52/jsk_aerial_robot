@@ -57,7 +57,7 @@ controller:
   pitch:
     p_gain: 8.0 #8~25
     i_gain: 1.0
-    d_gain: 6.0 #4~11
+    d_gain: 5.0 #4~11
     limit_sum: 20.0
     limit_p: 20.0
     limit_i: 10.0
@@ -66,13 +66,13 @@ controller:
     start_rp_integration_height: 0.01
 
   yaw:
-    p_gain: 7.0
+    p_gain: 5.0
     i_gain: 1.0
-    d_gain: 5.0
+    d_gain: 4.0
     limit_err_p: 0.4
     limit_sum: 20.0
     limit_p: 20.0
-    limit_i: 5.0
+    limit_i: 20.0
     limit_d: 20.0
 
     need_d_control: true

@@ -16,7 +16,7 @@
   <joint name="base_dummy_arm_joint" type="fixed">
     <parent link="base_link"/>
     <child link="dummy_arm"/>
-    <origin xyz="0.22 0 0.1455" rpy="0 0 0"/>
+    <origin xyz="0.239 0 0.0895" rpy="0 0 0"/>
   </joint>
 
   <link name="dummy_arm">
@@ -90,7 +90,7 @@
   <joint name="battery1_joint" type="fixed">
     <parent link="base_link"/>
     <child link="battery1"/>
-    <origin xyz="0 0.044 0.055" rpy="0 0 0"/>
+    <origin xyz="0 0.044 -0.01" rpy="0 0 0"/>
     <axis xyz="1 0 0"/>
   </joint>
   <link name="battery1">
@@ -113,7 +113,7 @@
   <joint name="battery2_joint" type="fixed">
     <parent link="base_link"/>
     <child link="battery2"/>
-    <origin xyz="0 -0.044 0.055" rpy="0 0 0"/>
+    <origin xyz="0 -0.044 -0.01" rpy="0 0 0"/>
     <axis xyz="1 0 0"/>
   </joint>
   <link name="battery2">

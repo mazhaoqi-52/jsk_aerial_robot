@@ -16,7 +16,7 @@
   <joint name="base_dummy_arm_joint" type="fixed">
     <parent link="base_link"/>
     <child link="dummy_arm"/>
-    <origin xyz="0.239 0 0.0895" rpy="0 0 0"/>
+    <origin xyz="0.22 0 0.0895" rpy="0 0 0"/>
   </joint>
 
   <link name="dummy_arm">

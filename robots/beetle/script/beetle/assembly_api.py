@@ -34,10 +34,10 @@ class StandbyState(smach.State):
                  male_servo_id = 4,
                  female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 1900,
-                 lock_servo_angle_male = 1575,
+                 unlock_servo_angle_male = 1850,
+                 lock_servo_angle_male = 1550,
                  unlock_servo_angle_female = 2000,
-                 lock_servo_angle_female = 3000,
+                 lock_servo_angle_female = 3200,
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,
@@ -146,14 +146,16 @@ class StandbyState(smach.State):
         # calculate current follower position in leader coordinate
         #TODO: determine leader namespace dynamically
         try:
+            self.listener.waitForTransform('/world', self.leader+'/root', rospy.Time(0), rospy.Duration(1.0))
             leader_from_world = self.listener.lookupTransform('/world', self.leader+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
             rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: /world -> %s/root: %s" % (self.leader, str(e)))
             self.run_rate.sleep()
             return 'in_process'
         try:
+            self.listener.waitForTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0), rospy.Duration(1.0))
             follower_from_leader = self.listener.lookupTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
             rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: %s/root -> %s/root: %s" % (self.leader, self.robot_name, str(e)))
             self.run_rate.sleep()
             return 'in_process'
@@ -254,10 +256,10 @@ class ApproachState(smach.State):
                  male_servo_id = 4,
                  female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 1900,
-                 lock_servo_angle_male = 1575,
+                 unlock_servo_angle_male = 1850,
+                 lock_servo_angle_male = 1550,
                  unlock_servo_angle_female = 2000,
-                 lock_servo_angle_female = 3000,
+                 lock_servo_angle_female = 3200,
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,
@@ -353,8 +355,9 @@ class ApproachState(smach.State):
         # calculate now follower position in leader coordinate
         #TODO: determine leader namespace dynamically
         try:
+            self.listener.waitForTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0), rospy.Duration(1.0))
             follower_from_leader = self.listener.lookupTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception):
             return 'in_process'
 
         # set target odom in leader coordinate
@@ -369,16 +372,17 @@ class ApproachState(smach.State):
 
         # convert target position from leader coord to world coord
         try:
+            self.listener.waitForTransform('/world', '/follower_target_odom', rospy.Time(0), rospy.Duration(0.5))
             homo_transformed_target_odom = self.listener.lookupTransform('/world', '/follower_target_odom', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
-            return 'in process'
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception):
+            return 'in_process'
         target_pos = homo_transformed_target_odom[0]
         target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])
 
         pos_error = np.array(self.target_offset - follower_from_leader[0])
         att_error = att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
 
-        rospy.loginfo(pos_error)
+        rospy.loginfo("[ApproachState] target_offset: %s, follower_from_leader: %s, pos_error: %s" % (self.target_offset, follower_from_leader[0], pos_error))
 
         #check if pos and att error are within the torrelance
         if np.all(np.less(np.abs(pos_error),self.pos_error_tol)) and np.all(np.less(np.abs(att_error),self.att_error_tol)):
@@ -446,10 +450,10 @@ class AssemblyState(smach.State):
                  male_servo_id = 4,
                  female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 1900,
-                 lock_servo_angle_male = 1575,
+                 unlock_servo_angle_male = 1850,
+                 lock_servo_angle_male = 1550,
                  unlock_servo_angle_female = 2000,
-                 lock_servo_angle_female = 3000,
+                 lock_servo_angle_female = 3200,
                  leader = 'beetle2',
                  leader_id = 2,
                  attach_dir = -1.0):

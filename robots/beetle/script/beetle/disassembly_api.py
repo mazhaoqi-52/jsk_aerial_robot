@@ -30,15 +30,15 @@ class SwitchState(smach.State):
     def __init__(self,
                  robot_name = 'beetle1',
                  robot_id = 1,
-                 male_servo_id = 8,
+                 male_servo_id = 4,
                  real_machine = False,
-                 unlock_servo_angle_male = 2000,
+                 unlock_servo_angle_male = 1850,
                  lock_servo_angle_male = 1550,
                  unlock_servo_angle_female = 2000,
-                 lock_servo_angle_female = 3000,
+                 lock_servo_angle_female = 3200,
                  neighboring = 'beetle2',
                  neighboring_id = 2,
-                 female_servo_id = 6,
+                 female_servo_id = 5,
                  separate_dir = -1):
         smach.State.__init__(self, outcomes=['done'])
 

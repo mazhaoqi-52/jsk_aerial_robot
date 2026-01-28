@@ -12,12 +12,12 @@ if __name__=="__main__":
     switch_type = rospy.get_param("/switch_type",1) # 1 -> assembly, 2->disassembly
     print(switch_type)
 
-    male_servo_id = rospy.get_param("male_serve_id",5)
-    female_servo_id = rospy.get_param("female_serve_id",6)
-    unlock_servo_angle_male = rospy.get_param("unlock_servo_angle_male",7000)
-    lock_servo_angle_male = rospy.get_param("lock_servo_angle_male",8300)
-    unlock_servo_angle_female = rospy.get_param("unlock_servo_angle_female",11000)
-    lock_servo_angle_female = rospy.get_param("lock_servo_angle_female",5600)
+    male_servo_id = rospy.get_param("male_serve_id",4)
+    female_servo_id = rospy.get_param("female_serve_id",5)
+    unlock_servo_angle_male = rospy.get_param("unlock_servo_angle_male",1850)
+    lock_servo_angle_male = rospy.get_param("lock_servo_angle_male",1550)
+    unlock_servo_angle_female = rospy.get_param("unlock_servo_angle_female",2000)
+    lock_servo_angle_female = rospy.get_param("lock_servo_angle_female",3200)
 
     left_edge_id = rospy.get_param("left_edge_id",1)
     right_edge_id = rospy.get_param("right_edge_id",3)

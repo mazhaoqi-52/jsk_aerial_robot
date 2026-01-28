@@ -117,7 +117,6 @@ class StandbyState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)
 
         # position offset while StandbyState
-        # attach_dir indicates which direction follower should approach from
         # attach_dir < 0: follower is at positive X of leader, target at leader's positive X side
         # attach_dir > 0: follower is at negative X of leader, target at leader's negative X side
         if(self.attach_dir < 0):
@@ -265,7 +264,7 @@ class ApproachState(smach.State):
                  x_offset = 0,
                  y_offset = 0,
                  z_offset = 0,
-                 x_tol = 0.01,
+                 x_tol = 0.005,
                  y_tol = 0.01,
                  z_tol = 0.01,
                  roll_tol = 0.15,
@@ -335,9 +334,8 @@ class ApproachState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)        
 
         # position offset while ApproachState
-        # attach_dir indicates which direction follower should approach from
-        # attach_dir < 0: follower is at positive X of leader, should move to negative X (target at leader's positive X side)
-        # attach_dir > 0: follower is at negative X of leader, should move to positive X (target at leader's negative X side)
+        # attach_dir < 0: follower is at positive X of leader, target at leader's positive X side
+        # attach_dir > 0: follower is at negative X of leader, target at leader's negative X side
         if(self.attach_dir < 0):
             self.target_offset = np.array([(self.airframe_size + self.x_offset), self.y_offset, self.z_offset]) 
         else:
@@ -360,8 +358,10 @@ class ApproachState(smach.State):
             return 'in_process'
 
         # set target odom in leader coordinate
+        # The 0.05 offset makes follower approach slightly closer than final docking position
+        # attach_dir < 0: follower at positive X, target_offset positive, need to subtract to get closer
         #TODO: determine leader namespace dynamically
-        self.br.sendTransform((self.target_offset[0] - 0.05 * self.attach_dir+self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
+        self.br.sendTransform((self.target_offset[0] + 0.05 * self.attach_dir + self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
                               tf.transformations.quaternion_from_euler(0, 0, 0),
                               rospy.Time.now(),
                               "follower_target_odom",

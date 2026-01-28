@@ -34,8 +34,8 @@ class StandbyState(smach.State):
                  male_servo_id = 4,
                  female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 2000,
-                 lock_servo_angle_male = 1550,
+                 unlock_servo_angle_male = 1900,
+                 lock_servo_angle_male = 1575,
                  unlock_servo_angle_female = 2000,
                  lock_servo_angle_female = 3000,
                  leader = 'beetle2',
@@ -44,12 +44,12 @@ class StandbyState(smach.State):
                  x_offset = 0.12,
                  y_offset = 0,
                  z_offset = 0,
-                 x_tol = 0.01,
-                 y_tol = 0.01,
-                 z_tol = 0.01,
-                 roll_tol = 0.08,
-                 pitch_tol = 0.08,
-                 yaw_tol = 0.08,
+                 x_tol = 0.05,
+                 y_tol = 0.05,
+                 z_tol = 0.05,
+                 roll_tol = 0.15,
+                 pitch_tol = 0.15,
+                 yaw_tol = 0.15,
                  root_fc_dis = [0,0,0.06747],  # Updated to match current fc_joint z
                  attach_dir = -1.0,
                  approach_mode = 'nav',
@@ -117,10 +117,13 @@ class StandbyState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)
 
         # position offset while StandbyState
+        # attach_dir indicates which direction follower should approach from
+        # attach_dir < 0: follower is at positive X of leader, target at leader's positive X side
+        # attach_dir > 0: follower is at negative X of leader, target at leader's negative X side
         if(self.attach_dir < 0):
-            self.target_offset = np.array([-(self.airframe_size + self.x_offset), self.y_offset, self.z_offset]) 
+            self.target_offset = np.array([(self.airframe_size + self.x_offset), self.y_offset, self.z_offset]) 
         else:
-            self.target_offset = np.array([(self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
+            self.target_offset = np.array([-(self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
         self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol]) # position error torelance
         self.att_error_tol = np.array([self.roll_tol, self.pitch_tol, self.yaw_tol]) # attitude error torelance
 
@@ -249,25 +252,25 @@ class ApproachState(smach.State):
     def __init__(self,
                  robot_name = 'beetle1',
                  robot_id = 1,
-                 male_servo_id = 8,
-                 female_servo_id = 6,
+                 male_servo_id = 4,
+                 female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 2300,
-                 lock_servo_angle_male = 4050,
-                 unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 4600,
+                 unlock_servo_angle_male = 1900,
+                 lock_servo_angle_male = 1575,
+                 unlock_servo_angle_female = 2000,
+                 lock_servo_angle_female = 3000,
                  leader = 'beetle2',
                  leader_id = 2,
                  airframe_size = 0.52,
                  x_offset = 0,
                  y_offset = 0,
                  z_offset = 0,
-                 x_tol = 0.02,
-                 y_tol = 0.02,
-                 z_tol = 0.01,#0.02
-                 roll_tol = 0.08,
-                 pitch_tol = 0.08,
-                 yaw_tol = 0.08,
+                 x_tol = 0.01,
+                 y_tol = 0.01,
+                 z_tol = 0.01,
+                 roll_tol = 0.15,
+                 pitch_tol = 0.15,
+                 yaw_tol = 0.15,
                  root_fc_dis = [0,0,0.06747],  # Updated to match current fc_joint z
                  x_danger_thre = 0.02,
                  y_danger_thre = 0.1,
@@ -332,10 +335,13 @@ class ApproachState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)        
 
         # position offset while ApproachState
+        # attach_dir indicates which direction follower should approach from
+        # attach_dir < 0: follower is at positive X of leader, should move to negative X (target at leader's positive X side)
+        # attach_dir > 0: follower is at negative X of leader, should move to positive X (target at leader's negative X side)
         if(self.attach_dir < 0):
-            self.target_offset = np.array([-(self.airframe_size + self.x_offset), self.y_offset, self.z_offset]) 
+            self.target_offset = np.array([(self.airframe_size + self.x_offset), self.y_offset, self.z_offset]) 
         else:
-            self.target_offset = np.array([(self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
+            self.target_offset = np.array([-(self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
         # position error torelance
         self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol])
         # attitude error torelance
@@ -437,13 +443,13 @@ class AssemblyState(smach.State):
     def __init__(self,
                  robot_name = 'beetle1',
                  robot_id = 1,
-                 male_servo_id = 8,
-                 female_servo_id = 6,
+                 male_servo_id = 4,
+                 female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 2300,
-                 lock_servo_angle_male = 4050,
-                 unlock_servo_angle_female = 11000,
-                 lock_servo_angle_female = 4600,
+                 unlock_servo_angle_male = 1900,
+                 lock_servo_angle_male = 1575,
+                 unlock_servo_angle_female = 2000,
+                 lock_servo_angle_female = 3000,
                  leader = 'beetle2',
                  leader_id = 2,
                  attach_dir = -1.0):

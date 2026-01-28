@@ -22,7 +22,10 @@ class AssemblyDemo():
                 target_leader_id = self.module_ids[i-1]
                 motion_prefix = str(target_follower_id) + '_' + str(target_leader_id)
                 sub_sm = smach.StateMachine(outcomes=['succeeded_'+motion_prefix,'interupted_'+motion_prefix])
-                direction = 1 if target_follower_id > target_leader_id else -1
+                # module_ids order represents X-axis position from small to large
+                # follower (current module) is at larger X, leader (previous module) is at smaller X
+                # so follower needs to move in negative X direction to approach leader
+                direction = -1
                 with sub_sm:
                     smach.StateMachine.add('StandbyState'+ motion_prefix,
                                            StandbyState(robot_name = 'beetle'+str(target_follower_id), robot_id = target_follower_id, leader = 'beetle'+str(target_leader_id), leader_id = target_leader_id, attach_dir = direction, real_machine = self.real_machine),

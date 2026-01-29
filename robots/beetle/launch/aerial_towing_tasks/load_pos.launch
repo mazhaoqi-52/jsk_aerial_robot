@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="real_machine" default="true" />
+  <arg name="simulation" default="false" />
+  <arg name="robot_ns" default="load" />
+  <arg name="load_id" default="86" />
+  <arg name="robot_id" default="1" />
+  
+  <!-- Load position in gazebo -->
+  <arg name="load_x" default="3" />
+  <arg name="load_y" default="0" />
+  <arg name="load_z" default="0" />
+  <arg name="load_yaw" default="0" />
+  <arg name="load_friction" default="10.0" />
+  
+  <group ns="$(arg robot_ns)">
+    <group if="$(arg real_machine)">
+      <group unless="$(arg simulation)">
+        <include file="$(find aerial_robot_base)/launch/external_module/mocap.launch">
+          <arg name="robot_id" value="$(arg load_id)" />
+        </include>
+      </group>
+    </group>
+    <group if="$(arg simulation)">
+      <group unless="$(arg real_machine)">
+        <param name="robot_description"
+          command="$(find xacro)/xacro $(find beetle)/urdf/load.urdf load_friction:=$(arg load_friction)" />
+        <!-- Spawn load -->
+        <node pkg="gazebo_ros" type="spawn_model" name="spawn_load" respawn="false" output="screen"
+          args="-urdf -model load -x $(arg load_x) -y $(arg load_y) -z $(arg load_z) -Y $(arg load_yaw) -param robot_description" />
+      </group>
+    </group>
+  </group>
+</launch>

@@ -5,53 +5,56 @@
   <arg name="simulation" default="true"/>
 
   <!-- Formation parameters -->
-  <arg name="module_ids" default="1,2" />
-  <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
-  <arg name="approach_height" default="0.48" /> <!-- Adjusted for end-effector offset compensation -->
+  <arg name="module_ids" default="2,3,1" />
   
-  <!-- Valve parameters -->
-  <arg name="valve_ns" default="valve"/>
-  <arg name="valve_id" default="85"/>
-  <arg name="valve_x" default="3"/>
-  <arg name="valve_y" default="0"/>
-  <arg name="valve_z" default="0"/>
-  <arg name="valve_yaw" default="0"/>
+  <!-- Load parameters -->
+  <arg name="load_ns" default="load"/>
+  <arg name="load_id" default="86"/>
+  <arg name="load_x" default="3"/>
+  <arg name="load_y" default="0"/>
+  <arg name="load_z" default="0"/>
+  <arg name="load_yaw" default="0"/>
+  <arg name="load_friction" default="10.0"/>
+  
+  <!-- Towing parameters -->
+  <arg name="towing_distance" default="1.0"/> <!-- meters -->
+  <arg name="towing_force" default="5.0"/> <!-- Newtons -->
   
   <!-- Debug mode -->
   <arg name="debug" default="false" />
   
-  <!-- Include valve position setup -->
-  <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
+  <!-- Include load position setup -->
+  <include file="$(find beetle)/launch/aerial_towing_tasks/load_pos.launch">
     <arg name="real_machine" value="$(arg real_machine)" />
     <arg name="simulation" value="$(arg simulation)" />
-    <arg name="robot_ns" value="$(arg valve_ns)" />
-    <arg name="robot_id" value="$(arg valve_id)"/>
-    <arg name="valve_x" value="$(arg valve_x)" />
-    <arg name="valve_y" value="$(arg valve_y)" />
-    <arg name="valve_z" value="$(arg valve_z)" />
-    <arg name="valve_yaw" value="$(arg valve_yaw)" />
+    <arg name="robot_ns" value="$(arg load_ns)" />
+    <arg name="load_id" value="$(arg load_id)"/>
+    <arg name="load_x" value="$(arg load_x)" />
+    <arg name="load_y" value="$(arg load_y)" />
+    <arg name="load_z" value="$(arg load_z)" />
+    <arg name="load_yaw" value="$(arg load_yaw)" />
+    <arg name="load_friction" value="$(arg load_friction)" />
   </include>
   
-  <!-- Controller parameters for formation valve rotation -->
+  <!-- Controller parameters for formation towing -->
   <param name="controller/unified_control_mode" value="false" />
-  <param name="controller/valve_rotation_feedforward/enabled" value="true" />
-  <param name="controller/valve_rotation_feedforward/force_z" value="-5.0" />
-  <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />
+  <param name="controller/towing_feedforward/enabled" value="true" />
+  <param name="controller/towing_feedforward/force_x" value="$(arg towing_force)" />
   
   <!-- Assembly CoG publisher node -->
   <node name="assembly_cog_publisher" pkg="beetle" type="assembly_cog_publisher.py"
         output="screen">
     <param name="module_ids" value="$(arg module_ids)" />
-    <param name="publish_rate" value="50.0" /> <!-- 50Hz -->
-    <param name="timeout_threshold" value="0.5" /> <!-- 0.5s timeout -->
+    <param name="publish_rate" value="50.0" />
+    <param name="timeout_threshold" value="0.5" />
   </node>
   
-  <!-- Formation valve rotation node -->
-  <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_clean.py"
-        output="screen">
+  <!-- Formation load towing node -->
+  <node name="formation_load_towing" pkg="beetle" type="load_towing_formation.py"
+        output="screen" cwd="node">
     <param name="module_ids" value="$(arg module_ids)" />
-    <param name="rotation_angle" value="$(arg rotation_angle)" />
-    <param name="approach_height" value="$(arg approach_height)" />
+    <param name="towing_distance" value="$(arg towing_distance)" />
+    <param name="towing_force" value="$(arg towing_force)" />
     <param name="simulation" value="$(arg simulation)" />
     <param name="real_machine" value="$(arg real_machine)" />
     <param name="debug" value="$(arg debug)" />

@@ -1,0 +1,185 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="load">
+
+  <!-- ============== Parameters ============== -->
+  <!-- Load box outer dimensions (m) -->
+  <xacro:property name="box_length" value="0.5" />  <!-- x -->
+  <xacro:property name="box_width" value="0.3" />   <!-- y -->
+  <xacro:property name="box_height" value="0.3" />  <!-- z -->
+  <xacro:property name="wall_thickness" value="0.02" /> <!-- wall thickness -->
+  
+  <!-- Load properties -->
+  <xacro:property name="load_mass" value="5.0" />   <!-- kg -->
+  <xacro:arg name="load_friction" default="10.0" /> <!-- N, force needed to move -->
+  
+  <!-- Inertia approximation (treating as hollow box) -->
+  <xacro:property name="ixx" value="${(1.0/12.0) * load_mass * (box_width*box_width + box_height*box_height)}" />
+  <xacro:property name="iyy" value="${(1.0/12.0) * load_mass * (box_length*box_length + box_height*box_height)}" />
+  <xacro:property name="izz" value="${(1.0/12.0) * load_mass * (box_length*box_length + box_width*box_width)}" />
+
+  <!-- ============== Materials ============== -->
+  <material name="orange">
+    <color rgba="1.0 0.5 0.0 1.0"/>
+  </material>
+
+  <!-- ============== World Base (virtual fixed link) ============== -->
+  <link name="world"/>
+
+  <!-- Intermediate link for X-axis motion -->
+  <link name="slide_x">
+    <inertial>
+      <mass value="0.001"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000001" iyz="0" izz="0.000001"/>
+    </inertial>
+  </link>
+
+  <!-- ============== Prismatic Joint X (sliding along X-axis) ============== -->
+  <joint name="load_joint_x" type="prismatic">
+    <parent link="world"/>
+    <child link="slide_x"/>
+    <origin xyz="0 0 ${box_height/2}" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <dynamics damping="5.0" friction="$(arg load_friction)"/>
+    <limit lower="-1000" upper="1000" effort="1000" velocity="10"/>
+  </joint>
+
+  <!-- ============== Prismatic Joint Y (sliding along Y-axis) ============== -->
+  <joint name="load_joint_y" type="prismatic">
+    <parent link="slide_x"/>
+    <child link="load_box"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <dynamics damping="5.0" friction="$(arg load_friction)"/>
+    <limit lower="-1000" upper="1000" effort="1000" velocity="10"/>
+  </joint>
+
+  <!-- ============== Load Box Link (Open-top hollow box: 5 walls) ============== -->
+  <link name="load_box">
+    <!-- Bottom wall -->
+    <visual>
+      <origin xyz="0 0 ${-box_height/2 + wall_thickness/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${box_length} ${box_width} ${wall_thickness}"/>
+      </geometry>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${-box_height/2 + wall_thickness/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${box_length} ${box_width} ${wall_thickness}"/>
+      </geometry>
+    </collision>
+    
+    <!-- Front wall (+X) -->
+    <visual>
+      <origin xyz="${box_length/2 - wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+      </geometry>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <origin xyz="${box_length/2 - wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+      </geometry>
+    </collision>
+    
+    <!-- Back wall (-X) -->
+    <visual>
+      <origin xyz="${-box_length/2 + wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+      </geometry>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <origin xyz="${-box_length/2 + wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+      </geometry>
+    </collision>
+    
+    <!-- Left wall (+Y) -->
+    <visual>
+      <origin xyz="0 ${box_width/2 - wall_thickness/2} 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+      </geometry>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <origin xyz="0 ${box_width/2 - wall_thickness/2} 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+      </geometry>
+    </collision>
+    
+    <!-- Right wall (-Y) -->
+    <visual>
+      <origin xyz="0 ${-box_width/2 + wall_thickness/2} 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+      </geometry>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <origin xyz="0 ${-box_width/2 + wall_thickness/2} 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+      </geometry>
+    </collision>
+    
+    <!-- Inertial (single, at center of mass) -->
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${load_mass}"/>
+      <inertia ixx="${ixx}" ixy="0" ixz="0" iyy="${iyy}" iyz="0" izz="${izz}"/>
+    </inertial>
+  </link>
+
+  <!-- ============== Gazebo Materials ============== -->
+  <gazebo reference="load_box">
+    <material>Gazebo/Orange</material>
+  </gazebo>
+
+  <!-- ============== Gazebo Plugins ============== -->
+  <!-- Position publisher (like valve's p3d) -->
+  <gazebo>
+    <plugin name="p3d_load_controller" filename="libgazebo_ros_p3d.so">
+      <alwaysOn>true</alwaysOn>
+      <updateRate>50.0</updateRate>
+      <bodyName>load_box</bodyName>
+      <topicName>/load/odom</topicName>
+      <gaussianNoise>0</gaussianNoise>
+      <frameName>world</frameName>
+      <xyzOffsets>0 0 0</xyzOffsets>
+      <rpyOffsets>0 0 0</rpyOffsets>
+    </plugin>
+  </gazebo>
+
+  <!-- Force/Torque sensor for X joint -->
+  <gazebo reference="load_joint_x">
+    <provideFeedback>true</provideFeedback>
+  </gazebo>
+  <gazebo>
+    <plugin name="ft_sensor_x" filename="libgazebo_ros_ft_sensor.so">
+      <updateRate>100.0</updateRate>
+      <topicName>load/wrench_x</topicName>
+      <jointName>load_joint_x</jointName>
+    </plugin>
+  </gazebo>
+
+  <!-- Force/Torque sensor for Y joint -->
+  <gazebo reference="load_joint_y">
+    <provideFeedback>true</provideFeedback>
+  </gazebo>
+  <gazebo>
+    <plugin name="ft_sensor_y" filename="libgazebo_ros_ft_sensor.so">
+      <updateRate>100.0</updateRate>
+      <topicName>load/wrench_y</topicName>
+      <jointName>load_joint_y</jointName>
+    </plugin>
+  </gazebo>
+
+</robot>

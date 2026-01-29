@@ -87,14 +87,6 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 catkin_install_python(PROGRAMS
-  script/demos/valve_rotation_demo/valve_rotation_formation_n_module.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
-catkin_install_python(PROGRAMS
-  script/demos/valve_rotation_demo/valve_rotation_formation_clean_fixed.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
-catkin_install_python(PROGRAMS
-  script/demos/valve_rotation_demo/valve_rotation_formation_n_module_fixed.py
+  script/demos/aerial_towing_demo/load_towing_formation.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

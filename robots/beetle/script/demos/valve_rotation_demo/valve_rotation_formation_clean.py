@@ -416,15 +416,20 @@ class FormationSingleUAVStateBase(smach.State):
     def get_end_effector_yaw(self):
         return self.formation_adapter.get_end_effector_yaw()
     
-    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None):
-        """Formation-style active convergence with trajectory decomposition"""
+    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, yaw_only=False):
+        """Formation-style active convergence with trajectory decomposition
+        
+        Args:
+            yaw_only: If True, only check yaw convergence (ignore position error)
+        """
         start_time = rospy.get_time()
         
         current_pos = self.get_end_effector_position()
         if current_pos is None:
             rospy.logerr("[Convergence] Cannot get current position, skipping decomposition")
         
-        if current_pos is not None:
+        # Skip trajectory decomposition if yaw_only mode
+        if current_pos is not None and not yaw_only:
             initial_distance = np.linalg.norm(np.array(target_pos) - np.array(current_pos))
             VEL_NAV_THRESHOLD = 0.05
             SAFE_STEP_SIZE = 0.04
@@ -508,7 +513,10 @@ class FormationSingleUAVStateBase(smach.State):
             position_ok = pos_error < pos_thresh
             yaw_ok = yaw_error < yaw_thresh
             
-            if position_ok and yaw_ok:
+            # If yaw_only mode, only check yaw convergence
+            converged = (yaw_ok) if yaw_only else (position_ok and yaw_ok)
+            
+            if converged:
                 consecutive_good_readings += 1
                 if consecutive_good_readings >= required_consecutive:
                     rospy.loginfo(f"Convergence success: pos={pos_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f}°")
@@ -1134,7 +1142,7 @@ class FormationInitializeStartPositionState(FormationSingleUAVStateBase):
     def __init__(self):
         FormationSingleUAVStateBase.__init__(self, 
             outcomes=['succeeded', 'failed'], 
-            output_keys=['start_position', 'valve_position', 'valve_yaw'])
+            output_keys=['start_position', 'start_yaw', 'valve_position', 'valve_yaw'])
     
     def execute(self, userdata):
         rospy.loginfo("=== Formation Initialize Start Position State ===")
@@ -1160,10 +1168,11 @@ class FormationInitializeStartPositionState(FormationSingleUAVStateBase):
         
         # Store positions in userdata
         userdata.start_position = assembly_pos
+        userdata.start_yaw = assembly_yaw
         userdata.valve_position = valve_pos
         userdata.valve_yaw = valve_yaw
         
-        rospy.loginfo(f"Formation start position: {assembly_pos}")
+        rospy.loginfo(f"Formation start position: {assembly_pos}, yaw: {math.degrees(assembly_yaw):.1f}°")
         rospy.loginfo(f"Valve position: {valve_pos}")
         rospy.loginfo(f"Valve yaw: {valve_yaw}")
         
@@ -2314,7 +2323,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
     def __init__(self):
         FormationSingleUAVStateBase.__init__(self,
             outcomes=['succeeded', 'failed'],
-            input_keys=['valve_position', 'start_position', 'trajectory_state'],
+            input_keys=['valve_position', 'start_position', 'start_yaw', 'trajectory_state'],
             output_keys=['disengagement_position'])
     
     def execute(self, userdata):
@@ -2326,6 +2335,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             return 'failed'
         
         start_assembly_pos = getattr(userdata, 'start_position', None)
+        start_yaw = getattr(userdata, 'start_yaw', 0.0)
         trajectory_state = getattr(userdata, 'trajectory_state', {}) or {}
         
         current_pos = self.get_end_effector_position()
@@ -2441,35 +2451,35 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         rospy.loginfo("[Phase 3] Returning to start XY position")
         
         if start_assembly_pos is not None:
-            # Phase 3A: First adjust yaw to 0° (maintain current XY position)
-            rospy.loginfo("[Phase 3A] Adjusting yaw to 0° before XY movement")
+            # Phase 3A: First adjust yaw to start_yaw (yaw-only convergence)
+            rospy.loginfo(f"[Phase 3A] Adjusting yaw to {math.degrees(start_yaw):.1f}° before XY movement")
             yaw_adjust_target = (current_pos[0], current_pos[1], current_pos[2])
             
-            # Strict yaw convergence: must reach < 1.5° before proceeding
+            # Yaw-only convergence: ignore position error, only check yaw
             yaw_success = self.active_position_convergence(
                 yaw_adjust_target,
-                target_yaw=0.0,  # Target yaw = 0°
-                pos_thresh=0.10,  # Very loose position tolerance (100mm) - only care about yaw
-                yaw_thresh=0.026,  # Strict yaw threshold: 1.5° (was 2.9°)
-                timeout=30.0,      # Longer timeout for strict convergence
-                max_linear_vel=0.02,  # Very slow XY to minimize drift (was 0.03)
-                max_angular_vel=0.035,  # 2°/s for smooth yaw adjustment
-                max_yaw_step=0.05  # Limit yaw step to 2.9° per control cycle (prevent overshoot)
+                target_yaw=start_yaw,
+                yaw_thresh=0.05,  # ~2.9° threshold
+                timeout=60.0,
+                max_linear_vel=0.02,
+                max_angular_vel=0.05,
+                max_yaw_step=0.05,
+                yaw_only=True  # Only check yaw convergence
             )
             
             if not yaw_success:
-                rospy.logwarn("[Phase 3A] Yaw adjustment incomplete, but continuing")
+                rospy.logwarn("[Phase 3A] Yaw adjustment timeout, but continuing")
             else:
                 rospy.loginfo("[Phase 3A] Yaw adjustment complete")
             
-            rospy.sleep(1.5)  # Longer stabilization after yaw adjustment
+            rospy.sleep(1.0)
             
             # Update current position after yaw adjustment
             current_pos = self.get_end_effector_position()
             current_yaw = self.get_end_effector_yaw()
             
-            # Phase 3B: Now perform XY movement with yaw locked at 0°
-            rospy.loginfo("[Phase 3B] XY movement to start position (yaw locked at 0°)")
+            # Phase 3B: Now perform XY movement with yaw locked at start_yaw
+            rospy.loginfo(f"[Phase 3B] XY movement to start position (yaw locked at {math.degrees(start_yaw):.1f}°)")
             return_target = (start_assembly_pos[0], start_assembly_pos[1], current_pos[2])
             rospy.loginfo(f"Target: ({return_target[0]:.3f}, {return_target[1]:.3f}, {return_target[2]:.3f})")
             
@@ -2489,9 +2499,9 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
                 trajectory_points = self.generate_polynomial_trajectory(
                     start_pos=current_pos,
                     target_pos=return_target,
-                    target_yaw=0.0,  # Keep yaw locked at 0° during return
+                    target_yaw=start_yaw,
                     num_points=num_points,
-                    lock_yaw=True  # ✅ Force all trajectory points to use yaw=0°, prevent oscillation
+                    lock_yaw=True
                 )
                 
                 if trajectory_points:
@@ -2506,7 +2516,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
                     rospy.loginfo("[Phase 3B] Final precision convergence")
                     success = self.active_position_convergence(
                         return_target,
-                        target_yaw=0.0,
+                        target_yaw=start_yaw,
                         pos_thresh=0.05,
                         yaw_thresh=0.1,
                         timeout=15.0,
@@ -2518,7 +2528,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
                     rospy.loginfo("[Phase 3B] Using direct convergence (fallback)")
                     success = self.active_position_convergence(
                         return_target,
-                        target_yaw=0.0,
+                        target_yaw=start_yaw,
                         pos_thresh=0.05,
                         yaw_thresh=0.1,
                         timeout=90.0,
@@ -2530,7 +2540,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
                 rospy.loginfo("[Phase 3B] Short distance, using direct convergence")
                 success = self.active_position_convergence(
                     return_target,
-                    target_yaw=0.0,
+                    target_yaw=start_yaw,
                     pos_thresh=0.05,
                     yaw_thresh=0.1,
                     timeout=20.0,

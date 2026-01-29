@@ -85,6 +85,14 @@ if __name__=="__main__":
                                 if ns and ns not in robot_namespaces:
                                         robot_namespaces.append(ns)
                         
+                        # Also check for assembly namespace (for nav control after docking)
+                        nav_topics = [topic[0] for topic in subs if '/uav/nav' in topic[0]]
+                        for topic in nav_topics:
+                                ns = topic.split('/uav/nav')[0].strip('/')
+                                if ns and ns not in robot_namespaces:
+                                        robot_namespaces.append(ns)
+                                        rospy.loginfo("Added namespace from nav topic: %s" % ns)
+                        
                         if robot_namespaces:
                                 rospy.loginfo("Auto-detected robot namespaces: %s" % str(robot_namespaces))
                         else:

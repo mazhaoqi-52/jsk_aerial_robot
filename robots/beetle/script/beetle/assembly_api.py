@@ -117,12 +117,7 @@ class StandbyState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)
 
         # position offset while StandbyState
-        # attach_dir < 0: follower is at positive X of leader, target at leader's positive X side
-        # attach_dir > 0: follower is at negative X of leader, target at leader's negative X side
-        if(self.attach_dir < 0):
-            self.target_offset = np.array([(self.airframe_size + self.x_offset), self.y_offset, self.z_offset]) 
-        else:
-            self.target_offset = np.array([-(self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
+        self.target_offset = np.array([-self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
         self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol]) # position error torelance
         self.att_error_tol = np.array([self.roll_tol, self.pitch_tol, self.yaw_tol]) # attitude error torelance
 
@@ -183,14 +178,7 @@ class StandbyState(smach.State):
         if(pos_error[0] * self.attach_dir > 0):
             pos_error[0] = 0.0
         att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
-        
-        # DEBUG: 详细日志
-        rospy.loginfo_throttle(1.0, "[StandbyState] target_offset: %s, root_fc_dis: %s" % (self.target_offset, self.root_fc_dis))
-        rospy.loginfo_throttle(1.0, "[StandbyState] follower_from_leader: pos=%s" % (follower_from_leader[0],))
-        rospy.loginfo_throttle(1.0, "[StandbyState] target_pos (world): %s" % (target_pos,))
-        rospy.loginfo_throttle(1.0, "[StandbyState] pos_error: %s, att_error: %s" % (pos_error, att_error))
-        rospy.loginfo_throttle(1.0, "[StandbyState] pos_tol: %s, att_tol: %s" % (self.pos_error_tol, self.att_error_tol))
-        
+
         #check if pos and att error are within the torrelance
         if np.all(np.less(np.abs(pos_error),self.pos_error_tol)) and np.all(np.less(np.abs(att_error),self.att_error_tol)):
             return 'done'
@@ -336,12 +324,7 @@ class ApproachState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)        
 
         # position offset while ApproachState
-        # attach_dir < 0: follower is at positive X of leader, target at leader's positive X side
-        # attach_dir > 0: follower is at negative X of leader, target at leader's negative X side
-        if(self.attach_dir < 0):
-            self.target_offset = np.array([(self.airframe_size + self.x_offset), self.y_offset, self.z_offset]) 
-        else:
-            self.target_offset = np.array([-(self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
+        self.target_offset = np.array([-self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
         # position error torelance
         self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol])
         # attitude error torelance
@@ -361,8 +344,6 @@ class ApproachState(smach.State):
             return 'in_process'
 
         # set target odom in leader coordinate
-        # The 0.05 offset makes follower approach slightly closer than final docking position
-        # attach_dir < 0: follower at positive X, target_offset positive, need to subtract to get closer
         #TODO: determine leader namespace dynamically
         self.br.sendTransform((self.target_offset[0] + 0.05 * self.attach_dir + self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
                               tf.transformations.quaternion_from_euler(0, 0, 0),
@@ -382,7 +363,7 @@ class ApproachState(smach.State):
         pos_error = np.array(self.target_offset - follower_from_leader[0])
         att_error = att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
 
-        rospy.loginfo("[ApproachState] target_offset: %s, follower_from_leader: %s, pos_error: %s" % (self.target_offset, follower_from_leader[0], pos_error))
+        rospy.loginfo(pos_error)
 
         #check if pos and att error are within the torrelance
         if np.all(np.less(np.abs(pos_error),self.pos_error_tol)) and np.all(np.less(np.abs(att_error),self.att_error_tol)):

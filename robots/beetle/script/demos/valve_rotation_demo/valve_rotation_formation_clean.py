@@ -636,7 +636,7 @@ class FormationSingleUAVStateBase(smach.State):
         )
 
 
-    def controlled_z_descent(self, start_pos, final_target, final_yaw, descent_speed=0.12):
+    def controlled_z_descent(self, start_pos, final_target, final_yaw, descent_speed=0.12, xy_hold_tolerance=None):
         """Controlled Z-axis descent in fixed steps with contact detection"""
         rospy.loginfo("=== Formation Z Descent ===")
 
@@ -686,11 +686,22 @@ class FormationSingleUAVStateBase(smach.State):
         stagnation_hit_counter = 0
         proximity_hit_counter = 0
         final_descent_margin = 0.03
-        
+
         # Motion tracking for contact detection
         consecutive_small_motions = 0
         small_motion_threshold = 0.008
         max_consecutive_small_motions = 2
+
+        # Step acceptance (contact-first): require XY hold and Z progress when using relaxed 3D convergence.
+        # NOTE: active_position_convergence() uses 3D norm and may report success even when Z is far.
+        if xy_hold_tolerance is None:
+            xy_hold_tolerance = 0.030  # 30mm default
+        z_step_tolerance = 0.020   # 20mm per-step Z tolerance to advance the descent sequence
+
+        # Retry control: if a single Z step is repeatedly reported as converged-but-not-reached,
+        # abort early to avoid getting stuck forever.
+        step_retry_count = 0
+        max_step_retries = 10
 
         while previous_z - target_z > 1e-4:
             if step_count >= max_step_iterations:
@@ -727,9 +738,8 @@ class FormationSingleUAVStateBase(smach.State):
             if current_z < target_z:
                 current_z = target_z
 
-            step_count += 1
+            # Compute step target early; we only increment step_count once this step is truly accepted.
             progress = progress_ratio
-
             step_target = [target_x, target_y, current_z]
 
             # RELAXED: Formation control requires much larger XY tolerance during descent
@@ -742,11 +752,17 @@ class FormationSingleUAVStateBase(smach.State):
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3
 
-            # Unified descent speed strategy - proven 0.036 m/s works well for all steps
-            effective_descent_speed = max(0.03, descent_speed * 0.3)
+            # S2: Softer descent speed.
+            # - Keep a small minimum to avoid stalling, but lower than 0.03 to reduce pitch excitation.
+            # - Slow down further when close to final target.
+            near_target_scale = 0.5 if remaining_descent <= 0.08 else 1.0
+            effective_descent_speed = max(0.01, descent_speed * 0.3) * near_target_scale
             linear_vel = [0.0, 0.0, -effective_descent_speed]
 
-            rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm, speed={effective_descent_speed:.3f}m/s")
+            rospy.loginfo(
+                f"[Z Descent] Step {step_count + 1}/{planned_steps} Z={step_target[2]:.3f}m, "
+                f"remain {remaining_descent*1000:.1f}mm, speed={effective_descent_speed:.3f}m/s"
+            )
 
             self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=linear_vel, angular_vel=0.0)
 
@@ -868,6 +884,40 @@ class FormationSingleUAVStateBase(smach.State):
 
             current_pos = self.get_end_effector_position() or tuple(step_target)
             actual_descent = max(0.0, previous_z - current_pos[2])
+
+            # Guard against false-positive convergence: evaluate XY and Z separately.
+            # We only advance the step sequence when:
+            #  - XY stays within tolerance relative to final target (to keep contact geometry), AND
+            #  - Z reaches the planned step height within tolerance.
+            current_xy_to_final = math.sqrt((current_pos[0] - target_x)**2 + (current_pos[1] - target_y)**2)
+            current_z_to_step = abs(current_pos[2] - step_target[2])
+            step_reached = (current_xy_to_final <= xy_hold_tolerance) and (current_z_to_step <= z_step_tolerance)
+
+            if step_converged and not step_reached:
+                rospy.logwarn(
+                    f"[Z Descent] Convergence reported but step not reached: "
+                    f"XY_to_final={current_xy_to_final*1000:.1f}mm (tol {xy_hold_tolerance*1000:.0f}mm), "
+                    f"Z_to_step={current_z_to_step*1000:.1f}mm (tol {z_step_tolerance*1000:.0f}mm). "
+                    "Holding step target and retrying..."
+                )
+                step_retry_count += 1
+                if step_retry_count >= max_step_retries:
+                    rospy.logerr(
+                        f"[Z Descent] Step retry exceeded {max_step_retries} times at Z={step_target[2]:.3f}m "
+                        f"(XY_to_final={current_xy_to_final*1000:.1f}mm, Z_to_step={current_z_to_step*1000:.1f}mm). "
+                        "Aborting descent to exit state machine."
+                    )
+                    achieved_position = current_pos
+                    return False, achieved_position
+                # Force retry of the same step by keeping previous_z unchanged.
+                # Also reset small-motion counter to avoid accidental contact detection on a wrong height.
+                consecutive_small_motions = 0
+                continue
+
+            # Step accepted (either reached, or we reached contact-return earlier): reset retry counter and
+            # advance the step index.
+            step_retry_count = 0
+            step_count += 1
             
             # Consecutive small motion detection on success path
             if actual_descent <= small_motion_threshold:
@@ -914,15 +964,17 @@ class FormationSingleUAVStateBase(smach.State):
                     rospy.logerr("[Formation Z Descent] XY correction failed")
                     return False, current_pos
 
-            previous_z = current_pos[2]
+            # IMPORTANT: keep previous_z monotonic to prevent step targets drifting upward due to feedback noise.
+            # Advance reference height based on the planned step height (or lower), never higher.
+            previous_z = min(previous_z, step_target[2], current_pos[2])
             achieved_position = current_pos
             total_descent_completed = max(0.0, start_z - previous_z)
             progress_ratio = 0.0 if total_z_descent <= 1e-6 else min(1.0, total_descent_completed / total_z_descent)
 
-        achieved_position = self.get_end_effector_position() or achieved_position
+            achieved_position = self.get_end_effector_position() or achieved_position
 
-        rospy.loginfo("[Formation Z Descent] Completed all steps successfully")
-        return True, (target_x, target_y, achieved_position[2])
+            rospy.loginfo("[Formation Z Descent] Completed all steps successfully")
+            return True, (target_x, target_y, achieved_position[2])
 
     def active_stabilization_wait(self, target_pos, target_yaw, duration, description="position stabilization"):
         """

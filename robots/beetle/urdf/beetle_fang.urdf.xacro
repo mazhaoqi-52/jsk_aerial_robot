@@ -119,6 +119,16 @@
       <origin xyz="0.246 0 0.0113823" rpy="0 0 0"/>
     </joint> 
 
+    <!-- Gazebo碰撞属性 - 高摩擦防止滑动 -->
+    <gazebo reference="beetle_fang_link">
+      <mu1>10.0</mu1>
+      <mu2>10.0</mu2>
+      <kp>1000000.0</kp>
+      <kd>100.0</kd>
+      <minDepth>0.001</minDepth>
+      <maxVel>0.5</maxVel>
+    </gazebo>
+
     ## rotor arm macro
     <xacro:macro name="dummy_rotor_arm" params="id x y z yaw">
       ## link

@@ -5,12 +5,12 @@
   <!-- Load box outer dimensions (m) -->
   <xacro:property name="box_length" value="0.5" />  <!-- x -->
   <xacro:property name="box_width" value="0.3" />   <!-- y -->
-  <xacro:property name="box_height" value="0.3" />  <!-- z -->
+  <xacro:property name="box_height" value="0.65" />  <!-- z -->
   <xacro:property name="wall_thickness" value="0.02" /> <!-- wall thickness -->
   
   <!-- Load properties -->
-  <xacro:property name="load_mass" value="5.0" />   <!-- kg -->
-  <xacro:arg name="load_friction" default="10.0" /> <!-- N, force needed to move -->
+  <xacro:property name="load_mass" value="2.0" />   <!-- kg -->
+  <xacro:arg name="load_friction" default="3.0" /> <!-- N, force needed to move -->
   
   <!-- Inertia approximation (treating as hollow box) -->
   <xacro:property name="ixx" value="${(1.0/12.0) * load_mass * (box_width*box_width + box_height*box_height)}" />
@@ -28,9 +28,16 @@
   <!-- Intermediate link for X-axis motion -->
   <link name="slide_x">
     <inertial>
-      <mass value="0.001"/>
-      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000001" iyz="0" izz="0.000001"/>
+      <mass value="0.1"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
     </inertial>
+    <!-- 添加一个小的虚拟碰撞体，提高数值稳定性 -->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.01"/>
+      </geometry>
+    </visual>
   </link>
 
   <!-- ============== Prismatic Joint X (sliding along X-axis) ============== -->
@@ -39,7 +46,7 @@
     <child link="slide_x"/>
     <origin xyz="0 0 ${box_height/2}" rpy="0 0 0"/>
     <axis xyz="1 0 0"/>
-    <dynamics damping="5.0" friction="$(arg load_friction)"/>
+    <dynamics damping="1.0" friction="$(arg load_friction)"/>
     <limit lower="-1000" upper="1000" effort="1000" velocity="10"/>
   </joint>
 
@@ -49,7 +56,7 @@
     <child link="load_box"/>
     <origin xyz="0 0 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-    <dynamics damping="5.0" friction="$(arg load_friction)"/>
+    <dynamics damping="1.0" friction="$(arg load_friction)"/>
     <limit lower="-1000" upper="1000" effort="1000" velocity="10"/>
   </joint>
 
@@ -141,6 +148,13 @@
   <!-- ============== Gazebo Materials ============== -->
   <gazebo reference="load_box">
     <material>Gazebo/Orange</material>
+    <!-- 碰撞表面属性 - 高摩擦防止滑动 -->
+    <mu1>10.0</mu1>
+    <mu2>10.0</mu2>
+    <kp>1000000.0</kp>
+    <kd>100.0</kd>
+    <minDepth>0.001</minDepth>
+    <maxVel>0.5</maxVel>
   </gazebo>
 
   <!-- ============== Gazebo Plugins ============== -->

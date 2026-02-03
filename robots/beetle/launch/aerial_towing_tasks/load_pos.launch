@@ -7,11 +7,11 @@
   <arg name="robot_id" default="1" />
   
   <!-- Load position in gazebo -->
-  <arg name="load_x" default="3" />
+  <arg name="load_x" default="2" />
   <arg name="load_y" default="0" />
   <arg name="load_z" default="0" />
   <arg name="load_yaw" default="0" />
-  <arg name="load_friction" default="10.0" />
+  <arg name="load_friction" default="0.5" />
   
   <group ns="$(arg robot_ns)">
     <group if="$(arg real_machine)">

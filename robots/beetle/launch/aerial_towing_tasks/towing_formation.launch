@@ -14,7 +14,7 @@
   <arg name="load_y" default="0"/>
   <arg name="load_z" default="0"/>
   <arg name="load_yaw" default="0"/>
-  <arg name="load_friction" default="10.0"/>
+  <arg name="load_friction" default="0.5"/>
   
   <!-- Towing parameters -->
   <arg name="towing_distance" default="1.0"/> <!-- meters -->

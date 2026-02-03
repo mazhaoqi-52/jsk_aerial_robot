@@ -40,15 +40,23 @@ from trajectory import PolynomialTrajectory
 # ============== Load Box Parameters (from load.urdf) ==============
 LOAD_BOX_LENGTH = 0.5    # x dimension (m)
 LOAD_BOX_WIDTH = 0.3     # y dimension (m)
-LOAD_BOX_HEIGHT = 0.3    # z dimension (m)
+LOAD_BOX_HEIGHT = 0.65   # z dimension (m)
 LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 
 # ============== Towing Task Parameters ==============
-INSERTION_DEPTH = 0.03   # 30mm insertion depth
+# Note: end_effector_offset_z in n_modules_tf.py (0.074382) differs from actual fang tip offset (~0.041)
+# This causes ~33mm extra insertion. Compensate by reducing INSERTION_DEPTH.
+# Target actual insertion: 30mm, so set to approximately 0 or negative to compensate.
+INSERTION_DEPTH = 0.0    # Compensated insertion depth (actual ~30mm due to offset error)
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
+HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
 TOWING_DISTANCE = 1.0    # 1m towing distance
 TOWING_FORCE = 5.0       # 5N initial feedforward force
-APPROACH_HEIGHT_OFFSET = 0.05  # 50mm above box top for approach
+# Approach height above box top for entering the load area.
+# Default is 50mm. Tune as needed; with box_top_z=0.65m:
+# - offset 0.15 -> approach 0.80m
+# - offset 0.18 -> approach 0.83m
+APPROACH_HEIGHT_OFFSET = 0.18
 
 
 class LinearTowingTrajectoryGenerator:
@@ -186,9 +194,10 @@ class LinearTowingTrajectoryGenerator:
         # Target velocity in world frame
         target_linear_vel = self.towing_direction * self.current_velocity
         
-        # Force in towing direction
+        # Force feedforward: tell the controller to apply force in towing direction.
+        # The controller interprets tagged_wrench as the force UAV should apply.
         target_force = self.towing_direction * self.current_force
-        # Add small vertical force component for stability
+        # Add small vertical force component for stability (slight upward to counteract load weight)
         target_force[2] = 0.5  # Small upward bias
         
         return {
@@ -282,45 +291,41 @@ class TowingStateBase(FormationSingleUAVStateBase):
     
     def calculate_approach_side(self, assembly_pos, load_pos):
         """
-        Calculate which side of the load to approach (auto-detect nearest side).
+        Calculate which side of the load to approach (nearest edge midpoint).
+        Approach direction is perpendicular to the selected edge, pointing outward.
         
         Returns:
-            tuple: (approach_direction_vector, side_name, edge_position)
+            tuple: (approach_direction_vector, side_name, edge_midpoint_position)
         """
         if assembly_pos is None or load_pos is None:
             return None, None, None
         
-        # Calculate relative position of assembly to load
-        rel_x = assembly_pos[0] - load_pos[0]
-        rel_y = assembly_pos[1] - load_pos[1]
-        
-        # Determine nearest side based on which axis has larger relative displacement
-        # and the sign of that displacement
         half_length = LOAD_BOX_LENGTH / 2
         half_width = LOAD_BOX_WIDTH / 2
         
-        # Calculate distance to each side
-        dist_to_plus_x = abs(rel_x - half_length)
-        dist_to_minus_x = abs(rel_x + half_length)
-        dist_to_plus_y = abs(rel_y - half_width)
-        dist_to_minus_y = abs(rel_y + half_width)
-        
-        distances = {
-            '+X': (dist_to_plus_x, np.array([1, 0, 0]), load_pos[0] + half_length),
-            '-X': (dist_to_minus_x, np.array([-1, 0, 0]), load_pos[0] - half_length),
-            '+Y': (dist_to_plus_y, np.array([0, 1, 0]), load_pos[1] + half_width),
-            '-Y': (dist_to_minus_y, np.array([0, -1, 0]), load_pos[1] - half_width),
+        # Calculate each edge midpoint position
+        edge_midpoints = {
+            '+X': np.array([load_pos[0] + half_length, load_pos[1], load_pos[2]]),
+            '-X': np.array([load_pos[0] - half_length, load_pos[1], load_pos[2]]),
+            '+Y': np.array([load_pos[0], load_pos[1] + half_width, load_pos[2]]),
+            '-Y': np.array([load_pos[0], load_pos[1] - half_width, load_pos[2]]),
         }
         
-        # Find nearest side
-        nearest_side = min(distances.keys(), key=lambda k: distances[k][0])
-        _, approach_dir, edge_coord = distances[nearest_side]
+        # Approach direction: perpendicular to edge, pointing outward
+        approach_dirs = {
+            '+X': np.array([1, 0, 0]),
+            '-X': np.array([-1, 0, 0]),
+            '+Y': np.array([0, 1, 0]),
+            '-Y': np.array([0, -1, 0]),
+        }
         
-        # Calculate edge position
-        if nearest_side in ['+X', '-X']:
-            edge_pos = np.array([edge_coord, load_pos[1], load_pos[2]])
-        else:
-            edge_pos = np.array([load_pos[0], edge_coord, load_pos[2]])
+        # Calculate distance from assembly to each edge midpoint, select nearest
+        distances = {side: np.linalg.norm(np.array(assembly_pos) - midpoint) 
+                     for side, midpoint in edge_midpoints.items()}
+        
+        nearest_side = min(distances.keys(), key=lambda k: distances[k])
+        edge_pos = edge_midpoints[nearest_side]
+        approach_dir = approach_dirs[nearest_side]
         
         rospy.loginfo(f"Approach side: {nearest_side}, direction: {approach_dir}, edge: {edge_pos}")
         return approach_dir, nearest_side, edge_pos
@@ -392,74 +397,99 @@ class ApproachLoadState(TowingStateBase):
     
     def execute(self, userdata):
         rospy.loginfo("=== Approach Load State ===")
-        
+
         load_pos = userdata.load_position
         approach_dir = userdata.approach_direction
         edge_pos = userdata.edge_position
-        
-        # Calculate approach position: above box edge, slightly over the top
-        load_top_z = load_pos[2] + LOAD_BOX_HEIGHT / 2
+
+        # Calculate positions
+        # NOTE: `/load/odom` provides the load pose at the model origin (center) in this setup.
+        # Therefore: top_z = center_z + height/2.
+        load_center_z = float(load_pos[2])
+        load_top_z = load_center_z + LOAD_BOX_HEIGHT / 2
         approach_height = load_top_z + APPROACH_HEIGHT_OFFSET
-        
+
         # Position slightly inside the box edge (overshoot by 30mm for insertion)
         overshoot = 0.03  # 30mm inside box edge
         approach_xy = edge_pos[:2] - approach_dir[:2] * overshoot
-        
-        approach_pos = np.array([approach_xy[0], approach_xy[1], approach_height])
-        
+
         # Calculate target yaw: facing into the box (opposite of approach direction)
         target_yaw = math.atan2(-approach_dir[1], -approach_dir[0])
-        
-        rospy.loginfo(f"Approach position: {FormationUtils.format_vec(approach_pos)}")
-        rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f}°")
-        
-        # Execute approach movement
+
+        # Get current state
         current_pos = self.get_end_effector_position()
+        current_yaw = self.get_end_effector_yaw()
         if current_pos is None:
             rospy.logerr("Cannot get current end-effector position")
             return 'failed'
-        
-        # Phase 1: Adjust height first
-        rospy.loginfo("[Phase 1] Adjusting height")
-        height_target = (current_pos[0], current_pos[1], approach_height)
-        success = self.active_position_convergence(
-            height_target, target_yaw=self.get_end_effector_yaw(),
-            pos_thresh=0.03, yaw_thresh=0.1, timeout=15.0
+
+        rospy.loginfo(f"Current position: {FormationUtils.format_vec(current_pos)}")
+        rospy.loginfo(f"Target XY: ({approach_xy[0]:.3f}, {approach_xy[1]:.3f})")
+        rospy.loginfo(
+            f"Load Z: center={load_center_z:.3f}m, top={load_top_z:.3f}m, "
+            f"approach_offset={APPROACH_HEIGHT_OFFSET:.3f}m"
         )
-        
-        if not success:
-            rospy.logwarn("Height adjustment incomplete, continuing...")
-        
-        # Phase 2: Move to XY position above box
-        rospy.loginfo("[Phase 2] Moving to approach XY position")
+        rospy.loginfo(f"Target height: {approach_height:.3f}m")
+        rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f}°")
+
+        # Phase 1: XY movement (keep current Z)
+        rospy.loginfo("[Phase 1] Moving to XY position above box (Z unchanged)")
+        phase1_target = np.array([approach_xy[0], approach_xy[1], current_pos[2]])
+
         trajectory_points = self.generate_polynomial_trajectory(
-            start_pos=self.get_end_effector_position(),
-            target_pos=approach_pos,
-            target_yaw=target_yaw,
-            num_points=15
+            start_pos=current_pos,
+            target_pos=phase1_target,
+            target_yaw=current_yaw,  # Keep current yaw during XY movement
+            num_points=15,
+            lock_yaw=True
         )
-        
+
         if trajectory_points:
             self.execute_polynomial_trajectory(trajectory_points)
-        
-        # Final convergence
+
         success = self.active_position_convergence(
-            approach_pos, target_yaw=target_yaw,
-            pos_thresh=0.025, yaw_thresh=0.05, timeout=20.0
+            phase1_target, target_yaw=current_yaw,
+            pos_thresh=0.03, yaw_thresh=0.1, timeout=20.0
         )
-        
         if not success:
-            rospy.logwarn("Approach convergence incomplete")
-        
+            rospy.logwarn("Phase 1 XY convergence incomplete, continuing...")
+
+        # Phase 2: Adjust yaw (keep position)
+        rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(target_yaw):.1f}°")
+        current_pos = self.get_end_effector_position()
+
+        success = self.active_position_convergence(
+            current_pos, target_yaw=target_yaw,
+            pos_thresh=0.05, yaw_thresh=0.05, timeout=15.0,
+            yaw_only=True
+        )
+        if not success:
+            rospy.logwarn("Phase 2 yaw adjustment incomplete, continuing...")
+
+        # Phase 3: Z descent to approach height (keep XY)
+        rospy.loginfo(f"[Phase 3] Descending to approach height {approach_height:.3f}m")
+        current_pos = self.get_end_effector_position()
+        phase3_target = np.array([current_pos[0], current_pos[1], approach_height])
+
+        success = self.active_position_convergence(
+            phase3_target, target_yaw=target_yaw,
+            pos_thresh=0.025, yaw_thresh=0.05, timeout=15.0
+        )
+        if not success:
+            rospy.logwarn("Phase 3 Z descent incomplete, continuing...")
+
         # Stabilize
         rospy.loginfo("Stabilizing at approach position...")
+        approach_pos = np.array([approach_xy[0], approach_xy[1], approach_height])
         self.active_stabilization_wait(approach_pos, target_yaw, duration=2.0)
-        
+
         # Store for next state
-        insertion_z = load_top_z - INSERTION_DEPTH
+        # Z=approach_height is already "inserted" (end-effector inside the box opening).
+        # No further descent needed; RETRACT_AND_HOOK will operate at this height.
+        insertion_z = approach_height
         userdata.insertion_position = np.array([approach_xy[0], approach_xy[1], insertion_z])
         userdata.insertion_yaw = target_yaw
-        
+
         rospy.loginfo("Approach complete")
         return 'succeeded'
 
@@ -492,17 +522,21 @@ class DescendAndInsertState(TowingStateBase):
             current_pos, 
             insertion_pos, 
             insertion_yaw,
-            descent_speed=0.05  # Slow descent
+            descent_speed=0.03,  # Slower descent (gentler insertion)
+            xy_hold_tolerance=0.05  # 50mm: tolerate small XY residuals to avoid retry-abort at the first step
         )
         
         if not success:
-            rospy.logwarn("Z descent incomplete, checking position...")
-            achieved_pos = self.get_end_effector_position()
+            # If descent aborted (e.g., retry limit hit), don't continue with hook/tow.
+            rospy.logerr("Z descent failed (aborted). Exiting state machine.")
+            return 'failed'
         
         # Verify insertion depth
         if achieved_pos is not None:
-            actual_depth = (userdata.insertion_position[2] + INSERTION_DEPTH) - achieved_pos[2]
-            rospy.loginfo(f"Achieved insertion: {actual_depth*1000:.1f}mm")
+            # Positive means deeper into the box (below the planned top surface).
+            box_top_z = (userdata.insertion_position[2] + INSERTION_DEPTH)
+            actual_depth = box_top_z - achieved_pos[2]
+            rospy.loginfo(f"Achieved insertion: {actual_depth*1000:.1f}mm (positive=deeper)")
         
         # Stabilize at insertion position
         rospy.loginfo("Stabilizing at insertion position...")
@@ -547,7 +581,7 @@ class RetractAndHookState(TowingStateBase):
         # Slow horizontal retraction
         success = self.active_position_convergence(
             hook_pos, target_yaw=hook_yaw,
-            pos_thresh=0.015, yaw_thresh=0.05, timeout=15.0,
+            pos_thresh=HOOK_POSITION_TOLERANCE, yaw_thresh=0.05, timeout=15.0,
             max_linear_vel=0.03  # Very slow for precise hooking
         )
         
@@ -624,6 +658,10 @@ class TowingWithFeedforwardState(TowingStateBase):
             # Update trajectory
             state_info = trajectory_gen.update_state(current_pos, load_pos)
             
+            # Debug: log actual vs target position every 0.5s
+            if int(elapsed * 2) != int((elapsed - 0.04) * 2):
+                rospy.loginfo(f"[Towing Pos] actual={current_pos}, start={start_pos}")
+            
             # Check completion
             if trajectory_gen.is_complete():
                 rospy.loginfo(f"Towing complete! Distance: {state_info['current_distance']*1000:.0f}mm")
@@ -642,14 +680,28 @@ class TowingWithFeedforwardState(TowingStateBase):
             # Generate and execute target
             target_state = trajectory_gen.generate_target_state(maintain_yaw)
             
-            # Execute with force feedforward
-            self.beetle.executeTrajectoryWithWrench(
-                pos=target_state['position'].tolist(),
-                rot=target_state['yaw'],
-                linear_vel=target_state['linear_velocity'].tolist(),
-                angular_vel=target_state['angular_velocity'],
-                force=target_state['force'].tolist(),
-                torque=target_state['torque'].tolist()
+            # Z compensation: add velocity to correct Z drift
+            z_error = target_state['position'][2] - current_pos[2]
+            corrected_linear_vel = target_state['linear_velocity'].copy()
+            corrected_linear_vel[2] = np.clip(z_error * 2.0, -0.05, 0.05)
+            
+            # Debug: log target state details every 0.5s
+            if int(elapsed * 2) != int((elapsed - 0.04) * 2):
+                rospy.loginfo(f"[Towing Debug] target_pos={target_state['position']}, "
+                             f"force={target_state['force']}, vel={corrected_linear_vel}")
+            
+            # Execute with position/velocity control and force feedforward
+            self.send_assembly_command_from_end_effector(
+                target_state['position'],
+                target_state['yaw'],
+                linear_vel=corrected_linear_vel,
+                angular_vel=target_state['angular_velocity']
+            )
+            
+            # Apply force feedforward
+            self.beetle.addExternalWrench(
+                force=target_state['force'],
+                torque=target_state['torque']
             )
             
             # Log progress

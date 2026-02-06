@@ -34,8 +34,8 @@ class StandbyState(smach.State):
                  male_servo_id = 4,
                  female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 1850,
-                 lock_servo_angle_male = 1550,
+                 unlock_servo_angle_male = 1820,
+                 lock_servo_angle_male = 1580,
                  unlock_servo_angle_female = 2000,
                  lock_servo_angle_female = 3200,
                  leader = 'beetle2',
@@ -99,13 +99,18 @@ class StandbyState(smach.State):
         if(self.attach_dir < 0):
             self.follower_docking_pub = rospy.Publisher(self.robot_name+"/docking_cmd", Bool, queue_size=10)
             self.dynamixel_servo = DynamixelControl(self.leader,self.leader_id,self.female_servo_id,self.real_machine)
-            # male servo control for unlock initialization
-            self.dynamixel_servo_male = DynamixelControl(self.robot_name, self.robot_id, self.male_servo_id, self.real_machine)
+            # male servo will be controlled - robot_name has male side
+            self.male_servo_robot_name = self.robot_name
+            self.male_servo_robot_id = self.robot_id
         else:
             self.follower_docking_pub = rospy.Publisher(self.leader+"/docking_cmd", Bool, queue_size=10)
             self.dynamixel_servo = DynamixelControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
-            # male servo control for unlock initialization
-            self.dynamixel_servo_male = DynamixelControl(self.leader, self.leader_id, self.male_servo_id, self.real_machine)
+            # male servo will be controlled - leader has male side
+            self.male_servo_robot_name = self.leader
+            self.male_servo_robot_id = self.leader_id
+        
+        # Male servo control will be created dynamically in execute() to ensure fresh connection
+        self.dynamixel_servo_male = None
             
         # subscriber
         self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
@@ -117,17 +122,29 @@ class StandbyState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)
 
         # position offset while StandbyState
-        self.target_offset = np.array([-self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
+        # attach_dir indicates which side has male connector:
+        # attach_dir = 1: leader has male side, follower is at +X of leader
+        # attach_dir = -1: follower has male side, follower is at -X of leader
+        self.target_offset = np.array([self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
         self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol]) # position error torelance
         self.att_error_tol = np.array([self.roll_tol, self.pitch_tol, self.yaw_tol]) # attitude error torelance
 
     def execute(self, userdata):
         # Initialize male servo to unlock angle (only once at the beginning)
         if not self.male_servo_initialized:
-            rospy.loginfo("[StandbyState] Initializing male servo to unlock angle")
             if self.real_machine:
+                # Create DynamixelControl fresh at execute time to ensure valid publisher connection
+                self.dynamixel_servo_male = DynamixelControl(self.male_servo_robot_name, self.male_servo_robot_id, self.male_servo_id, self.real_machine)
+                
+                # Wait for publisher to establish connection
+                timeout = rospy.Time.now() + rospy.Duration(3.0)
+                while self.dynamixel_servo_male.dx_pos_pub.get_num_connections() == 0:
+                    if rospy.Time.now() > timeout:
+                        rospy.logwarn("[StandbyState] Timeout waiting for servo subscriber on /%s/servo/target_states" % self.male_servo_robot_name)
+                        break
+                    rospy.sleep(0.1)
+                
                 self.dynamixel_servo_male.sendTargetAngle(self.unlock_servo_angle_male)
-                rospy.loginfo("[StandbyState] Male servo set to unlock angle: %d" % self.unlock_servo_angle_male)
             self.male_servo_initialized = True
         
         # Initialize female servo (only once)
@@ -175,7 +192,10 @@ class StandbyState(smach.State):
         target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])
 
         pos_error = np.array(self.target_offset - follower_from_leader[0])
-        if(pos_error[0] * self.attach_dir > 0):
+        # If follower has passed the target (moved too close to leader), ignore x error
+        # attach_dir = 1: follower at +X, moving toward -X, if pos_error[0] < 0 means passed
+        # attach_dir = -1: follower at -X, moving toward +X, if pos_error[0] > 0 means passed
+        if(pos_error[0] * self.attach_dir < 0):
             pos_error[0] = 0.0
         att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
 
@@ -244,8 +264,8 @@ class ApproachState(smach.State):
                  male_servo_id = 4,
                  female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 1850,
-                 lock_servo_angle_male = 1550,
+                 unlock_servo_angle_male = 1820,
+                 lock_servo_angle_male = 1580,
                  unlock_servo_angle_female = 2000,
                  lock_servo_angle_female = 3200,
                  leader = 'beetle2',
@@ -254,8 +274,8 @@ class ApproachState(smach.State):
                  x_offset = 0,
                  y_offset = 0,
                  z_offset = 0,
-                 x_tol = 0.005,
-                 y_tol = 0.01,
+                 x_tol = 0.02,
+                 y_tol = 0.02,
                  z_tol = 0.01,
                  roll_tol = 0.15,
                  pitch_tol = 0.15,
@@ -324,7 +344,10 @@ class ApproachState(smach.State):
         self.coordTransformer = coordTransformer(self.robot_name)        
 
         # position offset while ApproachState
-        self.target_offset = np.array([-self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
+        # attach_dir indicates which side has male connector:
+        # attach_dir = 1: leader has male side, follower is at +X of leader
+        # attach_dir = -1: follower has male side, follower is at -X of leader
+        self.target_offset = np.array([self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
         # position error torelance
         self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol])
         # attitude error torelance
@@ -345,7 +368,8 @@ class ApproachState(smach.State):
 
         # set target odom in leader coordinate
         #TODO: determine leader namespace dynamically
-        self.br.sendTransform((self.target_offset[0] + 0.05 * self.attach_dir + self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
+        # Add small offset toward leader for final approach (negative direction relative to attach_dir)
+        self.br.sendTransform((self.target_offset[0] - 0.05 * self.attach_dir + self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
                               tf.transformations.quaternion_from_euler(0, 0, 0),
                               rospy.Time.now(),
                               "follower_target_odom",
@@ -431,8 +455,8 @@ class AssemblyState(smach.State):
                  male_servo_id = 4,
                  female_servo_id = 5,
                  real_machine = False,
-                 unlock_servo_angle_male = 1850,
-                 lock_servo_angle_male = 1550,
+                 unlock_servo_angle_male = 1820,
+                 lock_servo_angle_male = 1580,
                  unlock_servo_angle_female = 2000,
                  lock_servo_angle_female = 3200,
                  leader = 'beetle2',
@@ -456,16 +480,13 @@ class AssemblyState(smach.State):
 
         # flags
         self.emergency_flag = False
+        self.dynamixel_servo = None  # Will be created in execute()
 
         # publisher
         self.follower_docking_pub = rospy.Publisher(self.robot_name+"/docking_cmd", Bool, queue_size=10)
         self.follower_nav_pub = rospy.Publisher(self.robot_name+"/uav/nav", FlightNav, queue_size=10)
         self.leader_nav_pub = rospy.Publisher(self.leader+"/uav/nav", FlightNav, queue_size=10)
         self.assembly_nav_pub = rospy.Publisher("/assembly/uav/nav", FlightNav, queue_size=10)
-        if(self.attach_dir < 0):
-            self.dynamixel_servo = DynamixelControl(self.robot_name,self.robot_id,self.male_servo_id,self.real_machine)
-        else:
-            self.dynamixel_servo = DynamixelControl(self.leader,self.leader_id,self.male_servo_id,self.real_machine)
         self.flag_pub = rospy.Publisher('/' + self.robot_name + '/assembly_flag', KeyValue, queue_size = 1)
         self.flag_pub_leader = rospy.Publisher('/' + self.leader + '/assembly_flag', KeyValue, queue_size = 1)
 
@@ -477,13 +498,49 @@ class AssemblyState(smach.State):
         self.docking_msg = Bool()
         #messages
         self.nav_msg = FlightNav()
-        time.sleep(0.5)
 
     def execute(self, userdata):
         if self.emergency_flag:
             return 'emergency'
+        
+        # Determine which robot's male servo to control
+        if self.attach_dir < 0:
+            servo_robot_name = self.robot_name
+            servo_robot_id = self.robot_id
+        else:
+            servo_robot_name = self.leader
+            servo_robot_id = self.leader_id
+            
+        rospy.loginfo("[AssemblyState] Starting assembly, attach_dir=%s, real_machine=%s" % (self.attach_dir, self.real_machine))
+        rospy.loginfo("[AssemblyState] Servo control: robot=%s, servo_id=%s, lock_angle=%s" % 
+                      (servo_robot_name, self.male_servo_id, self.lock_servo_angle_male))
+        
         if self.real_machine:
-            self.dynamixel_servo.sendTargetAngle(self.lock_servo_angle_male)
+            # Create DynamixelControl fresh at execute time to ensure valid publisher connection
+            rospy.loginfo("[AssemblyState] Creating new DynamixelControl for %s" % servo_robot_name)
+            self.dynamixel_servo = DynamixelControl(servo_robot_name, servo_robot_id, self.male_servo_id, self.real_machine)
+            
+            # Wait for publisher to establish connection
+            rospy.loginfo("[AssemblyState] Waiting for servo publisher to connect...")
+            timeout = rospy.Time.now() + rospy.Duration(5.0)
+            while self.dynamixel_servo.dx_pos_pub.get_num_connections() == 0:
+                if rospy.Time.now() > timeout:
+                    rospy.logwarn("[AssemblyState] Timeout waiting for servo subscriber on /%s/servo/target_states" % servo_robot_name)
+                    break
+                rospy.sleep(0.1)
+            
+            num_subscribers = self.dynamixel_servo.dx_pos_pub.get_num_connections()
+            rospy.loginfo("[AssemblyState] Publisher /%s/servo/target_states has %d subscribers" % (servo_robot_name, num_subscribers))
+            
+            if num_subscribers == 0:
+                rospy.logerr("[AssemblyState] No subscribers found! Servo command may not be received.")
+            
+            # Send servo command multiple times to ensure it's received
+            for i in range(5):
+                rospy.loginfo("[AssemblyState] Sending lock_servo_angle_male: %d (attempt %d)" % (self.lock_servo_angle_male, i+1))
+                self.dynamixel_servo.sendTargetAngle(self.lock_servo_angle_male)
+                rospy.sleep(0.2)
+        
         time.sleep(1.0)
         if not self.real_machine:
             rospy.sleep(1.0)

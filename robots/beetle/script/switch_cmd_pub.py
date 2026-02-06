@@ -14,8 +14,8 @@ if __name__=="__main__":
 
     male_servo_id = rospy.get_param("male_serve_id",4)
     female_servo_id = rospy.get_param("female_serve_id",5)
-    unlock_servo_angle_male = rospy.get_param("unlock_servo_angle_male",1850)
-    lock_servo_angle_male = rospy.get_param("lock_servo_angle_male",1550)
+    unlock_servo_angle_male = rospy.get_param("unlock_servo_angle_male",1820)
+    lock_servo_angle_male = rospy.get_param("lock_servo_angle_male",1580)
     unlock_servo_angle_female = rospy.get_param("unlock_servo_angle_female",2000)
     lock_servo_angle_female = rospy.get_param("lock_servo_angle_female",3200)
 

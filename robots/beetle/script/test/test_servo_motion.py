@@ -22,7 +22,7 @@ class ServoMotionTest():
     def __init__(self, robot_name="beetle2"):
         # Servo configuration
         self.servo_ids = [0, 1, 2, 3, 4, 5]  # 6 servos
-        self.robot_name = robot_name
+        self.robot_name = "beetle3"
         
         # Dynamixel position parameters
         # Position range: 0 ~ 4096, center position: 2048

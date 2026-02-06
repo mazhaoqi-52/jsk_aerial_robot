@@ -11,8 +11,8 @@
   <arg name="load_y" default="0" />
   <arg name="load_z" default="0" />
   <arg name="load_yaw" default="0" />
-  <arg name="load_friction" default="0.5" />
-  
+  <arg name="load_friction" default="5.0" />
+
   <group ns="$(arg robot_ns)">
     <group if="$(arg real_machine)">
       <group unless="$(arg simulation)">

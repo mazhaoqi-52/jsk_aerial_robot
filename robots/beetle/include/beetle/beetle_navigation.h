@@ -8,6 +8,8 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/Point.h>
+#include <nav_msgs/Odometry.h>
+#include <Eigen/Dense>
 #include <algorithm>
 #include <cctype>
 
@@ -104,6 +106,11 @@ namespace aerial_robot_navigation
     ros::Subscriber assembly_nav_sub_;
     ros::Subscriber assembly_target_rot_sub_;
 
+    // Assembly CoG odom publishing
+    ros::Publisher assembly_cog_odom_pub_;
+    nav_msgs::Odometry assembly_cog_odom_;
+    bool publish_assembly_odom_;
+
     double max_target_roll_pitch_rate_;
     bool joy_roll_positive_flag_;
     bool joy_roll_negative_flag_;
@@ -115,6 +122,11 @@ namespace aerial_robot_navigation
 
 
     void rosParamInit() override;
+    
+    // Assembly CoG calculation and publishing
+    virtual void calculateAndPublishAssemblyCoGOdom();
+    virtual Eigen::Vector3d calculateAssemblyCoGPosition();
+    virtual Eigen::Quaterniond calculateAssemblyCoGOrientation();
     virtual void convertTargetPosFromCoG2CoM();
     virtual void assemblyNavCallback(const aerial_robot_msgs::FlightNavConstPtr & msg);
     virtual void joyStickControl(const sensor_msgs::JoyConstPtr & joy_msg) override;

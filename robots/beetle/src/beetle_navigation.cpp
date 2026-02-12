@@ -36,6 +36,13 @@ void BeetleNavigator::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   assembly_nav_sub_ = nh_.subscribe("/assembly/uav/nav", 1, &BeetleNavigator::assemblyNavCallback, this);
   assembly_target_rot_sub_ = nh_.subscribe("/assembly/final_target_baselink_rot", 1, &BeetleNavigator::setAssemblyFinalTargetBaselinkRotCallback, this);
 
+  // Initialize Assembly CoG odom publisher
+  nhp_.param("publish_assembly_odom", publish_assembly_odom_, true);
+  if(publish_assembly_odom_) {
+    assembly_cog_odom_pub_ = nh_.advertise<nav_msgs::Odometry>("/assemble/cog/odom", 10);
+    ROS_INFO("[BeetleNavigator] Assembly CoG odom publisher initialized: /assemble/cog/odom");
+  }
+
   beetle_robot_model_ = boost::dynamic_pointer_cast<BeetleRobotModel>(robot_model);
 
   for(int i = 0; i < max_modules_num_; i++){
@@ -644,6 +651,10 @@ void BeetleNavigator::update()
 {
   rotateContactPointFrame();
   calcCenterOfMoving();
+  
+  // Publish assembly CoG odom
+  calculateAndPublishAssemblyCoGOdom();
+  
   GimbalrotorNavigator::update();
   setControlFlag((getNaviState() == HOVER_STATE || getNaviState() == TAKEOFF_STATE || getNaviState() == LAND_STATE) ? true : false);
   convertTargetPosFromCoG2CoM();
@@ -848,6 +859,110 @@ void BeetleNavigator::rosParamInit()
   nh_.getParam("robot_id", my_id_);
   nh_.getParam("aerial_robot_base_node/tf_prefix", my_name_);
   my_name_.pop_back(); // extract common robot name
+}
+
+// Assembly CoG odom calculation and publishing
+void BeetleNavigator::calculateAndPublishAssemblyCoGOdom()
+{
+  if(!publish_assembly_odom_) return;
+  if(getModuleState() == SEPARATED) return;  // Not assembled
+  
+  std::vector<int> assembled_ids = getAssemblyIds();
+  if(assembled_ids.empty()) return;
+  
+  // Calculate CoG position (weighted average)
+  Eigen::Vector3d cog_pos = calculateAssemblyCoGPosition();
+  
+  // Calculate CoG orientation (quaternion average)
+  Eigen::Quaterniond cog_quat = calculateAssemblyCoGOrientation();
+  
+  // Fill Odometry message
+  assembly_cog_odom_.header.stamp = ros::Time::now();
+  assembly_cog_odom_.header.frame_id = "world";
+  assembly_cog_odom_.child_frame_id = "assembly_cog";
+  
+  assembly_cog_odom_.pose.pose.position.x = cog_pos.x();
+  assembly_cog_odom_.pose.pose.position.y = cog_pos.y();
+  assembly_cog_odom_.pose.pose.position.z = cog_pos.z();
+  
+  assembly_cog_odom_.pose.pose.orientation.x = cog_quat.x();
+  assembly_cog_odom_.pose.pose.orientation.y = cog_quat.y();
+  assembly_cog_odom_.pose.pose.orientation.z = cog_quat.z();
+  assembly_cog_odom_.pose.pose.orientation.w = cog_quat.w();
+  
+  // Publish
+  assembly_cog_odom_pub_.publish(assembly_cog_odom_);
+}
+
+Eigen::Vector3d BeetleNavigator::calculateAssemblyCoGPosition()
+{
+  std::vector<int> assembled_ids = getAssemblyIds();
+  Eigen::Vector3d cog_pos = Eigen::Vector3d::Zero();
+  double total_mass = 0.0;
+  double module_mass = beetle_robot_model_->getMass();
+  
+  for(int id : assembled_ids) {
+    geometry_msgs::TransformStamped transform;
+    try {
+      std::string frame_name = my_name_ + std::to_string(id) + "/cog";
+      transform = tfBuffer_.lookupTransform("world", frame_name, ros::Time(0));
+      
+      Eigen::Vector3d module_pos(
+        transform.transform.translation.x,
+        transform.transform.translation.y,
+        transform.transform.translation.z
+      );
+      
+      cog_pos += module_pos * module_mass;
+      total_mass += module_mass;
+      
+    } catch(tf2::TransformException& ex) {
+      ROS_WARN_THROTTLE(5.0, "[BeetleNavigator] Failed to get transform for %s%d: %s", 
+                        my_name_.c_str(), id, ex.what());
+    }
+  }
+  
+  if(total_mass > 0) {
+    cog_pos /= total_mass;
+  }
+  
+  return cog_pos;
+}
+
+Eigen::Quaterniond BeetleNavigator::calculateAssemblyCoGOrientation()
+{
+  std::vector<int> assembled_ids = getAssemblyIds();
+  
+  // Simple quaternion averaging (suitable for small attitude differences <30°)
+  Eigen::Vector4d quat_sum = Eigen::Vector4d::Zero();
+  int count = 0;
+  
+  for(int id : assembled_ids) {
+    try {
+      std::string frame_name = my_name_ + std::to_string(id) + "/cog";
+      geometry_msgs::TransformStamped transform = 
+        tfBuffer_.lookupTransform("world", frame_name, ros::Time(0));
+      
+      quat_sum.x() += transform.transform.rotation.x;
+      quat_sum.y() += transform.transform.rotation.y;
+      quat_sum.z() += transform.transform.rotation.z;
+      quat_sum.w() += transform.transform.rotation.w;
+      count++;
+      
+    } catch(tf2::TransformException& ex) {
+      ROS_WARN_THROTTLE(5.0, "[BeetleNavigator] Failed to get rotation for %s%d: %s", 
+                        my_name_.c_str(), id, ex.what());
+    }
+  }
+  
+  if(count > 0) {
+    quat_sum /= count;
+    quat_sum.normalize();
+  } else {
+    quat_sum = Eigen::Vector4d(0, 0, 0, 1);  // Default no rotation
+  }
+  
+  return Eigen::Quaterniond(quat_sum.w(), quat_sum.x(), quat_sum.y(), quat_sum.z());
 }
 
 

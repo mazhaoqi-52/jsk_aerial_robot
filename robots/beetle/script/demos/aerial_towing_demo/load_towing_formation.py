@@ -50,8 +50,8 @@ LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 INSERTION_DEPTH = 0.0    # Compensated insertion depth (actual ~30mm due to offset error)
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
-TOWING_DISTANCE = 1.0    # 1m towing distance
-TOWING_FORCE = 5.0       # 5N initial feedforward force
+TOWING_DISTANCE = 0.5    # towing distance (0.5m sufficient for validation)
+TOWING_MAX_FORCE = 30.0  # Maximum adaptive force (starts from 0, increases when stalled)
 # Approach height above box top for entering the load area.
 # Default is 50mm. Tune as needed; with box_top_z=0.65m:
 # - offset 0.15 -> approach 0.80m
@@ -66,7 +66,7 @@ class LinearTowingTrajectoryGenerator:
     """
     
     def __init__(self, start_pos, towing_direction, target_distance, 
-                 target_velocity=0.05, control_rate=25.0, feedforward_force=5.0):
+                 target_velocity=0.05, control_rate=25.0, max_force=30.0):
         """
         Initialize linear towing trajectory generator.
         
@@ -76,7 +76,7 @@ class LinearTowingTrajectoryGenerator:
             target_distance: Total distance to tow (m)
             target_velocity: Target towing velocity (m/s)
             control_rate: Control frequency (Hz)
-            feedforward_force: Force to apply in towing direction (N)
+            max_force: Maximum adaptive force in towing direction (N)
         """
         self.start_pos = np.array(start_pos)
         self.towing_direction = np.array(towing_direction)
@@ -90,7 +90,7 @@ class LinearTowingTrajectoryGenerator:
         self.target_velocity = target_velocity
         self.control_rate = control_rate
         self.dt = 1.0 / control_rate
-        self.feedforward_force = feedforward_force
+        self.max_force = max_force
         
         # State variables
         self.current_distance = 0.0
@@ -101,10 +101,8 @@ class LinearTowingTrajectoryGenerator:
         self.ramp_up_distance = 0.05  # 50mm ramp-up zone
         self.ramp_down_distance = 0.05  # 50mm ramp-down zone
         
-        # Force adaptation parameters
-        self.min_force = feedforward_force * 0.5
-        self.max_force = feedforward_force * 2.0
-        self.current_force = feedforward_force
+        # Force adaptation: starts from 0, increases when stalled (reactive control)
+        self.current_force = 0.0  # Start from 0N, not preset value
         
         # Performance monitoring
         self.start_time = rospy.Time.now().to_sec()
@@ -112,7 +110,7 @@ class LinearTowingTrajectoryGenerator:
         self.stall_counter = 0
         
         rospy.loginfo(f"LinearTowingTrajectory: dir={self.towing_direction}, "
-                     f"dist={target_distance}m, vel={target_velocity}m/s, force={feedforward_force}N")
+                     f"dist={target_distance}m, vel={target_velocity}m/s, max_force={max_force}N")
     
     def update_state(self, current_pos, load_pos=None):
         """
@@ -164,13 +162,14 @@ class LinearTowingTrajectoryGenerator:
         
         # Adaptive force based on progress
         actual_velocity = self.current_distance / max(0.1, current_time - self.start_time)
-        if actual_velocity < self.target_velocity * 0.3:
-            # Increase force if moving too slow
-            self.current_force = min(self.max_force, self.current_force * 1.1)
+        if actual_velocity < self.target_velocity * 0.05:  # 5% threshold (further relaxed from 10% to reduce false stall warnings during normal towing)
+            # Increase force gradually when stalled (+0.5N per cycle = +12.5N/s at 25Hz)
+            self.current_force = min(self.max_force, self.current_force + 0.5)
             self.stall_counter += 1
         else:
-            self.current_force = self.feedforward_force
-            self.stall_counter = 0
+            # Slowly decay force when moving well (-0.2N per cycle = -5N/s at 25Hz)
+            self.current_force = max(0.0, self.current_force - 0.2)
+            self.stall_counter = max(0, self.stall_counter - 2)  # Decay counter faster
         
         return {
             'current_distance': self.current_distance,
@@ -194,11 +193,10 @@ class LinearTowingTrajectoryGenerator:
         # Target velocity in world frame
         target_linear_vel = self.towing_direction * self.current_velocity
         
-        # Force feedforward: tell the controller to apply force in towing direction.
-        # The controller interprets tagged_wrench as the force UAV should apply.
+        # Force feedforward disabled - evidence shows it has no effect on Z-axis control
+        # Relying purely on velocity control for Z-axis stability
         target_force = self.towing_direction * self.current_force
-        # Add small vertical force component for stability (slight upward to counteract load weight)
-        target_force[2] = 0.5  # Small upward bias
+        target_force[2] = 0.0  # Force feedforward disabled (not working in current controller)
         
         return {
             'position': self.target_pos.copy(),
@@ -346,6 +344,71 @@ class TowingStateBase(FormationSingleUAVStateBase):
                 control_rate.sleep()
         
         rospy.loginfo("Smooth descent trajectory execution completed")
+        return True
+    
+    def execute_polynomial_trajectory(self, trajectory_points):
+        """
+        Execute polynomial trajectory using active convergence for each point.
+        Enhanced version with dynamic timeout based on distance.
+        """
+        rospy.loginfo(f"Executing Formation Polynomial Trajectory: {len(trajectory_points)} points")
+        total_points = len(trajectory_points)
+        
+        for i, (pos, yaw, velocity, vel_magnitude) in enumerate(trajectory_points):
+            is_final = (i >= total_points - 2)
+            
+            # Log progress
+            if i % 3 == 0 or i == total_points - 1:
+                mode = "precision" if is_final else "trajectory"
+                rospy.loginfo(f"Point {i+1}/{total_points} ({mode}): pos={FormationUtils.format_vec(pos)}, yaw={math.degrees(yaw):.1f}°")
+            
+            # Get current position to calculate distance
+            current_pos = self.get_end_effector_position()
+            if current_pos is not None:
+                distance = np.linalg.norm(np.array(pos) - np.array(current_pos))
+            else:
+                distance = 0.5  # Default assumption if position unavailable
+            
+            # Dynamic timeout based on distance with generous margins
+            # Conservative velocity assumptions to ensure sufficient timeout
+            if is_final:
+                # Final points: high precision, generous timeout
+                pos_thresh = 0.08
+                yaw_thresh = 0.08
+                # Assume 15mm/s velocity + 100% safety margin
+                base_timeout = max(distance / 0.015 * 2.0, 20.0)
+            else:
+                # Intermediate points: balanced threshold, safe timeout
+                pos_thresh = 0.08  # Reduced from 0.12 to avoid cumulative error
+                yaw_thresh = 0.15
+                # Assume 20mm/s velocity + 150% safety margin for long distances
+                if distance > 0.2:  # 200mm+
+                    base_timeout = max(distance / 0.020 * 2.5, 15.0)
+                else:
+                    base_timeout = max(distance / 0.025 * 2.0, 8.0)
+            
+            timeout = base_timeout
+            
+            rospy.loginfo(f"Converging to point {i+1}: dist={distance*1000:.1f}mm, timeout={timeout:.1f}s")
+            
+            success = self.active_position_convergence(pos, yaw, pos_thresh, yaw_thresh, timeout)
+            
+            if not success:
+                rospy.logwarn(f"Point {i+1} convergence issue - continuing")
+            
+            # Stabilize precision points
+            if is_final:
+                rospy.loginfo(f"Stabilizing point {i+1} for 2s")
+                stabilize_end = rospy.Time.now().to_sec() + 2.0
+                rate = rospy.Rate(10)
+                while rospy.Time.now().to_sec() < stabilize_end and not rospy.is_shutdown():
+                    self.send_assembly_command_from_end_effector(pos, yaw)
+                    rate.sleep()
+            
+            # Dynamic pause
+            rospy.sleep(0.2 if is_final else 0.067)
+        
+        rospy.loginfo("Polynomial trajectory execution completed")
         return True
     
     def calculate_approach_side(self, assembly_pos, load_pos):
@@ -704,23 +767,27 @@ class TowingWithFeedforwardState(TowingStateBase):
         rospy.loginfo(f"Towing start: {FormationUtils.format_vec(start_pos)}")
         rospy.loginfo(f"Towing direction: {towing_dir}")
         rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
-        rospy.loginfo(f"Feedforward force: {TOWING_FORCE}N")
+        rospy.loginfo(f"Max adaptive force: {TOWING_MAX_FORCE}N (starts from 0N)")
         
-        # Create trajectory generator
         trajectory_gen = LinearTowingTrajectoryGenerator(
             start_pos=start_pos,
             towing_direction=towing_dir,
             target_distance=TOWING_DISTANCE,
             target_velocity=0.05,  # 50mm/s towing speed
-            feedforward_force=TOWING_FORCE
+            max_force=TOWING_MAX_FORCE
         )
+        
+        # Note: We rely on the low-level PID controller (BeetleControl.yaml)
+        # for Z-axis stabilization. The controller has d_gain=5.0 which provides
+        # damping to suppress oscillation. We only provide position targets.
         
         # Towing control loop
         towing_start_time = rospy.Time.now().to_sec()
-        max_towing_time = TOWING_DISTANCE / 0.03 + 30  # Expected time + margin
+        # Conservative timeout: assume very slow 10mm/s actual speed + 50% margin
+        max_towing_time = TOWING_DISTANCE / 0.01 * 1.5  # 75 seconds for 0.5m
         control_rate = rospy.Rate(25)  # 25Hz
         
-        rospy.loginfo("Starting towing loop...")
+        rospy.loginfo(f"Starting towing loop (max time: {max_towing_time:.0f}s)...")
         
         while not rospy.is_shutdown():
             elapsed = rospy.Time.now().to_sec() - towing_start_time
@@ -753,29 +820,80 @@ class TowingWithFeedforwardState(TowingStateBase):
                 userdata.towing_end_position = current_pos
                 return 'timeout'
             
-            # Check for stall
-            if state_info['stall_counter'] > 50:
+            # Check for stall (increased threshold to reduce false warnings)
+            if state_info['stall_counter'] > 150:  # Increased from 50 to 150 (6s at 25Hz)
                 rospy.logwarn("Towing stalled - load may be stuck")
             
             # Generate and execute target
             target_state = trajectory_gen.generate_target_state(maintain_yaw)
             
-            # Z compensation: add velocity to correct Z drift
+            # Critical Fix: Z-axis drift compensation with dual strategy
+            # Strategy 1: Pitch-based geometric compensation (if data available)
+            # Strategy 2: Z-error feedforward compensation (robust fallback)
+            
+            # Calculate Z error for both monitoring and feedforward
             z_error = target_state['position'][2] - current_pos[2]
-            corrected_linear_vel = target_state['linear_velocity'].copy()
-            corrected_linear_vel[2] = np.clip(z_error * 2.0, -0.05, 0.05)
+            
+            # Initialize compensation
+            compensated_target_pos = list(target_state['position'])
+            compensation_method = "none"
+            pitch_deg = 0.0
+            z_comp_mm = 0.0
+            
+            # Diagnostic: Check assembly_mode status (log once)
+            rospy.loginfo_once(f"[Towing] Beetle assembly_mode = {self.beetle.assembly_mode}")
+            
+            # Try Strategy 1: Pitch-based compensation
+            try:
+                # Single-source Z compensation strategy (TODO 3B - Direction Fixed):
+                # CRITICAL: Correct compensation direction validated
+                # z_error > 0 → end-effector below target → raise target (add positive)
+                # z_error < 0 → end-effector above target → lower target (add negative)
+                
+                Z_ERROR_GAIN = 1.2  # Further reduced from 1.5 to prevent overcorrection
+                Z_ERROR_MAX = 0.030  # 30mm saturation to prevent aggressive compensation near completion
+                
+                # Direct Z error correction with CORRECT direction and saturation
+                z_error_compensation = Z_ERROR_GAIN * z_error
+                # Apply saturation to prevent excessive compensation
+                z_error_compensation = np.clip(z_error_compensation, -Z_ERROR_MAX, Z_ERROR_MAX)
+                total_z_compensation = z_error_compensation
+                compensated_target_pos[2] += total_z_compensation  # Correct: += not -=
+                
+                compensation_method = "z_error_saturated"
+                z_comp_mm = total_z_compensation * 1000
+                
+                # Optional: Get pitch for monitoring only (not used in compensation)
+                rpy_result = self.beetle.getAssemblyRPY()
+                pitch_deg = np.degrees(rpy_result[1]) if rpy_result is not None else 0.0
+                
+                rospy.loginfo_throttle(3.0, f"[Towing] Z-error compensation (saturated): "
+                                           f"z_err={z_error*1000:.1f}mm, z_comp={z_comp_mm:.1f}mm, "
+                                           f"pitch={pitch_deg:.2f}° (monitor only)")
+                    
+            except Exception as e:
+                rospy.logwarn_throttle(3.0, f"[Towing] Z compensation failed: {type(e).__name__}: {e}")
+                
+                # Fallback: Use same gain and CORRECT direction
+                Z_FEEDFORWARD_GAIN = 1.2
+                z_feedforward = z_error * Z_FEEDFORWARD_GAIN
+                compensated_target_pos[2] += z_feedforward  # Correct direction
+                
+                compensation_method = "feedforward"
+                z_comp_mm = z_feedforward * 1000
             
             # Debug: log target state details every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
                 rospy.loginfo(f"[Towing Debug] target_pos={target_state['position']}, "
-                             f"force={target_state['force']}, vel={corrected_linear_vel}")
+                             f"force={target_state['force']}, z_err={z_error*1000:.1f}mm, "
+                             f"method={compensation_method}, pitch={pitch_deg:.2f}°, z_comp={z_comp_mm:.1f}mm")
             
-            # Execute with position/velocity control and force feedforward
+            # Execute with compensated position target AND velocity feedforward
+            # Velocity feedforward enables smooth PID response by reducing position error
             self.send_assembly_command_from_end_effector(
-                target_state['position'],
+                compensated_target_pos,
                 target_state['yaw'],
-                linear_vel=corrected_linear_vel,
-                angular_vel=target_state['angular_velocity']
+                linear_vel=target_state['linear_velocity']  # Enable velocity feedforward for smooth towing
             )
             
             # Apply force feedforward
@@ -823,6 +941,41 @@ class DisengageAndReturnState(TowingStateBase):
         if current_pos is None:
             rospy.logerr("Cannot get current position")
             return 'failed'
+        
+        # Phase 0: Stabilize attitude after load release
+        # During towing, pitch/roll PID integral terms accumulated to compensate for load forces.
+        # After disengagement, these integral terms need time to decay back to zero.
+        # Send position hold command and wait for attitude convergence.
+        rospy.loginfo("[Phase 0] Stabilizing attitude after load release")
+        
+        stabilize_duration = 5.0  # seconds
+        stabilize_start = rospy.Time.now()
+        
+        while (rospy.Time.now() - stabilize_start).to_sec() < stabilize_duration:
+            # Hold current position
+            current_pos = self.get_end_effector_position()
+            if current_pos:
+                self.send_assembly_command_from_end_effector(current_pos, current_yaw)
+            
+            # Monitor attitude convergence
+            try:
+                rpy = self.beetle.getAssemblyRPY()
+                if rpy is not None:
+                    roll, pitch, yaw = rpy
+                    elapsed = (rospy.Time.now() - stabilize_start).to_sec()
+                    rospy.loginfo_throttle(0.5, f"[Phase 0] t={elapsed:.1f}s, Attitude: "
+                                                f"roll={np.degrees(roll):.2f}°, "
+                                                f"pitch={np.degrees(pitch):.2f}°, "
+                                                f"yaw={np.degrees(yaw):.2f}°")
+                else:
+                    rospy.logwarn_throttle(2.0, "[Phase 0] getAssemblyRPY() returned None")
+            except Exception as e:
+                rospy.logwarn_throttle(2.0, f"[Phase 0] Failed to get RPY: {e}")
+            
+            rospy.sleep(0.1)
+        
+        rospy.loginfo(f"[Phase 0] Stabilization complete after {stabilize_duration}s")
+
         
         # Phase 1: Ascend to safe height
         rospy.loginfo("[Phase 1] Ascending to safe height")
@@ -885,7 +1038,7 @@ def main():
     rospy.loginfo(f"Insertion depth: {INSERTION_DEPTH*1000:.0f}mm")
     rospy.loginfo(f"Retract distance: {RETRACT_DISTANCE*1000:.0f}mm")
     rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
-    rospy.loginfo(f"Towing force: {TOWING_FORCE}N")
+    rospy.loginfo(f"Max towing force: {TOWING_MAX_FORCE}N (adaptive from 0N)")
     rospy.loginfo("=" * 60)
     
     try:

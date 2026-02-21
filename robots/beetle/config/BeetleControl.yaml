@@ -7,12 +7,12 @@ controller:
   wrench_estimate_update_rate: 100
   momentum_observer_force_weight: 3
   momentum_observer_torque_weight: 2.5
-  # wrench_estimate_flag: true
-  wrench_estimate_flag: false
+  wrench_estimate_flag: true
+  # wrench_estimate_flag: false
   comp_term_update_freq: 40
 
-  # pd_wrench_comp_mode: true
-  pd_wrench_comp_mode: false
+  pd_wrench_comp_mode: true
+  # pd_wrench_comp_mode: false
 
   external_force_upper_limit: 0.0
   external_force_lower_limit: 0.0
@@ -30,7 +30,7 @@ controller:
     p_gain: 10.0
     i_gain: 0.2
     d_gain: 5.0
-    limit_sum: 4.0
+    limit_sum: 8.0
     limit_p: 12.0
     limit_i: 5.0
     limit_d: 12.0

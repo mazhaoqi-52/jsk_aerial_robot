@@ -196,14 +196,14 @@ class BeetleInterface(object):
         return euler_from_quaternion([o.x, o.y, o.z, o.w])
     
     def getEndEffectorPos(self):
-        """Get end-effector position in world coordinates."""
+        """Get end-effector position in world coordinates (pitch-aware)."""
         if self.assembly_mode and self.assembly_tf_calculator:
             assembly_pos = self.getAssemblyPos()
             assembly_rpy = self.getAssemblyRPY()
             if assembly_pos is None or assembly_rpy is None:
                 return None
             return self.assembly_tf_calculator.transform_assembly_to_end_effector(
-                tuple(assembly_pos), assembly_rpy[2])
+                tuple(assembly_pos), assembly_rpy[2], assembly_rpy[1])
         else:
             # Single mode: calculate from UAV position
             uav_pos = self.getIndividualUavPos()

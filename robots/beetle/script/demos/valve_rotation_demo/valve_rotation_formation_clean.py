@@ -149,8 +149,11 @@ class FormationAdapter:
         
         self.uav_positions = {}
         self.uav_orientations = {}
+        self.uav_pitches = {}
         self.assembly_pos = None
         self.assembly_yaw = 0.0
+        self.assembly_pitch = 0.0
+        self.pitch_compensation_enabled = False  # Disabled by default; enable for towing phase
         
         self.position_received = threading.Event()
         
@@ -191,8 +194,9 @@ class FormationAdapter:
         
         self.uav_positions[module_id] = (pos.x, pos.y, pos.z)
         
-        _, _, yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
+        _, pitch, yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
         self.uav_orientations[module_id] = yaw
+        self.uav_pitches[module_id] = pitch
         
         self._update_assembly_position()
     
@@ -226,6 +230,9 @@ class FormationAdapter:
         
         self.assembly_yaw = yaw_sum / self.number_of_modules
         
+        # Calculate average pitch
+        self.assembly_pitch = sum(self.uav_pitches.get(mid, 0.0) for mid in self.module_ids) / self.number_of_modules
+        
         if not self.position_received.is_set():
             rospy.loginfo(f"Formation position received: {self.assembly_pos}")
             for mid in self.module_ids:
@@ -240,14 +247,27 @@ class FormationAdapter:
         """Get current assembly yaw"""
         return self.assembly_yaw
     
+    def get_assembly_pitch(self):
+        """Get current assembly pitch"""
+        return self.assembly_pitch
+    
+    def set_pitch_compensation(self, enabled):
+        """Enable/disable pitch compensation in coordinate transforms.
+        Enable during towing to correct Z-drift from pitch coupling.
+        Disable during approach/insertion for stable convergence."""
+        self.pitch_compensation_enabled = enabled
+        rospy.loginfo(f"Pitch compensation {'ENABLED' if enabled else 'DISABLED'}")
+    
     def get_end_effector_position(self):
-        """Get end-effector position using coordinate transformation"""
+        """Get end-effector position using coordinate transformation.
+        Uses pitch compensation only when explicitly enabled."""
         if self.assembly_pos is None:
             rospy.logwarn("Assembly position not available for end-effector calculation")
             return None
-            
+        
+        pitch = self.assembly_pitch if self.pitch_compensation_enabled else 0.0
         return self.tf_calculator.transform_assembly_to_end_effector(
-            self.assembly_pos, self.assembly_yaw
+            self.assembly_pos, self.assembly_yaw, pitch
         )
     
     def transform_end_effector_to_assembly_command(self, target_end_effector_pos, target_yaw=None):
@@ -255,8 +275,11 @@ class FormationAdapter:
         if target_yaw is None:
             target_yaw = self.assembly_yaw if self.assembly_yaw is not None else 0.0
         
+        # Use pitch only when compensation is enabled
+        current_pitch = self.assembly_pitch if self.pitch_compensation_enabled else 0.0
+        
         assembly_to_leader = self.tf_calculator.calculate_assembly_to_leader_transform()
-        leader_to_ee = self.tf_calculator.calculate_leader_to_end_effector_transform(target_yaw)
+        leader_to_ee = self.tf_calculator.calculate_leader_to_end_effector_transform(target_yaw, current_pitch)
         
         cos_yaw = math.cos(target_yaw)
         sin_yaw = math.sin(target_yaw)

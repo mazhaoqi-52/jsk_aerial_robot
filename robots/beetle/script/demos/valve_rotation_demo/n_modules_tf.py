@@ -75,24 +75,33 @@ class NModuleTFCalculator:
             'offset_z': 0.0   # No Z offset for planar arrangement
         }
     
-    def calculate_leader_to_end_effector_transform(self, leader_yaw=0.0):
+    def calculate_leader_to_end_effector_transform(self, leader_yaw=0.0, leader_pitch=0.0):
         """
         Calculate transformation from leader UAV CoG to end-effector position.
         
+        When pitch != 0, the end-effector arm rotates about the body Y-axis,
+        causing a coupled shift in X/Z in the world frame.
+        
         Args:
             leader_yaw (float): Leader UAV's yaw angle in radians
+            leader_pitch (float): Leader UAV's pitch angle in radians
             
         Returns:
             dict: Transform with 'x', 'y', 'z' in world coordinates
         """
-        # End-effector is positioned in leader's body X direction
         cos_yaw = math.cos(leader_yaw)
         sin_yaw = math.sin(leader_yaw)
+        cos_pitch = math.cos(leader_pitch)
+        sin_pitch = math.sin(leader_pitch)
         
-        # Transform from leader body frame to world frame
-        end_effector_x = self.dual_fang_center_offset * cos_yaw
-        end_effector_y = self.dual_fang_center_offset * sin_yaw
-        end_effector_z = self.end_effector_offset_z
+        # Body-frame X projection shrinks by cos(pitch), and couples into Z by -sin(pitch)
+        arm_body_x = self.dual_fang_center_offset * cos_pitch
+        arm_body_z = -self.dual_fang_center_offset * sin_pitch
+        
+        # Rotate body-frame horizontal component into world frame via yaw
+        end_effector_x = arm_body_x * cos_yaw
+        end_effector_y = arm_body_x * sin_yaw
+        end_effector_z = self.end_effector_offset_z + arm_body_z
         
         return {
             'x': end_effector_x,
@@ -100,16 +109,14 @@ class NModuleTFCalculator:
             'z': end_effector_z
         }
     
-    def transform_assembly_to_end_effector(self, assembly_pos, assembly_yaw):
+    def transform_assembly_to_end_effector(self, assembly_pos, assembly_yaw, assembly_pitch=0.0):
         """
         Complete transformation from assembly CoG to end-effector position.
-        
-        This is the key function that replaces single UAV coordinate calculations
-        with multi-UAV assembly coordinate transformations.
         
         Args:
             assembly_pos (tuple): Assembly CoG position (x, y, z)
             assembly_yaw (float): Assembly yaw angle in radians
+            assembly_pitch (float): Assembly pitch angle in radians (default 0)
             
         Returns:
             tuple: End-effector position (x, y, z)
@@ -117,21 +124,18 @@ class NModuleTFCalculator:
         # Step 1: Transform from assembly CoG to leader CoG
         assembly_to_leader = self.calculate_assembly_to_leader_transform()
         
-        # Apply assembly orientation to the offset
         cos_assembly_yaw = math.cos(assembly_yaw)
         sin_assembly_yaw = math.sin(assembly_yaw)
         
-        # Transform offset from assembly body frame to world frame
         leader_x = assembly_pos[0] + (assembly_to_leader['offset_x'] * cos_assembly_yaw - 
                                     assembly_to_leader['offset_y'] * sin_assembly_yaw)
         leader_y = assembly_pos[1] + (assembly_to_leader['offset_x'] * sin_assembly_yaw + 
                                     assembly_to_leader['offset_y'] * cos_assembly_yaw)
         leader_z = assembly_pos[2] + assembly_to_leader['offset_z']
         
-        # Step 2: Transform from leader CoG to end-effector
-        leader_to_ee = self.calculate_leader_to_end_effector_transform(assembly_yaw)
+        # Step 2: Transform from leader CoG to end-effector (pitch-aware)
+        leader_to_ee = self.calculate_leader_to_end_effector_transform(assembly_yaw, assembly_pitch)
         
-        # Final end-effector position
         end_effector_x = leader_x + leader_to_ee['x']
         end_effector_y = leader_y + leader_to_ee['y']
         end_effector_z = leader_z + leader_to_ee['z']

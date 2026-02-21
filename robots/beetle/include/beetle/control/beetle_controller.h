@@ -43,6 +43,7 @@ namespace aerial_robot_control
     boost::shared_ptr<aerial_robot_navigation::BeetleNavigator> beetle_navigator_;
     
     map<string, ros::Subscriber> ff_inter_wrench_subs_;
+    ros::Subscriber external_ff_wrench_sub_;
 
     aerial_robot_msgs::PoseControlPid wrench_pid_msg_;
 
@@ -112,6 +113,7 @@ namespace aerial_robot_control
     void controlCore() override;
     
     virtual void ffInterWrenchCallback(const beetle::TaggedWrench & msg);
+    void externalFfWrenchCallback(const geometry_msgs::WrenchStamped & msg);
     void rosParamInit() override;
     void externalWrenchEstimate() override;
     void reset() override;

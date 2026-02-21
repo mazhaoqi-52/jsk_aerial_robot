@@ -92,6 +92,7 @@ class BeetleInterface(object):
         self.land_pub = rospy.Publisher('teleop_command/land', Empty, queue_size=1)
         self.halt_pub = rospy.Publisher('teleop_command/halt', Empty, queue_size=1)
         self.tagged_wrench_pub = rospy.Publisher(f'/beetle{module_id}/tagged_wrench', TaggedWrench, queue_size=1)
+        self.external_ff_wrench_pub = rospy.Publisher(f'/beetle{module_id}/external_ff_wrench', WrenchStamped, queue_size=1)
         
         # Setup subscribers
         if assembly_mode:
@@ -322,36 +323,40 @@ class BeetleInterface(object):
         
         self.nav_pub.publish(nav_msg)
         self.target_pos = pos
-        
-        if self.external_wrench_active:
-            self.tagged_wrench_pub.publish(self.current_external_wrench)
     
     def addExternalWrench(self, force, torque, frame_id="world"):
-        """Apply external wrench for force/torque feedforward control."""
+        """Apply external wrench for force/torque feedforward control.
+        
+        Uses external_ff_wrench topic -> external_force_feedforward_ in C++,
+        which injects force into PID I-term without overwriting momentum observer.
+        """
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
         
-        self.current_external_wrench.index = self.module_id
-        self.current_external_wrench.wrench.header.stamp = rospy.Time.now()
-        self.current_external_wrench.wrench.header.frame_id = frame_id
-        self.current_external_wrench.wrench.wrench.force.x = force_list[0]
-        self.current_external_wrench.wrench.wrench.force.y = force_list[1]
-        self.current_external_wrench.wrench.wrench.force.z = force_list[2]
-        self.current_external_wrench.wrench.wrench.torque.x = torque_list[0]
-        self.current_external_wrench.wrench.wrench.torque.y = torque_list[1]
-        self.current_external_wrench.wrench.wrench.torque.z = torque_list[2]
+        # Publish to external_ff_wrench (clean feedforward path)
+        ff_msg = WrenchStamped()
+        ff_msg.header.stamp = rospy.Time.now()
+        ff_msg.header.frame_id = frame_id
+        ff_msg.wrench.force.x = force_list[0]
+        ff_msg.wrench.force.y = force_list[1]
+        ff_msg.wrench.force.z = force_list[2]
+        ff_msg.wrench.torque.x = torque_list[0]
+        ff_msg.wrench.torque.y = torque_list[1]
+        ff_msg.wrench.torque.z = torque_list[2]
         
         self.external_wrench_active = True
-        self.tagged_wrench_pub.publish(self.current_external_wrench)
+        self.current_ff_force = force_list
+        self.current_ff_torque = torque_list
+        self.external_ff_wrench_pub.publish(ff_msg)
     
     def clearExternalWrench(self):
         """Clear external wrench application."""
         if self.external_wrench_active:
-            zero_wrench = TaggedWrench()
-            zero_wrench.index = self.module_id
-            zero_wrench.wrench.header.stamp = rospy.Time.now()
-            zero_wrench.wrench.header.frame_id = "world"
-            self.tagged_wrench_pub.publish(zero_wrench)
+            # Publish zero wrench to external_ff_wrench to disable feedforward
+            zero_msg = WrenchStamped()
+            zero_msg.header.stamp = rospy.Time.now()
+            zero_msg.header.frame_id = "world"
+            self.external_ff_wrench_pub.publish(zero_msg)
             self.external_wrench_active = False
     
     def updateExternalWrench(self, force, torque):
@@ -362,11 +367,10 @@ class BeetleInterface(object):
     def getExternalWrenchStatus(self):
         """Get current external wrench status."""
         if self.external_wrench_active:
-            w = self.current_external_wrench.wrench.wrench
             return {
                 'active': True,
-                'force': [w.force.x, w.force.y, w.force.z],
-                'torque': [w.torque.x, w.torque.y, w.torque.z]
+                'force': list(getattr(self, 'current_ff_force', [0, 0, 0])),
+                'torque': list(getattr(self, 'current_ff_torque', [0, 0, 0]))
             }
         return {'active': False, 'force': [0, 0, 0], 'torque': [0, 0, 0]}
     

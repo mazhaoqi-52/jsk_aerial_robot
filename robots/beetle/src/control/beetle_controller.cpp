@@ -61,6 +61,7 @@ namespace aerial_robot_control
     des_inter_wrench_pub_ = nh_.advertise<beetle::TaggedWrenches>("des_inter_wnrech", 1);
     formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("formation_wrench_debug", 1);
     feedforward_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("feedforward_wrench", 1);
+    external_ff_wrench_sub_ = nh_.subscribe("external_ff_wrench", 1, &BeetleController::externalFfWrenchCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
@@ -528,6 +529,19 @@ namespace aerial_robot_control
     if(feedforward_wrench_pub_.getNumSubscribers() > 0) {
       feedforward_wrench_pub_.publish(ff_wrench_msg);
     }
+  }
+
+  void BeetleController::externalFfWrenchCallback(const geometry_msgs::WrenchStamped & msg)
+  {
+    Eigen::VectorXd wrench = Eigen::VectorXd::Zero(6);
+    wrench(0) = msg.wrench.force.x;
+    wrench(1) = msg.wrench.force.y;
+    wrench(2) = msg.wrench.force.z;
+    wrench(3) = msg.wrench.torque.x;
+    wrench(4) = msg.wrench.torque.y;
+    wrench(5) = msg.wrench.torque.z;
+    external_force_feedforward_ = wrench;
+    valve_rotation_ff_enabled_ = (wrench.norm() > 1e-6);
   }
 
   void BeetleController::calcUnifiedRotorControl()

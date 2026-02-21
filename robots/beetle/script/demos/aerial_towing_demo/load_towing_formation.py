@@ -63,7 +63,7 @@ INSERTION_DEPTH = 0.0    # Compensated insertion depth (actual ~30mm due to offs
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
 TOWING_DISTANCE = 0.5    # towing distance (0.5m sufficient for validation)
-TOWING_MAX_FORCE = 15.0  # Maximum adaptive force (starts from 0, increases when stalled)
+TOWING_MAX_FORCE = 30.0  # Maximum adaptive force (starts from 0, increases when stalled)
 # Approach height above box top for entering the load area.
 # Default is 50mm. Tune as needed; with box_top_z=0.65m:
 # - offset 0.15 -> approach 0.80m
@@ -121,8 +121,8 @@ class LinearTowingTrajectoryGenerator:
         self.last_update_time = self.start_time
         self.stall_counter = 0
         
-        # Sliding window for stall detection (recent velocity instead of global average)
-        self.stall_window_time = 5.0    # seconds to look back
+        # Sliding window for stall-based abort detection
+        self.stall_window_time = 5.0    # seconds per window
         self.stall_last_check_time = self.start_time
         self.stall_last_check_distance = 0.0
         
@@ -177,7 +177,7 @@ class LinearTowingTrajectoryGenerator:
         # Keep Z constant
         self.target_pos[2] = self.start_pos[2]
         
-        # Stall detection using sliding window velocity
+        # Stall detection using sliding window (for abort decision only)
         window_elapsed = current_time - self.stall_last_check_time
         if window_elapsed >= self.stall_window_time:
             window_distance = self.current_distance - self.stall_last_check_distance
@@ -190,12 +190,14 @@ class LinearTowingTrajectoryGenerator:
             else:
                 self.stall_counter = max(0, self.stall_counter - 1)
         
-        # Adaptive force: ramp at 2N/s when stalled, decay at 2N/s when moving
-        FORCE_RAMP_RATE = 2.0  # N/s
-        if self.stall_counter > 0:
-            self.current_force = min(self.max_force, self.current_force + FORCE_RAMP_RATE * safe_dt)
+        # Adaptive force based on instantaneous progress (per-cycle, fast ramp)
+        actual_velocity = self.current_distance / max(0.1, current_time - self.start_time)
+        if actual_velocity < self.target_velocity * 0.05:
+            # Stalled: +0.5N per cycle = +12.5N/s at 25Hz
+            self.current_force = min(self.max_force, self.current_force + 0.5)
         else:
-            self.current_force = max(0.0, self.current_force - FORCE_RAMP_RATE * safe_dt)
+            # Moving: decay -0.2N per cycle = -5N/s at 25Hz
+            self.current_force = max(0.0, self.current_force - 0.2)
         
         return {
             'current_distance': self.current_distance,
@@ -793,9 +795,9 @@ class TowingWithFeedforwardState(TowingStateBase):
             output_keys=['towing_end_position'])
     
     @staticmethod
-    def _clear_ff_inter_wrench(ff_publishers, module_ids):
-        """Publish zero ff_inter_wrench to all modules to clear feedforward."""
-        rospy.loginfo("Clearing ff_inter_wrench feedforward (publishing zeros)")
+    def _clear_feedforward(ff_publishers, ext_ff_publishers, module_ids):
+        """Publish zeros to both ff_inter_wrench and external_ff_wrench for all modules."""
+        rospy.loginfo("Clearing all feedforward (publishing zeros)")
         for _ in range(10):
             for mid in module_ids:
                 ff_msg = TaggedWrench()
@@ -803,6 +805,11 @@ class TowingWithFeedforwardState(TowingStateBase):
                 ff_msg.wrench.header.stamp = rospy.Time.now()
                 ff_msg.wrench.header.frame_id = "fc"
                 ff_publishers[mid].publish(ff_msg)
+                
+                ext_msg = WrenchStamped()
+                ext_msg.header.stamp = rospy.Time.now()
+                ext_msg.header.frame_id = "fc"
+                ext_ff_publishers[mid].publish(ext_msg)
             rospy.sleep(0.04)
     
     def execute(self, userdata):
@@ -834,12 +841,13 @@ class TowingWithFeedforwardState(TowingStateBase):
         
         module_ids = self.formation_adapter.module_ids
         ff_publishers = {}
+        ext_ff_publishers = {}
         for mid in module_ids:
-            topic = f'/beetle{mid}/ff_inter_wrench'
-            ff_publishers[mid] = rospy.Publisher(topic, TaggedWrench, queue_size=1)
+            ff_publishers[mid] = rospy.Publisher(f'/beetle{mid}/ff_inter_wrench', TaggedWrench, queue_size=1)
+            ext_ff_publishers[mid] = rospy.Publisher(f'/beetle{mid}/external_ff_wrench', WrenchStamped, queue_size=1)
         rospy.sleep(0.3)  # Allow publisher registration
         
-        rospy.loginfo(f"ff_inter_wrench publishers created for modules {module_ids}")
+        rospy.loginfo(f"Feedforward publishers created for modules {module_ids}")
         
         trajectory_gen = LinearTowingTrajectoryGenerator(
             start_pos=start_pos,
@@ -898,13 +906,13 @@ class TowingWithFeedforwardState(TowingStateBase):
             if state_info['stall_counter'] >= STALL_TIMEOUT_COUNT:
                 rospy.logwarn(f"Towing aborted: stalled for {state_info['stall_counter']} "
                              f"consecutive windows ({state_info['stall_counter']*5}s no progress)")
-                self._clear_ff_inter_wrench(ff_publishers, module_ids)
+                self._clear_feedforward(ff_publishers, ext_ff_publishers, module_ids)
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
             if elapsed > ABSOLUTE_MAX_TIME:
                 rospy.logwarn(f"Towing absolute timeout after {elapsed:.1f}s")
-                self._clear_ff_inter_wrench(ff_publishers, module_ids)
+                self._clear_feedforward(ff_publishers, ext_ff_publishers, module_ids)
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
@@ -930,11 +938,9 @@ class TowingWithFeedforwardState(TowingStateBase):
                 linear_vel=target_state['linear_velocity']
             )
             
-            # ---- Publish ff_inter_wrench feedforward ----
-            # Tell C++ wrench_comp that internal forces from towing are expected.
-            # Force magnitude = trajectory_gen.current_force (adaptive: 0 → ramps up on stall).
-            # Direction = towing_dir rotated from world frame to body (CoG) frame; Z=0.
-            # Published for ALL module IDs; C++ section 3 only reads relevant indices.
+            # ---- Publish feedforward to both channels ----
+            # 1) ff_inter_wrench: tells wrench_comp not to compensate towing forces
+            # 2) external_ff_wrench: injects actual force into I_reconfig_acc → PID I-term
             ff_force_magnitude = state_info['current_force']
             assembly_yaw = self.get_assembly_yaw() or maintain_yaw
             cos_y = math.cos(assembly_yaw)
@@ -943,14 +949,24 @@ class TowingWithFeedforwardState(TowingStateBase):
             ff_body_x = ff_force_magnitude * ( cos_y * towing_dir[0] + sin_y * towing_dir[1])
             ff_body_y = ff_force_magnitude * (-sin_y * towing_dir[0] + cos_y * towing_dir[1])
             for mid in module_ids:
+                # Channel 1: ff_inter_wrench (wrench_comp cancellation)
                 ff_msg = TaggedWrench()
                 ff_msg.index = mid
                 ff_msg.wrench.header.stamp = rospy.Time.now()
-                ff_msg.wrench.header.frame_id = "fc"  # body (CoG) frame
+                ff_msg.wrench.header.frame_id = "fc"
                 ff_msg.wrench.wrench.force.x = ff_body_x
                 ff_msg.wrench.wrench.force.y = ff_body_y
-                ff_msg.wrench.wrench.force.z = 0.0  # CRITICAL: no Z to avoid drift
+                ff_msg.wrench.wrench.force.z = 0.0
                 ff_publishers[mid].publish(ff_msg)
+                
+                # Channel 2: external_ff_wrench (actual force injection into PID I-term)
+                ext_msg = WrenchStamped()
+                ext_msg.header.stamp = rospy.Time.now()
+                ext_msg.header.frame_id = "fc"
+                ext_msg.wrench.force.x = ff_body_x
+                ext_msg.wrench.force.y = ff_body_y
+                ext_msg.wrench.force.z = 0.0
+                ext_ff_publishers[mid].publish(ext_msg)
             
             # Debug: log ff force and progress every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
@@ -965,8 +981,8 @@ class TowingWithFeedforwardState(TowingStateBase):
             
             control_rate.sleep()
         
-        # ---- Clear ff_inter_wrench after towing completes ----
-        self._clear_ff_inter_wrench(ff_publishers, module_ids)
+        # ---- Clear all feedforward after towing completes ----
+        self._clear_feedforward(ff_publishers, ext_ff_publishers, module_ids)
         
         # Ensure pitch compensation stays disabled (already disabled, but defensive)
         self.formation_adapter.set_pitch_compensation(False)
@@ -984,7 +1000,7 @@ class DisengageAndReturnState(TowingStateBase):
     def __init__(self):
         TowingStateBase.__init__(self,
             outcomes=['succeeded', 'failed'],
-            input_keys=['start_position', 'start_yaw', 'towing_end_position'])
+            input_keys=['start_position', 'start_yaw', 'towing_end_position', 'towing_direction'])
     
     def execute(self, userdata):
         rospy.loginfo("=== Disengage and Return State ===")
@@ -1033,8 +1049,27 @@ class DisengageAndReturnState(TowingStateBase):
         
         rospy.loginfo(f"[Phase 0] Stabilization complete after {stabilize_duration}s")
 
+        # Phase 0.5: Reverse disengage — move opposite to towing direction to unhook
+        towing_dir = np.array(userdata.towing_direction)
+        DISENGAGE_DISTANCE = 0.06  # 60mm reverse to clear the box wall
+        current_pos = self.get_end_effector_position()
+        disengage_target = (
+            current_pos[0] - towing_dir[0] * DISENGAGE_DISTANCE,
+            current_pos[1] - towing_dir[1] * DISENGAGE_DISTANCE,
+            current_pos[2]
+        )
+        rospy.loginfo(f"[Phase 0.5] Reverse disengage: moving {DISENGAGE_DISTANCE*1000:.0f}mm "
+                      f"opposite to towing dir {towing_dir}")
+        
+        success = self.active_position_convergence(
+            disengage_target, target_yaw=current_yaw,
+            pos_thresh=0.03, yaw_thresh=0.1, timeout=10.0,
+            max_linear_vel=0.03  # Slow and gentle
+        )
+        rospy.sleep(0.5)
         
         # Phase 1: Ascend to safe height
+        current_pos = self.get_end_effector_position()
         rospy.loginfo("[Phase 1] Ascending to safe height")
         safe_height = current_pos[2] + 0.15  # 150mm up
         ascent_target = (current_pos[0], current_pos[1], safe_height)

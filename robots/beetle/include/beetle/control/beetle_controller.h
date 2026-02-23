@@ -77,27 +77,9 @@ namespace aerial_robot_control
     double I_comp_Fz_;
     double I_comp_Tx_;
     double I_comp_Ty_;
-    double I_comp_Tz_;    
+    double I_comp_Tz_;
 
     virtual void calcInteractionWrench();
-    
-    // Unified 4n-rotor control for assembled formation
-    virtual void calcUnifiedRotorControl();
-    
-    // Helper methods for unified control
-    Eigen::VectorXd distributeWrenchToRotors(const Eigen::VectorXd& target_wrench, 
-                                            const std::vector<int>& assembled_ids);
-    Eigen::MatrixXd buildFormationGeometryMatrix(const std::vector<int>& assembled_ids);
-    void publishUnifiedRotorCommands(const Eigen::VectorXd& rotor_commands, 
-                                   const std::vector<int>& assembled_ids);
-    void publishFormationControlDebug(const Eigen::VectorXd& total_wrench_demand, 
-                                    const std::vector<int>& assembled_ids);
-    
-    // Geometry helper methods for unified control
-    Eigen::Vector3d getModulePosition(int module_id);
-    Eigen::Vector3d getRotorPosition(int rotor_index);
-    double getRotorTorqueDirection(int rotor_index);
-    void publishModuleRotorCommands(int module_id, const Eigen::Vector4d& commands);
     
     ros::Publisher tagged_external_wrench_pub_;
     ros::Publisher external_wrench_compensation_pub_;
@@ -105,7 +87,6 @@ namespace aerial_robot_control
     ros::Publisher internal_wrench_pub_;
     ros::Publisher wrench_comp_pid_pub_;
     ros::Publisher des_inter_wrench_pub_;
-    ros::Publisher formation_wrench_pub_;  // Debug publisher for formation control
     void controlCore() override;
     
     virtual void ffInterWrenchCallback(const beetle::TaggedWrench & msg);

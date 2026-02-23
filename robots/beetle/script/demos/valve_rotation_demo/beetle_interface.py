@@ -92,7 +92,7 @@ class BeetleInterface(object):
         self.land_pub = rospy.Publisher('teleop_command/land', Empty, queue_size=1)
         self.halt_pub = rospy.Publisher('teleop_command/halt', Empty, queue_size=1)
         self.tagged_wrench_pub = rospy.Publisher(f'/beetle{module_id}/tagged_wrench', TaggedWrench, queue_size=1)
-        self.external_ff_wrench_pub = rospy.Publisher(f'/beetle{module_id}/external_ff_wrench', WrenchStamped, queue_size=1)
+        self.desired_ext_wrench_pub = rospy.Publisher(f'/beetle{module_id}/desired_external_wrench', WrenchStamped, queue_size=1)
         
         # Setup subscribers
         if assembly_mode:
@@ -325,15 +325,14 @@ class BeetleInterface(object):
         self.target_pos = pos
     
     def addExternalWrench(self, force, torque, frame_id="world"):
-        """Apply external wrench for force/torque feedforward control.
+        """Apply desired external wrench for the whole assembly (body frame).
         
-        Uses external_ff_wrench topic -> external_force_feedforward_ in C++,
-        which injects force into PID I-term without overwriting momentum observer.
+        Uses desired_external_wrench topic -> C++ auto-distributes to per-module
+        ff_inter_wrench_list_ for wrench_comp feedforward.
         """
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
         
-        # Publish to external_ff_wrench (clean feedforward path)
         ff_msg = WrenchStamped()
         ff_msg.header.stamp = rospy.Time.now()
         ff_msg.header.frame_id = frame_id
@@ -347,16 +346,15 @@ class BeetleInterface(object):
         self.external_wrench_active = True
         self.current_ff_force = force_list
         self.current_ff_torque = torque_list
-        self.external_ff_wrench_pub.publish(ff_msg)
+        self.desired_ext_wrench_pub.publish(ff_msg)
     
     def clearExternalWrench(self):
         """Clear external wrench application."""
         if self.external_wrench_active:
-            # Publish zero wrench to external_ff_wrench to disable feedforward
             zero_msg = WrenchStamped()
             zero_msg.header.stamp = rospy.Time.now()
             zero_msg.header.frame_id = "world"
-            self.external_ff_wrench_pub.publish(zero_msg)
+            self.desired_ext_wrench_pub.publish(zero_msg)
             self.external_wrench_active = False
     
     def updateExternalWrench(self, force, torque):

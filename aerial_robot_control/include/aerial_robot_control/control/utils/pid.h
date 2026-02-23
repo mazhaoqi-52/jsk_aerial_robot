@@ -53,7 +53,7 @@ namespace aerial_robot_control
       name_(name), result_(0), err_p_(0), err_p_prev_(0), err_i_(0), err_i_prev_(0), err_d_(0),
       target_p_(0), target_d_(0), val_p_(0), val_d_(0),
       p_term_(0), i_term_(0), d_term_(0),
-      i_comp_term_(0)
+      i_comp_term_(0), persistent_ff_term_(0)
     {
       setGains(p_gain, i_gain, d_gain);
       setLimits(limit_sum, limit_p, limit_i, limit_d, limit_err_p, limit_err_i, limit_err_d);
@@ -72,7 +72,7 @@ namespace aerial_robot_control
       i_term_ = clamp(err_i_ * i_gain_, -limit_i_, limit_i_);
       d_term_ = clamp(err_d_ * d_gain_, -limit_d_, limit_d_);
 
-      result_ = clamp(p_term_ + i_term_ + d_term_ + feedforward_term, -limit_sum_, limit_sum_);
+      result_ = clamp(p_term_ + i_term_ + d_term_ + feedforward_term + persistent_ff_term_, -limit_sum_, limit_sum_);
     }
 
     virtual void updateWoVel(const double err_p, const double du, const double feedforward_term = 0)
@@ -87,7 +87,7 @@ namespace aerial_robot_control
       i_term_ = clamp(err_i_ * i_gain_, -limit_i_, limit_i_);
       d_term_ = clamp(err_d_ * d_gain_, -limit_d_, limit_d_);
 
-      result_ = clamp(p_term_ + i_term_ + d_term_ + feedforward_term, -limit_sum_, limit_sum_);
+      result_ = clamp(p_term_ + i_term_ + d_term_ + feedforward_term + persistent_ff_term_, -limit_sum_, limit_sum_);
     }
 
     const double result() const { return result_; }
@@ -99,6 +99,7 @@ namespace aerial_robot_control
       err_p_prev_ = 0;
       result_ = 0;
       i_comp_term_ = 0;
+      persistent_ff_term_ = 0;
     }
 
     const double& getPGain() const { return p_gain_; }
@@ -139,6 +140,8 @@ namespace aerial_robot_control
       setLimitErrD(limit_err_d);
     }
     void setICompTerm(const double i_comp_term){ i_comp_term_ = i_comp_term; }
+    void setPersistentFF(const double ff){ persistent_ff_term_ = ff; }
+    const double& getPersistentFF() const { return persistent_ff_term_; }
     void setErrIRec(const double err_i_rec){ err_i_rec_ = err_i_rec; }
     const double& getErrIRec() const { return err_i_rec_; }
 
@@ -167,6 +170,7 @@ namespace aerial_robot_control
     double target_p_, target_d_;
     double val_p_, val_d_;
     double i_comp_term_;
+    double persistent_ff_term_;
 
   };
 

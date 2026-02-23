@@ -18,18 +18,6 @@ from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav
 from tf.transformations import euler_from_quaternion
 
-# Import TaggedWrench message for ff_inter_wrench feedforward
-try:
-    from beetle.msg import TaggedWrench
-except (ImportError, AttributeError):
-    import genpy
-    class TaggedWrench(genpy.Message):
-        __slots__ = ['index', 'wrench']
-        def __init__(self):
-            self.index = 0
-            self.wrench = WrenchStamped()
-    rospy.logwarn("Using mock TaggedWrench for ff_inter_wrench")
-
 # Add parent paths for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 valve_demo_dir = os.path.join(current_dir, '../valve_rotation_demo')
@@ -63,7 +51,7 @@ INSERTION_DEPTH = 0.0    # Compensated insertion depth (actual ~30mm due to offs
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
 TOWING_DISTANCE = 0.5    # towing distance (0.5m sufficient for validation)
-TOWING_MAX_FORCE = 30.0  # Maximum adaptive force (starts from 0, increases when stalled)
+TOWING_MAX_FORCE = 20.0  # Maximum adaptive force (starts from 0, increases when stalled)
 # Approach height above box top for entering the load area.
 # Default is 50mm. Tune as needed; with box_top_z=0.65m:
 # - offset 0.15 -> approach 0.80m
@@ -126,6 +114,19 @@ class LinearTowingTrajectoryGenerator:
         self.stall_last_check_time = self.start_time
         self.stall_last_check_distance = 0.0
         
+        # Z anti-windup: target Z pre-compensation to prevent I-term buildup
+        # When towing force ramps up, the assembly transiently drops in Z.
+        # Without compensation, the Z PID I-term accumulates during this drop,
+        # then overshoots upward when the assembly recovers.
+        # Strategy: lower target Z proportionally to applied force during ramp,
+        # then after force stabilizes, decay the offset so Z returns to original.
+        self.z_offset = 0.0           # current Z offset applied to target (m)
+        self.z_offset_decay_rate = 0.003  # decay rate (m/s) — ~10s to recover 30mm
+        self.z_force_coupling = 0.0015  # m/N — expected Z drop per N of towing force
+        # At 20N: expected drop = 0.0015 * 20 = 30mm (matches observed initial transient)
+        self.z_offset_decaying = False    # True once force stabilized, decay begins
+        self.z_force_stable_time = None   # time when force first reached max
+        
         rospy.loginfo(f"LinearTowingTrajectory: dir={self.towing_direction}, "
                      f"dist={target_distance}m, vel={target_velocity}m/s, max_force={max_force}N")
     
@@ -174,14 +175,40 @@ class LinearTowingTrajectoryGenerator:
         )
         
         self.target_pos[:2] = self.start_pos[:2] + self.towing_direction[:2] * new_target_distance
-        # Keep Z constant
-        self.target_pos[2] = self.start_pos[2]
+        
+        # Z anti-windup: manage target Z pre-compensation
+        # Phase 1 (force ramping): lower target Z to match expected pitch-induced drop
+        # Phase 2 (force stable >5s): gradually decay offset back to zero
+        force_at_max = (self.current_force >= self.max_force * 0.99)
+        
+        if not self.z_offset_decaying:
+            # Still in tracking phase
+            force_induced_offset = -self.z_force_coupling * self.current_force
+            self.z_offset = force_induced_offset
+            
+            # Check if force has been at max long enough to start decay
+            if force_at_max:
+                if self.z_force_stable_time is None:
+                    self.z_force_stable_time = current_time
+                elif current_time - self.z_force_stable_time > 5.0:
+                    # Force stable for 5s — Z transient should have settled
+                    self.z_offset_decaying = True
+                    rospy.loginfo(f"Z offset decay starting: z_offset={self.z_offset*1000:.1f}mm")
+            else:
+                self.z_force_stable_time = None  # reset if force drops
+        else:
+            # Decay phase: gradually return z_offset to zero
+            if self.z_offset < 0:
+                self.z_offset = min(0.0, self.z_offset + self.z_offset_decay_rate * safe_dt)
+        
+        self.target_pos[2] = self.start_pos[2] + self.z_offset
         
         # Stall detection using sliding window (for abort decision only)
         window_elapsed = current_time - self.stall_last_check_time
         if window_elapsed >= self.stall_window_time:
             window_distance = self.current_distance - self.stall_last_check_distance
             recent_velocity = window_distance / window_elapsed
+            self._recent_velocity = recent_velocity
             self.stall_last_check_time = current_time
             self.stall_last_check_distance = self.current_distance
             
@@ -190,14 +217,21 @@ class LinearTowingTrajectoryGenerator:
             else:
                 self.stall_counter = max(0, self.stall_counter - 1)
         
-        # Adaptive force based on instantaneous progress (per-cycle, fast ramp)
-        actual_velocity = self.current_distance / max(0.1, current_time - self.start_time)
-        if actual_velocity < self.target_velocity * 0.05:
-            # Stalled: +0.5N per cycle = +12.5N/s at 25Hz
-            self.current_force = min(self.max_force, self.current_force + 0.5)
+        # Adaptive force based on recent windowed velocity (not global average)
+        # Use the same sliding window velocity computed above for stall detection.
+        # Between window updates, approximate with global average as fallback.
+        if hasattr(self, '_recent_velocity'):
+            inst_vel = self._recent_velocity
         else:
-            # Moving: decay -0.2N per cycle = -5N/s at 25Hz
+            inst_vel = self.current_distance / max(0.1, current_time - self.start_time)
+        
+        if inst_vel < self.target_velocity * 0.5:
+            # Below 50% target: ramp up +0.5N/cycle = +12.5N/s at 25Hz
+            self.current_force = min(self.max_force, self.current_force + 0.5)
+        elif inst_vel > self.target_velocity * 0.8:
+            # Above 80% target: decay -0.2N/cycle = -5N/s at 25Hz
             self.current_force = max(0.0, self.current_force - 0.2)
+        # Between 50%-80%: hold current force (hysteresis band)
         
         return {
             'current_distance': self.current_distance,
@@ -205,7 +239,8 @@ class LinearTowingTrajectoryGenerator:
             'current_velocity': self.current_velocity,
             'current_force': self.current_force,
             'progress': self.current_distance / self.target_distance,
-            'stall_counter': self.stall_counter
+            'stall_counter': self.stall_counter,
+            'z_offset': self.z_offset
         }
     
     def generate_target_state(self, current_yaw):
@@ -221,10 +256,12 @@ class LinearTowingTrajectoryGenerator:
         # Target velocity in world frame
         target_linear_vel = self.towing_direction * self.current_velocity
         
-        # Force feedforward disabled - evidence shows it has no effect on Z-axis control
-        # Relying purely on velocity control for Z-axis stability
+        # Force feedforward: horizontal force in towing direction
+        # Z: set to 0. C++ LEADER injects body_z directly (bypassing cog_rot)
+        # to avoid pitch-coupling instability where cog_rot cross-couples
+        # large body_x into world_z at non-zero pitch angles.
         target_force = self.towing_direction * self.current_force
-        target_force[2] = 0.0  # Force feedforward disabled (not working in current controller)
+        target_force[2] = 0.0
         
         return {
             'position': self.target_pos.copy(),
@@ -795,21 +832,14 @@ class TowingWithFeedforwardState(TowingStateBase):
             output_keys=['towing_end_position'])
     
     @staticmethod
-    def _clear_feedforward(ff_publishers, ext_ff_publishers, module_ids):
-        """Publish zeros to both ff_inter_wrench and external_ff_wrench for all modules."""
-        rospy.loginfo("Clearing all feedforward (publishing zeros)")
+    def _clear_desired_wrench(desired_wrench_pub):
+        """Publish zero desired_external_wrench to clear feedforward."""
+        rospy.loginfo("Clearing desired external wrench (publishing zeros)")
+        zero_msg = WrenchStamped()
+        zero_msg.header.frame_id = "body"
         for _ in range(10):
-            for mid in module_ids:
-                ff_msg = TaggedWrench()
-                ff_msg.index = mid
-                ff_msg.wrench.header.stamp = rospy.Time.now()
-                ff_msg.wrench.header.frame_id = "fc"
-                ff_publishers[mid].publish(ff_msg)
-                
-                ext_msg = WrenchStamped()
-                ext_msg.header.stamp = rospy.Time.now()
-                ext_msg.header.frame_id = "fc"
-                ext_ff_publishers[mid].publish(ext_msg)
+            zero_msg.header.stamp = rospy.Time.now()
+            desired_wrench_pub.publish(zero_msg)
             rospy.sleep(0.04)
     
     def execute(self, userdata):
@@ -825,29 +855,22 @@ class TowingWithFeedforwardState(TowingStateBase):
         rospy.loginfo(f"Towing direction: {towing_dir}")
         rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
         
-        # ---- ff_inter_wrench feedforward setup ----
-        # Publish to /beetle{id}/ff_inter_wrench to inform C++ wrench_comp that
-        # internal forces during towing are EXPECTED and should not be compensated.
-        # This prevents wrench_comp from injecting drag-coupled Z-bias into Z-PID I-term.
-        #
-        # Topology (auto-detected, no hardcoding):
-        #   C++ leader = sorted(assembled_ids)[middle] (e.g., module 2 for [1,2,3])
-        #   Section 3.1 uses ff[i] for modules LEFT of C++ leader
-        #   Section 3.2 uses ff[left_module_id] for modules RIGHT of C++ leader
-        #   We publish ff for ALL module IDs — unused indices are harmless.
+        # ---- Desired external wrench feedforward setup ----
+        # Publish to /beetle{leader}/desired_external_wrench to specify the total
+        # external force the assembly should produce. C++ auto-distributes to
+        # per-module ff_inter_wrench_list_ for wrench_comp feedforward.
         #
         # Force value = trajectory_gen.current_force (adaptive: starts 0, ramps up on stall)
-        # Direction = body +X (towing direction in body frame, Z=0 to avoid Z-drift)
+        # Direction = body frame towing direction (Z=0 to avoid Z-drift)
         
         module_ids = self.formation_adapter.module_ids
-        ff_publishers = {}
-        ext_ff_publishers = {}
-        for mid in module_ids:
-            ff_publishers[mid] = rospy.Publisher(f'/beetle{mid}/ff_inter_wrench', TaggedWrench, queue_size=1)
-            ext_ff_publishers[mid] = rospy.Publisher(f'/beetle{mid}/external_ff_wrench', WrenchStamped, queue_size=1)
+        sorted_ids = sorted(module_ids)
+        leader_id = sorted_ids[len(sorted_ids) // 2]
+        desired_wrench_pub = rospy.Publisher(
+            f'/beetle{leader_id}/desired_external_wrench', WrenchStamped, queue_size=1)
         rospy.sleep(0.3)  # Allow publisher registration
         
-        rospy.loginfo(f"Feedforward publishers created for modules {module_ids}")
+        rospy.loginfo(f"Desired external wrench publisher created for leader {leader_id}")
         
         trajectory_gen = LinearTowingTrajectoryGenerator(
             start_pos=start_pos,
@@ -906,13 +929,13 @@ class TowingWithFeedforwardState(TowingStateBase):
             if state_info['stall_counter'] >= STALL_TIMEOUT_COUNT:
                 rospy.logwarn(f"Towing aborted: stalled for {state_info['stall_counter']} "
                              f"consecutive windows ({state_info['stall_counter']*5}s no progress)")
-                self._clear_feedforward(ff_publishers, ext_ff_publishers, module_ids)
+                self._clear_desired_wrench(desired_wrench_pub)
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
             if elapsed > ABSOLUTE_MAX_TIME:
                 rospy.logwarn(f"Towing absolute timeout after {elapsed:.1f}s")
-                self._clear_feedforward(ff_publishers, ext_ff_publishers, module_ids)
+                self._clear_desired_wrench(desired_wrench_pub)
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
@@ -929,8 +952,11 @@ class TowingWithFeedforwardState(TowingStateBase):
                 rpy_result = self.beetle.getAssemblyRPY()
                 pitch_deg = np.degrees(rpy_result[1]) if rpy_result is not None else 0.0
                 raw_z_err = target_state['position'][2] - current_pos[2]
+                z_comp = target_state['force'][2]
+                z_offset = state_info.get('z_offset', 0.0)
                 rospy.loginfo(f"[Towing Debug] target_pos={target_state['position']}, "
-                             f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f}°")
+                             f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f}°, "
+                             f"z_comp={z_comp:.3f}N, z_offset={z_offset*1000:.1f}mm")
             
             self.send_assembly_command_from_end_effector(
                 target_state['position'],
@@ -938,51 +964,41 @@ class TowingWithFeedforwardState(TowingStateBase):
                 linear_vel=target_state['linear_velocity']
             )
             
-            # ---- Publish feedforward to both channels ----
-            # 1) ff_inter_wrench: tells wrench_comp not to compensate towing forces
-            # 2) external_ff_wrench: injects actual force into I_reconfig_acc → PID I-term
-            ff_force_magnitude = state_info['current_force']
+            # ---- Publish desired external wrench (total force for assembly) ----
+            # C++ auto-distributes to per-module ff_inter for wrench_comp.
+            # target_state['force'] is in world frame: [fx, fy, fz]
+            # Rotate XY to body frame; Z passes through (yaw rotation doesn't affect Z)
+            ff_world = target_state['force']
             assembly_yaw = self.get_assembly_yaw() or maintain_yaw
             cos_y = math.cos(assembly_yaw)
             sin_y = math.sin(assembly_yaw)
-            # World→body rotation (inverse yaw): body_x = cos*world_x + sin*world_y
-            ff_body_x = ff_force_magnitude * ( cos_y * towing_dir[0] + sin_y * towing_dir[1])
-            ff_body_y = ff_force_magnitude * (-sin_y * towing_dir[0] + cos_y * towing_dir[1])
-            for mid in module_ids:
-                # Channel 1: ff_inter_wrench (wrench_comp cancellation)
-                ff_msg = TaggedWrench()
-                ff_msg.index = mid
-                ff_msg.wrench.header.stamp = rospy.Time.now()
-                ff_msg.wrench.header.frame_id = "fc"
-                ff_msg.wrench.wrench.force.x = ff_body_x
-                ff_msg.wrench.wrench.force.y = ff_body_y
-                ff_msg.wrench.wrench.force.z = 0.0
-                ff_publishers[mid].publish(ff_msg)
-                
-                # Channel 2: external_ff_wrench (actual force injection into PID I-term)
-                ext_msg = WrenchStamped()
-                ext_msg.header.stamp = rospy.Time.now()
-                ext_msg.header.frame_id = "fc"
-                ext_msg.wrench.force.x = ff_body_x
-                ext_msg.wrench.force.y = ff_body_y
-                ext_msg.wrench.force.z = 0.0
-                ext_ff_publishers[mid].publish(ext_msg)
+            ff_body_x =  cos_y * ff_world[0] + sin_y * ff_world[1]
+            ff_body_y = -sin_y * ff_world[0] + cos_y * ff_world[1]
+            ff_body_z = ff_world[2]
+            
+            ff_msg = WrenchStamped()
+            ff_msg.header.stamp = rospy.Time.now()
+            ff_msg.header.frame_id = "body"
+            ff_msg.wrench.force.x = ff_body_x
+            ff_msg.wrench.force.y = ff_body_y
+            ff_msg.wrench.force.z = ff_body_z
+            desired_wrench_pub.publish(ff_msg)
             
             # Debug: log ff force and progress every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
-                rospy.loginfo(f"[Towing FF] ff_body=({ff_body_x:.2f},{ff_body_y:.2f})N, "
-                             f"mag={ff_force_magnitude:.2f}N, progress={state_info['progress']*100:.1f}%")
+                rospy.loginfo(f"[Towing FF] ff_body=({ff_body_x:.2f},{ff_body_y:.2f},{ff_body_z:.2f})N, "
+                             f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%")
             
             # Log progress every 5s
             if int(elapsed) % 5 == 0 and int(elapsed * 10) % 50 == 0:
                 rospy.loginfo(f"Towing: {state_info['progress']*100:.1f}%, "
                              f"dist={state_info['current_distance']*1000:.0f}mm, "
-                             f"ff={ff_force_magnitude:.1f}N, time={elapsed:.1f}s")
+                             f"ff={state_info['current_force']:.1f}N, time={elapsed:.1f}s")
             
             control_rate.sleep()
         
-        # ---- Clear all feedforward after towing completes ----
-        self._clear_feedforward(ff_publishers, ext_ff_publishers, module_ids)
+        # ---- Clear feedforward after towing completes ----
+        self._clear_desired_wrench(desired_wrench_pub)
         
         # Ensure pitch compensation stays disabled (already disabled, but defensive)
         self.formation_adapter.set_pitch_compensation(False)

@@ -9,8 +9,7 @@ namespace aerial_robot_control
     pd_wrench_comp_mode_(false),
     pre_module_state_(SEPARATED),
     des_wrench_pub_flag_(false),
-    valve_rotation_ff_enabled_(false),
-    external_force_feedforward_(Eigen::VectorXd::Zero(6))
+    desired_external_wrench_(Eigen::VectorXd::Zero(6))
   {
   }
 
@@ -60,8 +59,7 @@ namespace aerial_robot_control
     wrench_comp_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("debug/wrench_comp/pid", 1);
     des_inter_wrench_pub_ = nh_.advertise<beetle::TaggedWrenches>("des_inter_wnrech", 1);
     formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("formation_wrench_debug", 1);
-    feedforward_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("feedforward_wrench", 1);
-    external_ff_wrench_sub_ = nh_.subscribe("external_ff_wrench", 1, &BeetleController::externalFfWrenchCallback, this);
+    desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
@@ -72,6 +70,8 @@ namespace aerial_robot_control
       wrench_comp_list_.insert(make_pair(i+1, wrench));
       ff_inter_wrench_list_.insert(make_pair(i+1, wrench));
       ff_inter_wrench_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/ff_inter_wrench"), 1, &BeetleController::ffInterWrenchCallback, this)));
+      ff_inter_wrench_pubs_[i+1] = nh_.advertise<beetle::TaggedWrench>(module_name + string("/ff_inter_wrench"), 1);
+      desired_ext_wrench_pubs_[i+1] = nh_.advertise<geometry_msgs::WrenchStamped>(module_name + string("/desired_external_wrench"), 1);
     }
     pid_controllers_.push_back(PID("f_x", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
     pid_controllers_.push_back(PID("f_y", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
@@ -148,16 +148,22 @@ namespace aerial_robot_control
       wrench_comp_term.head(3) = cog_rot * wrench_comp_term.head(3); // regarding world
 
       /* current version: I term reconfig mehod */
+      /* wrench_comp already includes ff_inter (feedforward) + inter (observer estimate),
+         so no separate desired_external_wrench_ injection needed here — that would double-count. */
       Eigen::VectorXd I_reconfig_acc_cog_term = Eigen::VectorXd::Zero(6);
       I_reconfig_acc_cog_term.head(3) = mass_inv * wrench_comp_term.head(3);
       I_reconfig_acc_cog_term.tail(3) = inertia_inv * wrench_comp_term.tail(3); //inavailable
-      
-      // Add feedforward compensation for external forces (e.g., valve rotation)
-      if(valve_rotation_ff_enabled_) {
-        Eigen::VectorXd ff_acc_term = Eigen::VectorXd::Zero(6);
-        ff_acc_term.head(3) = mass_inv * external_force_feedforward_.head(3);
-        ff_acc_term.tail(3) = inertia_inv * external_force_feedforward_.tail(3);
-        I_reconfig_acc_cog_term += ff_acc_term;
+
+      // Debug: log wrench_comp breakdown (throttled to 2Hz)
+      if(desired_external_wrench_.norm() > 1e-6) {
+        ROS_INFO_THROTTLE(0.5, "[FF Debug] id=%d, des_ext_wrench=(%.2f,%.2f,%.2f), "
+          "wrench_comp_cog=(%.2f,%.2f,%.2f), wrench_comp_world=(%.2f,%.2f,%.2f), "
+          "I_reconfig=(%.3f,%.3f,%.3f)",
+          my_id,
+          desired_external_wrench_(0), desired_external_wrench_(1), desired_external_wrench_(2),
+          wrench_comp_term_cog(0), wrench_comp_term_cog(1), wrench_comp_term_cog(2),
+          wrench_comp_term(0), wrench_comp_term(1), wrench_comp_term(2),
+          I_reconfig_acc_cog_term(0), I_reconfig_acc_cog_term(1), I_reconfig_acc_cog_term(2));
       }
 
       double IGain_Fx = pid_controllers_.at(X).getIGain();
@@ -190,12 +196,26 @@ namespace aerial_robot_control
       I_comp_Ty_ = pid_controllers_.at(TY).result();
       I_comp_Tz_ = pid_controllers_.at(TZ).result();
 
-      pid_controllers_.at(X).setICompTerm(I_comp_Fx_);
-      pid_controllers_.at(Y).setICompTerm(I_comp_Fy_);
+      // X/Y: inject wrench_comp acceleration as persistent feedforward on position PID
+      // Uses setPersistentFF to avoid race condition with nav callback clearing target_acc_
+      pid_controllers_.at(X).setPersistentFF(I_reconfig_acc_cog_term(0));
+      pid_controllers_.at(Y).setPersistentFF(I_reconfig_acc_cog_term(1));
+      pid_controllers_.at(X).setICompTerm(0.0);
+      pid_controllers_.at(Y).setICompTerm(0.0);
+      // Z and torque: keep original ICompTerm path
       pid_controllers_.at(Z).setICompTerm(I_comp_Fz_);
       pid_controllers_.at(ROLL).setICompTerm(I_comp_Tx_);
       pid_controllers_.at(PITCH).setICompTerm(I_comp_Ty_);
       pid_controllers_.at(YAW).setICompTerm(I_comp_Tz_);
+
+      // Debug: log feedforward injection values (throttled to 2Hz)
+      if(desired_external_wrench_.norm() > 1e-6) {
+        ROS_INFO_THROTTLE(0.5, "[FF PID] id=%d, ff_acc=(%.3f,%.3f), I_comp_z=%.3f, "
+          "FX_pid: p=%.3f i=%.3f d=%.3f, FY_pid: p=%.3f i=%.3f d=%.3f",
+          my_id, I_reconfig_acc_cog_term(0), I_reconfig_acc_cog_term(1), I_comp_Fz_,
+          pid_controllers_.at(FX).getPTerm(), pid_controllers_.at(FX).getITerm(), pid_controllers_.at(FX).getDTerm(),
+          pid_controllers_.at(FY).getPTerm(), pid_controllers_.at(FY).getITerm(), pid_controllers_.at(FY).getDTerm());
+      }
       
       geometry_msgs::WrenchStamped wrench_msg;
       wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
@@ -275,15 +295,74 @@ namespace aerial_robot_control
       pid_controllers_.at(TX).reset();
       pid_controllers_.at(TY).reset();
       pid_controllers_.at(TZ).reset();
+
+      // LEADER feedforward: inject desired_external_wrench_ as persistent FF on position PID
+      // Uses setPersistentFF to avoid race condition with nav callback clearing target_acc_
+      if(module_state == LEADER && desired_external_wrench_.norm() > 1e-6) {
+        Eigen::Matrix3d cog_rot;
+        tf::matrixTFToEigen(estimator_->getOrientation(Frame::COG, estimate_mode_), cog_rot);
+        // desired_external_wrench_ is in body frame, rotate to world frame
+        Eigen::Vector3d ff_world = cog_rot * desired_external_wrench_.head(3);
+        // convert force to acceleration
+        Eigen::Vector3d ff_acc = mass_inv * ff_world;
+        // X/Y: persistent feedforward (avoids race condition with nav callback)
+        pid_controllers_.at(X).setPersistentFF(ff_acc(0));
+        pid_controllers_.at(Y).setPersistentFF(ff_acc(1));
+        // Z: inject body_z directly as persistent FF, skip cog_rot to avoid
+        // pitch-coupling instability. Uses setPersistentFF (not setICompTerm)
+        // because ICompTerm accumulates in the I-term integrator, causing
+        // Z drift runaway even with small constant values.
+        double ff_z_direct = mass_inv * desired_external_wrench_(2);
+        pid_controllers_.at(Z).setPersistentFF(ff_z_direct);
+      } else {
+        pid_controllers_.at(X).setPersistentFF(0.0);
+        pid_controllers_.at(Y).setPersistentFF(0.0);
+        pid_controllers_.at(Z).setPersistentFF(0.0);
+      }
       pid_controllers_.at(X).setICompTerm(0.0);
       pid_controllers_.at(Y).setICompTerm(0.0);
-      pid_controllers_.at(Z).setICompTerm(0.0);
+      pid_controllers_.at(Z).setICompTerm(0.0);  // LEADER Z uses PersistentFF, keep ICompTerm zeroed
       pid_controllers_.at(ROLL).setICompTerm(0.0);
       pid_controllers_.at(PITCH).setICompTerm(0.0);
       pid_controllers_.at(YAW).setICompTerm(0.0);
     }
       
     GimbalrotorController::controlCore();
+
+    // Debug: log LEADER position PID output when towing is active
+    if(module_state == LEADER && desired_external_wrench_.norm() > 1e-6) {
+      Eigen::Matrix3d cog_rot_dbg;
+      tf::matrixTFToEigen(estimator_->getOrientation(Frame::COG, estimate_mode_), cog_rot_dbg);
+      Eigen::Vector3d ff_w_dbg = cog_rot_dbg * desired_external_wrench_.head(3);
+      Eigen::Vector3d ff_a_dbg = mass_inv * ff_w_dbg;
+      ROS_INFO_THROTTLE(0.5, "[LEADER PID] id=%d, ff_acc=(%.3f,%.3f), X: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, "
+        "Y: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, Z: p=%.3f i=%.3f d=%.3f ff_z=%.3f sum=%.3f",
+        my_id, ff_a_dbg(0), ff_a_dbg(1),
+        pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(),
+        pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).getPersistentFF(),
+        pid_controllers_.at(X).result(),
+        pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(),
+        pid_controllers_.at(Y).getDTerm(), pid_controllers_.at(Y).getPersistentFF(),
+        pid_controllers_.at(Y).result(),
+        pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
+        pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).getPersistentFF(),
+        pid_controllers_.at(Z).result());
+    }
+    // Debug: log FOLLOWER position PID output when wrench_comp feedforward is active
+    if(module_state != LEADER && module_state != SEPARATED && desired_external_wrench_.norm() > 1e-6) {
+      ROS_INFO_THROTTLE(0.5, "[FOLLOWER PID] id=%d, X: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, "
+        "Y: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, Z: p=%.3f i=%.3f sum=%.3f",
+        my_id,
+        pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(),
+        pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).getPersistentFF(),
+        pid_controllers_.at(X).result(),
+        pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(),
+        pid_controllers_.at(Y).getDTerm(), pid_controllers_.at(Y).getPersistentFF(),
+        pid_controllers_.at(Y).result(),
+        pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
+        pid_controllers_.at(Z).result());
+    }
+
     pre_module_state_ = module_state;
     
   }
@@ -303,6 +382,8 @@ namespace aerial_robot_control
     pid_controllers_.at(ROLL).setICompTerm(0.0);
     pid_controllers_.at(PITCH).setICompTerm(0.0);
     pid_controllers_.at(YAW).setICompTerm(0.0);
+    pid_controllers_.at(X).setPersistentFF(0.0);
+    pid_controllers_.at(Y).setPersistentFF(0.0);
   }
 
   void BeetleController::calcInteractionWrench()
@@ -379,6 +460,16 @@ namespace aerial_robot_control
       }else{
         wrench_comp_list_[i] = Eigen::VectorXd::Zero(6);
       }
+    }
+
+    // Debug: log ff_inter and wrench_comp for this module (throttled to 2Hz)
+    if(desired_external_wrench_.norm() > 1e-6) {
+      ROS_INFO_THROTTLE(0.5, "[WrenchComp Debug] id=%d, ff_inter[%d]=(%.3f,%.3f,%.3f), "
+        "inter[%d]=(%.3f,%.3f,%.3f), wrench_comp[%d]=(%.3f,%.3f,%.3f)",
+        my_id,
+        my_id, ff_inter_wrench_list_[my_id](0), ff_inter_wrench_list_[my_id](1), ff_inter_wrench_list_[my_id](2),
+        my_id, inter_wrench_list_[my_id](0), inter_wrench_list_[my_id](1), inter_wrench_list_[my_id](2),
+        my_id, wrench_comp_list_[my_id](0), wrench_comp_list_[my_id](1), wrench_comp_list_[my_id](2));
     }
   }
   void BeetleController::rosParamInit()
@@ -512,36 +603,123 @@ namespace aerial_robot_control
     ff_inter_wrench_list_[id] = wrench;
   }
 
-  void BeetleController::setExternalForceFeedforward(const Eigen::VectorXd& ff_wrench)
+  void BeetleController::desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg)
   {
-    external_force_feedforward_ = ff_wrench;
-    
-    // Publish feedforward wrench for debugging
-    geometry_msgs::WrenchStamped ff_wrench_msg;
-    ff_wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
-    ff_wrench_msg.wrench.force.x = ff_wrench(0);
-    ff_wrench_msg.wrench.force.y = ff_wrench(1);
-    ff_wrench_msg.wrench.force.z = ff_wrench(2);
-    ff_wrench_msg.wrench.torque.x = ff_wrench(3);
-    ff_wrench_msg.wrench.torque.y = ff_wrench(4);
-    ff_wrench_msg.wrench.torque.z = ff_wrench(5);
-    
-    if(feedforward_wrench_pub_.getNumSubscribers() > 0) {
-      feedforward_wrench_pub_.publish(ff_wrench_msg);
-    }
-  }
+    // Receive desired total external wrench for the whole assembly (body frame),
+    // then distribute to per-module ff_inter_wrench via ROS topics so that
+    // every module's ffInterWrenchCallback updates its local ff_inter_wrench_list_.
+    //
+    // Force distribution strategy:
+    //   F_total is split equally among ALL assembled modules (N_total).
+    //   - LEADER: gets share via desired_external_wrench_ -> setPersistentFF in else branch
+    //   - FOLLOWERs: get share via ff_inter_wrench_list_ -> wrench_comp -> setPersistentFF
+    //
+    // ff_inter mapping (after calcInteractionWrench sign fix):
+    //   3.1 (i < leader): wrench_comp[i] = -ff_inter[i] + inter[i]
+    //        To drive FOLLOWER i with +F_share: need -ff_inter[i] = F_share => ff_inter[i] = -F_share
+    //   3.2 (i > leader): wrench_comp[i] = ff_inter[left] - inter[left]
+    //        To drive FOLLOWER i with +F_share: need ff_inter[left] = F_share
 
-  void BeetleController::externalFfWrenchCallback(const geometry_msgs::WrenchStamped & msg)
-  {
-    Eigen::VectorXd wrench = Eigen::VectorXd::Zero(6);
-    wrench(0) = msg.wrench.force.x;
-    wrench(1) = msg.wrench.force.y;
-    wrench(2) = msg.wrench.force.z;
-    wrench(3) = msg.wrench.torque.x;
-    wrench(4) = msg.wrench.torque.y;
-    wrench(5) = msg.wrench.torque.z;
-    external_force_feedforward_ = wrench;
-    valve_rotation_ff_enabled_ = (wrench.norm() > 1e-6);
+    Eigen::VectorXd desired = Eigen::VectorXd::Zero(6);
+    desired(0) = msg.wrench.force.x;
+    desired(1) = msg.wrench.force.y;
+    desired(2) = msg.wrench.force.z;
+    desired(3) = msg.wrench.torque.x;
+    desired(4) = msg.wrench.torque.y;
+    desired(5) = msg.wrench.torque.z;
+
+    // Only LEADER distributes; FOLLOWERs just store their share and return
+    if(beetle_navigator_->getModuleState() != LEADER) {
+      // FOLLOWERs receive their share via desired_ext_wrench_pubs_ (set below)
+      desired_external_wrench_ = desired;
+      return;
+    }
+
+    std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
+    int leader_id = beetle_navigator_->getLeaderID();
+
+    // Count ALL assembled modules (including leader)
+    int total_count = 0;
+    for(const auto & item : assembly_flag) {
+      if(item.second) total_count++;
+    }
+    if(total_count == 0) return;
+
+    Eigen::VectorXd share = desired / total_count;
+
+    // LEADER stores its own share (not full desired!)
+    desired_external_wrench_ = share;
+
+    // Build per-module ff_inter values based on the derivation:
+    //   For module i < leader: ff_inter[i] = -share  (so wrench_comp[i] = share when inter=0)
+    //   For module i > leader: ff_inter[left_of_i] = share  (so wrench_comp[i] = share when inter=0)
+    std::map<int, Eigen::VectorXd> ff_values;
+    for(const auto & item : assembly_flag) {
+      if(!item.second) continue;
+      int id = item.first;
+      if(id < leader_id) {
+        // Section 3.1: wrench_comp[i] = -ff_inter[i] + inter[i]
+        // Want wrench_comp[i] = share => ff_inter[i] = -share
+        ff_values[id] = -share;
+      } else if(id > leader_id) {
+        // Section 3.2: wrench_comp[i] = ff_inter[left] - inter[left]
+        // Want wrench_comp[i] = share => ff_inter[left] = share
+        int left_id = leader_id;
+        for(int j = id - 1; j >= 1; j--) {
+          if(assembly_flag.count(j) && assembly_flag.at(j)) {
+            left_id = j;
+            break;
+          }
+        }
+        ff_values[left_id] = share;
+      }
+    }
+
+    // Publish ff_inter via ROS topics so all modules receive the update
+    ros::Time stamp = msg.header.stamp;
+    for(const auto & kv : ff_values) {
+      beetle::TaggedWrench tw;
+      tw.index = kv.first;
+      tw.wrench.header.stamp = stamp;
+      tw.wrench.wrench.force.x = kv.second(0);
+      tw.wrench.wrench.force.y = kv.second(1);
+      tw.wrench.wrench.force.z = kv.second(2);
+      tw.wrench.wrench.torque.x = kv.second(3);
+      tw.wrench.wrench.torque.y = kv.second(4);
+      tw.wrench.wrench.torque.z = kv.second(5);
+      if(ff_inter_wrench_pubs_.count(kv.first))
+        ff_inter_wrench_pubs_[kv.first].publish(tw);
+    }
+
+    // Publish zeros for assembled modules not in ff_values (e.g., leader itself, or modules
+    // whose ff_inter was not explicitly set)
+    for(const auto & item : assembly_flag) {
+      if(!item.second) continue;
+      if(ff_values.count(item.first)) continue;
+      beetle::TaggedWrench tw;
+      tw.index = item.first;
+      tw.wrench.header.stamp = stamp;
+      // wrench fields default to 0
+      if(ff_inter_wrench_pubs_.count(item.first))
+        ff_inter_wrench_pubs_[item.first].publish(tw);
+    }
+
+    // Distribute per-follower share via desired_external_wrench topics
+    // so each FOLLOWER's desired_external_wrench_ gets its share value
+    for(const auto & item : assembly_flag) {
+      if(!item.second) continue;
+      if(item.first == leader_id) continue;  // skip LEADER to avoid cascade
+      if(desired_ext_wrench_pubs_.count(item.first) == 0) continue;
+      geometry_msgs::WrenchStamped fw;
+      fw.header.stamp = stamp;
+      fw.wrench.force.x = share(0);
+      fw.wrench.force.y = share(1);
+      fw.wrench.force.z = share(2);
+      fw.wrench.torque.x = share(3);
+      fw.wrench.torque.y = share(4);
+      fw.wrench.torque.z = share(5);
+      desired_ext_wrench_pubs_[item.first].publish(fw);
+    }
   }
 
   void BeetleController::calcUnifiedRotorControl()
@@ -569,9 +747,9 @@ namespace aerial_robot_control
       total_wrench_demand.tail(3) = formation_inertia * target_wrench_acc_cog.tail(3);
     }
     
-    // Add feedforward compensation for valve rotation if enabled
-    if(valve_rotation_ff_enabled_) {
-      total_wrench_demand += external_force_feedforward_;
+    // Add feedforward compensation for desired external wrench
+    if(desired_external_wrench_.norm() > 1e-6) {
+      total_wrench_demand += desired_external_wrench_;
     }
     
     // Distribute wrench among all rotors in the formation

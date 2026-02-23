@@ -34,16 +34,14 @@ namespace aerial_robot_control
                     ) override;
     void setFfInterWrench(int id, Eigen::VectorXd des_int_wrench){ff_inter_wrench_list_[id] = des_int_wrench;}
     
-    // Feedforward external force compensation for valve rotation
-    void setExternalForceFeedforward(const Eigen::VectorXd& ff_wrench);
-    void enableValveRotationFeedforward(bool enable) { valve_rotation_ff_enabled_ = enable; }
-    
   private:
     boost::shared_ptr<BeetleRobotModel> beetle_robot_model_;
     boost::shared_ptr<aerial_robot_navigation::BeetleNavigator> beetle_navigator_;
     
     map<string, ros::Subscriber> ff_inter_wrench_subs_;
-    ros::Subscriber external_ff_wrench_sub_;
+    map<int, ros::Publisher> ff_inter_wrench_pubs_;
+    map<int, ros::Publisher> desired_ext_wrench_pubs_;
+    ros::Subscriber desired_ext_wrench_sub_;
 
     aerial_robot_msgs::PoseControlPid wrench_pid_msg_;
 
@@ -66,10 +64,8 @@ namespace aerial_robot_control
 
     bool des_wrench_pub_flag_;
 
-    // Feedforward control for external forces during valve rotation
-    bool valve_rotation_ff_enabled_;
-    Eigen::VectorXd external_force_feedforward_;
-    ros::Publisher feedforward_wrench_pub_;
+    // Desired external wrench for the whole assembly (body frame)
+    Eigen::VectorXd desired_external_wrench_;
 
     double comp_term_update_freq_;
     double prev_comp_update_time_;
@@ -113,7 +109,7 @@ namespace aerial_robot_control
     void controlCore() override;
     
     virtual void ffInterWrenchCallback(const beetle::TaggedWrench & msg);
-    void externalFfWrenchCallback(const geometry_msgs::WrenchStamped & msg);
+    void desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg);
     void rosParamInit() override;
     void externalWrenchEstimate() override;
     void reset() override;

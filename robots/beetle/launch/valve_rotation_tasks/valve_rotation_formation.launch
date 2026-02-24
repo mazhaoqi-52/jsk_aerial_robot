@@ -20,6 +20,9 @@
   <!-- Debug mode -->
   <arg name="debug" default="false" />
   
+  <!-- Unified control mode: LEADER allocates for all N*4 rotors -->
+  <arg name="unified_control_mode" default="false" />
+  
   <!-- Include valve position setup -->
   <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
     <arg name="real_machine" value="$(arg real_machine)" />
@@ -33,7 +36,13 @@
   </include>
   
   <!-- Controller parameters for formation valve rotation -->
-  <param name="controller/unified_control_mode" value="false" />
+  <!-- Set unified_control_mode for each module namespace -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 0)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[0].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
+  </group>
+  <group if="$(eval len(arg('module_ids').split(',')) > 1)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[1].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
+  </group>
   <param name="controller/valve_rotation_feedforward/enabled" value="true" />
   <param name="controller/valve_rotation_feedforward/force_z" value="-5.0" />
   <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />

@@ -71,6 +71,7 @@ namespace aerial_robot_navigation
     std::map<int, bool> getAssemblyFlags(){return assembly_flags_;}
     std::vector<int> getAssemblyIds(){return assembled_modules_ids_;}
     int getMaxModuleNum(){return max_modules_num_;}
+    tf2_ros::Buffer& getTfBuffer(){return tfBuffer_;}
 
     virtual void calcCenterOfMoving();  
 

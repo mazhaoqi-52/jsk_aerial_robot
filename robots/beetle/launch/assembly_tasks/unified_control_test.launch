@@ -1,0 +1,44 @@
+<launch>
+  <!-- Unified control mode test: launch N modules and enable unified allocation.
+       Uses n_module_test.launch to spawn beetles, then sets unified_control_mode=true
+       for each module via rosparam. -->
+
+  <arg name="module_ids" default="1,2,3" />
+  <arg name="dx" default="1.0" />
+  <arg name="spawn_y" default="0.0" />
+  <arg name="spawn_yaw" default="0.0" />
+  <arg name="center_formation" default="true" />
+  <arg name="base_x" default="0.0" />
+  <arg name="headless" default="true" />
+
+  <!-- Spawn the modules using existing n_module_test launch -->
+  <include file="$(find beetle)/launch/assembly_tasks/n_module_test.launch">
+    <arg name="module_ids" value="$(arg module_ids)" />
+    <arg name="dx" value="$(arg dx)" />
+    <arg name="spawn_y" value="$(arg spawn_y)" />
+    <arg name="spawn_yaw" value="$(arg spawn_yaw)" />
+    <arg name="center_formation" value="$(arg center_formation)" />
+    <arg name="base_x" value="$(arg base_x)" />
+    <arg name="headless" value="$(arg headless)" />
+  </include>
+
+  <!-- Enable unified_control_mode for each module.
+       This overrides the default=false from BeetleControl_sim.yaml.
+       The parameter is read each control loop in controlCore(). -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 0)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[0].strip())/controller/unified_control_mode" value="true" />
+  </group>
+  <group if="$(eval len(arg('module_ids').split(',')) > 1)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[1].strip())/controller/unified_control_mode" value="true" />
+  </group>
+  <group if="$(eval len(arg('module_ids').split(',')) > 2)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[2].strip())/controller/unified_control_mode" value="true" />
+  </group>
+  <group if="$(eval len(arg('module_ids').split(',')) > 3)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[3].strip())/controller/unified_control_mode" value="true" />
+  </group>
+  <group if="$(eval len(arg('module_ids').split(',')) > 4)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[4].strip())/controller/unified_control_mode" value="true" />
+  </group>
+
+</launch>

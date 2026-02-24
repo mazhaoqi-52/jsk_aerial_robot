@@ -10,6 +10,7 @@ controller:
   wrench_estimate_flag: true
   # wrench_estimate_flag: false
   comp_term_update_freq: 40
+  unified_control_mode: false
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

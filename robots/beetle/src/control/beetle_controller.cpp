@@ -1,4 +1,5 @@
 #include <beetle/control/beetle_controller.h>
+#include <sstream>
 
 using namespace std;
 
@@ -9,7 +10,11 @@ namespace aerial_robot_control
     pd_wrench_comp_mode_(false),
     pre_module_state_(SEPARATED),
     des_wrench_pub_flag_(false),
-    desired_external_wrench_(Eigen::VectorXd::Zero(6))
+    desired_external_wrench_(Eigen::VectorXd::Zero(6)),
+    unified_control_mode_(false),
+    prev_unified_control_mode_(false),
+    unified_cmd_received_(false),
+    spinal_gains_zeroed_(false)
   {
   }
 
@@ -58,7 +63,6 @@ namespace aerial_robot_control
     internal_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("internal_wrench", 1);
     wrench_comp_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("debug/wrench_comp/pid", 1);
     des_inter_wrench_pub_ = nh_.advertise<beetle::TaggedWrenches>("des_inter_wnrech", 1);
-    formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("formation_wrench_debug", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
@@ -87,6 +91,22 @@ namespace aerial_robot_control
     pid_reconf_servers_.back()->setCallback(boost::bind(&BeetleController::cfgPidCallback, this, _1, _2, indices));
 
     prev_comp_update_time_ = -1;
+
+    // Initialize unified controller (unified_control_mode_ is read by rosParamInit)
+    unified_controller_ = std::make_shared<BeetleUnifiedController>();
+    unified_controller_->initialize(nh_, beetle_robot_model_, beetle_navigator_, estimator_);
+
+    // FOLLOWER: subscribe to unified commands from LEADER
+    // Topic names match what BeetleUnifiedController::publishCommands() publishes
+    std::string my_ns = std::string("/") + beetle_navigator_->getMyName()
+                        + std::to_string(beetle_navigator_->getMyID());
+    unified_thrust_sub_ = nh_.subscribe(my_ns + "/unified_thrust_cmd", 1,
+                                        &BeetleController::unifiedThrustCallback, this);
+    unified_gimbal_sub_ = nh_.subscribe(my_ns + "/unified_gimbal_cmd", 1,
+                                        &BeetleController::unifiedGimbalCallback, this);
+    // Publishers to this module's own spinal (same topic names as GimbalrotorController)
+    follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
+    follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
   }
 
   void BeetleController::controlCore()
@@ -97,16 +117,192 @@ namespace aerial_robot_control
     bool comp_update_flag = false;
     double comp_update_interval = 1  / comp_term_update_freq_;
     
-    // Check if unified control mode is enabled for multi-rotor formation
-    bool unified_control_mode = false;
-    ros::param::get("controller/unified_control_mode", unified_control_mode);
+    // Check unified control mode from rosparam (allows runtime toggle)
+    ros::NodeHandle control_nh(nh_, "controller");
+    control_nh.getParam("unified_control_mode", unified_control_mode_);
     
-    if(unified_control_mode && module_state != SEPARATED && module_state == LEADER){
-      // Unified 4n-rotor control mode for formation
-      calcUnifiedRotorControl();
-      comp_update_flag = true;
+    // ======== Unified Control Mode ========
+    // Only LEADER runs the unified allocation for the entire formation.
+    // In this mode, LEADER does NOT call GimbalrotorController::controlCore().
+    // Instead it uses BeetleUnifiedController to allocate across all N*4 rotors.
+    if (unified_control_mode_ && module_state == LEADER && module_state != SEPARATED) {
+      // Detect mode switch: reset pitch/roll I terms and disable spinal's internal PID
+      if (pre_module_state_ != LEADER || !prev_unified_control_mode_) {
+        pid_controllers_.at(ROLL).setErrI(0);
+        pid_controllers_.at(PITCH).setErrI(0);
+        // H2: Disable spinal's internal attitude PID by sending zero gains
+        sendZeroAttitudeGains();
+        spinal_gains_zeroed_ = true;
+        ROS_INFO("[UnifiedCtrl] LEADER mode switch: reset pitch/roll I, zeroed spinal rpy/gain");
+      }
+      prev_unified_control_mode_ = true;
+
+      // Run position/attitude PID (parent of gimbalrotor)
+      PoseLinearController::controlCore();
+
+      // Build target wrench in acc space from PID outputs
+      tf::Matrix3x3 uav_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
+      tf::Vector3 target_acc_w(pid_controllers_.at(X).result(),
+                               pid_controllers_.at(Y).result(),
+                               pid_controllers_.at(Z).result());
+      tf::Vector3 target_acc_cog = uav_rot.inverse() * target_acc_w;
+
+      Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
+      target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
+      target_wrench_acc(3) = pid_controllers_.at(ROLL).result();
+      target_wrench_acc(4) = pid_controllers_.at(PITCH).result();
+      target_wrench_acc(5) = pid_controllers_.at(YAW).result();
+
+      // Store for external wrench estimator (externalWrenchEstimate uses this)
+      setTargetWrenchAccCog(target_wrench_acc);
+
+      // Run unified allocation
+      bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, desired_external_wrench_);
+      if (ok) {
+        // Publish commands to all FOLLOWERs via /beetle{id}/unified_thrust_cmd topics
+        unified_controller_->publishCommands();
+
+        // LEADER must also send its own share to its own spinal.
+        // publishCommands() only writes to /beetle{id}/unified_thrust_cmd,
+        // which FOLLOWERs forward to their four_axes/command.
+        // But LEADER's controlCore doesn't enter the FOLLOWER branch,
+        // so we forward LEADER's own command here directly.
+        int my_id = beetle_navigator_->getMyID();
+        const auto& cmds = unified_controller_->getModuleCommands();
+        auto it = cmds.find(my_id);
+        if (it != cmds.end()) {
+          spinal::FourAxisCommand my_thrust_msg;
+          my_thrust_msg.base_thrust = it->second.full_thrusts;
+          my_thrust_msg.angles[0] = 0;
+          my_thrust_msg.angles[1] = 0;
+          my_thrust_msg.angles[2] = 0;
+          follower_thrust_pub_.publish(my_thrust_msg);
+
+          sensor_msgs::JointState my_gimbal_msg;
+          my_gimbal_msg.header.stamp = ros::Time::now();
+          for (int r = 0; r < (int)it->second.gimbal_angles.size(); r++) {
+            my_gimbal_msg.position.push_back(it->second.gimbal_angles[r]);
+            my_gimbal_msg.name.push_back("gimbal" + std::to_string(r + 1));
+          }
+          follower_gimbal_pub_.publish(my_gimbal_msg);
+        }
+      }
+
+      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER] wrench_acc=(%.3f,%.3f,%.3f,%.3f,%.3f,%.3f), ext=(%.2f,%.2f,%.2f)",
+                        target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
+                        target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
+                        desired_external_wrench_(0), desired_external_wrench_(1), desired_external_wrench_(2));
+
+      // ===== DIAGNOSTIC: PID breakdown =====
+      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] PID_Z: P=%.4f I=%.4f D=%.4f total=%.4f",
+                        pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
+                        pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).result());
+      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] PID_ROLL: P=%.4f I=%.4f D=%.4f total=%.4f",
+                        pid_controllers_.at(ROLL).getPTerm(), pid_controllers_.at(ROLL).getITerm(),
+                        pid_controllers_.at(ROLL).getDTerm(), pid_controllers_.at(ROLL).result());
+      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] PID_PITCH: P=%.4f I=%.4f D=%.4f total=%.4f",
+                        pid_controllers_.at(PITCH).getPTerm(), pid_controllers_.at(PITCH).getITerm(),
+                        pid_controllers_.at(PITCH).getDTerm(), pid_controllers_.at(PITCH).result());
+      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] PID_YAW: P=%.4f I=%.4f D=%.4f total=%.4f",
+                        pid_controllers_.at(YAW).getPTerm(), pid_controllers_.at(YAW).getITerm(),
+                        pid_controllers_.at(YAW).getDTerm(), pid_controllers_.at(YAW).result());
+      {
+        // Log current RPY and target RPY for reference
+        tf::Vector3 rpy_now = estimator_->getEuler(Frame::COG, estimate_mode_);
+        tf::Vector3 target_rpy = navigator_->getTargetRPY();
+        ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] rpy=(%.4f,%.4f,%.4f) target_rpy=(%.4f,%.4f,%.4f)",
+                          rpy_now.x(), rpy_now.y(), rpy_now.z(),
+                          target_rpy.x(), target_rpy.y(), target_rpy.z());
+        tf::Vector3 pos_now = estimator_->getPos(Frame::COG, estimate_mode_);
+        tf::Vector3 target_pos = navigator_->getTargetPos();
+        ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] pos=(%.4f,%.4f,%.4f) target_pos=(%.4f,%.4f,%.4f)",
+                          pos_now.x(), pos_now.y(), pos_now.z(),
+                          target_pos.x(), target_pos.y(), target_pos.z());
+      }
+      // ===== DIAGNOSTIC: per-module commands sent =====
+      if (ok) {
+        const auto& all_cmds = unified_controller_->getModuleCommands();
+        std::stringstream cmd_ss;
+        for (const auto& kv : all_cmds) {
+          std::string thrust_str, gimbal_str;
+          for (size_t r = 0; r < kv.second.full_thrusts.size(); r++) {
+            thrust_str += std::to_string(kv.second.full_thrusts[r]) + " ";
+          }
+          for (size_t r = 0; r < kv.second.gimbal_angles.size(); r++) {
+            gimbal_str += std::to_string(kv.second.gimbal_angles[r] * 180.0 / M_PI) + " ";
+          }
+          char cb[256];
+          snprintf(cb, sizeof(cb), " m%d:T=[%s]g=[%s]", kv.first, thrust_str.c_str(), gimbal_str.c_str());
+          cmd_ss << cb;
+        }
+        ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] module cmds:%s", cmd_ss.str().c_str());
+      }
+
+      pre_module_state_ = module_state;
+      return;  // Skip individual control path entirely
     }
-    else if(beetle_navigator_->getControlFlag() &&
+
+    // ======== Unified Control Mode: FOLLOWER ========
+    // FOLLOWER receives thrust + gimbal commands from LEADER via ROS topics,
+    // then forwards them to its own spinal. No local PID or wrench comp.
+    if (unified_control_mode_ && module_state == FOLLOWER && module_state != SEPARATED) {
+      // H2: Disable spinal's internal attitude PID on first entry
+      if (!spinal_gains_zeroed_) {
+        sendZeroAttitudeGains();
+        spinal_gains_zeroed_ = true;
+        ROS_INFO("[UnifiedCtrl] FOLLOWER id=%d: zeroed spinal rpy/gain", beetle_navigator_->getMyID());
+      }
+      if (unified_cmd_received_) {
+        // Check command freshness (timeout 0.5s)
+        double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
+        if (age < 0.5) {
+          follower_thrust_pub_.publish(unified_thrust_cmd_);
+          follower_gimbal_pub_.publish(unified_gimbal_cmd_);
+
+          // ===== DIAGNOSTIC: FOLLOWER forwarding details =====
+          {
+            std::string thrust_str;
+            for (size_t r = 0; r < unified_thrust_cmd_.base_thrust.size(); r++) {
+              thrust_str += std::to_string(unified_thrust_cmd_.base_thrust[r]) + " ";
+            }
+            std::string gimbal_str;
+            for (size_t r = 0; r < unified_gimbal_cmd_.position.size(); r++) {
+              gimbal_str += std::to_string(unified_gimbal_cmd_.position[r] * 180.0 / M_PI) + "deg ";
+            }
+            std::string name_str;
+            for (size_t r = 0; r < unified_gimbal_cmd_.name.size(); r++) {
+              name_str += unified_gimbal_cmd_.name[r] + " ";
+            }
+            ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER DIAG] id=%d age=%.3fs thrusts=[%s] gimbals=[%s] names=[%s]",
+                              beetle_navigator_->getMyID(), age,
+                              thrust_str.c_str(), gimbal_str.c_str(), name_str.c_str());
+          }
+
+          ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d, forwarding unified commands (age=%.3fs)",
+                             beetle_navigator_->getMyID(), age);
+        } else {
+          ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d, unified command stale (age=%.3fs), skip",
+                            beetle_navigator_->getMyID(), age);
+        }
+      } else {
+        ROS_WARN_THROTTLE(2.0, "[UnifiedCtrl FOLLOWER] id=%d, no unified command received yet",
+                          beetle_navigator_->getMyID());
+      }
+      pre_module_state_ = module_state;
+      return;  // Skip individual control path entirely
+    }
+
+    prev_unified_control_mode_ = false;
+
+    // H2: Restore spinal's attitude gains when exiting unified mode
+    if (spinal_gains_zeroed_) {
+      setAttitudeGains();
+      spinal_gains_zeroed_ = false;
+      ROS_INFO("[UnifiedCtrl] Exiting unified mode, restored spinal rpy/gain (id=%d)",
+               beetle_navigator_->getMyID());
+    }
+    
+    if(beetle_navigator_->getControlFlag() &&
        module_state != SEPARATED){
       calcInteractionWrench();
       comp_update_flag = true;
@@ -310,8 +506,7 @@ namespace aerial_robot_control
         pid_controllers_.at(Y).setPersistentFF(ff_acc(1));
         // Z: inject body_z directly as persistent FF, skip cog_rot to avoid
         // pitch-coupling instability. Uses setPersistentFF (not setICompTerm)
-        // because ICompTerm accumulates in the I-term integrator, causing
-        // Z drift runaway even with small constant values.
+        // because ICompTerm accumulates in the I-term integrator every tick.
         double ff_z_direct = mass_inv * desired_external_wrench_(2);
         pid_controllers_.at(Z).setPersistentFF(ff_z_direct);
       } else {
@@ -321,7 +516,7 @@ namespace aerial_robot_control
       }
       pid_controllers_.at(X).setICompTerm(0.0);
       pid_controllers_.at(Y).setICompTerm(0.0);
-      pid_controllers_.at(Z).setICompTerm(0.0);  // LEADER Z uses PersistentFF, keep ICompTerm zeroed
+      pid_controllers_.at(Z).setICompTerm(0.0);
       pid_controllers_.at(ROLL).setICompTerm(0.0);
       pid_controllers_.at(PITCH).setICompTerm(0.0);
       pid_controllers_.at(YAW).setICompTerm(0.0);
@@ -331,13 +526,9 @@ namespace aerial_robot_control
 
     // Debug: log LEADER position PID output when towing is active
     if(module_state == LEADER && desired_external_wrench_.norm() > 1e-6) {
-      Eigen::Matrix3d cog_rot_dbg;
-      tf::matrixTFToEigen(estimator_->getOrientation(Frame::COG, estimate_mode_), cog_rot_dbg);
-      Eigen::Vector3d ff_w_dbg = cog_rot_dbg * desired_external_wrench_.head(3);
-      Eigen::Vector3d ff_a_dbg = mass_inv * ff_w_dbg;
-      ROS_INFO_THROTTLE(0.5, "[LEADER PID] id=%d, ff_acc=(%.3f,%.3f), X: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, "
-        "Y: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, Z: p=%.3f i=%.3f d=%.3f ff_z=%.3f sum=%.3f",
-        my_id, ff_a_dbg(0), ff_a_dbg(1),
+      ROS_INFO_THROTTLE(0.5, "[LEADER PID] id=%d, X: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, "
+        "Y: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, Z: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f err_i=%.3f",
+        my_id,
         pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(),
         pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).getPersistentFF(),
         pid_controllers_.at(X).result(),
@@ -346,7 +537,8 @@ namespace aerial_robot_control
         pid_controllers_.at(Y).result(),
         pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
         pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).getPersistentFF(),
-        pid_controllers_.at(Z).result());
+        pid_controllers_.at(Z).result(),
+        pid_controllers_.at(Z).getErrI());
     }
     // Debug: log FOLLOWER position PID output when wrench_comp feedforward is active
     if(module_state != LEADER && module_state != SEPARATED && desired_external_wrench_.norm() > 1e-6) {
@@ -367,6 +559,29 @@ namespace aerial_robot_control
     
   }
 
+  bool BeetleController::update()
+  {
+    if (unified_control_mode_) {
+      /* In unified control mode, thrust and gimbal commands are published
+         in controlCore() (LEADER via BeetleUnifiedController, FOLLOWER via
+         forwarding).  Bypass GimbalrotorController::update() which would
+         call sendCmd()->sendFourAxisCommand() and overwrite those commands.
+
+         We still need:
+         1. ControlBase::update() for activation/timing checks
+         2. controlCore() for the unified allocation / forwarding
+         3. PoseLinearController::sendCmd() for PID debug publishing */
+      if (!ControlBase::update()) return false;
+      controlCore();
+      PoseLinearController::sendCmd();
+      return true;
+    }
+
+    /* Non-unified mode: use the full GimbalrotorController update chain
+       (sendGimbalCommand + PoseLinearController::update -> controlCore + sendCmd) */
+    return GimbalrotorController::update();
+  }
+
   void BeetleController::reset()
   {
     GimbalrotorController::reset();
@@ -384,6 +599,43 @@ namespace aerial_robot_control
     pid_controllers_.at(YAW).setICompTerm(0.0);
     pid_controllers_.at(X).setPersistentFF(0.0);
     pid_controllers_.at(Y).setPersistentFF(0.0);
+    pid_controllers_.at(Z).setPersistentFF(0.0);
+
+    // Clear unified mode FOLLOWER state so that stale commands are not
+    // forwarded when switching back to unified mode.
+    unified_cmd_received_ = false;
+  }
+
+  void BeetleController::unifiedThrustCallback(const spinal::FourAxisCommand& msg)
+  {
+    unified_thrust_cmd_ = msg;
+    unified_cmd_received_ = true;
+    unified_cmd_stamp_ = ros::Time::now();
+  }
+
+  void BeetleController::unifiedGimbalCallback(const sensor_msgs::JointState& msg)
+  {
+    unified_gimbal_cmd_ = msg;
+    unified_cmd_received_ = true;
+    unified_cmd_stamp_ = ros::Time::now();
+  }
+
+  void BeetleController::sendZeroAttitudeGains()
+  {
+    // H2: Send all-zero rpy/gain to this module's spinal.
+    // This zeroes out thrust_p/i/d_gain_ inside spinal's AttitudeController,
+    // so roll_pitch_term_ becomes 0 and spinal acts as a pure PWM executor.
+    // rpy_gain_pub_ is inherited (protected) from GimbalrotorController.
+    spinal::RollPitchYawTerms rpy_gain_msg;
+    rpy_gain_msg.motors.resize(1);
+    rpy_gain_msg.motors.at(0).roll_p = 0;
+    rpy_gain_msg.motors.at(0).roll_i = 0;
+    rpy_gain_msg.motors.at(0).roll_d = 0;
+    rpy_gain_msg.motors.at(0).pitch_p = 0;
+    rpy_gain_msg.motors.at(0).pitch_i = 0;
+    rpy_gain_msg.motors.at(0).pitch_d = 0;
+    rpy_gain_msg.motors.at(0).yaw_d = 0;
+    rpy_gain_pub_.publish(rpy_gain_msg);
   }
 
   void BeetleController::calcInteractionWrench()
@@ -496,6 +748,8 @@ namespace aerial_robot_control
     getParam<double>(wrench_nh, "p_gain", wrench_comp_p_gain_, 0.1);
     getParam<double>(wrench_nh, "i_gain", wrench_comp_i_gain_, 0.005);
     getParam<double>(wrench_nh, "d_gain", wrench_comp_d_gain_, 0.07);
+
+    getParam<bool>(control_nh, "unified_control_mode", unified_control_mode_, false);
   }
 
   void BeetleController::externalWrenchEstimate()
@@ -720,190 +974,6 @@ namespace aerial_robot_control
       fw.wrench.torque.z = share(5);
       desired_ext_wrench_pubs_[item.first].publish(fw);
     }
-  }
-
-  void BeetleController::calcUnifiedRotorControl()
-  {
-    /* Unified 4n-rotor control for assembled formation */
-    int my_id = beetle_navigator_->getMyID();
-    int max_modules_num = beetle_navigator_->getMaxModuleNum();
-    std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
-    std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
-    
-    if(assembled_ids.empty()) return;
-    
-    // Calculate total force/torque requirements for the formation
-    Eigen::VectorXd total_wrench_demand = Eigen::VectorXd::Zero(6);
-    
-    // Get formation center of mass dynamics
-    double formation_mass = beetle_robot_model_->getMass() * assembled_ids.size();
-    Eigen::Matrix3d formation_inertia = beetle_robot_model_->getInertia<Eigen::Matrix3d>() * assembled_ids.size();
-    
-    // Calculate required wrench for formation control
-    // Coming from the high-level trajectory controller
-    const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
-    if(target_wrench_acc_cog.size() > 0) {
-      total_wrench_demand.head(3) = formation_mass * target_wrench_acc_cog.head(3);
-      total_wrench_demand.tail(3) = formation_inertia * target_wrench_acc_cog.tail(3);
-    }
-    
-    // Add feedforward compensation for desired external wrench
-    if(desired_external_wrench_.norm() > 1e-6) {
-      total_wrench_demand += desired_external_wrench_;
-    }
-    
-    // Distribute wrench among all rotors in the formation
-    int total_rotors = assembled_ids.size() * 4; // Assuming 4 rotors per module
-    
-    // Calculate optimal rotor command distribution
-    Eigen::VectorXd rotor_commands = distributeWrenchToRotors(total_wrench_demand, assembled_ids);
-    
-    // Send commands to individual modules
-    publishUnifiedRotorCommands(rotor_commands, assembled_ids);
-    
-    // Publish formation control debug info
-    publishFormationControlDebug(total_wrench_demand, assembled_ids);
-  }
-
-  Eigen::VectorXd BeetleController::distributeWrenchToRotors(const Eigen::VectorXd& target_wrench, 
-                                                           const std::vector<int>& assembled_ids)
-  {
-    int total_rotors = assembled_ids.size() * 4;
-    Eigen::VectorXd rotor_commands = Eigen::VectorXd::Zero(total_rotors);
-    
-    // Formation geometry matrix (maps rotor forces to formation wrench)
-    // This needs to be calculated based on relative positions of modules
-    Eigen::MatrixXd G = buildFormationGeometryMatrix(assembled_ids);
-    
-    // Solve for optimal rotor forces: G * f = target_wrench
-    // Using weighted least squares for force distribution
-    Eigen::MatrixXd W = Eigen::MatrixXd::Identity(total_rotors, total_rotors); // Weight matrix
-    
-    // Weighted least squares solution: f = (G^T * W * G)^(-1) * G^T * W * target_wrench
-    Eigen::MatrixXd GtWG = G.transpose() * W * G;
-    
-    if(GtWG.determinant() > 1e-6) {
-      rotor_commands = GtWG.inverse() * G.transpose() * W * target_wrench;
-    } else {
-      // Use Moore-Penrose pseudoinverse if matrix is singular
-      rotor_commands = G.completeOrthogonalDecomposition().pseudoInverse() * target_wrench;
-    }
-    
-    return rotor_commands;
-  }
-
-  Eigen::MatrixXd BeetleController::buildFormationGeometryMatrix(const std::vector<int>& assembled_ids)
-  {
-    int total_rotors = assembled_ids.size() * 4;
-    Eigen::MatrixXd G = Eigen::MatrixXd::Zero(6, total_rotors);
-    
-    // Build geometry matrix based on rotor positions relative to formation center
-    for(size_t i = 0; i < assembled_ids.size(); i++) {
-      int module_id = assembled_ids[i];
-      
-      // Get module position relative to formation center
-      // This should come from the navigation system
-      Eigen::Vector3d module_pos = getModulePosition(module_id);
-      
-      // For each rotor in this module
-      for(int rotor = 0; rotor < 4; rotor++) {
-        int rotor_index = i * 4 + rotor;
-        
-        // Get rotor position relative to module center
-        Eigen::Vector3d rotor_pos = getRotorPosition(rotor);
-        Eigen::Vector3d total_pos = module_pos + rotor_pos;
-        
-        // Force mapping (rotor thrust contributes to formation force)
-        G(0, rotor_index) = 0;  // X force (depends on rotor tilt)
-        G(1, rotor_index) = 0;  // Y force (depends on rotor tilt) 
-        G(2, rotor_index) = 1;  // Z force (thrust direction)
-        
-        // Torque mapping (moment arm × force)
-        G(3, rotor_index) = total_pos(1);  // Roll torque
-        G(4, rotor_index) = -total_pos(0); // Pitch torque
-        G(5, rotor_index) = getRotorTorqueDirection(rotor); // Yaw torque
-      }
-    }
-    
-    return G;
-  }
-
-  void BeetleController::publishUnifiedRotorCommands(const Eigen::VectorXd& rotor_commands, 
-                                                    const std::vector<int>& assembled_ids)
-  {
-    // Distribute rotor commands to individual modules
-    for(size_t i = 0; i < assembled_ids.size(); i++) {
-      int module_id = assembled_ids[i];
-      
-      // Extract commands for this module's 4 rotors
-      Eigen::Vector4d module_commands = rotor_commands.segment(i*4, 4);
-      publishModuleRotorCommands(module_id, module_commands);
-    }
-  }
-
-  void BeetleController::publishFormationControlDebug(const Eigen::VectorXd& total_wrench_demand, 
-                                                     const std::vector<int>& assembled_ids)
-  {
-    // Publish debug information for formation control
-    geometry_msgs::WrenchStamped formation_wrench_msg;
-    formation_wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
-    formation_wrench_msg.wrench.force.x = total_wrench_demand(0);
-    formation_wrench_msg.wrench.force.y = total_wrench_demand(1);
-    formation_wrench_msg.wrench.force.z = total_wrench_demand(2);
-    formation_wrench_msg.wrench.torque.x = total_wrench_demand(3);
-    formation_wrench_msg.wrench.torque.y = total_wrench_demand(4);
-    formation_wrench_msg.wrench.torque.z = total_wrench_demand(5);
-    
-    // Publish formation control wrench
-    if(formation_wrench_pub_.getNumSubscribers() > 0) {
-      formation_wrench_pub_.publish(formation_wrench_msg);
-    }
-  }
-
-  // Helper method implementations - these need to be customized based on your robot geometry
-  Eigen::Vector3d BeetleController::getModulePosition(int module_id)
-  {
-    // Get module position relative to formation center from navigation
-    double module_spacing = 0.5; // meters between modules
-    int my_id = beetle_navigator_->getMyID();
-    double x_offset = (module_id - my_id) * module_spacing;
-    
-    return Eigen::Vector3d(x_offset, 0, 0);
-  }
-
-  Eigen::Vector3d BeetleController::getRotorPosition(int rotor_index)
-  {
-    // Return rotor position relative to module center
-    double rotor_arm_length = 0.25; // meters
-    
-    switch(rotor_index) {
-      case 0: return Eigen::Vector3d(rotor_arm_length, 0, 0);           // Front
-      case 1: return Eigen::Vector3d(0, rotor_arm_length, 0);          // Right  
-      case 2: return Eigen::Vector3d(-rotor_arm_length, 0, 0);         // Back
-      case 3: return Eigen::Vector3d(0, -rotor_arm_length, 0);         // Left
-      default: return Eigen::Vector3d::Zero();
-    }
-  }
-
-  double BeetleController::getRotorTorqueDirection(int rotor_index)
-  {
-    // Return +1 for CCW rotors, -1 for CW rotors
-    // This depends on your specific rotor configuration
-    return (rotor_index % 2 == 0) ? 1.0 : -1.0;
-  }
-
-  void BeetleController::publishModuleRotorCommands(int module_id, const Eigen::Vector4d& commands)
-  {
-    // This method should interface with the existing gimbalrotor control system
-    // to send individual rotor commands to each module
-    // Implementation depends on your existing rotor command interface
-    
-    ROS_DEBUG_STREAM("Publishing rotor commands for module " << module_id << 
-                     ": [" << commands.transpose() << "]");
-    
-    // TODO: Implement actual rotor command publishing
-    // This might involve calling methods from the parent GimbalrotorController class
-    // or publishing to specific topics for each module
   }
 
 } //namespace aerial_robot_controller

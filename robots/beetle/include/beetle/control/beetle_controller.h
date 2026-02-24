@@ -7,6 +7,7 @@
 #include <beetle/TaggedWrenches.h>
 #include <gimbalrotor/control/gimbalrotor_controller.h>
 #include <beetle/sensor/imu.h>
+#include <beetle/control/beetle_unified_controller.h>
 
 namespace aerial_robot_control
 {
@@ -37,6 +38,29 @@ namespace aerial_robot_control
   private:
     boost::shared_ptr<BeetleRobotModel> beetle_robot_model_;
     boost::shared_ptr<aerial_robot_navigation::BeetleNavigator> beetle_navigator_;
+    
+    // Unified 4N-rotor controller for assembled formation
+    std::shared_ptr<BeetleUnifiedController> unified_controller_;
+    bool unified_control_mode_;
+    bool prev_unified_control_mode_;  // for detecting mode switch
+    bool spinal_gains_zeroed_;        // H2: track whether we sent zero rpy/gain to spinal
+
+    /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID.
+     *  This prevents spinal's internal PID (using stale single-body torque_allocation_matrix_inv)
+     *  from conflicting with the unified controller's allocation. */
+    void sendZeroAttitudeGains();
+
+    // FOLLOWER unified mode: receive commands from LEADER
+    ros::Subscriber unified_thrust_sub_;
+    ros::Subscriber unified_gimbal_sub_;
+    ros::Publisher follower_thrust_pub_;   // re-publish to own four_axes/command
+    ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl
+    spinal::FourAxisCommand unified_thrust_cmd_;
+    sensor_msgs::JointState unified_gimbal_cmd_;
+    bool unified_cmd_received_;
+    ros::Time unified_cmd_stamp_;
+    void unifiedThrustCallback(const spinal::FourAxisCommand& msg);
+    void unifiedGimbalCallback(const sensor_msgs::JointState& msg);
     
     map<string, ros::Subscriber> ff_inter_wrench_subs_;
     map<int, ros::Publisher> ff_inter_wrench_pubs_;
@@ -88,6 +112,7 @@ namespace aerial_robot_control
     ros::Publisher wrench_comp_pid_pub_;
     ros::Publisher des_inter_wrench_pub_;
     void controlCore() override;
+    bool update() override;
     
     virtual void ffInterWrenchCallback(const beetle::TaggedWrench & msg);
     void desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg);

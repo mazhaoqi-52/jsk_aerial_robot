@@ -115,15 +115,11 @@ class LinearTowingTrajectoryGenerator:
         self.stall_last_check_distance = 0.0
         
         # Z anti-windup: target Z pre-compensation to prevent I-term buildup
-        # When towing force ramps up, the assembly transiently drops in Z.
-        # Without compensation, the Z PID I-term accumulates during this drop,
-        # then overshoots upward when the assembly recovers.
-        # Strategy: lower target Z proportionally to applied force during ramp,
-        # then after force stabilizes, decay the offset so Z returns to original.
+        # When towing force is applied, the drone dips slightly; this offset
+        # pre-adjusts the target Z to reduce I-term accumulation.
         self.z_offset = 0.0           # current Z offset applied to target (m)
         self.z_offset_decay_rate = 0.003  # decay rate (m/s) — ~10s to recover 30mm
-        self.z_force_coupling = 0.0015  # m/N — expected Z drop per N of towing force
-        # At 20N: expected drop = 0.0015 * 20 = 30mm (matches observed initial transient)
+        self.z_force_coupling = 0.0015    # m/N — Z offset per unit force
         self.z_offset_decaying = False    # True once force stabilized, decay begins
         self.z_force_stable_time = None   # time when force first reached max
         

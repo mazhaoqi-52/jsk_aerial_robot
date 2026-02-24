@@ -23,6 +23,9 @@
   <!-- Debug mode -->
   <arg name="debug" default="false" />
   
+  <!-- Unified control mode: LEADER allocates for all N*4 rotors -->
+  <arg name="unified_control_mode" default="false" />
+  
   <!-- Include load position setup -->
   <include file="$(find beetle)/launch/aerial_towing_tasks/load_pos.launch">
     <arg name="real_machine" value="$(arg real_machine)" />
@@ -37,7 +40,18 @@
   </include>
   
   <!-- Controller parameters for formation towing -->
-  <param name="controller/unified_control_mode" value="false" />
+  <!-- Set unified_control_mode for each module namespace.
+       The YAML config (BeetleControl_sim.yaml) provides default=false.
+       This overrides it per-module at launch time. -->
+  <group if="$(eval len(arg('module_ids').split(',')) > 0)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[0].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
+  </group>
+  <group if="$(eval len(arg('module_ids').split(',')) > 1)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[1].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
+  </group>
+  <group if="$(eval len(arg('module_ids').split(',')) > 2)">
+    <param name="/beetle$(eval arg('module_ids').split(',')[2].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
+  </group>
   <param name="controller/towing_feedforward/enabled" value="true" />
   <param name="controller/towing_feedforward/force_x" value="$(arg towing_force)" />
   

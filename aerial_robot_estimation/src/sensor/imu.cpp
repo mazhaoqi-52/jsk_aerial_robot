@@ -167,20 +167,10 @@ namespace sensor_plugin
     
     if(imu_stamp_.toSec() <= prev_time.toSec())
       {
-        double time_diff = imu_stamp_.toSec() - prev_time.toSec();
-        ROS_WARN("IMU: bad timestamp. curr: %f, prev: %f, diff: %f sec", 
-                 imu_stamp_.toSec(), prev_time.toSec(), time_diff);
-        
-        // If the time difference is very small (< 1ms), it might be a timing precision issue
-        if(time_diff > -0.001)
-          {
-            ROS_WARN("IMU: Small time difference detected, might be precision issue. Continuing...");
-          }
-        else
-          {
-            ROS_WARN("IMU: Significant time regression detected. Skipping this frame.");
-            return;
-          }
+        ROS_WARN("IMU: bad timestamp. curr: %f, prev: %f, diff: %f sec",
+                 imu_stamp_.toSec(), prev_time.toSec(),
+                 imu_stamp_.toSec() - prev_time.toSec());
+        return;
       }
 
     /* set the time internal */

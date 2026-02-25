@@ -48,9 +48,13 @@ public:
   /** @brief Send computed commands to all modules via ROS topics. */
   void publishCommands();
 
-  // Per-module output commands (public for LEADER to forward its own share)
+  // Per-module output commands (public for LEADER to forward its own share).
+  // In beetle sim, gimbal_calc_in_fc_=false, so spinal expects:
+  //   base_thrust: scalar thrusts (size = motor_num_per_module_ = 4)
+  //   gimbal_angles: gimbal servo angles (size = motor_num_per_module_ * gimbal_dof_ = 4)
+  // These are sent as FourAxisCommand + JointState respectively.
   struct ModuleCommand {
-    std::vector<float> full_thrusts;    // size = motor_num_per_module_
+    std::vector<float> full_thrusts;    // size = motor_num_per_module_ (scalar per rotor)
     std::vector<double> gimbal_angles;  // size = motor_num_per_module_ * gimbal_dof_
   };
 
@@ -58,6 +62,10 @@ public:
   const Eigen::VectorXd& getTargetVectoringForce() const { return target_vectoring_f_; }
   const Eigen::MatrixXd& getIntegratedMap() const { return integrated_map_; }
   const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
+
+  /** @brief Get cached formation geometry (valid after computeUnifiedAllocation). */
+  const Eigen::Vector3d& getFormationCogOffset() const { return formation_cog_offset_; }
+  const Eigen::Matrix3d& getFormationInertia() const { return formation_inertia_; }
 
 private:
   ros::NodeHandle nh_;
@@ -73,10 +81,13 @@ private:
   // Formation allocation results
   Eigen::MatrixXd integrated_map_;
   Eigen::VectorXd target_vectoring_f_;
+  Eigen::Vector3d formation_cog_offset_;   // cached from last computeUnifiedAllocation
+  Eigen::Matrix3d formation_inertia_;      // cached from last computeUnifiedAllocation
 
   std::map<int, ModuleCommand> module_commands_;
 
   // ROS publishers: per-module thrust + gimbal
+  // gimbal_calc_in_fc_=false in beetle sim: need separate gimbal command.
   std::map<int, ros::Publisher> module_thrust_pubs_;
   std::map<int, ros::Publisher> module_gimbal_pubs_;
 
@@ -115,10 +126,13 @@ private:
                                           const Eigen::Vector3d& formation_cog_offset);
 
   /**
-   * @brief Extract per-rotor thrust magnitude and gimbal angle from vectoring force.
+   * @brief Extract per-rotor scalar thrust and gimbal angles from allocation result.
    *
-   * For gimbal_dof_=1: thrust = norm(f_i), angle = atan2(-f_i[0], f_i[1])
-   * Same formula as gimbalrotor_controller.cpp lines 271-280.
+   * For gimbal_dof_=1: each rotor's 2D vectoring force f_i is decomposed into:
+   *   full_thrust = f_i.norm()   (scalar magnitude)
+   *   gimbal_angle = atan2(-f_i[0], f_i[1])  (tilt angle)
+   * Clamps negative vertical (downward) thrust by zeroing lateral and flipping sign.
+   * Matches the decomposition in GimbalrotorController::controlCore().
    */
   void extractThrustAndGimbal(const Eigen::VectorXd& vectoring_f,
                               const std::vector<int>& assembled_ids);

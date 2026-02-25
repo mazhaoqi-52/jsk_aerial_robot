@@ -96,12 +96,12 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     }
     // LEADER offset = (0,0,0), already in sum
   }
-  formation_cog_offset /= N;
+  formation_cog_offset_ = formation_cog_offset / N;
 
-  Eigen::Matrix3d formation_inertia = computeFormationInertia(assembled_ids, formation_cog_offset);
+  formation_inertia_ = computeFormationInertia(assembled_ids, formation_cog_offset_);
 
   // Build the formation-wide allocation matrix (relative to formation CoG)
-  integrated_map_ = buildFormationAllocationMatrix(assembled_ids, formation_mass, formation_inertia, formation_cog_offset);
+  integrated_map_ = buildFormationAllocationMatrix(assembled_ids, formation_mass, formation_inertia_, formation_cog_offset_);
 
   // ---- Wrench acc: PID output is already in acceleration space ----
   // Allocation matrix is built relative to formation CoG, and PID angular
@@ -110,7 +110,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   Eigen::VectorXd total_wrench_acc = target_wrench_acc_cog;
   if (desired_ext_wrench.size() >= 6 && desired_ext_wrench.norm() > 1e-6) {
     double mass_inv = 1.0 / formation_mass;
-    Eigen::Matrix3d inertia_inv = formation_inertia.inverse();
+    Eigen::Matrix3d inertia_inv = formation_inertia_.inverse();
     total_wrench_acc.head(3) += mass_inv * desired_ext_wrench.head(3);
     total_wrench_acc.tail(3) += inertia_inv * desired_ext_wrench.tail(3);
   }
@@ -118,13 +118,13 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // ===== DIAGNOSTIC: formation inertia & allocation matrix =====
   {
     ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl DIAG] formation_cog_offset=(%.4f,%.4f,%.4f)",
-                      formation_cog_offset.x(), formation_cog_offset.y(), formation_cog_offset.z());
+                      formation_cog_offset_.x(), formation_cog_offset_.y(), formation_cog_offset_.z());
     ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl DIAG] formation_mass=%.3f, N=%d, single_mass=%.3f",
                       formation_mass, N, single_mass);
     ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl DIAG] formation_inertia diag=(%.4f, %.4f, %.4f)",
-                      formation_inertia(0,0), formation_inertia(1,1), formation_inertia(2,2));
+                      formation_inertia_(0,0), formation_inertia_(1,1), formation_inertia_(2,2));
     ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl DIAG] formation_inertia off-diag=(%.4f, %.4f, %.4f)",
-                      formation_inertia(0,1), formation_inertia(0,2), formation_inertia(1,2));
+                      formation_inertia_(0,1), formation_inertia_(0,2), formation_inertia_(1,2));
 
     // Allocation matrix condition number via SVD
     Eigen::JacobiSVD<Eigen::MatrixXd> svd(integrated_map_);
@@ -148,7 +148,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
                       reconstructed(3), reconstructed(4), reconstructed(5));
   }
 
-  // Extract per-rotor thrust magnitudes and gimbal angles
+  // Extract per-rotor scalar thrust and gimbal angles for spinal
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
 
   // Publish debug info
@@ -407,30 +407,33 @@ void BeetleUnifiedController::extractThrustAndGimbal(
 
       if (gimbal_dof_ == 1) {
         // Clamp: if f_i[1] < 0 (thrust pointing down), flip to ensure upward thrust.
-        // This keeps gimbal within [-π/2, π/2], matching URDF joint limits.
         if (f_i[1] < 0) {
           f_i[0] = 0;
           f_i[1] = std::abs(f_i[1]);
         }
-        cmd.full_thrusts[r] = f_i.norm();
-        cmd.gimbal_angles[r] = atan2(-f_i[0], f_i[1]);
+        // Scalar thrust = magnitude of vectoring force
+        double thrust_mag = f_i.norm();
+        // Gimbal angle: same as GimbalrotorController (atan2(-lateral, vertical))
+        double gimbal_angle = atan2(-f_i[0], f_i[1]);
 
+        cmd.full_thrusts[r] = static_cast<float>(thrust_mag);
+        cmd.gimbal_angles[r] = gimbal_angle;
+
+        double gimbal_deg = gimbal_angle * 180.0 / M_PI;
         snprintf(abuf, sizeof(abuf), " m%d_r%d:fi=(%.3f,%.3f)T=%.3f g=%.1fdeg",
-                 module_id, r+1, f_i[0], f_i[1],
-                 cmd.full_thrusts[r], cmd.gimbal_angles[r] * 180.0 / M_PI);
+                 module_id, r+1, f_i[0], f_i[1], thrust_mag, gimbal_deg);
         diag_alloc_ss << abuf;
       } else if (gimbal_dof_ == 2) {
-        cmd.full_thrusts[r] = f_i.norm();
-        if (f_i[0] != 0 && f_i[2] != 0) {
-          cmd.gimbal_angles[2 * r] = atan2(-f_i[1], f_i[2]);
-          double gimbal_roll = cmd.gimbal_angles[2 * r];
-          cmd.gimbal_angles[2 * r + 1] =
-              atan2(f_i[0], -f_i[1] * sin(gimbal_roll) + f_i[2] * cos(gimbal_roll));
-        }
-        snprintf(abuf, sizeof(abuf), " m%d_r%d:T=%.3f g2=(%.1f,%.1f)deg",
-                 module_id, r+1, cmd.full_thrusts[r],
-                 cmd.gimbal_angles[2*r] * 180.0 / M_PI,
-                 cmd.gimbal_angles[2*r+1] * 180.0 / M_PI);
+        double thrust_mag = f_i.norm();
+        cmd.full_thrusts[r] = static_cast<float>(thrust_mag);
+        // 2-DOF gimbal angles
+        double gimbal_roll = atan2(-f_i[1], f_i[2]);
+        double gimbal_pitch = atan2(f_i[0], -f_i[1] * sin(gimbal_roll) + f_i[2] * cos(gimbal_roll));
+        cmd.gimbal_angles[2*r] = gimbal_roll;
+        cmd.gimbal_angles[2*r+1] = gimbal_pitch;
+
+        snprintf(abuf, sizeof(abuf), " m%d_r%d:fi=(%.3f,%.3f,%.3f)T=%.3f",
+                 module_id, r+1, f_i[0], f_i[1], f_i[2], thrust_mag);
         diag_alloc_ss << abuf;
       }
 
@@ -444,45 +447,33 @@ void BeetleUnifiedController::extractThrustAndGimbal(
 
 void BeetleUnifiedController::publishCommands()
 {
-  ros::Time now = ros::Time::now();
-
   for (const auto& kv : module_commands_) {
     int module_id = kv.first;
     const ModuleCommand& cmd = kv.second;
 
-    // Publish thrust command (same format as spinal::FourAxisCommand)
+    // Publish scalar thrusts as FourAxisCommand.base_thrust (size 4)
+    // angles[0,1] = 0: with H2 zero gains, spinal's attitude PID produces no roll_pitch_term_.
     if (module_thrust_pubs_.count(module_id)) {
       spinal::FourAxisCommand thrust_msg;
-      // FourAxisCommand.base_thrust is vector<float>
       thrust_msg.base_thrust = cmd.full_thrusts;
-      // Set roll/pitch to 0 — unified controller handles everything via thrust vectoring
       thrust_msg.angles[0] = 0;
       thrust_msg.angles[1] = 0;
       thrust_msg.angles[2] = 0;
       module_thrust_pubs_[module_id].publish(thrust_msg);
     }
 
-    // Publish gimbal command
+    // Publish gimbal angles as JointState
     if (module_gimbal_pubs_.count(module_id)) {
       sensor_msgs::JointState gimbal_msg;
-      gimbal_msg.header.stamp = now;
-      for (int r = 0; r < motor_num_per_module_; r++) {
-        if (gimbal_dof_ == 1) {
-          gimbal_msg.position.push_back(cmd.gimbal_angles[r]);
-          gimbal_msg.name.push_back("gimbal" + std::to_string(r + 1));
-        } else if (gimbal_dof_ == 2) {
-          gimbal_msg.position.push_back(cmd.gimbal_angles[2 * r]);
-          gimbal_msg.position.push_back(cmd.gimbal_angles[2 * r + 1]);
-          gimbal_msg.name.push_back("gimbal" + std::to_string(r + 1) + "_roll");
-          gimbal_msg.name.push_back("gimbal" + std::to_string(r + 1) + "_pitch");
-        }
-      }
+      gimbal_msg.header.stamp = ros::Time::now();
+      gimbal_msg.position = cmd.gimbal_angles;
       module_gimbal_pubs_[module_id].publish(gimbal_msg);
     }
   }
 
-  ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl] Published commands for %zu modules",
-                     module_commands_.size());
+  ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl] Published commands for %zu modules (thrust size=%d, gimbal size=%d)",
+                     module_commands_.size(), motor_num_per_module_,
+                     motor_num_per_module_ * gimbal_dof_);
 }
 
 } // namespace aerial_robot_control

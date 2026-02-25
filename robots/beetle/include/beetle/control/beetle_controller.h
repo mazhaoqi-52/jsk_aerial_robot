@@ -58,6 +58,7 @@ namespace aerial_robot_control
     spinal::FourAxisCommand unified_thrust_cmd_;
     sensor_msgs::JointState unified_gimbal_cmd_;
     bool unified_cmd_received_;
+    bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
     void unifiedThrustCallback(const spinal::FourAxisCommand& msg);
     void unifiedGimbalCallback(const sensor_msgs::JointState& msg);

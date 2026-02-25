@@ -8,6 +8,10 @@
 #include <gimbalrotor/control/gimbalrotor_controller.h>
 #include <beetle/sensor/imu.h>
 #include <beetle/control/beetle_unified_controller.h>
+#include <spinal/TorqueAllocationMatrixInv.h>
+#include <spinal/RollPitchYawTerms.h>
+#include <spinal/DesireCoord.h>
+#include <std_msgs/UInt8.h>
 
 namespace aerial_robot_control
 {
@@ -44,24 +48,42 @@ namespace aerial_robot_control
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
     bool spinal_gains_zeroed_;        // H2: track whether we sent zero rpy/gain to spinal
-
-    /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID.
-     *  This prevents spinal's internal PID (using stale single-body torque_allocation_matrix_inv)
-     *  from conflicting with the unified controller's allocation. */
-    void sendZeroAttitudeGains();
+    int unified_transition_count_;    // frame counter since last mode switch (for high-freq diag)
 
     // FOLLOWER unified mode: receive commands from LEADER
     ros::Subscriber unified_thrust_sub_;
-    ros::Subscriber unified_gimbal_sub_;
-    ros::Publisher follower_thrust_pub_;   // re-publish to own four_axes/command
-    ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl
+    ros::Subscriber unified_torque_alloc_sub_;
+    ros::Subscriber unified_rpy_gain_sub_;
+    ros::Subscriber unified_desire_coord_sub_;
+    ros::Subscriber unified_gimbal_dof_sub_;
+
+    // Publishers to own spinal for forwarding unified commands
+    ros::Publisher follower_thrust_pub_;         // → four_axes/command
+    ros::Publisher follower_torque_alloc_pub_;    // → torque_allocation_matrix_inv
+    ros::Publisher follower_rpy_gain_pub_;        // → rpy/gain
+    ros::Publisher follower_desire_coord_pub_;    // → desire_coordinate
+    ros::Publisher follower_gimbal_dof_pub_;      // → gimbal_dof
+
+    // Cached unified messages from LEADER (for forwarding to own spinal)
     spinal::FourAxisCommand unified_thrust_cmd_;
-    sensor_msgs::JointState unified_gimbal_cmd_;
+    spinal::TorqueAllocationMatrixInv unified_torque_alloc_cmd_;
+    spinal::RollPitchYawTerms unified_rpy_gain_cmd_;
+    spinal::DesireCoord unified_desire_coord_cmd_;
+    std_msgs::UInt8 unified_gimbal_dof_cmd_;
     bool unified_cmd_received_;
+    bool unified_torque_alloc_received_;
+    bool unified_rpy_gain_received_;
+    bool unified_desire_coord_received_;
+    bool unified_gimbal_dof_received_;
     bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
+
+    // Callbacks for unified topics from LEADER
     void unifiedThrustCallback(const spinal::FourAxisCommand& msg);
-    void unifiedGimbalCallback(const sensor_msgs::JointState& msg);
+    void unifiedTorqueAllocCallback(const spinal::TorqueAllocationMatrixInv& msg);
+    void unifiedRpyGainCallback(const spinal::RollPitchYawTerms& msg);
+    void unifiedDesireCoordCallback(const spinal::DesireCoord& msg);
+    void unifiedGimbalDofCallback(const std_msgs::UInt8& msg);
     
     map<string, ros::Subscriber> ff_inter_wrench_subs_;
     map<int, ros::Publisher> ff_inter_wrench_pubs_;

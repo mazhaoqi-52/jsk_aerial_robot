@@ -14,7 +14,10 @@ namespace aerial_robot_control
 BeetleUnifiedController::BeetleUnifiedController()
   : motor_num_per_module_(4),
     gimbal_dof_(1),
-    rotor_coef_(2)
+    rotor_coef_(2),
+    candidate_yaw_term_(0),
+    formation_cog_offset_(Eigen::Vector3d::Zero()),
+    formation_inertia_(Eigen::Matrix3d::Zero())
 {
 }
 
@@ -35,12 +38,21 @@ void BeetleUnifiedController::initialize(
   rotor_coef_ = gimbal_dof_ + 1;
 
   // Create per-module publishers for all possible modules
+  // In unified mode we send full spinal commands to each module:
+  //   - FourAxisCommand (base_thrust 2D vectoring + target RPY angles)
+  //   - TorqueAllocationMatrixInv (per-module allocation for spinal's attitude PID)
+  //   - RollPitchYawTerms (RPY gains for spinal)
+  //   - DesireCoord (CoG frame orientation for spinal)
+  //   - UInt8 gimbal_dof (tell spinal to operate in gimbal_dof=1 mode)
   int max_modules = navigator_->getMaxModuleNum();
   std::string my_name = navigator_->getMyName();
   for (int i = 1; i <= max_modules; i++) {
     std::string ns = std::string("/") + my_name + std::to_string(i);
     module_thrust_pubs_[i] = nh_.advertise<spinal::FourAxisCommand>(ns + "/unified_thrust_cmd", 1);
-    module_gimbal_pubs_[i] = nh_.advertise<sensor_msgs::JointState>(ns + "/unified_gimbal_cmd", 1);
+    module_torque_alloc_pubs_[i] = nh_.advertise<spinal::TorqueAllocationMatrixInv>(ns + "/unified_torque_alloc_inv", 1);
+    module_rpy_gain_pubs_[i] = nh_.advertise<spinal::RollPitchYawTerms>(ns + "/unified_rpy_gain", 1);
+    module_desire_coord_pubs_[i] = nh_.advertise<spinal::DesireCoord>(ns + "/unified_desire_coord", 1);
+    module_gimbal_dof_pubs_[i] = nh_.advertise<std_msgs::UInt8>(ns + "/unified_gimbal_dof", 1);
   }
 
   formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("unified_control/formation_wrench", 1);
@@ -56,6 +68,38 @@ void BeetleUnifiedController::rosParamInit()
 
   // gimbal_dof: read from existing gimbalrotor param
   control_nh.param<int>("gimbal_dof", gimbal_dof_, 1);
+}
+
+bool BeetleUnifiedController::updateFormationGeometry()
+{
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  if (assembled_ids.empty()) return false;
+
+  int N = assembled_ids.size();
+  double single_mass = robot_model_->getMass();
+  int leader_id = navigator_->getLeaderID();
+  std::string leader_cog_frame = navigator_->getMyName() + std::to_string(leader_id) + "/cog";
+
+  Eigen::Vector3d cog_offset_sum = Eigen::Vector3d::Zero();
+  for (int i = 0; i < N; i++) {
+    int module_id = assembled_ids[i];
+    if (module_id != leader_id) {
+      try {
+        std::string module_cog_frame = navigator_->getMyName() + std::to_string(module_id) + "/cog";
+        geometry_msgs::TransformStamped tf_stamped =
+            navigator_->getTfBuffer().lookupTransform(leader_cog_frame, module_cog_frame, ros::Time(0));
+        cog_offset_sum.x() += tf_stamped.transform.translation.x;
+        cog_offset_sum.y() += tf_stamped.transform.translation.y;
+        cog_offset_sum.z() += tf_stamped.transform.translation.z;
+      } catch (tf2::TransformException& ex) {
+        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] TF lookup for formation geometry failed: %s", ex.what());
+        return false;
+      }
+    }
+  }
+  formation_cog_offset_ = cog_offset_sum / N;
+  formation_inertia_ = computeFormationInertia(assembled_ids, formation_cog_offset_);
+  return true;
 }
 
 bool BeetleUnifiedController::computeUnifiedAllocation(
@@ -135,8 +179,33 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   }
 
   // Solve allocation: pseudoinverse
-  Eigen::MatrixXd integrated_map_inv = aerial_robot_model::pseudoinverse(integrated_map_);
-  target_vectoring_f_ = integrated_map_inv * total_wrench_acc;
+  integrated_map_inv_ = aerial_robot_model::pseudoinverse(integrated_map_);
+
+  // Split allocation into translational (XYZ) and rotational (RPY) parts.
+  // This follows the same approach as GimbalrotorController (gimbal_calc_in_fc=true):
+  //   integrated_map_inv_trans_ = leftCols(3)  → maps XYZ acc to 2D vectoring force (base_thrust)
+  //   integrated_map_inv_rot_  = rightCols(3) → maps RPY acc to 2D vectoring force (TorqueAllocationMatrixInv)
+  // The RPY part is sent to spinal so it can do high-freq attitude PID at 1kHz.
+  integrated_map_inv_trans_ = integrated_map_inv_.leftCols(3);
+  integrated_map_inv_rot_ = integrated_map_inv_.rightCols(3);
+
+  // Position-only vectoring force = only from XYZ acceleration commands
+  target_vectoring_f_trans_ = integrated_map_inv_trans_ * total_wrench_acc.head(3);
+
+  // Full vectoring force (for debug / monitoring)
+  target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
+
+  // Compute candidate_yaw_term for spinal's yaw reconstruction
+  // (same approach as GimbalrotorController: find max yaw scale factor)
+  double max_yaw_scale = 0;
+  int total_entries = integrated_map_inv_.rows();
+  int yaw_col = 5;  // YAW is the last column (index 5 in 6D wrench)
+  for (int i = 0; i < total_entries; i++) {
+    if (integrated_map_inv_(i, yaw_col) > max_yaw_scale)
+      max_yaw_scale = integrated_map_inv_(i, yaw_col);
+  }
+  // The yaw PID result is the 6th element (index 5) of target_wrench_acc
+  candidate_yaw_term_ = total_wrench_acc(5) * max_yaw_scale;
 
   // ===== DIAGNOSTIC: verify allocation roundtrip =====
   {
@@ -148,8 +217,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
                       reconstructed(3), reconstructed(4), reconstructed(5));
   }
 
-  // Extract per-rotor scalar thrust and gimbal angles for spinal
-  extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
+  // Extract per-module base_thrust (2D vectoring, position-only) and TorqueAllocationMatrixInv
+  extractModuleCommands(target_vectoring_f_trans_, integrated_map_inv_rot_, assembled_ids);
 
   // Publish debug info
   if (formation_wrench_pub_.getNumSubscribers() > 0) {
@@ -385,95 +454,158 @@ Eigen::Matrix3d BeetleUnifiedController::computeFormationInertia(
   return formation_inertia;
 }
 
-void BeetleUnifiedController::extractThrustAndGimbal(
-    const Eigen::VectorXd& vectoring_f,
+void BeetleUnifiedController::extractModuleCommands(
+    const Eigen::VectorXd& vectoring_f_trans,
+    const Eigen::MatrixXd& map_inv_rot,
     const std::vector<int>& assembled_ids)
 {
+  // Extract per-module commands for spinal's gimbal_calc_in_fc=true mode:
+  //
+  // For each module m with motor_num_per_module_ rotors (rotor_coef_=2 entries each):
+  //   base_thrust_2d[8] = position-only vectoring force for this module's 4 rotors
+  //                       (from vectoring_f_trans, 2 entries per rotor: [lateral, vertical])
+  //   torque_alloc_inv[8x3] = attitude allocation sub-matrix for this module's rotors
+  //                           (from map_inv_rot, maps RPY acceleration to 2D vectoring force)
+  //
+  // Spinal will use: thrust[i] = base_thrust[i] + roll_pitch_term[i] + yaw_term[i]
+  //   where roll_pitch_term is computed from torque_alloc_inv × RPY_PID_output at 1kHz.
+  //   Final scalar thrust and gimbal angle are computed by spinal:
+  //     thrust = norm(fx, fz), angle = atan2(-fx, fz)
+
   int N = assembled_ids.size();
   module_commands_.clear();
 
-  std::stringstream diag_alloc_ss;
+  std::stringstream diag_ss;
   char abuf[256];
 
-  int col = 0;
+  int entry_offset = 0;  // offset into vectoring_f_trans / map_inv_rot rows
+  int entries_per_module = motor_num_per_module_ * rotor_coef_;  // 4*2=8
+
   for (int m = 0; m < N; m++) {
     int module_id = assembled_ids[m];
     ModuleCommand cmd;
-    cmd.full_thrusts.resize(motor_num_per_module_);
-    cmd.gimbal_angles.resize(motor_num_per_module_ * gimbal_dof_);
 
-    for (int r = 0; r < motor_num_per_module_; r++) {
-      Eigen::VectorXd f_i = vectoring_f.segment(col, rotor_coef_);
-
-      if (gimbal_dof_ == 1) {
-        // Clamp: if f_i[1] < 0 (thrust pointing down), flip to ensure upward thrust.
-        if (f_i[1] < 0) {
-          f_i[0] = 0;
-          f_i[1] = std::abs(f_i[1]);
-        }
-        // Scalar thrust = magnitude of vectoring force
-        double thrust_mag = f_i.norm();
-        // Gimbal angle: same as GimbalrotorController (atan2(-lateral, vertical))
-        double gimbal_angle = atan2(-f_i[0], f_i[1]);
-
-        cmd.full_thrusts[r] = static_cast<float>(thrust_mag);
-        cmd.gimbal_angles[r] = gimbal_angle;
-
-        double gimbal_deg = gimbal_angle * 180.0 / M_PI;
-        snprintf(abuf, sizeof(abuf), " m%d_r%d:fi=(%.3f,%.3f)T=%.3f g=%.1fdeg",
-                 module_id, r+1, f_i[0], f_i[1], thrust_mag, gimbal_deg);
-        diag_alloc_ss << abuf;
-      } else if (gimbal_dof_ == 2) {
-        double thrust_mag = f_i.norm();
-        cmd.full_thrusts[r] = static_cast<float>(thrust_mag);
-        // 2-DOF gimbal angles
-        double gimbal_roll = atan2(-f_i[1], f_i[2]);
-        double gimbal_pitch = atan2(f_i[0], -f_i[1] * sin(gimbal_roll) + f_i[2] * cos(gimbal_roll));
-        cmd.gimbal_angles[2*r] = gimbal_roll;
-        cmd.gimbal_angles[2*r+1] = gimbal_pitch;
-
-        snprintf(abuf, sizeof(abuf), " m%d_r%d:fi=(%.3f,%.3f,%.3f)T=%.3f",
-                 module_id, r+1, f_i[0], f_i[1], f_i[2], thrust_mag);
-        diag_alloc_ss << abuf;
-      }
-
-      col += rotor_coef_;
+    // base_thrust_2d: position-only vectoring force for this module's rotors
+    cmd.base_thrust_2d.resize(entries_per_module);
+    for (int i = 0; i < entries_per_module; i++) {
+      cmd.base_thrust_2d[i] = static_cast<float>(vectoring_f_trans(entry_offset + i));
     }
 
+    // torque_alloc_inv: sub-matrix of map_inv_rot for this module's rotors
+    // Shape: entries_per_module x 3 (maps RPY acc → 2D vectoring corrections)
+    cmd.torque_alloc_inv = map_inv_rot.block(entry_offset, 0, entries_per_module, 3);
+
+    snprintf(abuf, sizeof(abuf), " m%d: bt2d=[", module_id);
+    diag_ss << abuf;
+    for (int i = 0; i < entries_per_module; i++) {
+      snprintf(abuf, sizeof(abuf), "%.3f%s", cmd.base_thrust_2d[i],
+               (i < entries_per_module-1) ? "," : "");
+      diag_ss << abuf;
+    }
+    diag_ss << "]";
+
     module_commands_[module_id] = cmd;
+    entry_offset += entries_per_module;
   }
-  ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl DIAG] alloc results:%s", diag_alloc_ss.str().c_str());
+  ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl DIAG] extractModuleCommands:%s", diag_ss.str().c_str());
 }
 
-void BeetleUnifiedController::publishCommands()
+void BeetleUnifiedController::publishCommands(
+    double target_roll, double target_pitch, double candidate_yaw_term,
+    const std::vector<double>& rpy_p_gains,
+    const std::vector<double>& rpy_i_gains,
+    const std::vector<double>& rpy_d_gains)
 {
+  // Publish full spinal commands to each module in gimbal_calc_in_fc=true mode.
+  //
+  // Each module's spinal (SimulationAttitudeController → FlightControl → AttitudeController)
+  // receives these on its standard topics (the beetle_controller forwards from unified_* → spinal):
+  //
+  // 1. FourAxisCommand (→ four_axes/command):
+  //      base_thrust[8] = position-only 2D vectoring force (4 rotors × rotor_coef 2)
+  //      angles[0] = target_roll
+  //      angles[1] = target_pitch
+  //      angles[2] = candidate_yaw_term
+  //
+  // 2. TorqueAllocationMatrixInv (→ torque_allocation_matrix_inv):
+  //      rows[8] of Vector3Int16: per-motor RPY allocation, scaled ×1000
+  //      Spinal uses: thrust_p_gain[i][axis] = rows[i].axis * 0.001 * torque_p_gain[axis]
+  //
+  // 3. RollPitchYawTerms (→ rpy/gain):
+  //      motors[1] of RollPitchYawTerm: RPY PID gains, scaled ×1000
+  //      With i_term_rp_calc_in_pc=true: roll_i/pitch_i = 0 (I-term computed in FC)
+  //
+  // 4. DesireCoord (→ desire_coordinate):
+  //      roll=0, pitch=0, yaw=0 (formation frame = world, no offset)
+  //
+  // 5. UInt8 gimbal_dof = 1 (→ gimbal_dof):
+  //      Ensure spinal operates in 2D vectoring mode.
+
   for (const auto& kv : module_commands_) {
     int module_id = kv.first;
     const ModuleCommand& cmd = kv.second;
 
-    // Publish scalar thrusts as FourAxisCommand.base_thrust (size 4)
-    // angles[0,1] = 0: with H2 zero gains, spinal's attitude PID produces no roll_pitch_term_.
+    // --- 1. FourAxisCommand: base_thrust (2D vectoring) + target angles ---
     if (module_thrust_pubs_.count(module_id)) {
       spinal::FourAxisCommand thrust_msg;
-      thrust_msg.base_thrust = cmd.full_thrusts;
-      thrust_msg.angles[0] = 0;
-      thrust_msg.angles[1] = 0;
-      thrust_msg.angles[2] = 0;
+      thrust_msg.base_thrust = cmd.base_thrust_2d;  // size 8
+      thrust_msg.angles[0] = static_cast<float>(target_roll);
+      thrust_msg.angles[1] = static_cast<float>(target_pitch);
+      thrust_msg.angles[2] = static_cast<float>(candidate_yaw_term);
       module_thrust_pubs_[module_id].publish(thrust_msg);
     }
 
-    // Publish gimbal angles as JointState
-    if (module_gimbal_pubs_.count(module_id)) {
-      sensor_msgs::JointState gimbal_msg;
-      gimbal_msg.header.stamp = ros::Time::now();
-      gimbal_msg.position = cmd.gimbal_angles;
-      module_gimbal_pubs_[module_id].publish(gimbal_msg);
+    // --- 2. TorqueAllocationMatrixInv (8 rows × 3 axes, int16 scaled ×1000) ---
+    if (module_torque_alloc_pubs_.count(module_id)) {
+      spinal::TorqueAllocationMatrixInv alloc_msg;
+      int rows = cmd.torque_alloc_inv.rows();  // 8 = motor_num * rotor_coef
+      alloc_msg.rows.resize(rows);
+      if (cmd.torque_alloc_inv.cwiseAbs().maxCoeff() > INT16_MAX * 0.001)
+        ROS_ERROR("[UnifiedCtrl] TorqueAllocationMatrixInv overflow for module %d", module_id);
+      for (int i = 0; i < rows; i++) {
+        alloc_msg.rows[i].x = static_cast<int16_t>(cmd.torque_alloc_inv(i, 0) * 1000);
+        alloc_msg.rows[i].y = static_cast<int16_t>(cmd.torque_alloc_inv(i, 1) * 1000);
+        alloc_msg.rows[i].z = static_cast<int16_t>(cmd.torque_alloc_inv(i, 2) * 1000);
+      }
+      module_torque_alloc_pubs_[module_id].publish(alloc_msg);
+    }
+
+    // --- 3. RollPitchYawTerms: RPY PID gains for spinal, scaled ×1000 ---
+    // Same format as GimbalrotorController::setAttitudeGains() with i_term_rp_calc_in_pc=true
+    if (module_rpy_gain_pubs_.count(module_id)) {
+      spinal::RollPitchYawTerms gain_msg;
+      gain_msg.motors.resize(1);
+      gain_msg.motors[0].roll_p  = static_cast<int16_t>(rpy_p_gains.size() > 0 ? rpy_p_gains[0] * 1000 : 0);
+      gain_msg.motors[0].roll_i  = static_cast<int16_t>(rpy_i_gains.size() > 0 ? rpy_i_gains[0] * 1000 : 0);
+      gain_msg.motors[0].roll_d  = static_cast<int16_t>(rpy_d_gains.size() > 0 ? rpy_d_gains[0] * 1000 : 0);
+      gain_msg.motors[0].pitch_p = static_cast<int16_t>(rpy_p_gains.size() > 1 ? rpy_p_gains[1] * 1000 : 0);
+      gain_msg.motors[0].pitch_i = static_cast<int16_t>(rpy_i_gains.size() > 1 ? rpy_i_gains[1] * 1000 : 0);
+      gain_msg.motors[0].pitch_d = static_cast<int16_t>(rpy_d_gains.size() > 1 ? rpy_d_gains[1] * 1000 : 0);
+      gain_msg.motors[0].yaw_d   = static_cast<int16_t>(rpy_d_gains.size() > 2 ? rpy_d_gains[2] * 1000 : 0);
+      module_rpy_gain_pubs_[module_id].publish(gain_msg);
+    }
+
+    // --- 4. DesireCoord: zero (formation frame = world) ---
+    if (module_desire_coord_pubs_.count(module_id)) {
+      spinal::DesireCoord coord_msg;
+      coord_msg.roll = 0;
+      coord_msg.pitch = 0;
+      coord_msg.yaw = 0;
+      module_desire_coord_pubs_[module_id].publish(coord_msg);
+    }
+
+    // --- 5. UInt8 gimbal_dof = 1: ensure 2D vectoring mode ---
+    if (module_gimbal_dof_pubs_.count(module_id)) {
+      std_msgs::UInt8 dof_msg;
+      dof_msg.data = 1;
+      module_gimbal_dof_pubs_[module_id].publish(dof_msg);
     }
   }
 
-  ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl] Published commands for %zu modules (thrust size=%d, gimbal size=%d)",
-                     module_commands_.size(), motor_num_per_module_,
-                     motor_num_per_module_ * gimbal_dof_);
+  ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl] Published 2D vectoring commands for %zu modules "
+                     "(entries_per_module=%d, roll=%.3f, pitch=%.3f, yaw_term=%.3f)",
+                     module_commands_.size(), motor_num_per_module_ * rotor_coef_,
+                     target_roll, target_pitch, candidate_yaw_term);
 }
 
 } // namespace aerial_robot_control

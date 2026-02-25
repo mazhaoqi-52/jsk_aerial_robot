@@ -14,8 +14,13 @@ namespace aerial_robot_control
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
     unified_cmd_received_(false),
+    unified_torque_alloc_received_(false),
+    unified_rpy_gain_received_(false),
+    unified_desire_coord_received_(false),
+    unified_gimbal_dof_received_(false),
     follower_unified_active_(false),
-    spinal_gains_zeroed_(false)
+    spinal_gains_zeroed_(false),
+    unified_transition_count_(-1)
   {
   }
 
@@ -103,11 +108,21 @@ namespace aerial_robot_control
                         + std::to_string(beetle_navigator_->getMyID());
     unified_thrust_sub_ = nh_.subscribe(my_ns + "/unified_thrust_cmd", 1,
                                         &BeetleController::unifiedThrustCallback, this);
-    unified_gimbal_sub_ = nh_.subscribe(my_ns + "/unified_gimbal_cmd", 1,
-                                        &BeetleController::unifiedGimbalCallback, this);
-    // Publishers to this module's own spinal (same topic names as GimbalrotorController)
+    unified_torque_alloc_sub_ = nh_.subscribe(my_ns + "/unified_torque_alloc_inv", 1,
+                                              &BeetleController::unifiedTorqueAllocCallback, this);
+    unified_rpy_gain_sub_ = nh_.subscribe(my_ns + "/unified_rpy_gain", 1,
+                                          &BeetleController::unifiedRpyGainCallback, this);
+    unified_desire_coord_sub_ = nh_.subscribe(my_ns + "/unified_desire_coord", 1,
+                                              &BeetleController::unifiedDesireCoordCallback, this);
+    unified_gimbal_dof_sub_ = nh_.subscribe(my_ns + "/unified_gimbal_dof", 1,
+                                            &BeetleController::unifiedGimbalDofCallback, this);
+
+    // Publishers to this module's own spinal (standard topic names)
     follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
-    follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
+    follower_torque_alloc_pub_ = nh_.advertise<spinal::TorqueAllocationMatrixInv>("torque_allocation_matrix_inv", 1);
+    follower_rpy_gain_pub_ = nh_.advertise<spinal::RollPitchYawTerms>("rpy/gain", 1);
+    follower_desire_coord_pub_ = nh_.advertise<spinal::DesireCoord>("desire_coordinate", 1);
+    follower_gimbal_dof_pub_ = nh_.advertise<std_msgs::UInt8>("gimbal_dof", 1);
   }
 
   void BeetleController::controlCore()
@@ -127,14 +142,42 @@ namespace aerial_robot_control
     // In this mode, LEADER does NOT call GimbalrotorController::controlCore().
     // Instead it uses BeetleUnifiedController to allocate across all N*4 rotors.
     if (unified_control_mode_ && module_state == LEADER && module_state != SEPARATED) {
-      // Detect mode switch: reset pitch/roll I terms and disable spinal's internal PID
+      // Detect mode switch: reset pitch/roll I terms
       if (pre_module_state_ != LEADER || !prev_unified_control_mode_) {
+        // Bug 3 fix: Reset target position/yaw to current state at mode switch,
+        // so that PID sees zero initial error (avoids step from stale target).
+        {
+          tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
+          navigator_->setXyControlMode(aerial_robot_navigation::POS_CONTROL_MODE);
+          navigator_->setTargetPosX(cur_pos.x());
+          navigator_->setTargetPosY(cur_pos.y());
+          navigator_->setTargetVelX(0);
+          navigator_->setTargetVelY(0);
+          navigator_->setTargetAccX(0);
+          navigator_->setTargetAccY(0);
+
+          double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
+          navigator_->setTargetYaw(cur_yaw);
+          navigator_->setTargetOmegaZ(0);
+        }
+
         pid_controllers_.at(ROLL).setErrI(0);
         pid_controllers_.at(PITCH).setErrI(0);
-        // H2: Disable spinal's internal attitude PID by sending zero gains
-        sendZeroAttitudeGains();
-        spinal_gains_zeroed_ = true;
-        ROS_INFO("[UnifiedCtrl] LEADER mode switch: reset pitch/roll I, zeroed spinal rpy/gain");
+        // Note: With gimbal_calc_in_fc=true, spinal's attitude PID stays active.
+        // We send updated TorqueAllocationMatrixInv + RPY gains for the formation,
+        // replacing the single-module values. No need to zero gains.
+        spinal_gains_zeroed_ = true;  // mark that we've overwritten single-module alloc/gains
+        unified_transition_count_ = 0;  // start high-freq diag counter
+        ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset pitch/roll I. "
+                 "PID state at switch: Z_I=%.4f, ROLL_I=%.4f(reset), PITCH_I=%.4f(reset), YAW_I=%.4f, "
+                 "X_I=%.4f, Y_I=%.4f, control_timestamp=%.4f, now=%.4f",
+                 pid_controllers_.at(Z).getErrI(),
+                 pid_controllers_.at(ROLL).getErrI(),
+                 pid_controllers_.at(PITCH).getErrI(),
+                 pid_controllers_.at(YAW).getErrI(),
+                 pid_controllers_.at(X).getErrI(),
+                 pid_controllers_.at(Y).getErrI(),
+                 control_timestamp_, ros::Time::now().toSec());
       }
       prev_unified_control_mode_ = true;
 
@@ -165,11 +208,19 @@ namespace aerial_robot_control
       // 2. Compute formation CoG position in world frame
       //    formation_cog_offset is in LEADER body frame (from TF lookups).
       //    Transform to world frame: formation_cog_world = leader_pos + R * offset
+      //    Bug 4 fix: ensure geometry is up-to-date BEFORE PID uses the offset
+      //    (computeUnifiedAllocation runs after PID, so first frame would use stale data).
+      unified_controller_->updateFormationGeometry();
       const Eigen::Vector3d& cog_offset = unified_controller_->getFormationCogOffset();
       tf::Vector3 offset_body(cog_offset.x(), cog_offset.y(), cog_offset.z());
       tf::Vector3 offset_world = cog_rot * offset_body;
       tf::Vector3 formation_pos = pos_ + offset_world;
-      tf::Vector3 formation_vel = vel_;  // ω×r term is small at near-hover, use leader vel as approx
+      // Formation CoG velocity = leader_vel + ω_world × r_world
+      // where r_world is the offset from leader CoG to formation CoG in world frame.
+      // Note: omega_ is in CoG body frame (from IMU gyro), must rotate to world frame first.
+      // v_formation = v_leader + R * (ω_body × offset_body)  [equivalent to (R*ω_body) × (R*offset_body)]
+      tf::Vector3 omega_world = cog_rot * omega_;
+      tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
 
       // target for formation CoG: leader's target + R_target * offset (at target orientation)
       tf::Vector3 target_formation_pos = target_pos_ + target_rot * offset_body;
@@ -233,6 +284,59 @@ namespace aerial_robot_control
 
       control_timestamp_ = ros::Time::now().toSec();
 
+      // ===== HIGH-FREQ TRANSITION DIAG: first 20 frames after mode switch =====
+      if (unified_transition_count_ >= 0 && unified_transition_count_ < 20) {
+        ROS_WARN("[TRANS_DIAG frame=%d] t=%.4f du=%.6f du_rp=%.6f",
+                 unified_transition_count_, ros::Time::now().toSec(), du, du_rp);
+        ROS_WARN("[TRANS_DIAG frame=%d] cog_offset=(%.4f,%.4f,%.4f) offset_world=(%.4f,%.4f,%.4f)",
+                 unified_transition_count_,
+                 cog_offset.x(), cog_offset.y(), cog_offset.z(),
+                 offset_world.x(), offset_world.y(), offset_world.z());
+        ROS_WARN("[TRANS_DIAG frame=%d] leader_pos=(%.4f,%.4f,%.4f) formation_pos=(%.4f,%.4f,%.4f)",
+                 unified_transition_count_,
+                 pos_.x(), pos_.y(), pos_.z(),
+                 formation_pos.x(), formation_pos.y(), formation_pos.z());
+        ROS_WARN("[TRANS_DIAG frame=%d] target_pos=(%.4f,%.4f,%.4f) target_form_pos=(%.4f,%.4f,%.4f)",
+                 unified_transition_count_,
+                 target_pos_.x(), target_pos_.y(), target_pos_.z(),
+                 target_formation_pos.x(), target_formation_pos.y(), target_formation_pos.z());
+        ROS_WARN("[TRANS_DIAG frame=%d] rpy=(%.5f,%.5f,%.5f) target_rpy=(%.5f,%.5f,%.5f)",
+                 unified_transition_count_,
+                 rpy_.x(), rpy_.y(), rpy_.z(),
+                 target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
+        ROS_WARN("[TRANS_DIAG frame=%d] omega=(%.5f,%.5f,%.5f)",
+                 unified_transition_count_, omega_.x(), omega_.y(), omega_.z());
+        ROS_WARN("[TRANS_DIAG frame=%d] PID_X: P=%.4f I=%.4f D=%.4f res=%.4f",
+                 unified_transition_count_,
+                 pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(),
+                 pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).result());
+        ROS_WARN("[TRANS_DIAG frame=%d] PID_Y: P=%.4f I=%.4f D=%.4f res=%.4f",
+                 unified_transition_count_,
+                 pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(),
+                 pid_controllers_.at(Y).getDTerm(), pid_controllers_.at(Y).result());
+        ROS_WARN("[TRANS_DIAG frame=%d] PID_Z: P=%.4f I=%.4f D=%.4f res=%.4f err_z=%.4f",
+                 unified_transition_count_,
+                 pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
+                 pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).result(),
+                 target_formation_pos.z() - formation_pos.z());
+        ROS_WARN("[TRANS_DIAG frame=%d] PID_ROLL: P=%.4f I=%.4f D=%.4f res=%.4f err=%.5f",
+                 unified_transition_count_,
+                 pid_controllers_.at(ROLL).getPTerm(), pid_controllers_.at(ROLL).getITerm(),
+                 pid_controllers_.at(ROLL).getDTerm(), pid_controllers_.at(ROLL).result(),
+                 target_rpy_.x() - rpy_.x());
+        ROS_WARN("[TRANS_DIAG frame=%d] PID_PITCH: P=%.4f I=%.4f D=%.4f res=%.4f err=%.5f",
+                 unified_transition_count_,
+                 pid_controllers_.at(PITCH).getPTerm(), pid_controllers_.at(PITCH).getITerm(),
+                 pid_controllers_.at(PITCH).getDTerm(), pid_controllers_.at(PITCH).result(),
+                 target_rpy_.y() - rpy_.y());
+        ROS_WARN("[TRANS_DIAG frame=%d] PID_YAW: P=%.4f I=%.4f D=%.4f res=%.4f err=%.5f",
+                 unified_transition_count_,
+                 pid_controllers_.at(YAW).getPTerm(), pid_controllers_.at(YAW).getITerm(),
+                 pid_controllers_.at(YAW).getDTerm(), pid_controllers_.at(YAW).result(),
+                 err_yaw);
+        unified_transition_count_++;
+      }
+
       // Build target wrench in acc space from PID outputs
       tf::Matrix3x3 uav_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
       tf::Vector3 target_acc_w(pid_controllers_.at(X).result(),
@@ -247,12 +351,16 @@ namespace aerial_robot_control
       target_wrench_acc(5) = pid_controllers_.at(YAW).result();
 
       // --- 方案δ: Add gyro compensation (ω × I·ω) ---
+      // Newton-Euler: I·α = τ_ext - ω×(I·ω)
+      // To achieve desired α, we need τ = I·α_desired + ω×(I·ω)
+      // In acceleration space (wrench_acc): α_needed = α_desired + I^{-1}·(ω×(I·ω))
       {
         const Eigen::Matrix3d& I_form = unified_controller_->getFormationInertia();
         Eigen::Vector3d omega_eigen;
         tf::vectorTFToEigen(omega_, omega_eigen);
-        Eigen::Vector3d gyro = omega_eigen.cross(I_form * omega_eigen);
-        target_wrench_acc.tail(3) += gyro;
+        Eigen::Vector3d gyro_torque = omega_eigen.cross(I_form * omega_eigen);  // [Nm]
+        Eigen::Vector3d gyro_acc = I_form.inverse() * gyro_torque;              // [rad/s²]
+        target_wrench_acc.tail(3) += gyro_acc;
       }
 
       // Store for external wrench estimator (externalWrenchEstimate uses this)
@@ -260,32 +368,96 @@ namespace aerial_robot_control
 
       // Run unified allocation
       bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, desired_external_wrench_);
-      if (ok) {
-        // Publish commands to all FOLLOWERs via /beetle{id}/unified_thrust_cmd topics
-        unified_controller_->publishCommands();
 
-        // LEADER must also send its own share to its own spinal.
-        // publishCommands() only writes to /beetle{id}/unified_thrust_cmd + gimbal_cmd,
-        // which FOLLOWERs forward to their four_axes/command + gimbals_ctrl.
-        // But LEADER's controlCore doesn't enter the FOLLOWER branch,
-        // so we forward LEADER's own command here directly.
+      // ===== HIGH-FREQ TRANSITION DIAG: wrench and allocation results =====
+      if (unified_transition_count_ > 0 && unified_transition_count_ <= 20) {
+        int frame = unified_transition_count_ - 1;
+        ROS_WARN("[TRANS_DIAG frame=%d] wrench_acc=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f) alloc_ok=%d",
+                 frame,
+                 target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
+                 target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok);
+        if (ok) {
+          const auto& all_cmds = unified_controller_->getModuleCommands();
+          for (const auto& kv : all_cmds) {
+            std::string bt_str;
+            for (size_t r = 0; r < kv.second.base_thrust_2d.size(); r++)
+              bt_str += std::to_string(kv.second.base_thrust_2d[r]) + " ";
+            ROS_WARN("[TRANS_DIAG frame=%d] m%d: bt2d=[%s]",
+                     frame, kv.first, bt_str.c_str());
+          }
+        }
+      }
+
+      if (ok) {
+        // Build RPY gains for spinal's attitude PID (from the FC's PID gains).
+        // With i_term_rp_calc_in_pc=true (sim config), roll_i/pitch_i → 0 for spinal.
+        std::vector<double> rpy_p_gains = {
+          pid_controllers_.at(ROLL).getPGain(),
+          pid_controllers_.at(PITCH).getPGain(),
+          pid_controllers_.at(YAW).getPGain()
+        };
+        std::vector<double> rpy_i_gains = {0, 0, 0};  // I-term computed in FC, not in spinal
+        std::vector<double> rpy_d_gains = {
+          pid_controllers_.at(ROLL).getDGain(),
+          pid_controllers_.at(PITCH).getDGain(),
+          pid_controllers_.at(YAW).getDGain()
+        };
+
+        // Target RPY for spinal's attitude tracking
+        double target_roll_cmd = target_rpy_.x();
+        double target_pitch_cmd = target_rpy_.y();
+        double candidate_yaw_cmd = unified_controller_->getCandidateYawTerm();
+
+        // Publish commands to all modules (LEADER + FOLLOWERs) via unified topics
+        unified_controller_->publishCommands(
+            target_roll_cmd, target_pitch_cmd, candidate_yaw_cmd,
+            rpy_p_gains, rpy_i_gains, rpy_d_gains);
+
+        // LEADER also forwards its own unified commands to its own spinal.
+        // The unified_controller publishes to /beetle{id}/unified_* topics,
+        // and the FOLLOWER path subscribes + forwards to spinal standard topics.
+        // But LEADER doesn't enter the FOLLOWER branch, so forward here directly.
         int my_id = beetle_navigator_->getMyID();
         const auto& cmds = unified_controller_->getModuleCommands();
         auto it = cmds.find(my_id);
         if (it != cmds.end()) {
-          // Send scalar thrusts (size 4) to own spinal
+          // Send 2D vectoring base_thrust + target angles to own spinal
           spinal::FourAxisCommand my_thrust_msg;
-          my_thrust_msg.base_thrust = it->second.full_thrusts;
-          my_thrust_msg.angles[0] = 0;
-          my_thrust_msg.angles[1] = 0;
-          my_thrust_msg.angles[2] = 0;
+          my_thrust_msg.base_thrust = it->second.base_thrust_2d;  // size 8
+          my_thrust_msg.angles[0] = static_cast<float>(target_roll_cmd);
+          my_thrust_msg.angles[1] = static_cast<float>(target_pitch_cmd);
+          my_thrust_msg.angles[2] = static_cast<float>(candidate_yaw_cmd);
           follower_thrust_pub_.publish(my_thrust_msg);
 
-          // Send gimbal angles to own spinal
-          sensor_msgs::JointState my_gimbal_msg;
-          my_gimbal_msg.header.stamp = ros::Time::now();
-          my_gimbal_msg.position = it->second.gimbal_angles;
-          follower_gimbal_pub_.publish(my_gimbal_msg);
+          // Send TorqueAllocationMatrixInv to own spinal
+          spinal::TorqueAllocationMatrixInv my_alloc_msg;
+          int n_rows = it->second.torque_alloc_inv.rows();
+          my_alloc_msg.rows.resize(n_rows);
+          for (int i = 0; i < n_rows; i++) {
+            my_alloc_msg.rows[i].x = static_cast<int16_t>(it->second.torque_alloc_inv(i, 0) * 1000);
+            my_alloc_msg.rows[i].y = static_cast<int16_t>(it->second.torque_alloc_inv(i, 1) * 1000);
+            my_alloc_msg.rows[i].z = static_cast<int16_t>(it->second.torque_alloc_inv(i, 2) * 1000);
+          }
+          follower_torque_alloc_pub_.publish(my_alloc_msg);
+
+          // Send RPY gains to own spinal
+          spinal::RollPitchYawTerms my_gain_msg;
+          my_gain_msg.motors.resize(1);
+          my_gain_msg.motors[0].roll_p  = static_cast<int16_t>(rpy_p_gains[0] * 1000);
+          my_gain_msg.motors[0].roll_i  = 0;
+          my_gain_msg.motors[0].roll_d  = static_cast<int16_t>(rpy_d_gains[0] * 1000);
+          my_gain_msg.motors[0].pitch_p = static_cast<int16_t>(rpy_p_gains[1] * 1000);
+          my_gain_msg.motors[0].pitch_i = 0;
+          my_gain_msg.motors[0].pitch_d = static_cast<int16_t>(rpy_d_gains[1] * 1000);
+          my_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(rpy_d_gains[2] * 1000);
+          follower_rpy_gain_pub_.publish(my_gain_msg);
+
+          // Send DesireCoord (zero for unified mode)
+          spinal::DesireCoord my_coord_msg;
+          my_coord_msg.roll = 0;
+          my_coord_msg.pitch = 0;
+          my_coord_msg.yaw = 0;
+          follower_desire_coord_pub_.publish(my_coord_msg);
         }
       }
 
@@ -324,17 +496,14 @@ namespace aerial_robot_control
         const auto& all_cmds = unified_controller_->getModuleCommands();
         std::stringstream cmd_ss;
         for (const auto& kv : all_cmds) {
-          std::string thrust_str, gimbal_str;
-          for (size_t r = 0; r < kv.second.full_thrusts.size(); r++) {
-            thrust_str += std::to_string(kv.second.full_thrusts[r]) + " ";
-          }
-          for (size_t r = 0; r < kv.second.gimbal_angles.size(); r++) {
-            gimbal_str += std::to_string(kv.second.gimbal_angles[r]) + " ";
+          std::string bt_str;
+          for (size_t r = 0; r < kv.second.base_thrust_2d.size(); r++) {
+            bt_str += std::to_string(kv.second.base_thrust_2d[r]) + " ";
           }
           char cb[256];
-          snprintf(cb, sizeof(cb), " m%d:T=[%s](sz=%zu) G=[%s](sz=%zu)",
-                   kv.first, thrust_str.c_str(), kv.second.full_thrusts.size(),
-                   gimbal_str.c_str(), kv.second.gimbal_angles.size());
+          snprintf(cb, sizeof(cb), " m%d:bt2d=[%s](sz=%zu) alloc=%ldx%ld",
+                   kv.first, bt_str.c_str(), kv.second.base_thrust_2d.size(),
+                   kv.second.torque_alloc_inv.rows(), kv.second.torque_alloc_inv.cols());
           cmd_ss << cb;
         }
         ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER DIAG] module cmds:%s", cmd_ss.str().c_str());
@@ -345,15 +514,11 @@ namespace aerial_robot_control
     }
 
     // ======== Unified Control Mode: FOLLOWER ========
-    // FOLLOWER receives thrust + gimbal commands from LEADER via ROS topics,
-    // then forwards them to its own spinal. No local PID or wrench comp.
+    // FOLLOWER receives all spinal commands from LEADER via unified_* topics,
+    // then forwards them to its own spinal's standard topics.
+    // With gimbal_calc_in_fc=true, spinal handles attitude PID + gimbal computation at 1kHz.
     if (unified_control_mode_ && module_state == FOLLOWER && module_state != SEPARATED) {
-      // H2: Disable spinal's internal attitude PID on first entry
-      if (!spinal_gains_zeroed_) {
-        sendZeroAttitudeGains();
-        spinal_gains_zeroed_ = true;
-        ROS_INFO("[UnifiedCtrl] FOLLOWER id=%d: zeroed spinal rpy/gain", beetle_navigator_->getMyID());
-      }
+      unified_transition_count_ = (unified_transition_count_ < 0) ? 0 : unified_transition_count_;
 
       // Check if we have a fresh unified command from LEADER
       bool have_valid_cmd = false;
@@ -364,30 +529,57 @@ namespace aerial_robot_control
         }
       }
 
-      if (have_valid_cmd) {
-        // Forward scalar thrusts (size 4) to own spinal's four_axes/command.
-        follower_thrust_pub_.publish(unified_thrust_cmd_);
-        // Forward gimbal angles to own spinal's gimbals_ctrl.
-        follower_gimbal_pub_.publish(unified_gimbal_cmd_);
+      // HIGH-FREQ FOLLOWER TRANSITION DIAG
+      if (unified_transition_count_ >= 0 && unified_transition_count_ < 20) {
+        tf::Vector3 fol_rpy = estimator_->getEuler(Frame::COG, estimate_mode_);
+        tf::Vector3 fol_pos = estimator_->getPos(Frame::COG, estimate_mode_);
+        ROS_WARN("[FOLLOWER_TRANS_DIAG id=%d frame=%d] t=%.4f have_cmd=%d "
+                 "rpy=(%.5f,%.5f,%.5f) pos=(%.4f,%.4f,%.4f) "
+                 "alloc_recv=%d gain_recv=%d coord_recv=%d dof_recv=%d",
+                 beetle_navigator_->getMyID(), unified_transition_count_,
+                 ros::Time::now().toSec(), have_valid_cmd,
+                 fol_rpy.x(), fol_rpy.y(), fol_rpy.z(),
+                 fol_pos.x(), fol_pos.y(), fol_pos.z(),
+                 unified_torque_alloc_received_, unified_rpy_gain_received_,
+                 unified_desire_coord_received_, unified_gimbal_dof_received_);
+        unified_transition_count_++;
+      }
 
-        // Mark that we have successfully transitioned to unified forwarding
+      if (have_valid_cmd) {
+        // Forward FourAxisCommand (2D vectoring base_thrust + target angles) to own spinal
+        follower_thrust_pub_.publish(unified_thrust_cmd_);
+
+        // Forward TorqueAllocationMatrixInv to own spinal
+        if (unified_torque_alloc_received_)
+          follower_torque_alloc_pub_.publish(unified_torque_alloc_cmd_);
+
+        // Forward RPY gains to own spinal
+        if (unified_rpy_gain_received_)
+          follower_rpy_gain_pub_.publish(unified_rpy_gain_cmd_);
+
+        // Forward DesireCoord to own spinal
+        if (unified_desire_coord_received_)
+          follower_desire_coord_pub_.publish(unified_desire_coord_cmd_);
+
+        // Forward gimbal_dof to own spinal (only needed once, but publish continuously for safety)
+        if (unified_gimbal_dof_received_)
+          follower_gimbal_dof_pub_.publish(unified_gimbal_dof_cmd_);
+
         follower_unified_active_ = true;
 
         // ===== DIAGNOSTIC: FOLLOWER forwarding details =====
         {
           double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
-          std::string thrust_str;
+          std::string bt_str;
           for (size_t r = 0; r < unified_thrust_cmd_.base_thrust.size(); r++) {
-            thrust_str += std::to_string(unified_thrust_cmd_.base_thrust[r]) + " ";
+            bt_str += std::to_string(unified_thrust_cmd_.base_thrust[r]) + " ";
           }
-          std::string gimbal_str;
-          for (size_t r = 0; r < unified_gimbal_cmd_.position.size(); r++) {
-            gimbal_str += std::to_string(unified_gimbal_cmd_.position[r]) + " ";
-          }
-          ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER DIAG] id=%d age=%.3fs thrust=[%s](sz=%zu) gimbal=[%s](sz=%zu)",
+          ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER DIAG] id=%d age=%.3fs bt2d=[%s](sz=%zu) "
+                            "roll=%.3f pitch=%.3f yaw_term=%.3f",
                             beetle_navigator_->getMyID(), age,
-                            thrust_str.c_str(), unified_thrust_cmd_.base_thrust.size(),
-                            gimbal_str.c_str(), unified_gimbal_cmd_.position.size());
+                            bt_str.c_str(), unified_thrust_cmd_.base_thrust.size(),
+                            unified_thrust_cmd_.angles[0], unified_thrust_cmd_.angles[1],
+                            unified_thrust_cmd_.angles[2]);
         }
 
         pre_module_state_ = module_state;
@@ -395,23 +587,25 @@ namespace aerial_robot_control
       }
 
       // ---- No valid unified command yet: continue independent hover ----
-      // This avoids a thrust gap during the transition ticks before
-      // LEADER's first command arrives via cross-process ROS topics.
-      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d, no valid unified cmd yet — maintaining independent hover",
-                        beetle_navigator_->getMyID());
+      // With gimbal_calc_in_fc=true, spinal's attitude PID is still active
+      // using the standalone single-module TorqueAllocationMatrixInv. 
+      // This provides basic stabilization until LEADER's commands arrive.
+      ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d, no valid unified cmd yet at t=%.4f — "
+               "fallback to independent hover (gimbal_calc_in_fc=true, spinal PID still active)",
+               beetle_navigator_->getMyID(), ros::Time::now().toSec());
       // Fall through to the normal independent control path below.
-      // GimbalrotorController::controlCore() will run and produce
-      // thrust + gimbal output via the normal sendCmd() chain.
     }
 
     prev_unified_control_mode_ = false;
     follower_unified_active_ = false;  // Reset so next unified entry starts fresh
 
-    // H2: Restore spinal's attitude gains when exiting unified mode
+    // When exiting unified mode, restore single-module RPY gains.
+    // The TorqueAllocationMatrixInv will be automatically resent by
+    // the normal GimbalrotorController flow (controlCore → sendCmd → sendTorqueAllocationMatrixInv).
     if (spinal_gains_zeroed_) {
       setAttitudeGains();
       spinal_gains_zeroed_ = false;
-      ROS_INFO("[UnifiedCtrl] Exiting unified mode, restored spinal rpy/gain (id=%d)",
+      ROS_INFO("[UnifiedCtrl] Exiting unified mode, restored single-module gains (id=%d)",
                beetle_navigator_->getMyID());
     }
     
@@ -697,7 +891,11 @@ namespace aerial_robot_control
       if (is_follower_without_cmd) {
         /* FOLLOWER has not yet received its first unified command from LEADER.
            Use the full GimbalrotorController update chain to maintain
-           independent hover, avoiding a thrust gap during the transition. */
+           independent hover, avoiding a thrust gap during the transition.
+           WARNING: spinal_gains_zeroed_ may already be true here! */
+        ROS_WARN("[FOLLOWER_TRANS_DIAG id=%d] update() fallback to GimbalrotorController::update() "
+                 "at t=%.4f, spinal_gains_zeroed=%d",
+                 beetle_navigator_->getMyID(), ros::Time::now().toSec(), spinal_gains_zeroed_);
         return GimbalrotorController::update();
       }
 
@@ -753,29 +951,28 @@ namespace aerial_robot_control
     unified_cmd_stamp_ = ros::Time::now();
   }
 
-  void BeetleController::unifiedGimbalCallback(const sensor_msgs::JointState& msg)
+  void BeetleController::unifiedTorqueAllocCallback(const spinal::TorqueAllocationMatrixInv& msg)
   {
-    unified_gimbal_cmd_ = msg;
-    unified_cmd_received_ = true;
-    unified_cmd_stamp_ = ros::Time::now();
+    unified_torque_alloc_cmd_ = msg;
+    unified_torque_alloc_received_ = true;
   }
 
-  void BeetleController::sendZeroAttitudeGains()
+  void BeetleController::unifiedRpyGainCallback(const spinal::RollPitchYawTerms& msg)
   {
-    // H2: Send all-zero rpy/gain to this module's spinal.
-    // This zeroes out thrust_p/i/d_gain_ inside spinal's AttitudeController,
-    // so roll_pitch_term_ becomes 0 and spinal acts as a pure PWM executor.
-    // rpy_gain_pub_ is inherited (protected) from GimbalrotorController.
-    spinal::RollPitchYawTerms rpy_gain_msg;
-    rpy_gain_msg.motors.resize(1);
-    rpy_gain_msg.motors.at(0).roll_p = 0;
-    rpy_gain_msg.motors.at(0).roll_i = 0;
-    rpy_gain_msg.motors.at(0).roll_d = 0;
-    rpy_gain_msg.motors.at(0).pitch_p = 0;
-    rpy_gain_msg.motors.at(0).pitch_i = 0;
-    rpy_gain_msg.motors.at(0).pitch_d = 0;
-    rpy_gain_msg.motors.at(0).yaw_d = 0;
-    rpy_gain_pub_.publish(rpy_gain_msg);
+    unified_rpy_gain_cmd_ = msg;
+    unified_rpy_gain_received_ = true;
+  }
+
+  void BeetleController::unifiedDesireCoordCallback(const spinal::DesireCoord& msg)
+  {
+    unified_desire_coord_cmd_ = msg;
+    unified_desire_coord_received_ = true;
+  }
+
+  void BeetleController::unifiedGimbalDofCallback(const std_msgs::UInt8& msg)
+  {
+    unified_gimbal_dof_cmd_ = msg;
+    unified_gimbal_dof_received_ = true;
   }
 
   void BeetleController::calcInteractionWrench()

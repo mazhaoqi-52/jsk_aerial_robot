@@ -40,18 +40,7 @@
   </include>
   
   <!-- Controller parameters for formation towing -->
-  <!-- Set unified_control_mode for each module namespace.
-       The YAML config (BeetleControl_sim.yaml) provides default=false.
-       This overrides it per-module at launch time. -->
-  <group if="$(eval len(arg('module_ids').split(',')) > 0)">
-    <param name="/beetle$(eval arg('module_ids').split(',')[0].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
-  </group>
-  <group if="$(eval len(arg('module_ids').split(',')) > 1)">
-    <param name="/beetle$(eval arg('module_ids').split(',')[1].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
-  </group>
-  <group if="$(eval len(arg('module_ids').split(',')) > 2)">
-    <param name="/beetle$(eval arg('module_ids').split(',')[2].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
-  </group>
+  <param name="controller/unified_control_mode" value="$(arg unified_control_mode)" />
   <param name="controller/towing_feedforward/enabled" value="true" />
   <param name="controller/towing_feedforward/force_x" value="$(arg towing_force)" />
   

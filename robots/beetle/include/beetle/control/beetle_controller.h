@@ -39,12 +39,15 @@ namespace aerial_robot_control
     boost::shared_ptr<BeetleRobotModel> beetle_robot_model_;
     boost::shared_ptr<aerial_robot_navigation::BeetleNavigator> beetle_navigator_;
     
-    // Unified 4N-rotor controller for assembled formation (Plan B)
+    // Unified 4N-rotor controller for assembled formation
     std::shared_ptr<BeetleUnifiedController> unified_controller_;
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
     int unified_transition_count_;    // frame counter since last mode switch (for high-freq diag)
-    bool formation_alloc_sent_;       // track whether formation torque_alloc_inv + RPY gains have been sent
+    bool spinal_gains_zeroed_;        // track whether we sent zero rpy/gain to spinal
+
+    /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID. */
+    void sendZeroAttitudeGains();
 
     // FOLLOWER unified mode: receive commands from LEADER
     ros::Subscriber unified_thrust_sub_;

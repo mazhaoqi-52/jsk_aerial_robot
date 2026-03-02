@@ -77,3 +77,27 @@ controller:
     limit_d: 20.0
 
     need_d_control: true
+
+  # ========== Unified mode PID overrides ==========
+  # In unified (formation) mode, the formation has a large CoG offset (~0.522 m)
+  # creating an inverted pendulum effect. The gravity instability threshold is
+  # ω² = m·g·d / I_yy ≈ 23.2 rad/s²/rad, so P gain must exceed this.
+  # These gains are applied ONLY when entering unified control mode.
+  # When exiting unified mode, the original (per-module) gains are restored.
+  unified_roll:
+    p_gain: 36.0
+    i_gain: 1.0
+    d_gain: 12.0
+    limit_sum: 50.0
+    limit_p: 50.0
+    limit_i: 10.0
+    limit_d: 50.0
+
+  unified_pitch:
+    p_gain: 36.0
+    i_gain: 1.0
+    d_gain: 12.0
+    limit_sum: 50.0
+    limit_p: 50.0
+    limit_i: 10.0
+    limit_d: 50.0

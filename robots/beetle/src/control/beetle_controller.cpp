@@ -16,7 +16,9 @@ namespace aerial_robot_control
     unified_cmd_received_(false),
     follower_unified_active_(false),
     unified_transition_count_(-1),
-    spinal_gains_zeroed_(false)
+    spinal_gains_zeroed_(false),
+    has_cached_independent_cmd_(false),
+    gains_switched_(false)
   {
   }
 
@@ -119,10 +121,9 @@ namespace aerial_robot_control
     bool comp_update_flag = false;
     double comp_update_interval = 1  / comp_term_update_freq_;
     
-    // Check unified control mode from rosparam (allows runtime toggle)
-    ros::NodeHandle control_nh(nh_, "controller");
-    control_nh.getParam("unified_control_mode", unified_control_mode_);
-    
+    // Note: unified_control_mode_ is now read in update() before routing,
+    // so controlCore() always sees the up-to-date value.
+
     // ======== Unified Control Mode ========
     // LEADER does full 6-DOF PID (position + attitude) → formation allocation.
     // Spinal acts as pure PWM executor (zero attitude gains).
@@ -146,10 +147,14 @@ namespace aerial_robot_control
         }
         pid_controllers_.at(ROLL).setErrI(0);
         pid_controllers_.at(PITCH).setErrI(0);
+        pid_controllers_.at(X).setErrI(0);
+        pid_controllers_.at(Y).setErrI(0);
+        pid_controllers_.at(Z).setErrI(0);  // clear Z I term: gravity is now explicit feedforward (+g)
         sendZeroAttitudeGains();
+        applyUnifiedGains();
         spinal_gains_zeroed_ = true;
         unified_transition_count_ = 0;
-        ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, zeroed spinal gains, t=%.4f",
+        ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, zeroed spinal gains, applied unified PID gains, t=%.4f",
                  ros::Time::now().toSec());
       }
       prev_unified_control_mode_ = true;
@@ -250,6 +255,15 @@ namespace aerial_robot_control
       target_wrench_acc(3) = pid_controllers_.at(ROLL).result();
       target_wrench_acc(4) = pid_controllers_.at(PITCH).result();
       target_wrench_acc(5) = pid_controllers_.at(YAW).result();
+
+      // Gravity feedforward: in unified mode spinal's attitude PID is zeroed,
+      // so PC must explicitly provide gravity compensation in the body Z axis.
+      {
+        tf::Matrix3x3 uav_rot_ff = estimator_->getOrientation(Frame::COG, estimate_mode_);
+        tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
+        tf::Vector3 gravity_cog = uav_rot_ff.inverse() * gravity_w;
+        target_wrench_acc.head(3) += Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
+      }
 
       // --- Gyro compensation: ω × I·ω (same as GimbalrotorController: add torque directly) ---
       {
@@ -359,6 +373,7 @@ namespace aerial_robot_control
     prev_unified_control_mode_ = false;
     follower_unified_active_ = false;
     spinal_gains_zeroed_ = false;
+    restoreIndependentGains();  // restore per-module roll/pitch PID gains
     
     if(beetle_navigator_->getControlFlag() &&
        module_state != SEPARATED){
@@ -619,27 +634,57 @@ namespace aerial_robot_control
 
   bool BeetleController::update()
   {
+    // Read unified_control_mode from rosparam at the START of update(),
+    // so routing decisions below use the latest value (not stale from last cycle).
+    {
+      ros::NodeHandle control_nh(nh_, "controller");
+      control_nh.getParam("unified_control_mode", unified_control_mode_);
+    }
+
     if (unified_control_mode_) {
       int module_state = beetle_navigator_->getModuleState();
-      bool is_follower_without_cmd = false;
 
-      // Check if this FOLLOWER lacks a valid unified command and needs
-      // to fall back to independent hover (方案 A).
+      // --- FOLLOWER without valid unified command: FREEZE (defensive) ---
+      // Note: In practice this rarely triggers because LEADER publishes unified
+      // commands before FOLLOWERs detect the mode switch. Kept as a safety net.
       if (module_state == FOLLOWER && module_state != SEPARATED) {
         bool have_valid_cmd = false;
         if (unified_cmd_received_) {
           double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
           if (age < 0.5) have_valid_cmd = true;
         }
-        if (!have_valid_cmd && !follower_unified_active_) {
-          is_follower_without_cmd = true;
-        }
-      }
 
-      if (is_follower_without_cmd) {
-        ROS_WARN("[FOLLOWER_TRANS_DIAG id=%d] update() fallback to GimbalrotorController::update()",
-                 beetle_navigator_->getMyID());
-        return GimbalrotorController::update();
+        if (!have_valid_cmd && !follower_unified_active_) {
+          // Transition: zero spinal PID immediately, then freeze on last hover output.
+          // Do NOT call GimbalrotorController::update() — that would run its own
+          // attitude PID and publish competing commands on four_axes/command.
+          if (!prev_unified_control_mode_) {
+            sendZeroAttitudeGains();
+            spinal_gains_zeroed_ = true;
+            unified_transition_count_ = 0;
+            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d freeze: zeroed spinal gains, awaiting unified cmd, t=%.4f",
+                     beetle_navigator_->getMyID(), ros::Time::now().toSec());
+          }
+          prev_unified_control_mode_ = true;
+
+          // Re-send cached independent hover commands to keep motors running
+          if (has_cached_independent_cmd_) {
+            // Override angles to zero (spinal PID is zeroed, these are ignored anyway)
+            last_independent_thrust_cmd_.angles[0] = 0;
+            last_independent_thrust_cmd_.angles[1] = 0;
+            last_independent_thrust_cmd_.angles[2] = 0;
+            follower_thrust_pub_.publish(last_independent_thrust_cmd_);
+            follower_gimbal_pub_.publish(last_independent_gimbal_cmd_);
+            ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] FOLLOWER id=%d freeze: re-sending cached hover cmd (thrust_sz=%zu)",
+                              beetle_navigator_->getMyID(), last_independent_thrust_cmd_.base_thrust.size());
+          } else {
+            ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] FOLLOWER id=%d freeze: no cached cmd yet, waiting",
+                              beetle_navigator_->getMyID());
+          }
+
+          pre_module_state_ = module_state;
+          return true;  // Skip everything — no competing publish
+        }
       }
 
       /* In unified control mode (LEADER, or FOLLOWER with valid cmd),
@@ -659,7 +704,25 @@ namespace aerial_robot_control
 
     /* Non-unified mode: use the full GimbalrotorController update chain
        (sendGimbalCommand + PoseLinearController::update -> controlCore + sendCmd) */
-    return GimbalrotorController::update();
+    bool result = GimbalrotorController::update();
+
+    // Cache the commands that GimbalrotorController just published,
+    // so we can freeze on them during unified mode transition.
+    if (result) {
+      last_independent_thrust_cmd_.base_thrust = target_full_thrust_;
+      last_independent_thrust_cmd_.angles[0] = 0;
+      last_independent_thrust_cmd_.angles[1] = 0;
+      last_independent_thrust_cmd_.angles[2] = 0;
+
+      last_independent_gimbal_cmd_.header.stamp = ros::Time::now();
+      last_independent_gimbal_cmd_.position.clear();
+      for (int i = 0; i < motor_num_; i++) {
+        last_independent_gimbal_cmd_.position.push_back(target_gimbal_angles_.at(i));
+      }
+      has_cached_independent_cmd_ = true;
+    }
+
+    return result;
   }
 
   void BeetleController::reset()
@@ -716,6 +779,61 @@ namespace aerial_robot_control
     rpy_gain_msg.motors.at(0).pitch_d = 0;
     rpy_gain_msg.motors.at(0).yaw_d = 0;
     rpy_gain_pub_.publish(rpy_gain_msg);
+  }
+
+  void BeetleController::applyUnifiedGains()
+  {
+    if (gains_switched_) return;  // already applied
+
+    // Save current (independent) gains
+    auto& roll_pid = pid_controllers_.at(ROLL);
+    auto& pitch_pid = pid_controllers_.at(PITCH);
+    saved_roll_gains_ = {roll_pid.getPGain(), roll_pid.getIGain(), roll_pid.getDGain(),
+                         roll_pid.getLimitSum(), roll_pid.getLimitP(), roll_pid.getLimitI(), roll_pid.getLimitD()};
+    saved_pitch_gains_ = {pitch_pid.getPGain(), pitch_pid.getIGain(), pitch_pid.getDGain(),
+                          pitch_pid.getLimitSum(), pitch_pid.getLimitP(), pitch_pid.getLimitI(), pitch_pid.getLimitD()};
+
+    // Apply unified (formation) gains
+    roll_pid.setGains(unified_roll_gains_.p, unified_roll_gains_.i, unified_roll_gains_.d);
+    roll_pid.setLimitSum(unified_roll_gains_.limit_sum);
+    roll_pid.setLimitP(unified_roll_gains_.limit_p);
+    roll_pid.setLimitI(unified_roll_gains_.limit_i);
+    roll_pid.setLimitD(unified_roll_gains_.limit_d);
+
+    pitch_pid.setGains(unified_pitch_gains_.p, unified_pitch_gains_.i, unified_pitch_gains_.d);
+    pitch_pid.setLimitSum(unified_pitch_gains_.limit_sum);
+    pitch_pid.setLimitP(unified_pitch_gains_.limit_p);
+    pitch_pid.setLimitI(unified_pitch_gains_.limit_i);
+    pitch_pid.setLimitD(unified_pitch_gains_.limit_d);
+
+    gains_switched_ = true;
+    ROS_WARN("[UnifiedCtrl] Applied unified roll/pitch gains: P=%.1f D=%.1f (was P=%.1f D=%.1f)",
+             unified_pitch_gains_.p, unified_pitch_gains_.d,
+             saved_pitch_gains_.p, saved_pitch_gains_.d);
+  }
+
+  void BeetleController::restoreIndependentGains()
+  {
+    if (!gains_switched_) return;  // nothing to restore
+
+    auto& roll_pid = pid_controllers_.at(ROLL);
+    auto& pitch_pid = pid_controllers_.at(PITCH);
+
+    roll_pid.setGains(saved_roll_gains_.p, saved_roll_gains_.i, saved_roll_gains_.d);
+    roll_pid.setLimitSum(saved_roll_gains_.limit_sum);
+    roll_pid.setLimitP(saved_roll_gains_.limit_p);
+    roll_pid.setLimitI(saved_roll_gains_.limit_i);
+    roll_pid.setLimitD(saved_roll_gains_.limit_d);
+
+    pitch_pid.setGains(saved_pitch_gains_.p, saved_pitch_gains_.i, saved_pitch_gains_.d);
+    pitch_pid.setLimitSum(saved_pitch_gains_.limit_sum);
+    pitch_pid.setLimitP(saved_pitch_gains_.limit_p);
+    pitch_pid.setLimitI(saved_pitch_gains_.limit_i);
+    pitch_pid.setLimitD(saved_pitch_gains_.limit_d);
+
+    gains_switched_ = false;
+    ROS_WARN("[UnifiedCtrl] Restored independent roll/pitch gains: P=%.1f D=%.1f",
+             saved_pitch_gains_.p, saved_pitch_gains_.d);
   }
 
   void BeetleController::calcInteractionWrench()
@@ -830,6 +948,25 @@ namespace aerial_robot_control
     getParam<double>(wrench_nh, "d_gain", wrench_comp_d_gain_, 0.07);
 
     getParam<bool>(control_nh, "unified_control_mode", unified_control_mode_, false);
+
+    // Load unified-mode PID gains for roll/pitch (formation pendulum compensation)
+    ros::NodeHandle u_roll_nh(control_nh, "unified_roll");
+    getParam<double>(u_roll_nh, "p_gain", unified_roll_gains_.p, 36.0);
+    getParam<double>(u_roll_nh, "i_gain", unified_roll_gains_.i, 1.0);
+    getParam<double>(u_roll_nh, "d_gain", unified_roll_gains_.d, 12.0);
+    getParam<double>(u_roll_nh, "limit_sum", unified_roll_gains_.limit_sum, 50.0);
+    getParam<double>(u_roll_nh, "limit_p", unified_roll_gains_.limit_p, 50.0);
+    getParam<double>(u_roll_nh, "limit_i", unified_roll_gains_.limit_i, 10.0);
+    getParam<double>(u_roll_nh, "limit_d", unified_roll_gains_.limit_d, 50.0);
+
+    ros::NodeHandle u_pitch_nh(control_nh, "unified_pitch");
+    getParam<double>(u_pitch_nh, "p_gain", unified_pitch_gains_.p, 36.0);
+    getParam<double>(u_pitch_nh, "i_gain", unified_pitch_gains_.i, 1.0);
+    getParam<double>(u_pitch_nh, "d_gain", unified_pitch_gains_.d, 12.0);
+    getParam<double>(u_pitch_nh, "limit_sum", unified_pitch_gains_.limit_sum, 50.0);
+    getParam<double>(u_pitch_nh, "limit_p", unified_pitch_gains_.limit_p, 50.0);
+    getParam<double>(u_pitch_nh, "limit_i", unified_pitch_gains_.limit_i, 10.0);
+    getParam<double>(u_pitch_nh, "limit_d", unified_pitch_gains_.limit_d, 50.0);
   }
 
   void BeetleController::externalWrenchEstimate()

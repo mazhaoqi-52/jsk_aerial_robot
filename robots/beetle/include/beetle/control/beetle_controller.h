@@ -49,6 +49,20 @@ namespace aerial_robot_control
     /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID. */
     void sendZeroAttitudeGains();
 
+    /** @brief Switch roll/pitch PID gains for unified (formation) mode. */
+    void applyUnifiedGains();
+    /** @brief Restore original (per-module) roll/pitch PID gains. */
+    void restoreIndependentGains();
+
+    // Unified-mode PID gain parameters (loaded from YAML)
+    struct AxisGainSet {
+      double p, i, d;
+      double limit_sum, limit_p, limit_i, limit_d;
+    };
+    AxisGainSet unified_roll_gains_, unified_pitch_gains_;
+    AxisGainSet saved_roll_gains_, saved_pitch_gains_;  // backup of original gains
+    bool gains_switched_;  // true when unified gains are active
+
     // FOLLOWER unified mode: receive commands from LEADER
     ros::Subscriber unified_thrust_sub_;
     ros::Subscriber unified_gimbal_sub_;
@@ -59,6 +73,11 @@ namespace aerial_robot_control
     bool unified_cmd_received_;
     bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
+
+    // Freeze: cache last independent hover commands to avoid competing publish during transition
+    spinal::FourAxisCommand last_independent_thrust_cmd_;
+    sensor_msgs::JointState last_independent_gimbal_cmd_;
+    bool has_cached_independent_cmd_;  // true once we've cached at least one frame
     void unifiedThrustCallback(const spinal::FourAxisCommand& msg);
     void unifiedGimbalCallback(const sensor_msgs::JointState& msg);
     

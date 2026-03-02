@@ -47,8 +47,6 @@ namespace aerial_robot_control
 
     boost::shared_ptr<GimbalrotorRobotModel> gimbalrotor_robot_model_;
     std::vector<float> target_base_thrust_;
-    std::vector<float> target_full_thrust_;
-    std::vector<double> target_gimbal_angles_;
     bool hovering_approximate_;
     Eigen::VectorXd target_vectoring_f_;
     Eigen::VectorXd target_vectoring_f_trans_;
@@ -66,6 +64,8 @@ namespace aerial_robot_control
     void sendGimbalCommand();
     void sendTorqueAllocationMatrixInv();
   protected:
+    std::vector<float> target_full_thrust_;
+    std::vector<double> target_gimbal_angles_;
     bool gimbal_calc_in_fc_;
     bool i_term_rp_calc_in_pc_;
     ros::Publisher rpy_gain_pub_; //for spinal

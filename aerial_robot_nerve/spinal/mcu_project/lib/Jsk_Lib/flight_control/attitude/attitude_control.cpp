@@ -650,6 +650,24 @@ void AttitudeController::rpyGainCallback( const spinal::RollPitchYawTerms &gain_
     }
   maxYawGainIndex();
 
+#ifdef SIMULATION
+  /* [SINK_DIAG] Log gain update so we know when spinal gains are zeroed and
+     what happens to max_yaw_term_index_ and extra_yaw_pi_term_ afterwards. */
+  {
+    float extra_yaw_sum = 0;
+    for (int i = 0; i < motor_number_; i++) extra_yaw_sum += fabs(extra_yaw_pi_term_[i]);
+    ROS_WARN("[SINK_DIAG_GAIN] rpyGainCB: tp[0]=(%.4f,%.4f) td[0]=(%.4f,%.4f,%.4f) "
+             "max_yaw_idx=%d |extra_yaw_pi|=%.4f err_i=(%.4f,%.4f)",
+             motor_number_ > 0 ? thrust_p_gain_[0][X] : 0.0f,
+             motor_number_ > 0 ? thrust_p_gain_[0][Y] : 0.0f,
+             motor_number_ > 0 ? thrust_d_gain_[0][X] : 0.0f,
+             motor_number_ > 0 ? thrust_d_gain_[0][Y] : 0.0f,
+             motor_number_ > 0 ? thrust_d_gain_[0][Z] : 0.0f,
+             max_yaw_term_index_, extra_yaw_sum,
+             error_angle_i_[X], error_angle_i_[Y]);
+  }
+#endif
+
 #ifndef SIMULATION
   /* mutex to protect the completion of following update  */
   if(mutex_ != NULL) osMutexRelease(*mutex_);
@@ -1091,6 +1109,39 @@ void AttitudeController::pwmConversion()
   
   for(int i = 0; i < motor_number_; i++)
     target_thrust_[i] = roll_pitch_term_[i] + (1 + base_thrust_decreasing_rate) * base_thrust_term_[i] + (1 + yaw_decreasing_rate) * yaw_term_[i];
+
+#ifdef SIMULATION
+  /* [SINK_DIAG] Log spinal internal terms to diagnose thrust corruption.
+     Only prints when any rp/yaw term is non-negligible, throttled to 2Hz. */
+  {
+    static uint32_t sink_diag_counter = 0;
+    sink_diag_counter++;
+    if (sink_diag_counter % 50 == 0 && motor_number_ > 0) { // ~2Hz at 100Hz control
+      float rp_sum = 0, yaw_sum = 0, extra_yaw_sum = 0;
+      for (int i = 0; i < motor_number_; i++) {
+        rp_sum += fabs(roll_pitch_term_[i]);
+        yaw_sum += fabs(yaw_term_[i]);
+        extra_yaw_sum += fabs(extra_yaw_pi_term_[i]);
+      }
+      // Always log a brief summary; only log per-motor detail when something is non-zero
+      ROS_WARN("[SINK_DIAG_SPINAL] bdr=%.4f ydr=%.4f max_yaw_idx=%d |rp|=%.4f |yaw|=%.4f |extra_yaw_pi|=%.4f "
+               "bt[0]=%.3f tgt[0]=%.3f bt[1]=%.3f tgt[1]=%.3f",
+               base_thrust_decreasing_rate, yaw_decreasing_rate, max_yaw_term_index_,
+               rp_sum, yaw_sum, extra_yaw_sum,
+               motor_number_ > 0 ? base_thrust_term_[0] : 0.0f,
+               motor_number_ > 0 ? target_thrust_[0] : 0.0f,
+               motor_number_ > 1 ? base_thrust_term_[1] : 0.0f,
+               motor_number_ > 1 ? target_thrust_[1] : 0.0f);
+      if (rp_sum > 0.01f || yaw_sum > 0.01f || fabs(base_thrust_decreasing_rate) > 0.001f) {
+        for (int i = 0; i < motor_number_ && i < 4; i++) {
+          ROS_WARN("[SINK_DIAG_SPINAL] m%d: rp=%.4f yaw=%.4f extra_yaw_pi=%.4f bt=%.3f tgt=%.3f",
+                   i, roll_pitch_term_[i], yaw_term_[i], extra_yaw_pi_term_[i],
+                   base_thrust_term_[i], target_thrust_[i]);
+        }
+      }
+    }
+  }
+#endif
 
   /* convert to target pwm and calculate target gimbal angles */
   /* TODO: adjust not only for gimbalrotor but also for fixed rotor */

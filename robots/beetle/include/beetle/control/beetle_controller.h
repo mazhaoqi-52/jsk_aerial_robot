@@ -44,6 +44,27 @@ namespace aerial_robot_control
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
     int unified_transition_count_;    // frame counter since last mode switch (for high-freq diag)
+    int z_integral_freeze_count_;     // frames remaining to freeze Z I-term after mode switch
+    static constexpr int Z_INTEGRAL_FREEZE_FRAMES = 5;  // freeze Z integration for first N frames
+
+    // Ki-boost for Z axis after mode switch (D' scheme):
+    // Temporarily multiply Z integral update rate to accelerate bias convergence.
+    // With seed preload, boost only needs to cover residual error → gentler settings.
+    int z_ki_boost_count_;            // frames remaining in boost phase (0 = normal)
+    static constexpr int Z_KI_BOOST_FRAMES = 60;   // boost duration: 60 frames = 1.5s @40Hz
+    static constexpr double Z_KI_BOOST_FACTOR = 2.0;  // effective Ki multiplier during boost
+
+    // Z I-term seed for unified mode switch (Plan E'):
+    // Unified mode needs a steady-state Z_i bias (≈0.86–0.94) that doesn't exist
+    // in independent mode. Instead of waiting for I-term to accumulate (→15cm sink),
+    // preload an estimated bias at mode switch. The seed is adaptively updated from
+    // the most recent unified-mode steady state, or uses a configurable default.
+    double last_unified_z_i_ss_;      // most recent unified steady-state Z err_i
+    bool has_unified_z_i_ss_;         // true after at least one SS sample recorded
+    double z_i_seed_default_;         // default seed when no history (from YAML, e.g. 0.8)
+    static constexpr double Z_SEED_GAIN = 0.8;       // inject 80% of seed to be conservative
+    static constexpr double Z_SEED_LPF_ALPHA = 0.05; // low-pass filter for SS tracking
+
     bool spinal_gains_zeroed_;        // track whether we sent zero rpy/gain to spinal
 
     /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID. */

@@ -228,8 +228,11 @@ void BeetleUnifiedController::publishCommands()
     int module_id = kv.first;
     const ModuleCommand& cmd = kv.second;
 
-    // Publish scalar thrusts as FourAxisCommand.base_thrust
-    // angles=[0,0,0]: spinal's attitude PID is zeroed, so these are ignored
+    // Publish scalar thrusts as FourAxisCommand.base_thrust (4 elements per module).
+    // When gimbal_calc_in_fc=false, spinal has motor_number_=motor_num (not *rotor_coef),
+    // so it expects scalar thrusts — the same format as GimbalrotorController::sendFourAxisCommand().
+    // Gimbal angles are sent separately via gimbals_ctrl topic below.
+    // angles=[0,0,0]: spinal's attitude PID is zeroed, so these are ignored.
     if (module_thrust_pubs_.count(module_id)) {
       spinal::FourAxisCommand thrust_msg;
       thrust_msg.base_thrust = cmd.full_thrusts;

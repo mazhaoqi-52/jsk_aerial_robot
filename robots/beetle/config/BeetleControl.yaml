@@ -11,6 +11,7 @@ controller:
   # wrench_estimate_flag: false
   comp_term_update_freq: 40
   unified_control_mode: false
+  z_i_seed_default: 0.8  # Z I-term seed for unified mode switch (Plan E')
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

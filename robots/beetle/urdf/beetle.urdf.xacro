@@ -31,6 +31,7 @@
             ixy="-0.0001753" ixz="0.0004696" iyz="-0.0000646"/>
       </inertial>
       <visual>
+        <origin xyz="0 0 0" rpy="0 0 3.141592"/>
         <geometry>
           <mesh filename="package://beetle/urdf/mesh/base_link_hyper.dae"/>
         </geometry>

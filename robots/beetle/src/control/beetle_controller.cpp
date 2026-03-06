@@ -18,6 +18,9 @@ namespace aerial_robot_control
     unified_transition_count_(-1),
     z_integral_freeze_count_(0),
     z_ki_boost_count_(0),
+    rp_integral_freeze_count_(0),
+    rp_ki_boost_count_(0),
+    rp_i_keep_ratio_(0.5),
     spinal_gains_zeroed_(false),
     last_unified_z_i_ss_(0.8),
     has_unified_z_i_ss_(false),
@@ -150,8 +153,42 @@ namespace aerial_robot_control
           navigator_->setTargetYaw(cur_yaw);
           navigator_->setTargetOmegaZ(0);
         }
-        pid_controllers_.at(ROLL).setErrI(0);
-        pid_controllers_.at(PITCH).setErrI(0);
+        // Roll/Pitch I-term partial retention + freeze/boost (same philosophy as Z axis):
+        // Instead of clearing to zero, keep a fraction of the old I-term to preserve
+        // part of the steady-state bias correction from independent mode.
+        // Then freeze for a few frames and boost to let it converge quickly.
+        {
+          double old_roll_i = pid_controllers_.at(ROLL).getErrI();
+          double old_pitch_i = pid_controllers_.at(PITCH).getErrI();
+
+          // Scale old I-term by keep ratio (0~1).  The gains/inertia change between
+          // independent and unified mode, so we don't keep 100%.
+          double new_roll_i = rp_i_keep_ratio_ * old_roll_i;
+          double new_pitch_i = rp_i_keep_ratio_ * old_pitch_i;
+
+          // Clamp to unified-mode I limits (gains may differ)
+          double Ki_roll = std::max(unified_roll_gains_.i, 1e-6);
+          double Ki_pitch = std::max(unified_pitch_gains_.i, 1e-6);
+          double roll_i_limit = unified_roll_gains_.limit_i / Ki_roll;
+          double pitch_i_limit = unified_pitch_gains_.limit_i / Ki_pitch;
+          new_roll_i = boost::algorithm::clamp(new_roll_i, -roll_i_limit, roll_i_limit);
+          new_pitch_i = boost::algorithm::clamp(new_pitch_i, -pitch_i_limit, pitch_i_limit);
+
+          pid_controllers_.at(ROLL).setErrI(new_roll_i);
+          pid_controllers_.at(PITCH).setErrI(new_pitch_i);
+
+          // Start freeze + boost sequence
+          rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
+          rp_ki_boost_count_ = RP_KI_BOOST_FRAMES;
+
+          ROS_WARN("[UnifiedCtrl] RP I-term transition: "
+                   "roll_i: old=%.4f → new=%.4f (×%.1f), "
+                   "pitch_i: old=%.4f → new=%.4f (×%.1f), "
+                   "freeze=%d, boost=%d(×%.1f)",
+                   old_roll_i, new_roll_i, rp_i_keep_ratio_,
+                   old_pitch_i, new_pitch_i, rp_i_keep_ratio_,
+                   rp_integral_freeze_count_, rp_ki_boost_count_, RP_KI_BOOST_FACTOR);
+        }
         pid_controllers_.at(X).setErrI(0);
         pid_controllers_.at(Y).setErrI(0);
 
@@ -365,6 +402,74 @@ namespace aerial_robot_control
                                        target_omega_.x() - omega_.x(), target_ang_acc_.x());
       pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
                                         target_omega_.y() - omega_.y(), target_ang_acc_.y());
+
+      // --- Roll/Pitch I-term freeze + boost (mirrors Z axis logic) ---
+      // Freeze: revert I-term to pre-update value for the first few frames
+      if (rp_integral_freeze_count_ > 0) {
+        pid_controllers_.at(ROLL).setErrI(pid_controllers_.at(ROLL).getPrevErrI());
+        pid_controllers_.at(PITCH).setErrI(pid_controllers_.at(PITCH).getPrevErrI());
+        rp_integral_freeze_count_--;
+      }
+      // Boost: after freeze ends, accelerate I-term convergence
+      else if (rp_ki_boost_count_ > 0) {
+        // Anti-windup: skip boost if allocation is saturated (reuse same check as Z)
+        bool allocation_saturated = false;
+        const auto& cmds_rp = unified_controller_->getModuleCommands();
+        if (!cmds_rp.empty()) {
+          const double t_max = beetle_robot_model_->getThrustUpperLimit();
+          const double t_min = beetle_robot_model_->getThrustLowerLimit();
+          const double sat_margin = 0.05;
+          const double t_upper = t_max * (1.0 - sat_margin);
+          const double t_lower = t_min + t_max * sat_margin;
+          for (const auto& kv : cmds_rp) {
+            for (float t : kv.second.full_thrusts) {
+              if (t >= t_upper || t <= t_lower) {
+                allocation_saturated = true;
+                break;
+              }
+            }
+            if (allocation_saturated) break;
+          }
+        }
+
+        if (!allocation_saturated) {
+          // Roll boost
+          {
+            double err_p_roll = pid_controllers_.at(ROLL).getErrP();
+            double extra = err_p_roll * du_rp * (RP_KI_BOOST_FACTOR - 1.0);
+            double new_i = pid_controllers_.at(ROLL).getErrI() + extra;
+            double Ki_r = std::max(pid_controllers_.at(ROLL).getIGain(), 1e-6);
+            double lim_r = pid_controllers_.at(ROLL).getLimitI() / Ki_r;
+            new_i = boost::algorithm::clamp(new_i, -lim_r, lim_r);
+            pid_controllers_.at(ROLL).setErrI(new_i);
+          }
+          // Pitch boost
+          {
+            double err_p_pitch = pid_controllers_.at(PITCH).getErrP();
+            double extra = err_p_pitch * du_rp * (RP_KI_BOOST_FACTOR - 1.0);
+            double new_i = pid_controllers_.at(PITCH).getErrI() + extra;
+            double Ki_p = std::max(pid_controllers_.at(PITCH).getIGain(), 1e-6);
+            double lim_p = pid_controllers_.at(PITCH).getLimitI() / Ki_p;
+            new_i = boost::algorithm::clamp(new_i, -lim_p, lim_p);
+            pid_controllers_.at(PITCH).setErrI(new_i);
+          }
+        }
+
+        rp_ki_boost_count_--;
+        if (rp_ki_boost_count_ % 10 == 0 || rp_ki_boost_count_ == 0) {
+          ROS_WARN("[RP_BOOST] remaining=%d sat=%d "
+                   "roll: err_p=%.4f err_i=%.4f i_term=%.4f | "
+                   "pitch: err_p=%.4f err_i=%.4f i_term=%.4f",
+                   rp_ki_boost_count_, allocation_saturated ? 1 : 0,
+                   pid_controllers_.at(ROLL).getErrP(),
+                   pid_controllers_.at(ROLL).getErrI(),
+                   pid_controllers_.at(ROLL).getITerm(),
+                   pid_controllers_.at(PITCH).getErrP(),
+                   pid_controllers_.at(PITCH).getErrI(),
+                   pid_controllers_.at(PITCH).getITerm());
+        }
+      }
+
       double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
       double err_omega_z = target_omega_.z() - omega_.z();
       if(!need_yaw_d_control_) err_omega_z = target_omega_.z();
@@ -1178,6 +1283,10 @@ namespace aerial_robot_control
     // Z I-term seed default for unified mode switch (Plan E')
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);
     last_unified_z_i_ss_ = z_i_seed_default_;
+
+    // Roll/Pitch I-term keep ratio for unified mode switch
+    // Fraction of independent-mode I-term to preserve at switch (0=clear, 1=full keep)
+    getParam<double>(control_nh, "rp_i_keep_ratio", rp_i_keep_ratio_, 0.5);
 
     // Load unified-mode PID gains for roll/pitch (formation pendulum compensation)
     ros::NodeHandle u_roll_nh(control_nh, "unified_roll");

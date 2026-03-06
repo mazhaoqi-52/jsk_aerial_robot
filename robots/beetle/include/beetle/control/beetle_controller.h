@@ -54,6 +54,16 @@ namespace aerial_robot_control
     static constexpr int Z_KI_BOOST_FRAMES = 60;   // boost duration: 60 frames = 1.5s @40Hz
     static constexpr double Z_KI_BOOST_FACTOR = 2.0;  // effective Ki multiplier during boost
 
+    // Roll/Pitch I-term transition support for unified mode switch:
+    // Same philosophy as Z axis — freeze then boost — but with different parameters
+    // because roll/pitch bias is typically smaller but more attitude-sensitive.
+    int rp_integral_freeze_count_;    // frames remaining to freeze Roll/Pitch I-term
+    int rp_ki_boost_count_;           // frames remaining in Roll/Pitch boost phase
+    static constexpr int RP_INTEGRAL_FREEZE_FRAMES = 3;   // shorter freeze (3 frames)
+    static constexpr int RP_KI_BOOST_FRAMES = 80;         // boost duration: 80 frames = 2.0s @40Hz
+    static constexpr double RP_KI_BOOST_FACTOR = 6.0;     // stronger boost to accelerate convergence with Ki=5
+    double rp_i_keep_ratio_;          // fraction of old I-term to keep at switch (0~1, from YAML)
+
     // Z I-term seed for unified mode switch (Plan E'):
     // Unified mode needs a steady-state Z_i bias (≈0.86–0.94) that doesn't exist
     // in independent mode. Instead of waiting for I-term to accumulate (→15cm sink),

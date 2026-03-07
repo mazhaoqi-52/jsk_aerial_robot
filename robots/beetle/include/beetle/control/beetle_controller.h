@@ -44,6 +44,7 @@ namespace aerial_robot_control
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
     int unified_transition_count_;    // frame counter since last mode switch (for high-freq diag)
+    int post_exit_diag_count_;        // frame counter after exiting unified mode (for exit diag)
     int z_integral_freeze_count_;     // frames remaining to freeze Z I-term after mode switch
     static constexpr int Z_INTEGRAL_FREEZE_FRAMES = 5;  // freeze Z integration for first N frames
 
@@ -64,16 +65,26 @@ namespace aerial_robot_control
     static constexpr double RP_KI_BOOST_FACTOR = 6.0;     // stronger boost to accelerate convergence with Ki=5
     double rp_i_keep_ratio_;          // fraction of old I-term to keep at switch (0~1, from YAML)
 
-    // Z I-term seed for unified mode switch (Plan E'):
-    // Unified mode needs a steady-state Z_i bias (≈0.86–0.94) that doesn't exist
-    // in independent mode. Instead of waiting for I-term to accumulate (→15cm sink),
-    // preload an estimated bias at mode switch. The seed is adaptively updated from
-    // the most recent unified-mode steady state, or uses a configurable default.
-    double last_unified_z_i_ss_;      // most recent unified steady-state Z err_i
+    // I-term seed for unified mode switch (Plan E'):
+    // Unified mode needs steady-state I-term biases that don't exist in independent mode.
+    // Instead of waiting for I-term to accumulate (→overshoot), preload estimated biases
+    // at mode switch. Seeds are adaptively updated from the most recent unified-mode
+    // steady state, or use configurable defaults.
+    //
+    // Z axis: bias ≈ 0.86–0.94 (formation efficiency offset under explicit gravity FF)
+    double last_unified_z_i_ss_;      // most recent unified steady-state Z I-term
     bool has_unified_z_i_ss_;         // true after at least one SS sample recorded
     double z_i_seed_default_;         // default seed when no history (from YAML, e.g. 0.8)
     static constexpr double Z_SEED_GAIN = 0.8;       // inject 80% of seed to be conservative
     static constexpr double Z_SEED_LPF_ALPHA = 0.05; // low-pass filter for SS tracking
+    //
+    // Pitch axis: SS err_i ≈ -0.54 (i_term ≈ -2.7 / Ki=5), from formation geometry offset.
+    // All pitch seed values are in err_i domain (consistent with setErrI at injection).
+    double last_unified_pitch_i_ss_;  // most recent unified steady-state pitch err_i
+    bool has_unified_pitch_i_ss_;     // true after at least one SS sample recorded
+    double pitch_i_seed_default_;     // default seed when no history (from YAML, e.g. -0.55)
+    static constexpr double PITCH_SEED_GAIN = 0.8;       // inject 80% of seed
+    static constexpr double PITCH_SEED_LPF_ALPHA = 0.02; // slower LPF than Z (pitch more sensitive)
 
     bool spinal_gains_zeroed_;        // track whether we sent zero rpy/gain to spinal
 
@@ -104,6 +115,10 @@ namespace aerial_robot_control
     bool unified_cmd_received_;
     bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
+    int follower_cmd_timeout_count_ = 0;  // consecutive frames without valid unified cmd
+    // T4.1: FOLLOWER holds last command for this many frames before full fallback.
+    // At 40Hz, 20 frames = 0.5s — covers short ROS communication glitches.
+    static constexpr int FOLLOWER_HOLD_LAST_FRAMES = 20;
 
     // Freeze: cache last independent hover commands to avoid competing publish during transition
     spinal::FourAxisCommand last_independent_thrust_cmd_;

@@ -42,6 +42,23 @@ namespace aerial_robot_navigation
     inline void setTargetPosCand( tf::Vector3 value){  target_pos_candidate_ = value ;}
     inline tf::Vector3 getTargetPosCand() {return target_pos_candidate_;}
     template<class T> T getCog2CoM();
+
+    // Unified control mode flag — set by BeetleController, read by navigation
+    // to skip leader-follower specific logic (e.g. CoG→CoM conversion).
+    void setUnifiedControlMode(bool mode) { unified_control_mode_ = mode; }
+    bool getUnifiedControlMode() const { return unified_control_mode_; }
+
+    // Synchronize pre_target_pos_ tracking state with current target position.
+    // Must be called when transitioning back from unified → leader-follower mode
+    // to prevent convertTargetPosFromCoG2CoM()'s "changed by something other than
+    // uav nav" check from detecting a false mismatch and corrupting target_pos_candidate_.
+    void syncPreTargetPos() {
+      tf::Vector3 cur_target = getTargetPos();
+      pre_target_pos_.setX(cur_target.x());
+      pre_target_pos_.setY(cur_target.y());
+      pre_target_pos_.setZ(cur_target.z());
+    }
+
     bool getCurrentAssembled(){return current_assembled_;}
     int getModuleState(){return module_state_;}
     int getReconfigFlag(){return reconfig_flag_;}
@@ -120,7 +137,11 @@ namespace aerial_robot_navigation
 
     bool roll_pitch_control_flag_;
     bool pre_assembled_ ; 
+    bool unified_control_mode_ = false;  // set by controller
 
+    // [EXIT_DIAG] per-instance diagnostic counters for CoG→CoM tracing
+    int cog2com_diag_count_ = -1;
+    bool was_unified_for_diag_ = false;
 
     void rosParamInit() override;
     

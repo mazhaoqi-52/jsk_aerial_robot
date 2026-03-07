@@ -13,7 +13,8 @@ controller:
   gimbal_dof: 1
   pd_wrench_comp_mode: true
   unified_control_mode: false
-  z_i_seed_default: 0.8  # Z I-term seed for unified mode switch (Plan E')
+  z_i_seed_default: 0.8    # Z I-term seed for unified mode switch (Plan E')
+  pitch_i_seed_default: -0.55  # Pitch I-term seed in err_i domain (SS i_term≈-2.7, Ki=5 → err_i≈-0.54)
 
   external_force_upper_limit: 0.0
   external_force_lower_limit: 0.0

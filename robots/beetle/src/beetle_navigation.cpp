@@ -433,6 +433,128 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
 
   if(force_att_control_flag_) return;
 
+  // ======== Unified Control Mode Navigation ========
+  // In unified mode, target positions are defined in formation CoG world frame.
+  // No CoG→CoM conversion needed — controller handles formation offset internally.
+  // Only LEADER processes navigation commands; FOLLOWERs receive direct motor commands.
+  if (unified_control_mode_ && getModuleState() == LEADER) {
+    /* yaw — same interface, formation yaw ≈ leader yaw for rigid assembly */
+    if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
+      setTargetYaw(angles::normalize_angle(msg->target_yaw));
+      setTargetOmegaZ(0);
+    }
+    if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::VEL_MODE) {
+      setTargetOmegaZ(msg->target_omega_z);
+      teleop_reset_time_ = teleop_reset_duration_ + ros::Time::now().toSec();
+    }
+    if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::POS_VEL_MODE) {
+      setTargetYaw(angles::normalize_angle(msg->target_yaw));
+      setTargetOmegaZ(msg->target_omega_z);
+      trajectory_mode_ = true;
+      trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
+    }
+
+    /* xy — directly set target pos (formation CoG frame, no candidate indirection) */
+    switch(msg->pos_xy_nav_mode) {
+    case aerial_robot_msgs::FlightNav::POS_MODE:
+      {
+        // In unified mode, target is formation CoG position in world frame.
+        // The controller computes: target_formation_pos = target_pos + R * cog_offset
+        // So we set target_pos such that formation CoG goes to the desired point:
+        // target_pos = desired_formation_pos - R * cog_offset
+        // This is handled in the controller's PID, so here we just set the raw target.
+        xy_control_mode_ = POS_CONTROL_MODE;
+        vel_based_waypoint_ = false;
+        setTargetPosX(msg->target_pos_x);
+        setTargetPosY(msg->target_pos_y);
+        setTargetVelX(0);
+        setTargetVelY(0);
+        break;
+      }
+    case aerial_robot_msgs::FlightNav::VEL_MODE:
+      {
+        xy_control_mode_ = POS_CONTROL_MODE;
+        teleop_reset_time_ = teleop_reset_duration_ + ros::Time::now().toSec();
+        switch(msg->control_frame) {
+        case WORLD_FRAME:
+          setTargetVelX(msg->target_vel_x);
+          setTargetVelY(msg->target_vel_y);
+          break;
+        case LOCAL_FRAME:
+          {
+            double yaw_angle = estimator_->getState(Frame::COG, estimate_mode_).z();
+            tf::Vector3 target_vel = frameConversion(
+                tf::Vector3(msg->target_vel_x, msg->target_vel_y, 0), yaw_angle);
+            setTargetVelX(target_vel.x());
+            setTargetVelY(target_vel.y());
+            break;
+          }
+        default: break;
+        }
+        break;
+      }
+    case aerial_robot_msgs::FlightNav::POS_VEL_MODE:
+      {
+        xy_control_mode_ = POS_CONTROL_MODE;
+        setTargetPosX(msg->target_pos_x);
+        setTargetPosY(msg->target_pos_y);
+        setTargetVelX(msg->target_vel_x);
+        setTargetVelY(msg->target_vel_y);
+        trajectory_mode_ = true;
+        trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
+        break;
+      }
+    case aerial_robot_msgs::FlightNav::STAY_HERE_MODE:
+      {
+        xy_control_mode_ = POS_CONTROL_MODE;
+        setTargetVelX(0);
+        setTargetVelY(0);
+        setTargetXyFromCurrentState();
+        break;
+      }
+    default: break;
+    }
+    if(msg->pos_xy_nav_mode != aerial_robot_msgs::FlightNav::ACC_MODE) setTargetZeroAcc();
+
+    /* z — directly set target pos */
+    if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::VEL_MODE) {
+      setTargetVelZ(msg->target_vel_z);
+      teleop_reset_time_ = teleop_reset_duration_ + ros::Time::now().toSec();
+    }
+    else if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
+      setTargetPosZ(msg->target_pos_z);
+      setTargetVelZ(0);
+    }
+    else if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::POS_VEL_MODE) {
+      setTargetPosZ(msg->target_pos_z);
+      setTargetVelZ(msg->target_vel_z);
+      trajectory_mode_ = true;
+      trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
+    }
+
+    /* pitch/roll target for formation (if needed) */
+    if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
+      tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
+      target_rp.setY(msg->target_pitch);
+      setFinalTargetBaselinkRPY(target_rp);
+    }
+    if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
+      tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
+      target_rp.setX(msg->target_roll);
+      setFinalTargetBaselinkRPY(target_rp);
+    }
+
+    {
+      tf::Vector3 final_rp = getFinalTargetBaselinkRPY();
+      ROS_INFO_THROTTLE(1.0, "[UnifiedNav] target_pos=(%.3f,%.3f,%.3f) target_yaw=%.3f target_rp=(%.4f,%.4f)",
+                        getTargetPos().x(), getTargetPos().y(), getTargetPos().z(),
+                        getTargetRPY().z(), final_rp.x(), final_rp.y());
+    }
+    return;  // Done — skip leader-follower path below
+  }
+
+  // ======== Leader-Follower Mode Navigation (original path) ========
+
   /* yaw */
   if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
     {
@@ -780,6 +902,12 @@ void BeetleNavigator::calcCenterOfMoving()
 
 void BeetleNavigator::convertTargetPosFromCoG2CoM()
 {
+  // In unified control mode, the controller manages target positions directly
+  // in formation CoG frame. The old CoG→CoM conversion is specific to the
+  // leader-follower architecture and must be bypassed to avoid corrupting
+  // the formation-level position reference.
+  if (unified_control_mode_) return;
+
   //TODO: considering correct rotaion axis
 
   tf::Transform cog2com_tf;
@@ -787,6 +915,33 @@ void BeetleNavigator::convertTargetPosFromCoG2CoM()
   tf::Matrix3x3 cog_orientation_tf;
   tf::matrixEigenToTF(beetle_robot_model_->getCogDesireOrientation<Eigen::Matrix3d>(),cog_orientation_tf);
   tf::Vector3 com_conversion = cog_orientation_tf *  tf::Matrix3x3(tf::createQuaternionFromYaw(getTargetRPY().z())) * cog2com_tf.getOrigin();
+
+  // [EXIT_DIAG] Log CoG→CoM conversion details after exiting unified mode
+  // This helps trace whether com_conversion is causing target position drift
+  if (was_unified_for_diag_ && !unified_control_mode_) {
+    cog2com_diag_count_ = 0;  // start logging on transition
+  }
+  was_unified_for_diag_ = unified_control_mode_;
+  if (cog2com_diag_count_ >= 0 && cog2com_diag_count_ < 80) {
+    if (cog2com_diag_count_ < 10 || cog2com_diag_count_ % 10 == 0) {
+      double cdo_r, cdo_p, cdo_y;
+      tf::Matrix3x3 cdo_mat;
+      tf::matrixEigenToTF(beetle_robot_model_->getCogDesireOrientation<Eigen::Matrix3d>(), cdo_mat);
+      cdo_mat.getRPY(cdo_r, cdo_p, cdo_y);
+      ROS_WARN("[EXIT_DIAG_COG2COM] id=%d f=%d com_conv=(%.4f,%.4f,%.4f) "
+               "cog2com_origin=(%.4f,%.4f,%.4f) CogDesOrient=(%.4f,%.4f,%.4f) "
+               "tgt_pos=(%.4f,%.4f,%.4f) tgt_cand=(%.4f,%.4f,%.4f) pre_tgt=(%.4f,%.4f,%.4f)",
+               my_id_, cog2com_diag_count_,
+               com_conversion.x(), com_conversion.y(), com_conversion.z(),
+               cog2com_tf.getOrigin().x(), cog2com_tf.getOrigin().y(), cog2com_tf.getOrigin().z(),
+               cdo_r, cdo_p, cdo_y,
+               getTargetPos().x(), getTargetPos().y(), getTargetPos().z(),
+               getTargetPosCand().x(), getTargetPosCand().y(), getTargetPosCand().z(),
+               pre_target_pos_.x(), pre_target_pos_.y(), pre_target_pos_.z());
+    }
+    cog2com_diag_count_++;
+  }
+
   bool current_assembled = getCurrentAssembled();
   bool reconfig_flag = getReconfigFlag();
 

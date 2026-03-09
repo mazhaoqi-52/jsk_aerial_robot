@@ -1,5 +1,4 @@
 #include <beetle/control/beetle_controller.h>
-#include <sstream>
 
 using namespace std;
 
@@ -16,7 +15,6 @@ namespace aerial_robot_control
     unified_cmd_received_(false),
     follower_unified_active_(false),
     unified_transition_count_(-1),
-    post_exit_diag_count_(-1),
     z_integral_freeze_count_(0),
     z_ki_boost_count_(0),
     rp_integral_freeze_count_(0),
@@ -123,6 +121,167 @@ namespace aerial_robot_control
     // Publishers to this module's own spinal (same topic names as GimbalrotorController)
     follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
     follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
+
+    // Service for toggling unified control mode
+    ros::NodeHandle srv_nh(nh_, "controller");
+    set_unified_mode_srv_ = srv_nh.advertiseService("set_unified_mode",
+                                                     &BeetleController::setUnifiedModeCb, this);
+  }
+
+  void BeetleController::resetToIndependentHover()
+  {
+    // Restore PID gains + re-send to spinal
+    restoreIndependentGains();
+    setAttitudeGains();
+
+    // Reset target to current state (zero initial error)
+    tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
+    navigator_->setXyControlMode(aerial_robot_navigation::POS_CONTROL_MODE);
+    navigator_->setTargetPosX(cur_pos.x());
+    navigator_->setTargetPosY(cur_pos.y());
+    navigator_->setTargetPosZ(cur_pos.z());
+    navigator_->setTargetVelX(0);
+    navigator_->setTargetVelY(0);
+
+    double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
+    navigator_->setTargetYaw(cur_yaw);
+    navigator_->setTargetOmegaZ(0);
+
+    // Sync target_pos_candidate_ (CoM frame) = cur_pos(CoG) + com_conversion
+    // to ensure convertTargetPosFromCoG2CoM() recovers the correct CoG target.
+    tf::Transform cog2com_tf;
+    tf::transformKDLToTF(beetle_navigator_->getCog2CoM<KDL::Frame>(), cog2com_tf);
+    tf::Matrix3x3 cog_orient;
+    tf::matrixEigenToTF(beetle_robot_model_->getCogDesireOrientation<Eigen::Matrix3d>(), cog_orient);
+    tf::Vector3 com_conv = cog_orient * tf::Matrix3x3(tf::createQuaternionFromYaw(cur_yaw)) * cog2com_tf.getOrigin();
+    beetle_navigator_->setTargetPosCandX(cur_pos.x() + com_conv.x());
+    beetle_navigator_->setTargetPosCandY(cur_pos.y() + com_conv.y());
+    beetle_navigator_->setTargetPosCandZ(cur_pos.z() + com_conv.z());
+    beetle_navigator_->syncPreTargetPos();
+
+    // Seed Z I-term with gravity compensation.
+    // Skip if force landing / halt — robot is on ground.
+    if (navigator_->getForceLandingFlag() ||
+        navigator_->getNaviState() == aerial_robot_navigation::STOP_STATE) {
+      pid_controllers_.at(Z).setErrI(0);
+    } else {
+      double gravity_acc = aerial_robot_estimation::G;
+      double Ki_z = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
+      double z_i_limit = pid_controllers_.at(Z).getLimitI() / Ki_z;
+      double seeded_z_i = boost::algorithm::clamp(gravity_acc / Ki_z, -z_i_limit, z_i_limit);
+      pid_controllers_.at(Z).setErrI(seeded_z_i);
+    }
+
+    // Clear RP/XY I-terms
+    pid_controllers_.at(ROLL).setErrI(0);
+    pid_controllers_.at(PITCH).setErrI(0);
+    pid_controllers_.at(X).setErrI(0);
+    pid_controllers_.at(Y).setErrI(0);
+
+    // Reset wrench comp timer to avoid abnormal du on first post-exit frame
+    prev_comp_update_time_ = -1;
+  }
+
+  void BeetleController::initUnifiedLeaderMode()
+  {
+    // Reset target position/yaw to current state at mode switch.
+    // PID error = (target_pos + R*offset) - (cur_pos + R*offset) = target_pos - cur_pos,
+    // so setting target_pos = cur_pos gives zero initial error.
+    tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
+    unified_controller_->updateFormationGeometry();
+
+    navigator_->setXyControlMode(aerial_robot_navigation::POS_CONTROL_MODE);
+    navigator_->setTargetPosX(cur_pos.x());
+    navigator_->setTargetPosY(cur_pos.y());
+    navigator_->setTargetPosZ(cur_pos.z());
+    navigator_->setTargetVelX(0);
+    navigator_->setTargetVelY(0);
+    navigator_->setTargetAccX(0);
+    navigator_->setTargetAccY(0);
+
+    double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
+    navigator_->setTargetYaw(cur_yaw);
+    navigator_->setTargetOmegaZ(0);
+    beetle_navigator_->setUnifiedControlMode(true);
+
+    // --- Roll/Pitch I-term: partial retention + seed injection + freeze/boost ---
+    // Pitch has significant SS bias in unified mode (formation geometry offset),
+    // so we preload a seed. Roll bias ≈ 0 → partial retention only.
+    {
+      double old_roll_i = pid_controllers_.at(ROLL).getErrI();
+      double old_pitch_i = pid_controllers_.at(PITCH).getErrI();
+
+      double new_roll_i = rp_i_keep_ratio_ * old_roll_i;
+
+      double pitch_seed = has_unified_pitch_i_ss_ ? last_unified_pitch_i_ss_ : pitch_i_seed_default_;
+      double new_pitch_i = rp_i_keep_ratio_ * old_pitch_i + PITCH_SEED_GAIN * pitch_seed;
+
+      // Clamp to unified-mode I limits (err_i domain = limit_i / Ki)
+      double Ki_roll = std::max(unified_roll_gains_.i, 1e-6);
+      double Ki_pitch = std::max(unified_pitch_gains_.i, 1e-6);
+      double roll_i_limit = unified_roll_gains_.limit_i / Ki_roll;
+      double pitch_i_limit = unified_pitch_gains_.limit_i / Ki_pitch;
+      new_roll_i = boost::algorithm::clamp(new_roll_i, -roll_i_limit, roll_i_limit);
+      new_pitch_i = boost::algorithm::clamp(new_pitch_i, -pitch_i_limit, pitch_i_limit);
+
+      pid_controllers_.at(ROLL).setErrI(new_roll_i);
+      pid_controllers_.at(PITCH).setErrI(new_pitch_i);
+      rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
+      rp_ki_boost_count_ = RP_KI_BOOST_FRAMES;
+
+      ROS_WARN("[UnifiedCtrl] RP I-term transition: "
+               "roll_i: old=%.4f → new=%.4f (keep×%.1f), "
+               "pitch_i: old=%.4f → new=%.4f (keep×%.1f + seed=%.4f×%.1f=%s), "
+               "freeze=%d, boost=%d(×%.1f)",
+               old_roll_i, new_roll_i, rp_i_keep_ratio_,
+               old_pitch_i, new_pitch_i, rp_i_keep_ratio_,
+               pitch_seed, PITCH_SEED_GAIN,
+               has_unified_pitch_i_ss_ ? "adaptive" : "default",
+               rp_integral_freeze_count_, rp_ki_boost_count_, RP_KI_BOOST_FACTOR);
+    }
+    pid_controllers_.at(X).setErrI(0);
+    pid_controllers_.at(Y).setErrI(0);
+
+    // --- Z I-term: de-gravity + seed injection (Plan E') ---
+    // Independent mode I-term ≈ G (implicit gravity). Unified mode has explicit
+    // gravity FF, so de-gravity subtracts it, then seed injects unified-mode bias.
+    {
+      double i_output_old = pid_controllers_.at(Z).getITerm();
+
+      tf::Matrix3x3 uav_rot_mig = estimator_->getOrientation(Frame::COG, estimate_mode_);
+      tf::Vector3 gravity_w_mig(0, 0, aerial_robot_estimation::G);
+      tf::Vector3 gravity_cog_mig = uav_rot_mig.inverse() * gravity_w_mig;
+      double gravity_ff_z = gravity_cog_mig.z();
+
+      double i_output_degrav = i_output_old - gravity_ff_z;
+      double seed_value = has_unified_z_i_ss_ ? last_unified_z_i_ss_ : z_i_seed_default_;
+      double i_output_seeded = i_output_degrav + Z_SEED_GAIN * seed_value;
+
+      double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
+      double iz_new = i_output_seeded / Ki;
+      double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
+      if (!std::isfinite(iz_new)) iz_new = 0.0;
+      iz_new = boost::algorithm::clamp(iz_new, -iz_limit, iz_limit);
+
+      pid_controllers_.at(Z).setErrI(iz_new);
+      z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
+      z_ki_boost_count_ = Z_KI_BOOST_FRAMES;
+      ROS_WARN("[UnifiedCtrl] Z de-gravity + seed: i_old=%.4f, gravity_ff=%.4f, "
+               "i_degrav=%.4f, seed=%.4f(×%.1f=%s), i_seeded=%.4f, err_i=%.4f "
+               "(limit=±%.1f), freeze=%d, boost=%d(×%.1f)",
+               i_output_old, gravity_ff_z, i_output_degrav,
+               seed_value, Z_SEED_GAIN,
+               has_unified_z_i_ss_ ? "adaptive" : "default",
+               i_output_seeded, iz_new, iz_limit,
+               z_integral_freeze_count_, z_ki_boost_count_, Z_KI_BOOST_FACTOR);
+    }
+
+    sendZeroAttitudeGains();
+    applyUnifiedGains();
+    spinal_gains_zeroed_ = true;
+    unified_transition_count_ = 0;
+    ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, zeroed spinal gains, applied unified PID gains, t=%.4f",
+             ros::Time::now().toSec());
   }
 
   void BeetleController::controlCore()
@@ -142,159 +301,7 @@ namespace aerial_robot_control
     if (unified_control_mode_ && module_state == LEADER && module_state != SEPARATED) {
       // Detect mode switch: reset targets and zero spinal gains
       if (pre_module_state_ != LEADER || !prev_unified_control_mode_) {
-        post_exit_diag_count_ = -1;  // stop exit diagnostics when re-entering unified mode
-        // Reset target position/yaw to current FORMATION CoG state at mode switch.
-        // This ensures the position PID reference matches the actual controlled output
-        // (formation CoG), not the leader's individual CoG.
-        {
-          // Get leader CoG state
-          tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
-          tf::Vector3 cur_vel = estimator_->getVel(Frame::COG, estimate_mode_);
-
-          // Compute formation CoG offset in world frame
-          unified_controller_->updateFormationGeometry();
-          const Eigen::Vector3d& cog_off = unified_controller_->getFormationCogOffset();
-          tf::Vector3 offset_body(cog_off.x(), cog_off.y(), cog_off.z());
-          tf::Matrix3x3 cur_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
-          tf::Vector3 offset_world = cur_rot * offset_body;
-          tf::Vector3 formation_pos = cur_pos + offset_world;
-
-          // Set target = current formation CoG position (zero-error start)
-          // The controller PID will compute: target_formation_pos = target_pos + R*offset
-          // So we need: target_pos = formation_pos - R*offset = cur_pos (leader CoG).
-          // BUT the PID error is computed as: target_formation_pos - formation_pos
-          //   = (target_pos + R*offset) - (cur_pos + R*offset) = target_pos - cur_pos
-          // So setting target_pos = cur_pos gives zero initial error. Correct.
-          navigator_->setXyControlMode(aerial_robot_navigation::POS_CONTROL_MODE);
-          navigator_->setTargetPosX(cur_pos.x());
-          navigator_->setTargetPosY(cur_pos.y());
-          navigator_->setTargetPosZ(cur_pos.z());
-          navigator_->setTargetVelX(0);
-          navigator_->setTargetVelY(0);
-          navigator_->setTargetAccX(0);
-          navigator_->setTargetAccY(0);
-
-          double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
-          navigator_->setTargetYaw(cur_yaw);
-          navigator_->setTargetOmegaZ(0);
-
-          // Notify navigator that we're in unified mode
-          // (so it skips CoG→CoM conversion and uses unified nav path)
-          beetle_navigator_->setUnifiedControlMode(true);
-        }
-        // Roll/Pitch I-term: partial retention + seed injection + freeze/boost.
-        // Pitch has a significant steady-state bias in unified mode (formation geometry
-        // offset), so we preload a seed similar to the Z axis approach.
-        // Roll bias is typically near zero, so roll only gets partial retention (no seed).
-        {
-          double old_roll_i = pid_controllers_.at(ROLL).getErrI();
-          double old_pitch_i = pid_controllers_.at(PITCH).getErrI();
-
-          // Roll: simple partial retention (no seed — observed SS bias ≈ 0)
-          double new_roll_i = rp_i_keep_ratio_ * old_roll_i;
-
-          // Pitch: partial retention + seed injection
-          double pitch_seed = has_unified_pitch_i_ss_ ? last_unified_pitch_i_ss_ : pitch_i_seed_default_;
-          double new_pitch_i = rp_i_keep_ratio_ * old_pitch_i + PITCH_SEED_GAIN * pitch_seed;
-
-          // Clamp to unified-mode I limits (in err_i domain = limit_i / Ki)
-          double Ki_roll = std::max(unified_roll_gains_.i, 1e-6);
-          double Ki_pitch = std::max(unified_pitch_gains_.i, 1e-6);
-          double roll_i_limit = unified_roll_gains_.limit_i / Ki_roll;
-          double pitch_i_limit = unified_pitch_gains_.limit_i / Ki_pitch;
-          new_roll_i = boost::algorithm::clamp(new_roll_i, -roll_i_limit, roll_i_limit);
-          new_pitch_i = boost::algorithm::clamp(new_pitch_i, -pitch_i_limit, pitch_i_limit);
-
-          pid_controllers_.at(ROLL).setErrI(new_roll_i);
-          pid_controllers_.at(PITCH).setErrI(new_pitch_i);
-
-          // Start freeze + boost sequence
-          rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
-          rp_ki_boost_count_ = RP_KI_BOOST_FRAMES;
-
-          ROS_WARN("[UnifiedCtrl] RP I-term transition: "
-                   "roll_i: old=%.4f → new=%.4f (keep×%.1f), "
-                   "pitch_i: old=%.4f → new=%.4f (keep×%.1f + seed=%.4f×%.1f=%s), "
-                   "freeze=%d, boost=%d(×%.1f)",
-                   old_roll_i, new_roll_i, rp_i_keep_ratio_,
-                   old_pitch_i, new_pitch_i, rp_i_keep_ratio_,
-                   pitch_seed, PITCH_SEED_GAIN,
-                   has_unified_pitch_i_ss_ ? "adaptive" : "default",
-                   rp_integral_freeze_count_, rp_ki_boost_count_, RP_KI_BOOST_FACTOR);
-        }
-        pid_controllers_.at(X).setErrI(0);
-        pid_controllers_.at(Y).setErrI(0);
-
-        // De-gravity Z I-term migration + seed injection (Plan E'):
-        // Step 1: Remove gravity from I-term (de-gravity, same as before)
-        // Step 2: Add unified-mode steady-state bias seed (NEW)
-        //
-        // Independent mode Z I-term ≈ G (compensates gravity implicitly).
-        // Unified mode has explicit gravity FF, so de-gravity subtracts it.
-        // But unified mode also needs an additional Z_i bias (≈0.86–0.94) due to
-        // formation geometry (CoG offset, gimbal deflection for pitch moment, etc.).
-        // This bias doesn't exist in independent mode, so we preload it as a seed.
-        {
-          // 1. Get current I output in acceleration domain (same units as gravity_ff)
-          double i_output_old = pid_controllers_.at(Z).getITerm();  // clamp(err_i * Ki, -limit_i, limit_i)
-
-          // 2. Compute gravity_ff_z using the SAME path as unified mode (reuse R^{-1} * (0,0,G))
-          tf::Matrix3x3 uav_rot_mig = estimator_->getOrientation(Frame::COG, estimate_mode_);
-          tf::Vector3 gravity_w_mig(0, 0, aerial_robot_estimation::G);
-          tf::Vector3 gravity_cog_mig = uav_rot_mig.inverse() * gravity_w_mig;
-          double gravity_ff_z = gravity_cog_mig.z();  // body-z component of gravity in acc domain
-
-          // 3. De-gravity: new I output = old I output - gravity_ff (keep only bias)
-          double i_output_degrav = i_output_old - gravity_ff_z;
-
-          // 4. Seed injection: add unified-mode steady-state bias
-          //    seed source: last recorded SS value, or configurable default
-          double seed_value = has_unified_z_i_ss_ ? last_unified_z_i_ss_ : z_i_seed_default_;
-          double i_output_seeded = i_output_degrav + Z_SEED_GAIN * seed_value;
-
-          // 5. Convert back to err_i domain: err_i = i_output / Ki
-          double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
-          double iz_new = i_output_seeded / Ki;
-
-          // 6. Symmetric clamp (allow negative bias) + finite check
-          double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
-          if (!std::isfinite(iz_new)) iz_new = 0.0;
-          iz_new = boost::algorithm::clamp(iz_new, -iz_limit, iz_limit);
-
-          pid_controllers_.at(Z).setErrI(iz_new);
-          // Freeze Z integration for a few frames to avoid transient pollution
-          z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
-          // Start Ki-boost phase right after freeze ends (gentler now with seed)
-          z_ki_boost_count_ = Z_KI_BOOST_FRAMES;
-          ROS_WARN("[UnifiedCtrl] Z de-gravity + seed: i_old=%.4f, gravity_ff=%.4f, "
-                   "i_degrav=%.4f, seed=%.4f(×%.1f=%s), i_seeded=%.4f, err_i=%.4f "
-                   "(limit=±%.1f), freeze=%d, boost=%d(×%.1f)",
-                   i_output_old, gravity_ff_z, i_output_degrav,
-                   seed_value, Z_SEED_GAIN,
-                   has_unified_z_i_ss_ ? "adaptive" : "default",
-                   i_output_seeded, iz_new, iz_limit,
-                   z_integral_freeze_count_, z_ki_boost_count_, Z_KI_BOOST_FACTOR);
-        }
-
-        // [SINK_DIAG] Snapshot state at mode switch to identify sinking root cause
-        {
-          tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
-          tf::Vector3 cur_vel = estimator_->getVel(Frame::COG, estimate_mode_);
-          tf::Vector3 cur_rpy = estimator_->getEuler(Frame::COG, estimate_mode_);
-          ROS_WARN("[SINK_DIAG_SWITCH] LEADER snapshot: pos=(%.4f,%.4f,%.4f) vel=(%.3f,%.3f,%.3f) "
-                   "rpy=(%.4f,%.4f,%.4f) Z_I_kept=%.4f",
-                   cur_pos.x(), cur_pos.y(), cur_pos.z(),
-                   cur_vel.x(), cur_vel.y(), cur_vel.z(),
-                   cur_rpy.x(), cur_rpy.y(), cur_rpy.z(),
-                   pid_controllers_.at(Z).getErrI());
-        }
-
-        sendZeroAttitudeGains();
-        applyUnifiedGains();
-        spinal_gains_zeroed_ = true;
-        unified_transition_count_ = 0;
-        ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, zeroed spinal gains, applied unified PID gains, t=%.4f",
-                 ros::Time::now().toSec());
+        initUnifiedLeaderMode();
       }
       prev_unified_control_mode_ = true;
 
@@ -393,27 +400,7 @@ namespace aerial_robot_control
       // AW1: if any motor thrust (from PREVIOUS frame's allocation) is near its
       // min/max limit, suppress the boost to prevent windup when allocation is saturated.
       else if (z_ki_boost_count_ > 0) {
-        bool allocation_saturated = false;
-        // Check motor thrust saturation using previous frame's allocation result
-        const auto& cmds_aw = unified_controller_->getModuleCommands();
-        if (!cmds_aw.empty()) {
-          const double t_max = beetle_robot_model_->getThrustUpperLimit();
-          const double t_min = beetle_robot_model_->getThrustLowerLimit();
-          const double sat_margin = 0.05;  // 5% margin to detect near-saturation
-          const double t_upper = t_max * (1.0 - sat_margin);
-          const double t_lower = t_min + t_max * sat_margin;
-          for (const auto& kv : cmds_aw) {
-            for (float t : kv.second.full_thrusts) {
-              if (t >= t_upper || t <= t_lower) {
-                allocation_saturated = true;
-                break;
-              }
-            }
-            if (allocation_saturated) break;
-          }
-        }
-
-        if (!allocation_saturated) {
+        if (!unified_controller_->isAllocationSaturated()) {
           // Apply boost: add extra (boost_factor - 1) × err_p × dt to err_i
           double clamped_err_p = pid_controllers_.at(Z).getErrP();  // already clamped by PID::update
           double extra_increment = clamped_err_p * du * (Z_KI_BOOST_FACTOR - 1.0);
@@ -427,13 +414,6 @@ namespace aerial_robot_control
         }
 
         z_ki_boost_count_--;
-        if (z_ki_boost_count_ % 20 == 0 || z_ki_boost_count_ == 0) {
-          ROS_WARN("[Z_BOOST] remaining=%d sat=%d err_p=%.4f err_i=%.4f i_term=%.4f",
-                   z_ki_boost_count_, allocation_saturated ? 1 : 0,
-                   pid_controllers_.at(Z).getErrP(),
-                   pid_controllers_.at(Z).getErrI(),
-                   pid_controllers_.at(Z).getITerm());
-        }
       }
 
       if(navigator_->getForceLandingFlag()) {
@@ -458,27 +438,7 @@ namespace aerial_robot_control
       }
       // Boost: after freeze ends, accelerate I-term convergence
       else if (rp_ki_boost_count_ > 0) {
-        // Anti-windup: skip boost if allocation is saturated (reuse same check as Z)
-        bool allocation_saturated = false;
-        const auto& cmds_rp = unified_controller_->getModuleCommands();
-        if (!cmds_rp.empty()) {
-          const double t_max = beetle_robot_model_->getThrustUpperLimit();
-          const double t_min = beetle_robot_model_->getThrustLowerLimit();
-          const double sat_margin = 0.05;
-          const double t_upper = t_max * (1.0 - sat_margin);
-          const double t_lower = t_min + t_max * sat_margin;
-          for (const auto& kv : cmds_rp) {
-            for (float t : kv.second.full_thrusts) {
-              if (t >= t_upper || t <= t_lower) {
-                allocation_saturated = true;
-                break;
-              }
-            }
-            if (allocation_saturated) break;
-          }
-        }
-
-        if (!allocation_saturated) {
+        if (!unified_controller_->isAllocationSaturated()) {
           // Roll boost
           {
             double err_p_roll = pid_controllers_.at(ROLL).getErrP();
@@ -502,18 +462,6 @@ namespace aerial_robot_control
         }
 
         rp_ki_boost_count_--;
-        if (rp_ki_boost_count_ % 10 == 0 || rp_ki_boost_count_ == 0) {
-          ROS_WARN("[RP_BOOST] remaining=%d sat=%d "
-                   "roll: err_p=%.4f err_i=%.4f i_term=%.4f | "
-                   "pitch: err_p=%.4f err_i=%.4f i_term=%.4f",
-                   rp_ki_boost_count_, allocation_saturated ? 1 : 0,
-                   pid_controllers_.at(ROLL).getErrP(),
-                   pid_controllers_.at(ROLL).getErrI(),
-                   pid_controllers_.at(ROLL).getITerm(),
-                   pid_controllers_.at(PITCH).getErrP(),
-                   pid_controllers_.at(PITCH).getErrI(),
-                   pid_controllers_.at(PITCH).getITerm());
-        }
       }
 
       double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
@@ -585,83 +533,12 @@ namespace aerial_robot_control
         }
       }
 
-      // --- Diagnostics ---
-      if (unified_transition_count_ >= 0 && unified_transition_count_ < 20) {
-        ROS_WARN("[TRANS_DIAG frame=%d] rpy=(%.5f,%.5f,%.5f) wrench_acc=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f) ok=%d",
-                 unified_transition_count_,
-                 rpy_.x(), rpy_.y(), rpy_.z(),
-                 target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
-                 target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok);
-
-        // [SINK_DIAG] Extended transition diagnostics
-        {
-          // Target vs actual formation position
-          const Eigen::Vector3d& cog_off = unified_controller_->getFormationCogOffset();
-          tf::Matrix3x3 cur_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
-          tf::Vector3 off_body(cog_off.x(), cog_off.y(), cog_off.z());
-          tf::Vector3 off_world = cur_rot * off_body;
-          tf::Vector3 fpos = pos_ + off_world;
-          tf::Vector3 tpos = target_pos_;
-          tf::Matrix3x3 tgt_rot; tgt_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
-          tf::Vector3 tfpos = tpos + tgt_rot * off_body;
-
-          ROS_WARN("[SINK_DIAG_POS frame=%d] form_pos=(%.4f,%.4f,%.4f) tgt_form_pos=(%.4f,%.4f,%.4f) "
-                   "err_z=%.5f Z_pid: p=%.4f i=%.4f d=%.4f sum=%.4f",
-                   unified_transition_count_,
-                   fpos.x(), fpos.y(), fpos.z(),
-                   tfpos.x(), tfpos.y(), tfpos.z(),
-                   tfpos.z() - fpos.z(),
-                   pid_controllers_.at(Z).getPTerm(),
-                   pid_controllers_.at(Z).getITerm(),
-                   pid_controllers_.at(Z).getDTerm(),
-                   pid_controllers_.at(Z).result());
-
-          // Per-module thrust summary from allocation
-          if (ok) {
-            const auto& cmds2 = unified_controller_->getModuleCommands();
-            for (const auto& kv : cmds2) {
-              float tsum = 0;
-              for (float t : kv.second.full_thrusts) tsum += t;
-              ROS_WARN("[SINK_DIAG_THRUST frame=%d] module=%d thrust_sum=%.3f thrusts=[%.3f,%.3f,%.3f,%.3f]",
-                       unified_transition_count_, kv.first, tsum,
-                       kv.second.full_thrusts.size() > 0 ? kv.second.full_thrusts[0] : 0.0f,
-                       kv.second.full_thrusts.size() > 1 ? kv.second.full_thrusts[1] : 0.0f,
-                       kv.second.full_thrusts.size() > 2 ? kv.second.full_thrusts[2] : 0.0f,
-                       kv.second.full_thrusts.size() > 3 ? kv.second.full_thrusts[3] : 0.0f);
-            }
-          }
-        }
-
+      if (unified_transition_count_ >= 0)
         unified_transition_count_++;
-      }
 
       ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d",
                         target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
                         target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok);
-
-      // [SINK_DIAG] Steady-state tracking (1Hz)
-      ROS_WARN_THROTTLE(1.0, "[SINK_DIAG_Z_SS] pos_z=%.4f vel_z=%.3f form_pos_z=%.4f tgt_z=%.4f "
-                        "Z_pid: p=%.4f i=%.4f d=%.4f sum=%.4f gravity_ff_z=%.4f boost=%d seed=%.4f(%s)",
-                        pos_.z(), vel_.z(),
-                        pos_.z() + (estimator_->getOrientation(Frame::COG, estimate_mode_) *
-                                    tf::Vector3(unified_controller_->getFormationCogOffset().x(),
-                                                unified_controller_->getFormationCogOffset().y(),
-                                                unified_controller_->getFormationCogOffset().z())).z(),
-                        target_pos_.z(),
-                        pid_controllers_.at(Z).getPTerm(),
-                        pid_controllers_.at(Z).getITerm(),
-                        pid_controllers_.at(Z).getDTerm(),
-                        pid_controllers_.at(Z).result(),
-                        target_wrench_acc(2) - pid_controllers_.at(Z).result(),
-                        z_ki_boost_count_,
-                        last_unified_z_i_ss_,
-                        has_unified_z_i_ss_ ? "adaptive" : "default");
-      ROS_WARN_THROTTLE(2.0, "[PITCH_SEED_SS] pitch=%.4f err_i=%.4f i_term=%.4f seed=%.4f(%s) boost=%d",
-                        rpy_.y(), pid_controllers_.at(PITCH).getErrI(),
-                        pid_controllers_.at(PITCH).getITerm(),
-                        last_unified_pitch_i_ss_,
-                        has_unified_pitch_i_ss_ ? "adaptive" : "default",
-                        rp_ki_boost_count_);
 
       // Adaptive seed tracking: when in quasi-steady-state, low-pass update
       // last_unified_*_i_ss_ so the NEXT mode switch gets a better seed.
@@ -696,30 +573,6 @@ namespace aerial_robot_control
         }
       }
 
-      // T1.4: Formation yaw consistency verification.
-      // In rigid assembly, leader yaw should equal formation yaw.
-      // Log relative yaw between leader and each follower to verify this assumption.
-      // If relative yaw residuals are large, we need explicit formation yaw estimation.
-      {
-        std::vector<int> ids = beetle_navigator_->getAssemblyIds();
-        int leader_id = beetle_navigator_->getLeaderID();
-        std::string leader_cog = beetle_navigator_->getMyName() + std::to_string(leader_id) + "/cog";
-        for (int fid : ids) {
-          if (fid == leader_id) continue;
-          try {
-            std::string fol_cog = beetle_navigator_->getMyName() + std::to_string(fid) + "/cog";
-            geometry_msgs::TransformStamped tf_rel =
-                beetle_navigator_->getTfBuffer().lookupTransform(leader_cog, fol_cog, ros::Time(0));
-            tf::Quaternion q(tf_rel.transform.rotation.x, tf_rel.transform.rotation.y,
-                             tf_rel.transform.rotation.z, tf_rel.transform.rotation.w);
-            double rel_r, rel_p, rel_y;
-            tf::Matrix3x3(q).getRPY(rel_r, rel_p, rel_y);
-            ROS_WARN_THROTTLE(2.0, "[YAW_CHECK] leader=%d fol=%d rel_rpy=(%.4f,%.4f,%.4f)",
-                              leader_id, fid, rel_r, rel_p, rel_y);
-          } catch (tf2::TransformException&) {}
-        }
-      }
-
       pre_module_state_ = module_state;
       return;  // Skip individual control path
     }
@@ -741,31 +594,6 @@ namespace aerial_robot_control
       if (unified_cmd_received_) {
         double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
         if (age < 0.5) have_valid_cmd = true;
-      }
-
-      if (unified_transition_count_ >= 0 && unified_transition_count_ < 20) {
-        tf::Vector3 fol_rpy = estimator_->getEuler(Frame::COG, estimate_mode_);
-        ROS_WARN("[FOLLOWER_TRANS_DIAG id=%d frame=%d] t=%.4f have_cmd=%d rpy=(%.5f,%.5f,%.5f)",
-                 beetle_navigator_->getMyID(), unified_transition_count_,
-                 ros::Time::now().toSec(), have_valid_cmd,
-                 fol_rpy.x(), fol_rpy.y(), fol_rpy.z());
-
-        // [SINK_DIAG] Show what commands the FOLLOWER has/hasn't received
-        if (have_valid_cmd && unified_thrust_cmd_.base_thrust.size() >= 4) {
-          float tsum = 0;
-          for (float t : unified_thrust_cmd_.base_thrust) tsum += t;
-          ROS_WARN("[SINK_DIAG_FOL_CMD id=%d frame=%d] n_elements=%zu thrust_sum=%.3f first4=[%.3f,%.3f,%.3f,%.3f] "
-                   "angles=[%.3f,%.3f,%.3f] age=%.4f",
-                   beetle_navigator_->getMyID(), unified_transition_count_,
-                   unified_thrust_cmd_.base_thrust.size(),
-                   tsum,
-                   unified_thrust_cmd_.base_thrust[0], unified_thrust_cmd_.base_thrust[1],
-                   unified_thrust_cmd_.base_thrust[2], unified_thrust_cmd_.base_thrust[3],
-                   unified_thrust_cmd_.angles[0], unified_thrust_cmd_.angles[1], unified_thrust_cmd_.angles[2],
-                   (ros::Time::now() - unified_cmd_stamp_).toSec());
-        }
-
-        unified_transition_count_++;
       }
 
       if (have_valid_cmd) {
@@ -813,66 +641,8 @@ namespace aerial_robot_control
                   "restoring independent hover!",
                   beetle_navigator_->getMyID(), follower_cmd_timeout_count_);
 
-        // T4.4 (partial): Restore spinal attitude PID gains (PC-side)
-        restoreIndependentGains();
-        // Re-send restored gains to spinal — critical! sendZeroAttitudeGains()
-        // zeroed the spinal's internal thrust_p/i/d_gain_, so we must explicitly
-        // push the restored values back via rosserial.
-        setAttitudeGains();
+        resetToIndependentHover();
         spinal_gains_zeroed_ = false;
-
-        // Reset position/yaw targets to current state to avoid jump
-        {
-          tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
-          navigator_->setXyControlMode(aerial_robot_navigation::POS_CONTROL_MODE);
-          navigator_->setTargetPosX(cur_pos.x());
-          navigator_->setTargetPosY(cur_pos.y());
-          navigator_->setTargetPosZ(cur_pos.z());
-          navigator_->setTargetVelX(0);
-          navigator_->setTargetVelY(0);
-
-          double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
-          navigator_->setTargetYaw(cur_yaw);
-          navigator_->setTargetOmegaZ(0);
-
-          // Sync target_pos_candidate_ (CoM frame) = cur_pos(CoG) + com_conversion
-          // to ensure convertTargetPosFromCoG2CoM() recovers the correct CoG target.
-          tf::Transform cog2com_tf;
-          tf::transformKDLToTF(beetle_navigator_->getCog2CoM<KDL::Frame>(), cog2com_tf);
-          tf::Matrix3x3 cog_orient;
-          tf::matrixEigenToTF(beetle_robot_model_->getCogDesireOrientation<Eigen::Matrix3d>(), cog_orient);
-          tf::Vector3 com_conv = cog_orient * tf::Matrix3x3(tf::createQuaternionFromYaw(cur_yaw)) * cog2com_tf.getOrigin();
-          beetle_navigator_->setTargetPosCandX(cur_pos.x() + com_conv.x());
-          beetle_navigator_->setTargetPosCandY(cur_pos.y() + com_conv.y());
-          beetle_navigator_->setTargetPosCandZ(cur_pos.z() + com_conv.z());
-          beetle_navigator_->syncPreTargetPos();
-        }
-
-        // Seed Z I-term with gravity compensation to avoid altitude drop.
-        // In independent mode, Z I-term ≈ G.
-        // T4.3: Skip gravity seed if force landing / halt — robot is on ground.
-        if (navigator_->getForceLandingFlag() ||
-            navigator_->getNaviState() == aerial_robot_navigation::STOP_STATE) {
-          pid_controllers_.at(Z).setErrI(0);
-          ROS_WARN("[UnifiedCtrl FOLLOWER] id=%d Z I-term cleared (force_landing/halt)",
-                   beetle_navigator_->getMyID());
-        } else {
-          double gravity_acc = aerial_robot_estimation::G;
-          double Ki_z = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
-          double z_i_limit = pid_controllers_.at(Z).getLimitI() / Ki_z;
-          double seeded_z_i = gravity_acc / Ki_z;
-          seeded_z_i = boost::algorithm::clamp(seeded_z_i, -z_i_limit, z_i_limit);
-          pid_controllers_.at(Z).setErrI(seeded_z_i);
-        }
-
-        // Clear RP I-terms (small residual, not worth keeping)
-        pid_controllers_.at(ROLL).setErrI(0);
-        pid_controllers_.at(PITCH).setErrI(0);
-        pid_controllers_.at(X).setErrI(0);
-        pid_controllers_.at(Y).setErrI(0);
-
-        // Reset wrench comp timer to avoid abnormal du on first post-exit frame
-        prev_comp_update_time_ = -1;
 
         // Clear unified state
         follower_unified_active_ = false;
@@ -902,118 +672,7 @@ namespace aerial_robot_control
     if (prev_unified_control_mode_) {
       ROS_WARN("[UnifiedCtrl] id=%d exiting unified mode → restoring independent hover state",
                beetle_navigator_->getMyID());
-
-      // [EXIT_DIAG] Snapshot ALL relevant state at exit moment
-      {
-        int my_id = beetle_navigator_->getMyID();
-        tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
-        tf::Vector3 cur_vel = estimator_->getVel(Frame::COG, estimate_mode_);
-        tf::Vector3 cur_rpy_est = estimator_->getEuler(Frame::COG, estimate_mode_);
-        tf::Vector3 final_baselink_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
-        tf::Vector3 curr_baselink_rpy = beetle_navigator_->getCurrTargetBaselinkRPY();
-
-        tf::Quaternion cog2bl_rot;
-        tf::quaternionKDLToTF(robot_model_->getCogDesireOrientation<KDL::Rotation>(), cog2bl_rot);
-        double cdo_r, cdo_p, cdo_y;
-        tf::Matrix3x3(cog2bl_rot).getRPY(cdo_r, cdo_p, cdo_y);
-
-        ROS_ERROR("[EXIT_DIAG] id=%d SNAPSHOT at exit: "
-                  "pos=(%.4f,%.4f,%.4f) vel=(%.3f,%.3f,%.3f) est_rpy=(%.4f,%.4f,%.4f) "
-                  "FinalBaselinkRPY=(%.4f,%.4f,%.4f) CurrBaselinkRPY=(%.4f,%.4f,%.4f) "
-                  "CogDesireOrient=(%.4f,%.4f,%.4f) "
-                  "module_state=%d des_ext_wrench=(%.3f,%.3f,%.3f,%.3f,%.3f,%.3f) "
-                  "prev_comp_update_time=%.3f "
-                  "PID_X: erri=%.4f ff=%.4f | PID_Y: erri=%.4f ff=%.4f | PID_Z: erri=%.4f ff=%.4f "
-                  "PID_R: erri=%.4f | PID_P: erri=%.4f | PID_YAW: erri=%.4f "
-                  "ROLL gains: P=%.1f I=%.1f D=%.1f | PITCH gains: P=%.1f I=%.1f D=%.1f",
-                  my_id,
-                  cur_pos.x(), cur_pos.y(), cur_pos.z(),
-                  cur_vel.x(), cur_vel.y(), cur_vel.z(),
-                  cur_rpy_est.x(), cur_rpy_est.y(), cur_rpy_est.z(),
-                  final_baselink_rpy.x(), final_baselink_rpy.y(), final_baselink_rpy.z(),
-                  curr_baselink_rpy.x(), curr_baselink_rpy.y(), curr_baselink_rpy.z(),
-                  cdo_r, cdo_p, cdo_y,
-                  module_state,
-                  desired_external_wrench_(0), desired_external_wrench_(1), desired_external_wrench_(2),
-                  desired_external_wrench_(3), desired_external_wrench_(4), desired_external_wrench_(5),
-                  prev_comp_update_time_,
-                  pid_controllers_.at(X).getErrI(), pid_controllers_.at(X).getPersistentFF(),
-                  pid_controllers_.at(Y).getErrI(), pid_controllers_.at(Y).getPersistentFF(),
-                  pid_controllers_.at(Z).getErrI(), pid_controllers_.at(Z).getPersistentFF(),
-                  pid_controllers_.at(ROLL).getErrI(),
-                  pid_controllers_.at(PITCH).getErrI(),
-                  pid_controllers_.at(YAW).getErrI(),
-                  pid_controllers_.at(ROLL).getPGain(), pid_controllers_.at(ROLL).getIGain(), pid_controllers_.at(ROLL).getDGain(),
-                  pid_controllers_.at(PITCH).getPGain(), pid_controllers_.at(PITCH).getIGain(), pid_controllers_.at(PITCH).getDGain());
-      }
-
-      // Start post-exit diagnostic counter
-      post_exit_diag_count_ = 0;
-
-      // 1. Restore PID gains + re-send to spinal
-      restoreIndependentGains();
-      setAttitudeGains();
-
-      // 2. Reset target to current state (zero initial error)
-      {
-        tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
-        navigator_->setXyControlMode(aerial_robot_navigation::POS_CONTROL_MODE);
-        navigator_->setTargetPosX(cur_pos.x());
-        navigator_->setTargetPosY(cur_pos.y());
-        navigator_->setTargetPosZ(cur_pos.z());
-        navigator_->setTargetVelX(0);
-        navigator_->setTargetVelY(0);
-
-        double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
-        navigator_->setTargetYaw(cur_yaw);
-        navigator_->setTargetOmegaZ(0);
-
-        // 5. Sync target_pos_candidate_ so that convertTargetPosFromCoG2CoM()
-        // (which resumes in leader-follower mode) doesn't use stale values.
-        // TargetPosCand is in CoM frame, so we must add com_conversion to cur_pos(CoG).
-        // Otherwise convertTargetPosFromCoG2CoM() computes targetPos = cand - com_conversion
-        // = cur_pos - com_conversion, introducing a cog2com offset error.
-        tf::Transform cog2com_tf;
-        tf::transformKDLToTF(beetle_navigator_->getCog2CoM<KDL::Frame>(), cog2com_tf);
-        tf::Matrix3x3 cog_orient;
-        tf::matrixEigenToTF(beetle_robot_model_->getCogDesireOrientation<Eigen::Matrix3d>(), cog_orient);
-        tf::Vector3 com_conv = cog_orient * tf::Matrix3x3(tf::createQuaternionFromYaw(cur_yaw)) * cog2com_tf.getOrigin();
-        beetle_navigator_->setTargetPosCandX(cur_pos.x() + com_conv.x());
-        beetle_navigator_->setTargetPosCandY(cur_pos.y() + com_conv.y());
-        beetle_navigator_->setTargetPosCandZ(cur_pos.z() + com_conv.z());
-
-        // Also sync pre_target_pos_ to prevent the "changed by something other
-        // than uav nav" check from detecting a false mismatch on the first frame.
-        beetle_navigator_->syncPreTargetPos();
-      }
-
-      // 3. Seed Z I-term with gravity compensation
-      // T4.3: Skip gravity seed if force landing / halt — robot is descending/on ground,
-      // seeding gravity would cause a thrust spike before motors disarm.
-      if (navigator_->getForceLandingFlag() ||
-          navigator_->getNaviState() == aerial_robot_navigation::STOP_STATE) {
-        pid_controllers_.at(Z).setErrI(0);
-        ROS_WARN("[UnifiedCtrl] id=%d Z I-term cleared (force_landing/halt — no gravity seed)",
-                 beetle_navigator_->getMyID());
-      } else {
-        double gravity_acc = aerial_robot_estimation::G;
-        double Ki_z = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
-        double z_i_limit = pid_controllers_.at(Z).getLimitI() / Ki_z;
-        double seeded_z_i = gravity_acc / Ki_z;
-        seeded_z_i = boost::algorithm::clamp(seeded_z_i, -z_i_limit, z_i_limit);
-        pid_controllers_.at(Z).setErrI(seeded_z_i);
-        ROS_WARN("[UnifiedCtrl] id=%d Z I-term seeded: %.4f (G=%.2f, Ki_z=%.2f)",
-                 beetle_navigator_->getMyID(), seeded_z_i, gravity_acc, Ki_z);
-      }
-
-      // 4. Clear RP/XY I-terms
-      pid_controllers_.at(ROLL).setErrI(0);
-      pid_controllers_.at(PITCH).setErrI(0);
-      pid_controllers_.at(X).setErrI(0);
-      pid_controllers_.at(Y).setErrI(0);
-
-      // 6. Reset wrench comp timer to avoid abnormal du on first post-exit frame
-      prev_comp_update_time_ = -1;
+      resetToIndependentHover();
     }
 
     prev_unified_control_mode_ = false;
@@ -1070,18 +729,6 @@ namespace aerial_robot_control
       I_reconfig_acc_cog_term.head(3) = mass_inv * wrench_comp_term.head(3);
       I_reconfig_acc_cog_term.tail(3) = inertia_inv * wrench_comp_term.tail(3); //inavailable
 
-      // Debug: log wrench_comp breakdown (throttled to 2Hz)
-      if(desired_external_wrench_.norm() > 1e-6) {
-        ROS_INFO_THROTTLE(0.5, "[FF Debug] id=%d, des_ext_wrench=(%.2f,%.2f,%.2f), "
-          "wrench_comp_cog=(%.2f,%.2f,%.2f), wrench_comp_world=(%.2f,%.2f,%.2f), "
-          "I_reconfig=(%.3f,%.3f,%.3f)",
-          my_id,
-          desired_external_wrench_(0), desired_external_wrench_(1), desired_external_wrench_(2),
-          wrench_comp_term_cog(0), wrench_comp_term_cog(1), wrench_comp_term_cog(2),
-          wrench_comp_term(0), wrench_comp_term(1), wrench_comp_term(2),
-          I_reconfig_acc_cog_term(0), I_reconfig_acc_cog_term(1), I_reconfig_acc_cog_term(2));
-      }
-
       double IGain_Fx = pid_controllers_.at(X).getIGain();
       double IGain_Fy = pid_controllers_.at(Y).getIGain();
       double IGain_Fz = pid_controllers_.at(Z).getIGain();
@@ -1096,16 +743,6 @@ namespace aerial_robot_control
       }else{
         du = ros::Time::now().toSec() - prev_comp_update_time_;
         prev_comp_update_time_ = ros::Time::now().toSec();
-      }
-
-      // [EXIT_DIAG] Log wrench comp du on first post-exit frames to detect stale timestamp
-      if (post_exit_diag_count_ >= 0 && post_exit_diag_count_ < 20) {
-        ROS_WARN("[EXIT_DIAG_WRENCH_COMP] id=%d f=%d du=%.4f wrench_comp=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f) "
-                 "I_reconfig_acc=(%.4f,%.4f,%.4f)",
-                 my_id, post_exit_diag_count_, du,
-                 wrench_comp_term_cog(0), wrench_comp_term_cog(1), wrench_comp_term_cog(2),
-                 wrench_comp_term_cog(3), wrench_comp_term_cog(4), wrench_comp_term_cog(5),
-                 I_reconfig_acc_cog_term(0), I_reconfig_acc_cog_term(1), I_reconfig_acc_cog_term(2));
       }
 
       pid_controllers_.at(FX).updateWoVel(I_reconfig_acc_cog_term(0) / IGain_Fx, du);
@@ -1134,15 +771,6 @@ namespace aerial_robot_control
       pid_controllers_.at(PITCH).setICompTerm(I_comp_Ty_);
       pid_controllers_.at(YAW).setICompTerm(I_comp_Tz_);
 
-      // Debug: log feedforward injection values (throttled to 2Hz)
-      if(desired_external_wrench_.norm() > 1e-6) {
-        ROS_INFO_THROTTLE(0.5, "[FF PID] id=%d, ff_acc=(%.3f,%.3f), I_comp_z=%.3f, "
-          "FX_pid: p=%.3f i=%.3f d=%.3f, FY_pid: p=%.3f i=%.3f d=%.3f",
-          my_id, I_reconfig_acc_cog_term(0), I_reconfig_acc_cog_term(1), I_comp_Fz_,
-          pid_controllers_.at(FX).getPTerm(), pid_controllers_.at(FX).getITerm(), pid_controllers_.at(FX).getDTerm(),
-          pid_controllers_.at(FY).getPTerm(), pid_controllers_.at(FY).getITerm(), pid_controllers_.at(FY).getDTerm());
-      }
-      
       geometry_msgs::WrenchStamped wrench_msg;
       wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
       wrench_msg.wrench.force.x = I_reconfig_acc_cog_term(0);
@@ -1253,94 +881,6 @@ namespace aerial_robot_control
     }
       
     GimbalrotorController::controlCore();
-
-    // [EXIT_DIAG] Post-exit per-frame diagnostics for first 80 frames (2s @40Hz)
-    if (post_exit_diag_count_ >= 0 && post_exit_diag_count_ < 80) {
-      tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
-      tf::Vector3 cur_vel = estimator_->getVel(Frame::COG, estimate_mode_);
-
-      tf::Quaternion cog2bl_rot;
-      tf::quaternionKDLToTF(robot_model_->getCogDesireOrientation<KDL::Rotation>(), cog2bl_rot);
-      double cdo_r, cdo_p, cdo_y;
-      tf::Matrix3x3(cog2bl_rot).getRPY(cdo_r, cdo_p, cdo_y);
-
-      tf::Vector3 final_bl_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
-      tf::Vector3 curr_bl_rpy = beetle_navigator_->getCurrTargetBaselinkRPY();
-
-      // Log every frame for first 10 frames, then every 5 frames
-      if (post_exit_diag_count_ < 10 || post_exit_diag_count_ % 5 == 0) {
-        ROS_WARN("[EXIT_DIAG_FRAME] id=%d f=%d state=%d "
-                 "rpy_=(%.4f,%.4f,%.4f) target_rpy_=(%.4f,%.4f,%.4f) "
-                 "pos=(%.4f,%.4f,%.4f) tgt_pos=(%.4f,%.4f,%.4f) vel=(%.3f,%.3f,%.3f) "
-                 "CogDesOrient=(%.4f,%.4f,%.4f) FinalBLrpy=(%.4f,%.4f,%.4f) CurrBLrpy=(%.4f,%.4f,%.4f) "
-                 "PID_X: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f "
-                 "PID_Y: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f "
-                 "PID_Z: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f erri=%.4f "
-                 "PID_R: p=%.3f i=%.3f d=%.3f err=%.4f "
-                 "PID_P: p=%.3f i=%.3f d=%.3f err=%.4f "
-                 "target_roll=%.4f target_pitch=%.4f "
-                 "wrench_comp[%d]=(%.3f,%.3f,%.3f)",
-                 my_id, post_exit_diag_count_, module_state,
-                 rpy_.x(), rpy_.y(), rpy_.z(),
-                 target_rpy_.x(), target_rpy_.y(), target_rpy_.z(),
-                 cur_pos.x(), cur_pos.y(), cur_pos.z(),
-                 target_pos_.x(), target_pos_.y(), target_pos_.z(),
-                 cur_vel.x(), cur_vel.y(), cur_vel.z(),
-                 cdo_r, cdo_p, cdo_y,
-                 final_bl_rpy.x(), final_bl_rpy.y(), final_bl_rpy.z(),
-                 curr_bl_rpy.x(), curr_bl_rpy.y(), curr_bl_rpy.z(),
-                 pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(),
-                 pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).getPersistentFF(),
-                 pid_controllers_.at(X).result(),
-                 pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(),
-                 pid_controllers_.at(Y).getDTerm(), pid_controllers_.at(Y).getPersistentFF(),
-                 pid_controllers_.at(Y).result(),
-                 pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
-                 pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).getPersistentFF(),
-                 pid_controllers_.at(Z).result(), pid_controllers_.at(Z).getErrI(),
-                 pid_controllers_.at(ROLL).getPTerm(), pid_controllers_.at(ROLL).getITerm(),
-                 pid_controllers_.at(ROLL).getDTerm(), pid_controllers_.at(ROLL).getErrP(),
-                 pid_controllers_.at(PITCH).getPTerm(), pid_controllers_.at(PITCH).getITerm(),
-                 pid_controllers_.at(PITCH).getDTerm(), pid_controllers_.at(PITCH).getErrP(),
-                 navigator_->getTargetRPY().x(), navigator_->getTargetRPY().y(),
-                 my_id,
-                 wrench_comp_list_.count(my_id) ? wrench_comp_list_[my_id](0) : 0.0,
-                 wrench_comp_list_.count(my_id) ? wrench_comp_list_[my_id](1) : 0.0,
-                 wrench_comp_list_.count(my_id) ? wrench_comp_list_[my_id](2) : 0.0);
-      }
-      post_exit_diag_count_++;
-    }
-
-    // Debug: log LEADER position PID output when towing is active
-    if(module_state == LEADER && desired_external_wrench_.norm() > 1e-6) {
-      ROS_INFO_THROTTLE(0.5, "[LEADER PID] id=%d, X: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, "
-        "Y: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, Z: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f err_i=%.3f",
-        my_id,
-        pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(),
-        pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).getPersistentFF(),
-        pid_controllers_.at(X).result(),
-        pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(),
-        pid_controllers_.at(Y).getDTerm(), pid_controllers_.at(Y).getPersistentFF(),
-        pid_controllers_.at(Y).result(),
-        pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
-        pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).getPersistentFF(),
-        pid_controllers_.at(Z).result(),
-        pid_controllers_.at(Z).getErrI());
-    }
-    // Debug: log FOLLOWER position PID output when wrench_comp feedforward is active
-    if(module_state != LEADER && module_state != SEPARATED && desired_external_wrench_.norm() > 1e-6) {
-      ROS_INFO_THROTTLE(0.5, "[FOLLOWER PID] id=%d, X: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, "
-        "Y: p=%.3f i=%.3f d=%.3f ff=%.3f sum=%.3f, Z: p=%.3f i=%.3f sum=%.3f",
-        my_id,
-        pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(),
-        pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).getPersistentFF(),
-        pid_controllers_.at(X).result(),
-        pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(),
-        pid_controllers_.at(Y).getDTerm(), pid_controllers_.at(Y).getPersistentFF(),
-        pid_controllers_.at(Y).result(),
-        pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(),
-        pid_controllers_.at(Z).result());
-    }
 
     pre_module_state_ = module_state;
     
@@ -1648,17 +1188,8 @@ namespace aerial_robot_control
         wrench_comp_list_[i] = Eigen::VectorXd::Zero(6);
       }
     }
-
-    // Debug: log ff_inter and wrench_comp for this module (throttled to 2Hz)
-    if(desired_external_wrench_.norm() > 1e-6) {
-      ROS_INFO_THROTTLE(0.5, "[WrenchComp Debug] id=%d, ff_inter[%d]=(%.3f,%.3f,%.3f), "
-        "inter[%d]=(%.3f,%.3f,%.3f), wrench_comp[%d]=(%.3f,%.3f,%.3f)",
-        my_id,
-        my_id, ff_inter_wrench_list_[my_id](0), ff_inter_wrench_list_[my_id](1), ff_inter_wrench_list_[my_id](2),
-        my_id, inter_wrench_list_[my_id](0), inter_wrench_list_[my_id](1), inter_wrench_list_[my_id](2),
-        my_id, wrench_comp_list_[my_id](0), wrench_comp_list_[my_id](1), wrench_comp_list_[my_id](2));
-    }
   }
+
   void BeetleController::rosParamInit()
   {
     GimbalrotorController::rosParamInit();
@@ -1940,6 +1471,19 @@ namespace aerial_robot_control
       fw.wrench.torque.z = share(5);
       desired_ext_wrench_pubs_[item.first].publish(fw);
     }
+  }
+
+  bool BeetleController::setUnifiedModeCb(std_srvs::SetBool::Request &req,
+                                          std_srvs::SetBool::Response &res)
+  {
+    unified_control_mode_ = req.data;
+    // Write to rosparam for consistency (backward compat with rosparam-based tools)
+    ros::NodeHandle control_nh(nh_, "controller");
+    control_nh.setParam("unified_control_mode", req.data);
+    res.success = true;
+    res.message = req.data ? "unified mode enabled" : "unified mode disabled";
+    ROS_INFO("[BeetleController] set_unified_mode service: %s", res.message.c_str());
+    return true;
   }
 
 } //namespace aerial_robot_controller

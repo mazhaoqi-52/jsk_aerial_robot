@@ -7,9 +7,6 @@
 #include <tf_conversions/tf_eigen.h>
 #include <tf2_ros/buffer.h>
 #include <geometry_msgs/TransformStamped.h>
-#include <Eigen/SVD>
-#include <sstream>
-#include <iomanip>
 
 namespace aerial_robot_control
 {
@@ -129,49 +126,6 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Extract per-rotor scalar thrust + gimbal angles
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
 
-  // --- Allocation diagnostics ---
-  {
-    // TODO#1: Verify allocation accuracy: realized vs demanded wrench
-    Eigen::VectorXd realized = integrated_map_ * target_vectoring_f_;
-    Eigen::VectorXd residual = realized - total_wrench_acc;
-    ROS_WARN_THROTTLE(0.5, "[ALLOC_DIAG] demanded=(%.4f,%.4f,%.4f,%.5f,%.5f,%.5f) "
-                      "realized=(%.4f,%.4f,%.4f,%.5f,%.5f,%.5f) "
-                      "residual=(%.4f,%.4f,%.4f,%.5f,%.5f,%.5f)",
-                      total_wrench_acc(0), total_wrench_acc(1), total_wrench_acc(2),
-                      total_wrench_acc(3), total_wrench_acc(4), total_wrench_acc(5),
-                      realized(0), realized(1), realized(2),
-                      realized(3), realized(4), realized(5),
-                      residual(0), residual(1), residual(2),
-                      residual(3), residual(4), residual(5));
-
-    // TODO#2: Per-rotor thrust and gimbal angle
-    std::stringstream ss;
-    ss << "[ROTOR_DIAG] ";
-    int col = 0;
-    for (int m = 0; m < N; m++) {
-      int mid = assembled_ids[m];
-      for (int r = 0; r < motor_num_per_module_; r++) {
-        auto it = module_commands_.find(mid);
-        if (it != module_commands_.end()) {
-          ss << "m" << mid << "r" << r << ":(T=" 
-             << std::fixed << std::setprecision(2) << it->second.full_thrusts[r]
-             << ",g=" << std::setprecision(3) << it->second.gimbal_angles[r] << ") ";
-        }
-        col += rotor_coef_;
-      }
-    }
-    ROS_WARN_THROTTLE(0.5, "%s", ss.str().c_str());
-
-    // TODO#3: Condition number of integrated_map
-    Eigen::JacobiSVD<Eigen::MatrixXd> svd(integrated_map_);
-    double cond = svd.singularValues()(0) / svd.singularValues()(svd.singularValues().size()-1);
-    // TODO#4: Formation inertia diagonal
-    ROS_WARN_THROTTLE(1.0, "[ALLOC_DIAG] cond_num=%.2f I_diag=(%.4f,%.4f,%.4f) mass=%.3f",
-                      cond,
-                      formation_inertia_(0,0), formation_inertia_(1,1), formation_inertia_(2,2),
-                      formation_mass_);
-  }
-
   ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl] N=%d mass=%.3f cog_offset=(%.4f,%.4f,%.4f) "
                     "wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f)",
                     N, formation_mass_,
@@ -250,6 +204,22 @@ void BeetleUnifiedController::publishCommands()
       module_gimbal_pubs_[module_id].publish(gimbal_msg);
     }
   }
+}
+
+bool BeetleUnifiedController::isAllocationSaturated() const
+{
+  if (module_commands_.empty()) return false;
+  const double t_max = robot_model_->getThrustUpperLimit();
+  const double t_min = robot_model_->getThrustLowerLimit();
+  const double sat_margin = 0.05;
+  const double t_upper = t_max * (1.0 - sat_margin);
+  const double t_lower = t_min + t_max * sat_margin;
+  for (const auto& kv : module_commands_) {
+    for (float t : kv.second.full_thrusts) {
+      if (t >= t_upper || t <= t_lower) return true;
+    }
+  }
+  return false;
 }
 
 // ---- Formation Allocation Matrix (same math as Plan A / GimbalrotorController) ----

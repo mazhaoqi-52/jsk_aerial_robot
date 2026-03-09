@@ -66,6 +66,9 @@ public:
   const Eigen::MatrixXd& getIntegratedMap() const { return integrated_map_; }
   const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
 
+  /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
+  bool isAllocationSaturated() const;
+
 private:
   ros::NodeHandle nh_;
   boost::shared_ptr<BeetleRobotModel> robot_model_;

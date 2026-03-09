@@ -11,6 +11,7 @@ find_package(catkin REQUIRED COMPONENTS
   gimbalrotor
   diagnostic_msgs
   std_msgs
+  std_srvs
   geometry_msgs
   message_generation
   )
@@ -31,7 +32,7 @@ generate_messages(DEPENDENCIES std_msgs geometry_msgs)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES beetle_robot_model beetle_controller beetle_navigation
-  CATKIN_DEPENDS aerial_robot_control aerial_robot_model aerial_robot_msgs pluginlib roscpp gimbalrotor diagnostic_msgs std_msgs geometry_msgs message_runtime
+  CATKIN_DEPENDS aerial_robot_control aerial_robot_model aerial_robot_msgs pluginlib roscpp gimbalrotor diagnostic_msgs std_msgs std_srvs geometry_msgs message_runtime
 )
 
 include_directories(

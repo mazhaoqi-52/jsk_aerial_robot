@@ -8,6 +8,7 @@
 #include <gimbalrotor/control/gimbalrotor_controller.h>
 #include <beetle/sensor/imu.h>
 #include <beetle/control/beetle_unified_controller.h>
+#include <std_srvs/SetBool.h>
 
 namespace aerial_robot_control
 {
@@ -43,8 +44,11 @@ namespace aerial_robot_control
     std::shared_ptr<BeetleUnifiedController> unified_controller_;
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
+
+    // Service for toggling unified control mode (replaces rosparam polling)
+    ros::ServiceServer set_unified_mode_srv_;
+    bool setUnifiedModeCb(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res);
     int unified_transition_count_;    // frame counter since last mode switch (for high-freq diag)
-    int post_exit_diag_count_;        // frame counter after exiting unified mode (for exit diag)
     int z_integral_freeze_count_;     // frames remaining to freeze Z I-term after mode switch
     static constexpr int Z_INTEGRAL_FREEZE_FRAMES = 5;  // freeze Z integration for first N frames
 
@@ -90,6 +94,12 @@ namespace aerial_robot_control
 
     /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID. */
     void sendZeroAttitudeGains();
+
+    /** @brief Common exit path: restore gains, reset targets, seed Z I-term, clear RP/XY. */
+    void resetToIndependentHover();
+
+    /** @brief LEADER mode switch: reset targets, migrate I-terms, zero spinal gains, apply unified gains. */
+    void initUnifiedLeaderMode();
 
     /** @brief Switch roll/pitch PID gains for unified (formation) mode. */
     void applyUnifiedGains();

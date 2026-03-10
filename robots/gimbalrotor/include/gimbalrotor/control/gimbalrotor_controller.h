@@ -44,21 +44,21 @@ namespace aerial_robot_control
     ros::Publisher target_vectoring_force_pub_;
 
     boost::shared_ptr<GimbalrotorRobotModel> gimbalrotor_robot_model_;
-    std::vector<float> target_base_thrust_;
     bool hovering_approximate_;
-    Eigen::VectorXd target_vectoring_f_;
     Eigen::VectorXd target_vectoring_f_trans_;
     Eigen::VectorXd target_vectoring_f_rot_;
     Eigen::MatrixXd integrated_map_inv_trans_;
     Eigen::MatrixXd integrated_map_inv_rot_;
-    double candidate_yaw_term_;
     bool underactuate_;
-    double target_roll_ = 0.0, target_pitch_ = 0.0;
 
     void sendCmd() override;
     void sendFourAxisCommand();
     void sendGimbalCommand();
   protected:
+    std::vector<float> target_base_thrust_;
+    Eigen::VectorXd target_vectoring_f_;
+    double candidate_yaw_term_;
+    double target_roll_ = 0.0, target_pitch_ = 0.0;
     ros::Publisher torque_allocation_matrix_inv_pub_; //for spinal
     ros::Publisher gimbal_dof_pub_; //for spinal
     int gimbal_dof_;

@@ -22,7 +22,15 @@ BeetleUnifiedController::BeetleUnifiedController()
     formation_inertia_(Eigen::Matrix3d::Zero()),
     target_roll_(0),
     target_pitch_(0),
-    candidate_yaw_term_(0)
+    candidate_yaw_term_(0),
+    cascade_alloc_sent_(false),
+    has_cascade_gain_cache_(false),
+    cached_cascade_roll_p_(0),
+    cached_cascade_roll_d_(0),
+    cached_cascade_pitch_p_(0),
+    cached_cascade_pitch_d_(0),
+    cached_cascade_yaw_d_(0),
+    follower_ready_wait_count_(0)
 {
 }
 
@@ -46,7 +54,6 @@ void BeetleUnifiedController::initialize(
   for (int i = 1; i <= max_modules; i++) {
     std::string ns = std::string("/") + my_name + std::to_string(i);
     module_thrust_pubs_[i] = nh_.advertise<spinal::FourAxisCommand>(ns + "/unified_thrust_cmd", 1);
-    module_gimbal_pubs_[i] = nh_.advertise<sensor_msgs::JointState>(ns + "/unified_gimbal_cmd", 1);
     module_torque_alloc_inv_pubs_[i] = nh_.advertise<spinal::TorqueAllocationMatrixInv>(
         ns + "/torque_allocation_matrix_inv", 1);
     module_rpy_gain_pubs_[i] = nh_.advertise<spinal::RollPitchYawTerms>(ns + "/rpy/gain", 1);
@@ -55,6 +62,12 @@ void BeetleUnifiedController::initialize(
 
   formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("unified_control/formation_wrench", 1);
   formation_vectoring_f_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/vectoring_force", 1);
+
+  // FOLLOWER Ready Sync: subscribe to ready signals from all modules.
+  // Each FOLLOWER publishes std_msgs::Int32 (containing its module ID) on this topic.
+  // Using a single global topic (relative to LEADER's namespace) for simplicity.
+  follower_ready_sub_ = nh_.subscribe("unified_control/follower_ready", 10,
+                                       &BeetleUnifiedController::followerReadyCallback, this);
 
   ROS_INFO("[UnifiedCtrl] Initialized: motor_per_module=%d, gimbal_dof=%d, rotor_coef=%d, gimbal_calc_in_fc=%d",
            motor_num_per_module_, gimbal_dof_, rotor_coef_, gimbal_calc_in_fc_);
@@ -171,6 +184,31 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
                     formation_cog_offset_.x(), formation_cog_offset_.y(), formation_cog_offset_.z(),
                     total_wrench_acc(0), total_wrench_acc(1), total_wrench_acc(2),
                     total_wrench_acc(3), total_wrench_acc(4), total_wrench_acc(5));
+
+  // ---- One-shot deferred cascade setup ----
+  // sendCascadeSetup() at mode switch runs BEFORE computeUnifiedAllocation(),
+  // so integrated_map_inv_rot_ is still empty at that point. The allocation
+  // matrix send silently fails, leaving spinal with the OLD independent-mode
+  // matrix. thrustGainMapping() then maps cascade gains through the wrong
+  // matrix → roll/pitch P/D ≈ 0 → pitch divergence.
+  //
+  // Fix: on the FIRST successful computation of integrated_map_inv_rot_,
+  // resend the allocation matrix followed by cascade gains to ALL spinals.
+  // Order matters: matrix first, then gains, so thrustGainMapping() uses
+  // the correct matrix when processing the new gains.
+  if (!cascade_alloc_sent_ && integrated_map_inv_rot_.rows() > 0 && has_cascade_gain_cache_) {
+    sendTorqueAllocationMatrixInv();
+    sendCascadeGains(cached_cascade_roll_p_, cached_cascade_roll_d_,
+                     cached_cascade_pitch_p_, cached_cascade_pitch_d_,
+                     cached_cascade_yaw_d_);
+    cascade_alloc_sent_ = true;
+    ROS_WARN("[UnifiedCtrl] One-shot cascade resend: allocation matrix (%ldx%ld) + "
+             "gains(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) sent to all spinals",
+             integrated_map_inv_rot_.rows(), integrated_map_inv_rot_.cols(),
+             cached_cascade_roll_p_, cached_cascade_roll_d_,
+             cached_cascade_pitch_p_, cached_cascade_pitch_d_,
+             cached_cascade_yaw_d_);
+  }
 
   return true;
 }
@@ -322,13 +360,13 @@ void BeetleUnifiedController::sendTorqueAllocationMatrixInv()
     }
 
     module_torque_alloc_inv_pubs_[module_id].publish(msg);
-    ROS_INFO_THROTTLE(2.0, "[UnifiedCtrl] Sent torque_alloc_inv to module %d: %d rows, "
-                      "inv_rot[0]=(%.4f,%.4f,%.4f)",
-                      module_id, rows_per_module,
-                      integrated_map_inv_rot_(row_start, 0),
-                      integrated_map_inv_rot_(row_start, 1),
-                      integrated_map_inv_rot_(row_start, 2));
   }
+
+  // Summary log (no throttle — this function is only called at mode switch / one-shot)
+  ROS_INFO("[UnifiedCtrl] Sent torque_alloc_inv to %zu modules (%d rows each), "
+           "inv_rot total rows=%ld cols=%ld",
+           assembled_ids.size(), rows_per_module,
+           integrated_map_inv_rot_.rows(), integrated_map_inv_rot_.cols());
 }
 
 void BeetleUnifiedController::sendCascadeGains(
@@ -363,6 +401,19 @@ void BeetleUnifiedController::sendCascadeGains(
   ROS_INFO_THROTTLE(2.0, "[UnifiedCtrl] Sent cascade gains to %zu modules: "
                     "roll(P=%.2f,D=%.2f) pitch(P=%.2f,D=%.2f) yaw(D=%.2f)",
                     assembled_ids.size(), roll_p, roll_d, pitch_p, pitch_d, yaw_d);
+}
+
+void BeetleUnifiedController::cacheCascadeGains(
+    double roll_p, double roll_d,
+    double pitch_p, double pitch_d,
+    double yaw_d)
+{
+  cached_cascade_roll_p_  = roll_p;
+  cached_cascade_roll_d_  = roll_d;
+  cached_cascade_pitch_p_ = pitch_p;
+  cached_cascade_pitch_d_ = pitch_d;
+  cached_cascade_yaw_d_   = yaw_d;
+  has_cascade_gain_cache_ = true;
 }
 
 // ---- Formation Allocation Matrix (same math as Plan A / GimbalrotorController) ----
@@ -493,6 +544,53 @@ Eigen::Matrix3d BeetleUnifiedController::computeFormationInertia(
   }
 
   return formation_inertia;
+}
+
+// ---- FOLLOWER Ready Sync (P2.1) ----
+
+void BeetleUnifiedController::followerReadyCallback(const std_msgs::Int32& msg)
+{
+  int follower_id = msg.data;
+  if (follower_ready_set_.find(follower_id) == follower_ready_set_.end()) {
+    follower_ready_set_.insert(follower_id);
+    ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d reported READY (%zu/%zu followers ready)",
+             follower_id, follower_ready_set_.size(),
+             navigator_->getAssemblyIds().size() - 1);
+  }
+}
+
+bool BeetleUnifiedController::allFollowersReady() const
+{
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  if (assembled_ids.size() <= 1) return true;  // solo — no followers to wait for
+
+  // Timeout: proceed anyway after FOLLOWER_READY_TIMEOUT_FRAMES
+  if (follower_ready_wait_count_ >= FOLLOWER_READY_TIMEOUT_FRAMES) return true;
+
+  int leader_id = navigator_->getLeaderID();
+  for (int id : assembled_ids) {
+    if (id == leader_id) continue;
+    if (follower_ready_set_.find(id) == follower_ready_set_.end()) return false;
+  }
+  return true;
+}
+
+void BeetleUnifiedController::resetFollowerReady()
+{
+  follower_ready_set_.clear();
+  follower_ready_wait_count_ = 0;
+}
+
+int BeetleUnifiedController::pendingFollowerCount() const
+{
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  int leader_id = navigator_->getLeaderID();
+  int pending = 0;
+  for (int id : assembled_ids) {
+    if (id == leader_id) continue;
+    if (follower_ready_set_.find(id) == follower_ready_set_.end()) pending++;
+  }
+  return pending;
 }
 
 } // namespace aerial_robot_control

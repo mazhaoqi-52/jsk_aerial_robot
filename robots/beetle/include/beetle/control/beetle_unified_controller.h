@@ -20,6 +20,7 @@
 
 #include <ros/ros.h>
 #include <Eigen/Dense>
+#include <set>
 #include <spinal/FourAxisCommand.h>
 #include <spinal/TorqueAllocationMatrixInv.h>
 #include <spinal/RollPitchYawTerms.h>
@@ -27,6 +28,7 @@
 #include <geometry_msgs/WrenchStamped.h>
 #include <std_msgs/Float32MultiArray.h>
 #include <std_msgs/UInt8.h>
+#include <std_msgs/Int32.h>
 
 #include <beetle/model/beetle_robot_model.h>
 #include <beetle/beetle_navigation.h>
@@ -78,6 +80,19 @@ public:
                         double pitch_p, double pitch_d,
                         double yaw_d);
 
+  /** @brief Cache cascade gains for deferred one-shot resend.
+   *  Called by BeetleController::sendCascadeSetup() so that the one-shot
+   *  logic inside computeUnifiedAllocation() can resend gains without
+   *  needing to know the gain values. */
+  void cacheCascadeGains(double roll_p, double roll_d,
+                         double pitch_p, double pitch_d,
+                         double yaw_d);
+
+  /** @brief Reset the one-shot flag so the next computeUnifiedAllocation()
+   *  will re-send allocation matrix + cascade gains to all spinals.
+   *  Call this when exiting unified mode. */
+  void resetCascadeAllocSent() { cascade_alloc_sent_ = false; }
+
   /** @brief Update formation CoG offset and inertia from current TF. */
   bool updateFormationGeometry();
 
@@ -104,10 +119,33 @@ public:
   double getTargetRoll() const { return target_roll_; }
   double getTargetPitch() const { return target_pitch_; }
   double getCandidateYawTerm() const { return candidate_yaw_term_; }
+  const Eigen::VectorXd& getTargetVectoringForce() const { return target_vectoring_f_; }
   const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
 
   /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
   bool isAllocationSaturated() const;
+
+  // ---- FOLLOWER Ready Sync (P2.1) ----
+  // LEADER waits for all FOLLOWERs to report ready before enabling outer-loop PID.
+  // FOLLOWERs publish their ID on /<myname><leader_id>/unified_control/follower_ready
+  // when they have sent cascade gains + forwarded the first valid unified command.
+
+  /** @brief Check if all expected FOLLOWERs have reported ready.
+   *  Returns true when every non-LEADER assembled module has acked,
+   *  OR when the timeout has elapsed. Always true if only 1 module (solo). */
+  bool allFollowersReady() const;
+
+  /** @brief Reset follower ready state. Call when entering/exiting unified mode. */
+  void resetFollowerReady();
+
+  /** @brief Number of followers still not ready. For logging. */
+  int pendingFollowerCount() const;
+
+  /** @brief Increment the wait frame counter (called each frame while waiting). */
+  void incrementFollowerReadyWait() { follower_ready_wait_count_++; }
+
+  /** @brief Get current wait frame count (for logging/timeout check). */
+  int getFollowerReadyWaitCount() const { return follower_ready_wait_count_; }
 
 private:
   ros::NodeHandle nh_;
@@ -140,9 +178,17 @@ private:
   // Per-module commands
   std::map<int, ModuleCommand> module_commands_;
 
+  // Cascade one-shot state: deferred resend of allocation matrix + gains
+  bool cascade_alloc_sent_;           // true once one-shot has fired
+  bool has_cascade_gain_cache_;       // true once cacheCascadeGains() has been called
+  double cached_cascade_roll_p_;
+  double cached_cascade_roll_d_;
+  double cached_cascade_pitch_p_;
+  double cached_cascade_pitch_d_;
+  double cached_cascade_yaw_d_;
+
   // ROS publishers per module
   std::map<int, ros::Publisher> module_thrust_pubs_;   // unified_thrust_cmd (FourAxisCommand)
-  std::map<int, ros::Publisher> module_gimbal_pubs_;   // unified_gimbal_cmd (JointState) - kept for non-cascade fallback
   std::map<int, ros::Publisher> module_torque_alloc_inv_pubs_;  // torque_allocation_matrix_inv
   std::map<int, ros::Publisher> module_rpy_gain_pubs_;          // rpy/gain
   std::map<int, ros::Publisher> module_gimbal_dof_pubs_;        // gimbal_dof
@@ -150,6 +196,13 @@ private:
   // Debug publishers
   ros::Publisher formation_wrench_pub_;
   ros::Publisher formation_vectoring_f_pub_;
+
+  // FOLLOWER Ready Sync state
+  ros::Subscriber follower_ready_sub_;               // subscribe to follower_ready topic
+  std::set<int> follower_ready_set_;                  // IDs of followers that reported ready
+  int follower_ready_wait_count_;                     // frames since reset (for timeout)
+  static constexpr int FOLLOWER_READY_TIMEOUT_FRAMES = 120;  // 3s @40Hz
+  void followerReadyCallback(const std_msgs::Int32& msg);
 
   // Internal methods
   Eigen::MatrixXd buildFormationAllocationMatrix(

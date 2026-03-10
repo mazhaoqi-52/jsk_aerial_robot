@@ -66,7 +66,7 @@ namespace aerial_robot_control
     int rp_ki_boost_count_;           // frames remaining in Roll/Pitch boost phase
     static constexpr int RP_INTEGRAL_FREEZE_FRAMES = 3;   // shorter freeze (3 frames)
     static constexpr int RP_KI_BOOST_FRAMES = 80;         // boost duration: 80 frames = 2.0s @40Hz
-    static constexpr double RP_KI_BOOST_FACTOR = 6.0;     // stronger boost to accelerate convergence with Ki=5
+    static constexpr double RP_KI_BOOST_FACTOR = 6.0;     // effective Ki = nominal_Ki * 6.0 during boost phase
     double rp_i_keep_ratio_;          // fraction of old I-term to keep at switch (0~1, from YAML)
 
     // I-term seed for unified mode switch (Plan E'):
@@ -103,13 +103,14 @@ namespace aerial_robot_control
     double cascade_pitch_d_;   // spinal pitch D gain (torque-level)
     double cascade_yaw_d_;     // spinal yaw D gain (torque-level)
 
-    /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID. */
-    void sendZeroAttitudeGains();
-
-    /** @brief Send cascade gains + allocation matrix inverse to all modules' spinals.
-     *  Uses the unified controller's sendTorqueAllocationMatrixInv() and sendCascadeGains()
-     *  to configure each spinal for P+D attitude tracking at 1000Hz. */
+    /** @brief LEADER-only: send cascade gains + allocation matrix inverse to ALL assembled
+     *  modules' spinals. Uses unified_controller_'s publishers. Also sends gimbal_dof=1
+     *  to LEADER's own spinal. */
     void sendCascadeSetup();
+
+    /** @brief FOLLOWER-only: send cascade gains + gimbal_dof=1 to THIS module's own spinal
+     *  only (via base-class publishers). Does NOT send alloc_inv or affect other modules. */
+    void sendFollowerCascadeSetup();
 
     /** @brief Common exit path: restore gains, reset targets, seed Z I-term, clear RP/XY. */
     void resetToIndependentHover();
@@ -133,11 +134,9 @@ namespace aerial_robot_control
 
     // FOLLOWER unified mode: receive commands from LEADER
     ros::Subscriber unified_thrust_sub_;
-    ros::Subscriber unified_gimbal_sub_;
     ros::Publisher follower_thrust_pub_;   // re-publish to own four_axes/command
-    ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl
+    ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl (only when !gimbal_calc_in_fc)
     spinal::FourAxisCommand unified_thrust_cmd_;
-    sensor_msgs::JointState unified_gimbal_cmd_;
     bool unified_cmd_received_;
     bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
@@ -151,7 +150,11 @@ namespace aerial_robot_control
     sensor_msgs::JointState last_independent_gimbal_cmd_;
     bool has_cached_independent_cmd_;  // true once we've cached at least one frame
     void unifiedThrustCallback(const spinal::FourAxisCommand& msg);
-    void unifiedGimbalCallback(const sensor_msgs::JointState& msg);
+
+    // FOLLOWER Ready Sync (P2.1): publish "I'm ready" once cascade gains are set
+    // and the first valid unified command has been forwarded to spinal.
+    ros::Publisher follower_ready_pub_;
+    bool follower_ready_sent_;  // true once this FOLLOWER has published its ready signal
     
     map<string, ros::Subscriber> ff_inter_wrench_subs_;
     map<int, ros::Publisher> ff_inter_wrench_pubs_;

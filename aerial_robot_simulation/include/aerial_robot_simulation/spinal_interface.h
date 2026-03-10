@@ -108,6 +108,14 @@ namespace rotor_limits_interface
     {
       if(jh_.getForce() == 0) return;
 
+      /* NaN/Inf guard: prevent corrupted values from reaching Gazebo physics */
+      if(!std::isfinite(jh_.getForce()))
+        {
+          ROS_ERROR_THROTTLE(1.0, "[%s] NaN/Inf force detected in enforceLimits, clamping to 0", jh_.getName().c_str());
+          jh_.setForce(0);
+          return;
+        }
+
       /* because of "inline double setForce(double force)    {*force_ = force;}", we can change the value with same address */
       jh_.setForce(internal::saturate(jh_.getForce(), min_force_, max_force_));
     }

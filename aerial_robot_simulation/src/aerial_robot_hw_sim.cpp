@@ -230,7 +230,20 @@ namespace gazebo_ros_control
       {
         auto acc = imu_handler_->LinearAcceleration();
         auto gyro = imu_handler_->AngularVelocity();
-        spinal_interface_.setImuValue(acc.X(), acc.Y(), acc.Z(), gyro.X(), gyro.Y(), gyro.Z());
+
+        /* NaN guard: Gazebo physics can produce NaN if a NaN force was applied in a previous cycle.
+           Reject NaN IMU readings to break the NaN feedback loop. */
+        if(std::isfinite(acc.X()) && std::isfinite(acc.Y()) && std::isfinite(acc.Z()) &&
+           std::isfinite(gyro.X()) && std::isfinite(gyro.Y()) && std::isfinite(gyro.Z()))
+          {
+            spinal_interface_.setImuValue(acc.X(), acc.Y(), acc.Z(), gyro.X(), gyro.Y(), gyro.Z());
+          }
+        else
+          {
+            ROS_ERROR_THROTTLE(1.0, "IMU NaN detected: acc=[%.4f, %.4f, %.4f] gyro=[%.4f, %.4f, %.4f]. "
+                               "Skipping IMU update to prevent NaN propagation.",
+                               acc.X(), acc.Y(), acc.Z(), gyro.X(), gyro.Y(), gyro.Z());
+          }
       }
     else
       ROS_DEBUG_THROTTLE(1.0, "No imu sensor handler to read sensor data");

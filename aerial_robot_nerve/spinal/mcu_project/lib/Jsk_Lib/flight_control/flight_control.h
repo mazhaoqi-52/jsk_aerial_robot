@@ -56,6 +56,9 @@ public:
     start_control_flag_ = false;
     pwm_test_flag_ = false;
     integrate_flag_ = false;
+    force_landing_flag_ = false;
+    gimbal_set_flag_ = false;
+    cached_motor_num_ = 0;
   }
 
   inline AttitudeController& getAttController(){ return att_controller_;}
@@ -98,6 +101,9 @@ public:
     start_control_flag_ = false;
     pwm_test_flag_ = false;
     integrate_flag_ = false;
+    force_landing_flag_ = false;
+    gimbal_set_flag_ = false;
+    cached_motor_num_ = 0;
   }
   void init(TIM_HandleTypeDef* htim1, TIM_HandleTypeDef* htim2, StateEstimate* estimator, BatteryStatus* bat, ros::NodeHandle* nh, osMutexId* mutex = NULL)
   {
@@ -157,6 +163,7 @@ private:
   bool integrate_flag_;
   bool force_landing_flag_;
   bool gimbal_set_flag_;
+  uint8_t cached_motor_num_;
 
   AttitudeController att_controller_;
 #ifndef SIMULATION
@@ -236,17 +243,44 @@ private:
 void uavInfoConfigCallback(const spinal::UavInfo& config_msg)
   {
     setUavModel(config_msg.uav_model);
-    setMotorNumber(config_msg.motor_num * (att_controller_.getGimbalDof() + 1) );
+    cached_motor_num_ = config_msg.motor_num;
+    setMotorNumber(cached_motor_num_ * (att_controller_.getGimbalDof() + 1) );
   }
 
 /* get DoF of gimbal rotation */
 void gimbalDofCallback(const std_msgs::UInt8& gimbal_msg)
   {
-    if(gimbal_msg.data && !gimbal_set_flag_)
+    if(gimbal_msg.data > 0)
       {
-        att_controller_.setGimbalDof(gimbal_msg.data);
-        att_controller_.setRotorCoef(gimbal_msg.data + 1);
-        gimbal_set_flag_ = true;
+        if(!gimbal_set_flag_)
+          {
+            att_controller_.setGimbalDof(gimbal_msg.data);
+            att_controller_.setRotorCoef(gimbal_msg.data + 1);
+            gimbal_set_flag_ = true;
+
+            /* If UavInfo already arrived, motor_number was set without gimbal_dof.
+               Reset and recalculate with the correct gimbal_dof. */
+            if(cached_motor_num_ > 0)
+              {
+                att_controller_.resetMotorNumber();
+                setMotorNumber(cached_motor_num_ * (att_controller_.getGimbalDof() + 1));
+#ifdef SIMULATION
+                ROS_INFO("[flight_control] gimbal_dof=%d arrived after UavInfo, "
+                         "recalculated motor_number: %d * %d = %d",
+                         gimbal_msg.data, cached_motor_num_,
+                         att_controller_.getGimbalDof() + 1,
+                         att_controller_.getMotorNumber());
+#endif
+              }
+          }
+        else if(att_controller_.getGimbalDof() != gimbal_msg.data)
+          {
+#ifdef SIMULATION
+            ROS_WARN("[flight_control] gimbal_dof changed after initialization: "
+                     "current=%d, received=%d. Ignored.",
+                     att_controller_.getGimbalDof(), gimbal_msg.data);
+#endif
+          }
       }
   }
 

@@ -4,6 +4,7 @@ controller:
   torque_allocation_matrix_inv_pub_interval: 0.05
   wrench_allocation_matrix_pub_interval: 0.1
   gimbal_calc_in_fc : true
+  i_term_rp_calc_in_pc: true
   wrench_estimate_update_rate: 100
   momentum_observer_force_weight: 3
   momentum_observer_torque_weight: 2.5
@@ -13,6 +14,15 @@ controller:
   unified_control_mode: false
   z_i_seed_default: 0.8    # Z I-term seed for unified mode switch (Plan E')
   pitch_i_seed_default: -0.55  # Pitch I-term seed in err_i domain (SS i_term≈-2.7, Ki=5 → err_i≈-0.54)
+
+  # ========== Cascade control for unified mode ==========
+  # Torque-level gains sent to spinal via RollPitchYawTerms.
+  # Spinal does P+D at 1000Hz; PC retains I-term only.
+  cascade_roll_p: 8.0
+  cascade_roll_d: 5.0
+  cascade_pitch_p: 8.0
+  cascade_pitch_d: 5.0
+  cascade_yaw_d: 4.0
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

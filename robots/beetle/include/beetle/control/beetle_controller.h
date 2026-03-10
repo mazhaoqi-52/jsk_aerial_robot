@@ -92,8 +92,24 @@ namespace aerial_robot_control
 
     bool spinal_gains_zeroed_;        // track whether we sent zero rpy/gain to spinal
 
+    // Cascade control gains for unified mode:
+    // These are TORQUE-LEVEL P/D gains sent to each module's spinal via
+    // the unified_controller's sendCascadeGains(). Spinal does P+D at 1000Hz
+    // using thrustGainMapping() to distribute per-motor.
+    // PC retains only I-term for roll/pitch.
+    double cascade_roll_p_;    // spinal roll P gain (torque-level)
+    double cascade_roll_d_;    // spinal roll D gain (torque-level)
+    double cascade_pitch_p_;   // spinal pitch P gain (torque-level)
+    double cascade_pitch_d_;   // spinal pitch D gain (torque-level)
+    double cascade_yaw_d_;     // spinal yaw D gain (torque-level)
+
     /** @brief Send all-zero rpy/gain to this module's spinal, disabling its internal attitude PID. */
     void sendZeroAttitudeGains();
+
+    /** @brief Send cascade gains + allocation matrix inverse to all modules' spinals.
+     *  Uses the unified controller's sendTorqueAllocationMatrixInv() and sendCascadeGains()
+     *  to configure each spinal for P+D attitude tracking at 1000Hz. */
+    void sendCascadeSetup();
 
     /** @brief Common exit path: restore gains, reset targets, seed Z I-term, clear RP/XY. */
     void resetToIndependentHover();

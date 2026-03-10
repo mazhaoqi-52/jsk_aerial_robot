@@ -21,6 +21,11 @@ namespace aerial_robot_control
     rp_ki_boost_count_(0),
     rp_i_keep_ratio_(0.5),
     spinal_gains_zeroed_(false),
+    cascade_roll_p_(8.0),
+    cascade_roll_d_(5.0),
+    cascade_pitch_p_(8.0),
+    cascade_pitch_d_(5.0),
+    cascade_yaw_d_(4.0),
     last_unified_z_i_ss_(0.8),
     has_unified_z_i_ss_(false),
     z_i_seed_default_(0.8),
@@ -133,6 +138,8 @@ namespace aerial_robot_control
     // Restore PID gains + re-send to spinal
     restoreIndependentGains();
     setAttitudeGains();
+    // Restore single-module allocation matrix (overwrite formation-level one)
+    sendTorqueAllocationMatrixInv();
 
     // Reset target to current state (zero initial error)
     tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
@@ -276,11 +283,11 @@ namespace aerial_robot_control
                z_integral_freeze_count_, z_ki_boost_count_, Z_KI_BOOST_FACTOR);
     }
 
-    sendZeroAttitudeGains();
+    sendCascadeSetup();
     applyUnifiedGains();
     spinal_gains_zeroed_ = true;
     unified_transition_count_ = 0;
-    ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, zeroed spinal gains, applied unified PID gains, t=%.4f",
+    ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, sent cascade gains + alloc_inv to all spinals, applied unified PID gains, t=%.4f",
              ros::Time::now().toSec());
   }
 
@@ -472,6 +479,9 @@ namespace aerial_robot_control
       control_timestamp_ = ros::Time::now().toSec();
 
       // --- Build 6-DOF target wrench in acceleration space ---
+      // CASCADE: Roll/Pitch use I-TERM ONLY in wrench_acc.
+      // P+D are handled by spinal at 1000Hz using cascade gains.
+      // Yaw uses full PID (no cascade for yaw yet).
       tf::Matrix3x3 uav_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
       tf::Vector3 target_acc_w(pid_controllers_.at(X).result(),
                                pid_controllers_.at(Y).result(),
@@ -480,12 +490,14 @@ namespace aerial_robot_control
 
       Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
       target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
-      target_wrench_acc(3) = pid_controllers_.at(ROLL).result();
-      target_wrench_acc(4) = pid_controllers_.at(PITCH).result();
+      // Roll/Pitch: I-term only (spinal does P+D at 1000Hz)
+      target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
+      target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
+      // Yaw: full PID result (no cascade)
       target_wrench_acc(5) = pid_controllers_.at(YAW).result();
 
-      // Gravity feedforward: in unified mode spinal's attitude PID is zeroed,
-      // so PC must explicitly provide gravity compensation in the body Z axis.
+      // Gravity feedforward: spinal's inner loop sees angles[0/1] as target roll/pitch,
+      // but does NOT add gravity. PC must provide gravity compensation in body Z.
       {
         tf::Matrix3x3 uav_rot_ff = estimator_->getOrientation(Frame::COG, estimate_mode_);
         tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
@@ -493,14 +505,8 @@ namespace aerial_robot_control
         target_wrench_acc.head(3) += Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
       }
 
-      // --- Gyro compensation: ω × I·ω (same as GimbalrotorController: add torque directly) ---
-      {
-        const Eigen::Matrix3d& I_form = unified_controller_->getFormationInertia();
-        Eigen::Vector3d omega_eigen;
-        tf::vectorTFToEigen(omega_, omega_eigen);
-        Eigen::Vector3d gyro = omega_eigen.cross(I_form * omega_eigen);
-        target_wrench_acc.tail(3) += gyro;
-      }
+      // NOTE: Gyro compensation (ω × I·ω) is NOT added here.
+      // In cascade mode, spinal handles gyro internally at 1000Hz.
 
       // Store for external wrench estimator
       setTargetWrenchAccCog(target_wrench_acc);
@@ -513,23 +519,26 @@ namespace aerial_robot_control
         unified_controller_->publishCommands();
 
         // LEADER also sends its own command to its own spinal
+        // CASCADE format: vectoring base_thrust[8] + angles[roll, pitch, yaw_term]
+        // Same format as publishCommands() sends to FOLLOWERs.
         int my_id = beetle_navigator_->getMyID();
         const auto& cmds = unified_controller_->getModuleCommands();
         auto it = cmds.find(my_id);
         if (it != cmds.end()) {
           spinal::FourAxisCommand my_thrust_msg;
-          // Send scalar thrusts (same format as GimbalrotorController::sendFourAxisCommand
-          // with gimbal_calc_in_fc=false): spinal has motor_number_=motor_num=4.
+          // Vectoring force components: [fx0,fz0, fx1,fz1, ..., fx3,fz3]
           my_thrust_msg.base_thrust = it->second.full_thrusts;
-          my_thrust_msg.angles[0] = 0;
-          my_thrust_msg.angles[1] = 0;
-          my_thrust_msg.angles[2] = 0;
+          // Cascade targets: spinal uses these for P+D inner loop
+          my_thrust_msg.angles[0] = unified_controller_->getTargetRoll();
+          my_thrust_msg.angles[1] = unified_controller_->getTargetPitch();
+          my_thrust_msg.angles[2] = unified_controller_->getCandidateYawTerm();
           follower_thrust_pub_.publish(my_thrust_msg);
 
-          sensor_msgs::JointState my_gimbal_msg;
-          my_gimbal_msg.header.stamp = ros::Time::now();
-          my_gimbal_msg.position = it->second.gimbal_angles;
-          follower_gimbal_pub_.publish(my_gimbal_msg);
+          // Publish gimbal_dof=1 for own spinal (enable vectoring decomposition)
+          std_msgs::UInt8 gimbal_dof_msg;
+          gimbal_dof_msg.data = 1;
+          // Use the own spinal's gimbal_dof topic (published by GimbalrotorController base)
+          gimbal_dof_pub_.publish(gimbal_dof_msg);
         }
       }
 
@@ -582,11 +591,11 @@ namespace aerial_robot_control
     // then forwards them to its own spinal. No local PID.
     if (unified_control_mode_ && module_state == FOLLOWER && module_state != SEPARATED) {
       if (!prev_unified_control_mode_) {
-        // Zero spinal's attitude PID on FOLLOWER too
-        sendZeroAttitudeGains();
+        // Set spinal to cascade mode on FOLLOWER too
+        sendCascadeSetup();
         spinal_gains_zeroed_ = true;
         unified_transition_count_ = 0;
-        ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d entering unified mode, zeroed spinal gains, t=%.4f",
+        ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d entering unified mode, sent cascade gains + alloc_inv, t=%.4f",
                  beetle_navigator_->getMyID(), ros::Time::now().toSec());
       }
 
@@ -930,14 +939,14 @@ namespace aerial_robot_control
         }
 
         if (!have_valid_cmd && !follower_unified_active_) {
-          // Transition: zero spinal PID immediately, then freeze on last hover output.
+          // Transition: set spinal damping-only immediately, then freeze on last hover output.
           // Do NOT call GimbalrotorController::update() — that would run its own
           // attitude PID and publish competing commands on four_axes/command.
           if (!prev_unified_control_mode_) {
-            sendZeroAttitudeGains();
+            sendCascadeSetup();
             spinal_gains_zeroed_ = true;
             unified_transition_count_ = 0;
-            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d freeze: zeroed spinal gains, awaiting unified cmd, t=%.4f",
+            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d freeze: sent cascade gains, awaiting unified cmd, t=%.4f",
                      beetle_navigator_->getMyID(), ros::Time::now().toSec());
           }
           prev_unified_control_mode_ = true;
@@ -1043,19 +1052,93 @@ namespace aerial_robot_control
 
   void BeetleController::sendZeroAttitudeGains()
   {
-    // Send all-zero rpy/gain to this module's spinal.
-    // This zeroes out thrust_p/i/d_gain_ inside spinal's AttitudeController,
-    // so roll_pitch_term_ becomes 0 and spinal acts as a pure PWM executor.
+    // Send all-zero rpy/gain to this module's spinal, disabling attitude PID.
+    // IMPORTANT: use motors.resize(motor_num_) to write per-motor thrust gains
+    // directly, bypassing thrustGainMapping(). The torque-level path
+    // (motors.resize(1)) relies on torque_allocation_matrix_inv_ which is zero
+    // when gimbal_calc_in_fc_=false (beetle's config), so gains would be silently
+    // eaten by the zero matrix.
     spinal::RollPitchYawTerms rpy_gain_msg;
-    rpy_gain_msg.motors.resize(1);
-    rpy_gain_msg.motors.at(0).roll_p = 0;
-    rpy_gain_msg.motors.at(0).roll_i = 0;
-    rpy_gain_msg.motors.at(0).roll_d = 0;
-    rpy_gain_msg.motors.at(0).pitch_p = 0;
-    rpy_gain_msg.motors.at(0).pitch_i = 0;
-    rpy_gain_msg.motors.at(0).pitch_d = 0;
-    rpy_gain_msg.motors.at(0).yaw_d = 0;
+    rpy_gain_msg.motors.resize(motor_num_);
+    for (int i = 0; i < motor_num_; i++) {
+      rpy_gain_msg.motors.at(i).roll_p = 0;
+      rpy_gain_msg.motors.at(i).roll_i = 0;
+      rpy_gain_msg.motors.at(i).roll_d = 0;
+      rpy_gain_msg.motors.at(i).pitch_p = 0;
+      rpy_gain_msg.motors.at(i).pitch_i = 0;
+      rpy_gain_msg.motors.at(i).pitch_d = 0;
+      rpy_gain_msg.motors.at(i).yaw_d = 0;
+    }
     rpy_gain_pub_.publish(rpy_gain_msg);
+  }
+
+  void BeetleController::sendCascadeSetup()
+  {
+    // Send torque allocation matrix inverse and cascade P/D gains to ALL
+    // assembled modules' spinals. This configures each spinal for 1000Hz
+    // P+D attitude tracking using thrustGainMapping().
+    //
+    // Also publish gimbal_dof=1 to own spinal so it uses vectoring decomposition.
+    // (FOLLOWERs' gimbal_dof is set by publishCommands() each frame.)
+
+    // Update formation geometry to ensure integrated_map_inv_rot_ is current
+    unified_controller_->updateFormationGeometry();
+    unified_controller_->sendTorqueAllocationMatrixInv();
+    unified_controller_->sendCascadeGains(
+        cascade_roll_p_, cascade_roll_d_,
+        cascade_pitch_p_, cascade_pitch_d_,
+        cascade_yaw_d_);
+
+    // Also send cascade gains to OWN spinal (LEADER's own module)
+    // via the torque-level path (motors.resize(1))
+    {
+      spinal::RollPitchYawTerms rpy_gain_msg;
+      rpy_gain_msg.motors.resize(1);
+      rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(cascade_roll_p_ * 1000);
+      rpy_gain_msg.motors[0].roll_i  = 0;  // I-term handled by PC
+      rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(cascade_roll_d_ * 1000);
+      rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(cascade_pitch_p_ * 1000);
+      rpy_gain_msg.motors[0].pitch_i = 0;
+      rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(cascade_pitch_d_ * 1000);
+      rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(cascade_yaw_d_ * 1000);
+      rpy_gain_pub_.publish(rpy_gain_msg);
+    }
+
+    // Send own torque_allocation_matrix_inv to own spinal
+    // Extract the sub-block for LEADER's module from integrated_map_inv_rot_
+    {
+      const Eigen::MatrixXd& full_inv = unified_controller_->getFormationWrenchMatrixInvRot();
+      if (full_inv.rows() > 0) {
+        int my_id = beetle_navigator_->getMyID();
+        std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
+        int my_index = -1;
+        for (size_t m = 0; m < assembled_ids.size(); m++) {
+          if (assembled_ids[m] == my_id) { my_index = m; break; }
+        }
+        if (my_index >= 0) {
+          int rows_per_module = motor_num_ * rotor_coef_;
+          int row_start = my_index * rows_per_module;
+          spinal::TorqueAllocationMatrixInv msg;
+          msg.rows.resize(rows_per_module);
+          for (int i = 0; i < rows_per_module; i++) {
+            msg.rows[i].x = static_cast<int16_t>(full_inv(row_start + i, 0) * 1000);
+            msg.rows[i].y = static_cast<int16_t>(full_inv(row_start + i, 1) * 1000);
+            msg.rows[i].z = static_cast<int16_t>(full_inv(row_start + i, 2) * 1000);
+          }
+          torque_allocation_matrix_inv_pub_.publish(msg);
+        }
+      }
+    }
+
+    // Publish gimbal_dof=1 to own spinal
+    {
+      std_msgs::UInt8 gimbal_dof_msg;
+      gimbal_dof_msg.data = 1;
+      gimbal_dof_pub_.publish(gimbal_dof_msg);
+    }
+
+    ROS_INFO("[UnifiedCtrl] Cascade setup: sent alloc_inv + gains(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) + gimbal_dof=1",
+             cascade_roll_p_, cascade_roll_d_, cascade_pitch_p_, cascade_pitch_d_, cascade_yaw_d_);
   }
 
   void BeetleController::applyUnifiedGains()
@@ -1216,6 +1299,14 @@ namespace aerial_robot_control
     getParam<double>(wrench_nh, "d_gain", wrench_comp_d_gain_, 0.07);
 
     getParam<bool>(control_nh, "unified_control_mode", unified_control_mode_, false);
+
+    // Cascade control gains: torque-level P/D sent to each spinal for 1000Hz inner loop.
+    // Default values are conservative starting points.
+    getParam<double>(control_nh, "cascade_roll_p", cascade_roll_p_, 8.0);
+    getParam<double>(control_nh, "cascade_roll_d", cascade_roll_d_, 5.0);
+    getParam<double>(control_nh, "cascade_pitch_p", cascade_pitch_p_, 8.0);
+    getParam<double>(control_nh, "cascade_pitch_d", cascade_pitch_d_, 5.0);
+    getParam<double>(control_nh, "cascade_yaw_d", cascade_yaw_d_, 4.0);
 
     // Z I-term seed default for unified mode switch (Plan E')
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);

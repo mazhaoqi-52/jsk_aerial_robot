@@ -3,7 +3,7 @@ aerial_robot_control_name: aerial_robot_control/beetle_controller
 controller:
   torque_allocation_matrix_inv_pub_interval: 0.05
   wrench_allocation_matrix_pub_interval: 0.1
-  gimbal_calc_in_fc : false
+  gimbal_calc_in_fc : true
   i_term_rp_calc_in_pc: true
   wrench_estimate_update_rate: 100 
   momentum_observer_force_weight: 3
@@ -15,6 +15,28 @@ controller:
   unified_control_mode: false
   z_i_seed_default: 0.8    # Z I-term seed for unified mode switch (Plan E')
   pitch_i_seed_default: -0.55  # Pitch I-term seed in err_i domain (SS i_term≈-2.7, Ki=5 → err_i≈-0.54)
+
+  # ========== Cascade control for unified mode ==========
+  # Architecture: PC outer loop (40Hz) does formation-level 6-DOF allocation,
+  # sends target_angle + base_thrust to each module's spinal.
+  # Spinal inner loop (1000Hz) does P+D attitude tracking per-motor.
+  # PC retains I-term only for roll/pitch (formation-level slow bias).
+  #
+  # These are TORQUE-LEVEL gains sent to spinal via RollPitchYawTerms message.
+  # Spinal multiplies them by torque_allocation_matrix_inv to get per-motor gains:
+  #   thrust_p_gain[i][axis] = torque_alloc_inv[i][axis] * cascade_*_p
+  #   thrust_d_gain[i][axis] = torque_alloc_inv[i][axis] * cascade_*_d
+  #
+  # Start conservative: these act as "local stabilizers", not "second main controller".
+  # Independent mode single-beetle gains: P=8, D=5 (from roll/pitch section below).
+  # Formation mode needs higher gains due to larger inertia (Iyy≈5.98 vs single≈0.01).
+  # But spinal P+D only handles LOCAL attitude tracking; the heavy lifting
+  # (formation allocation, position control) is done by PC.
+  cascade_roll_p: 8.0      # [rad/s²/rad] torque-level P gain for roll
+  cascade_roll_d: 5.0      # [rad/s²/(rad/s)] torque-level D gain for roll
+  cascade_pitch_p: 8.0     # [rad/s²/rad] torque-level P gain for pitch
+  cascade_pitch_d: 5.0     # [rad/s²/(rad/s)] torque-level D gain for pitch
+  cascade_yaw_d: 4.0       # [rad/s²/(rad/s)] torque-level D gain for yaw
 
   external_force_upper_limit: 0.0
   external_force_lower_limit: 0.0
@@ -89,7 +111,7 @@ controller:
   unified_roll:
     p_gain: 36.0
     i_gain: 1.0
-    d_gain: 12.0
+    d_gain: 25.0
     limit_sum: 50.0
     limit_p: 50.0
     limit_i: 10.0
@@ -98,7 +120,7 @@ controller:
   unified_pitch:
     p_gain: 36.0
     i_gain: 5.0
-    d_gain: 12.0
+    d_gain: 25.0
     limit_sum: 50.0
     limit_p: 50.0
     limit_i: 10.0

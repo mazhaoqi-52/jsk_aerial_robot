@@ -1,6 +1,7 @@
 // Unified controller for assembled beetle formation.
-// PC does full 6-DOF PID + formation-wide pseudoinverse allocation.
-// Spinal acts as pure PWM executor (zero attitude gains).
+// PC outer loop (40Hz): 6-DOF PID + formation-wide pseudoinverse allocation.
+// Spinal inner loop (1000Hz): P+D attitude tracking per-motor.
+// PC retains I-term only for roll/pitch.
 
 #include <beetle/control/beetle_unified_controller.h>
 #include <tf_conversions/tf_kdl.h>
@@ -18,7 +19,10 @@ BeetleUnifiedController::BeetleUnifiedController()
     gimbal_calc_in_fc_(false),
     formation_mass_(0),
     formation_cog_offset_(Eigen::Vector3d::Zero()),
-    formation_inertia_(Eigen::Matrix3d::Zero())
+    formation_inertia_(Eigen::Matrix3d::Zero()),
+    target_roll_(0),
+    target_pitch_(0),
+    candidate_yaw_term_(0)
 {
 }
 
@@ -43,6 +47,10 @@ void BeetleUnifiedController::initialize(
     std::string ns = std::string("/") + my_name + std::to_string(i);
     module_thrust_pubs_[i] = nh_.advertise<spinal::FourAxisCommand>(ns + "/unified_thrust_cmd", 1);
     module_gimbal_pubs_[i] = nh_.advertise<sensor_msgs::JointState>(ns + "/unified_gimbal_cmd", 1);
+    module_torque_alloc_inv_pubs_[i] = nh_.advertise<spinal::TorqueAllocationMatrixInv>(
+        ns + "/torque_allocation_matrix_inv", 1);
+    module_rpy_gain_pubs_[i] = nh_.advertise<spinal::RollPitchYawTerms>(ns + "/rpy/gain", 1);
+    module_gimbal_dof_pubs_[i] = nh_.advertise<std_msgs::UInt8>(ns + "/gimbal_dof", 1);
   }
 
   formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("unified_control/formation_wrench", 1);
@@ -111,6 +119,9 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Pseudoinverse
   integrated_map_inv_ = aerial_robot_model::pseudoinverse(integrated_map_);
 
+  // Split: rotational part (last 3 cols) for torque_allocation_matrix_inv
+  integrated_map_inv_rot_ = integrated_map_inv_.rightCols(3);
+
   // Add external wrench feedforward (convert from force/torque to acceleration)
   Eigen::VectorXd total_wrench_acc = target_wrench_acc_cog;
   if (desired_ext_wrench.size() == 6 && desired_ext_wrench.norm() > 1e-6) {
@@ -121,9 +132,37 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   }
 
   // Allocate: vectoring_f = pseudoinverse * 6D_wrench_acc
+  // In cascade mode, the wrench_acc torque channels contain ONLY I-term
+  // (P+D done by spinal). So base_thrust = allocation of (position PID + I-term only).
   target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
 
-  // Extract per-rotor scalar thrust + gimbal angles
+  // Compute target angles for spinal inner loop
+  // (underactuated: derive from position PID target acceleration)
+  {
+    // target_acc in body frame (first 3 elements of total_wrench_acc)
+    Eigen::Vector3d target_acc_body = total_wrench_acc.head(3);
+    target_roll_ = atan2(-target_acc_body.y(),
+                         sqrt(target_acc_body.x() * target_acc_body.x() +
+                              target_acc_body.z() * target_acc_body.z()));
+    target_pitch_ = atan2(target_acc_body.x(), target_acc_body.z());
+  }
+
+  // Compute candidate yaw term for spinal yaw reconstruction
+  {
+    // Find max yaw column entry to scale yaw PID result (same logic as gimbalrotor)
+    int yaw_col = 5; // yaw is the 6th column (index 5) in the 6-DOF wrench
+    double max_yaw_scale = 0;
+    int total_motors = assembled_ids.size() * motor_num_per_module_;
+    for (int i = 0; i < total_motors; i++) {
+      if (integrated_map_inv_(i * rotor_coef_, yaw_col) > max_yaw_scale)
+        max_yaw_scale = integrated_map_inv_(i * rotor_coef_, yaw_col);
+    }
+    // candidate_yaw_term = yaw_pid_result * max_yaw_scale
+    // (yaw PID result is wrench_acc(5), but we need the raw PID result before allocation)
+    candidate_yaw_term_ = total_wrench_acc(5) * max_yaw_scale;
+  }
+
+  // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
 
   ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl] N=%d mass=%.3f cog_offset=(%.4f,%.4f,%.4f) "
@@ -178,31 +217,56 @@ void BeetleUnifiedController::extractThrustAndGimbal(
 
 void BeetleUnifiedController::publishCommands()
 {
-  for (const auto& kv : module_commands_) {
-    int module_id = kv.first;
-    const ModuleCommand& cmd = kv.second;
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  int leader_id = navigator_->getLeaderID();
 
-    // Publish scalar thrusts as FourAxisCommand.base_thrust (4 elements per module).
-    // When gimbal_calc_in_fc=false, spinal has motor_number_=motor_num (not *rotor_coef),
-    // so it expects scalar thrusts — the same format as GimbalrotorController::sendFourAxisCommand().
-    // Gimbal angles are sent separately via gimbals_ctrl topic below.
-    // angles=[0,0,0]: spinal's attitude PID is zeroed, so these are ignored.
+  // In cascade mode (gimbal_calc_in_fc=true), send:
+  //   base_thrust[motor_num * rotor_coef] = vectoring force components (NOT scalar magnitude)
+  //   angles[0] = target_roll
+  //   angles[1] = target_pitch
+  //   angles[2] = candidate_yaw_term
+  // Spinal will add roll_pitch_term (from its own P+D) to base_thrust,
+  // then do sqrt+atan2 to decompose into scalar thrust + gimbal angle.
+
+  int col = 0;
+  for (size_t m = 0; m < assembled_ids.size(); m++) {
+    int module_id = assembled_ids[m];
+
+    // Skip LEADER — LEADER sends its own command in beetle_controller.cpp
+    if (module_id == leader_id) {
+      col += motor_num_per_module_ * rotor_coef_;
+      continue;
+    }
+
     if (module_thrust_pubs_.count(module_id)) {
       spinal::FourAxisCommand thrust_msg;
-      thrust_msg.base_thrust = cmd.full_thrusts;
-      thrust_msg.angles[0] = 0;
-      thrust_msg.angles[1] = 0;
-      thrust_msg.angles[2] = 0;
+
+      // base_thrust: vectoring force components for this module's motors
+      // size = motor_num_per_module_ * rotor_coef_ (e.g. 4*2=8 for gimbal_dof=1)
+      thrust_msg.base_thrust.resize(motor_num_per_module_ * rotor_coef_);
+      for (int r = 0; r < motor_num_per_module_; r++) {
+        for (int c = 0; c < rotor_coef_; c++) {
+          thrust_msg.base_thrust[r * rotor_coef_ + c] =
+              static_cast<float>(target_vectoring_f_(col + r * rotor_coef_ + c));
+        }
+      }
+
+      // Target angles for spinal inner-loop P+D tracking
+      thrust_msg.angles[0] = target_roll_;
+      thrust_msg.angles[1] = target_pitch_;
+      thrust_msg.angles[2] = candidate_yaw_term_;
+
       module_thrust_pubs_[module_id].publish(thrust_msg);
     }
 
-    // Publish gimbal angles
-    if (module_gimbal_pubs_.count(module_id)) {
-      sensor_msgs::JointState gimbal_msg;
-      gimbal_msg.header.stamp = ros::Time::now();
-      gimbal_msg.position = cmd.gimbal_angles;
-      module_gimbal_pubs_[module_id].publish(gimbal_msg);
+    // Also publish gimbal_dof=1 every frame to ensure spinal is in vectoring mode
+    if (module_gimbal_dof_pubs_.count(module_id)) {
+      std_msgs::UInt8 dof_msg;
+      dof_msg.data = gimbal_dof_;
+      module_gimbal_dof_pubs_[module_id].publish(dof_msg);
     }
+
+    col += motor_num_per_module_ * rotor_coef_;
   }
 }
 
@@ -220,6 +284,85 @@ bool BeetleUnifiedController::isAllocationSaturated() const
     }
   }
   return false;
+}
+
+void BeetleUnifiedController::sendTorqueAllocationMatrixInv()
+{
+  // Send the rotational part of the formation-level allocation pseudoinverse
+  // to each module's spinal. Each module receives only its sub-block:
+  // rows [m*motor_per_module*rotor_coef .. (m+1)*motor_per_module*rotor_coef) × 3 cols.
+  //
+  // Spinal uses this in thrustGainMapping():
+  //   thrust_p_gain[i][axis] = torque_alloc_inv[i][axis] * torque_p_gain[axis]
+  //   thrust_d_gain[i][axis] = torque_alloc_inv[i][axis] * torque_d_gain[axis]
+
+  if (integrated_map_inv_rot_.rows() == 0) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] sendTorqueAllocationMatrixInv: inv_rot not computed yet");
+    return;
+  }
+
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  int rows_per_module = motor_num_per_module_ * rotor_coef_;
+
+  for (size_t m = 0; m < assembled_ids.size(); m++) {
+    int module_id = assembled_ids[m];
+    if (!module_torque_alloc_inv_pubs_.count(module_id)) continue;
+
+    spinal::TorqueAllocationMatrixInv msg;
+    msg.rows.resize(rows_per_module);
+
+    int row_start = m * rows_per_module;
+    for (int i = 0; i < rows_per_module; i++) {
+      if (integrated_map_inv_rot_.cwiseAbs().maxCoeff() > INT16_MAX * 0.001f) {
+        ROS_ERROR_THROTTLE(1.0, "[UnifiedCtrl] Torque Allocation Matrix overflow for module %d", module_id);
+      }
+      msg.rows[i].x = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 0) * 1000);
+      msg.rows[i].y = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 1) * 1000);
+      msg.rows[i].z = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 2) * 1000);
+    }
+
+    module_torque_alloc_inv_pubs_[module_id].publish(msg);
+    ROS_INFO_THROTTLE(2.0, "[UnifiedCtrl] Sent torque_alloc_inv to module %d: %d rows, "
+                      "inv_rot[0]=(%.4f,%.4f,%.4f)",
+                      module_id, rows_per_module,
+                      integrated_map_inv_rot_(row_start, 0),
+                      integrated_map_inv_rot_(row_start, 1),
+                      integrated_map_inv_rot_(row_start, 2));
+  }
+}
+
+void BeetleUnifiedController::sendCascadeGains(
+    double roll_p, double roll_d,
+    double pitch_p, double pitch_d,
+    double yaw_d)
+{
+  // Send torque-level P/D gains to each module's spinal.
+  // Using motors.resize(1) → spinal stores as torque_p/d_gain and runs thrustGainMapping()
+  // to compute per-motor gains using the torque_allocation_matrix_inv.
+  // I=0: PC handles I-term in the outer loop.
+
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+
+  for (size_t m = 0; m < assembled_ids.size(); m++) {
+    int module_id = assembled_ids[m];
+    if (!module_rpy_gain_pubs_.count(module_id)) continue;
+
+    spinal::RollPitchYawTerms rpy_gain_msg;
+    rpy_gain_msg.motors.resize(1);
+    rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p * 1000);
+    rpy_gain_msg.motors[0].roll_i  = 0;  // I-term handled by PC
+    rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d * 1000);
+    rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(pitch_p * 1000);
+    rpy_gain_msg.motors[0].pitch_i = 0;  // I-term handled by PC
+    rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(pitch_d * 1000);
+    rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d * 1000);
+
+    module_rpy_gain_pubs_[module_id].publish(rpy_gain_msg);
+  }
+
+  ROS_INFO_THROTTLE(2.0, "[UnifiedCtrl] Sent cascade gains to %zu modules: "
+                    "roll(P=%.2f,D=%.2f) pitch(P=%.2f,D=%.2f) yaw(D=%.2f)",
+                    assembled_ids.size(), roll_p, roll_d, pitch_p, pitch_d, yaw_d);
 }
 
 // ---- Formation Allocation Matrix (same math as Plan A / GimbalrotorController) ----

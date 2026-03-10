@@ -405,6 +405,11 @@ void AttitudeController::update(void)
                 if(axis == Z)
                   {
                     yaw_term_[i] = extra_yaw_pi_term_[i] + d_term;
+#ifdef SIMULATION
+                    if(!std::isfinite(yaw_term_[i]))
+                      ROS_ERROR_THROTTLE(0.5, "yaw_term_[%d] inf: extra_yaw=%e, d_term=%e, vel_Z=%e, td[%d][Z]=%e",
+                                i, extra_yaw_pi_term_[i], d_term, vel[Z], i, thrust_d_gain_[i][Z]);
+#endif
                     control_term_msg_.motors[i].yaw_d = d_term * 1000; //d_term;
                   }
               }
@@ -437,7 +442,10 @@ void AttitudeController::update(void)
           if(average_thrust > force_landing_thrust_)
             {
               for(int i = 0; i < motor_number_; i++)
-                base_thrust_term_[i] -= (base_thrust_term_[i] / average_thrust * FORCE_LANDING_INTEGRAL);
+                {
+                  if(fabs(average_thrust) > 1e-6f)
+                    base_thrust_term_[i] -= (base_thrust_term_[i] / average_thrust * FORCE_LANDING_INTEGRAL);
+                }
             }
         }
     }
@@ -543,14 +551,28 @@ void AttitudeController::fourAxisCommandCallback( const spinal::FourAxisCommand 
   target_angle_[X] = cmd_msg.angles[0];
   target_angle_[Y] = cmd_msg.angles[1];
 
+  // snapshot volatile state to avoid race with torqueAllocationMatrixInvCallback
+  // which can reset thrust_d_gain_ and max_yaw_term_index_ between our check and use
+  int snap_max_yaw_idx = max_yaw_term_index_;
+  float snap_thrust_d_gain_z[MAX_MOTOR_NUMBER];
+  for(int i = 0; i < motor_number_; i++)
+    snap_thrust_d_gain_z[i] = thrust_d_gain_[i][Z];
+
+  float snap_max_yaw_denom = (snap_max_yaw_idx >= 0 && snap_max_yaw_idx < motor_number_)
+    ? snap_thrust_d_gain_z[snap_max_yaw_idx] : 0.0f;
+
   for(int i = 0; i < motor_number_; i++)
     {
       // base thrust is about the z control
       base_thrust_term_[i] = cmd_msg.base_thrust[i];
 
       // reconstruct the pi term for yaw (temporary measure for pwm saturation avoidance)
-      if(max_yaw_term_index_ != -1)
-        extra_yaw_pi_term_[i] = cmd_msg.angles[Z] * thrust_d_gain_[i][Z] / thrust_d_gain_[max_yaw_term_index_][Z];
+      if(snap_max_yaw_idx != -1 && fabs(snap_max_yaw_denom) > 1e-6f)
+        {
+          extra_yaw_pi_term_[i] = cmd_msg.angles[Z] * snap_thrust_d_gain_z[i] / snap_max_yaw_denom;
+        }
+      else
+        extra_yaw_pi_term_[i] = 0;
     }
 
 #ifndef SIMULATION
@@ -1094,7 +1116,11 @@ void AttitudeController::pwmConversion()
 
               if(residual_term < 0)
                 {
-                  yaw_decreasing_rate = residual_term / (fabs(yaw_term_[thrust_index]) / rotor_devider_);
+                  float yaw_denom = fabs(yaw_term_[thrust_index]) / rotor_devider_;
+                  if(yaw_denom > 1e-6f)
+                    yaw_decreasing_rate = residual_term / yaw_denom;
+                  else
+                    yaw_decreasing_rate = -1; // yaw term ~0, fully suppress yaw
                 }
 
               if(yaw_decreasing_rate < -1) yaw_decreasing_rate = -1;
@@ -1108,7 +1134,24 @@ void AttitudeController::pwmConversion()
     }
   
   for(int i = 0; i < motor_number_; i++)
-    target_thrust_[i] = roll_pitch_term_[i] + (1 + base_thrust_decreasing_rate) * base_thrust_term_[i] + (1 + yaw_decreasing_rate) * yaw_term_[i];
+    {
+      float candidate = roll_pitch_term_[i] + (1 + base_thrust_decreasing_rate) * base_thrust_term_[i] + (1 + yaw_decreasing_rate) * yaw_term_[i];
+
+      /* NaN/Inf guard: hold last valid value to avoid thrust discontinuity */
+      if(std::isfinite(candidate))
+        {
+          target_thrust_[i] = candidate;
+        }
+      else
+        {
+#ifdef SIMULATION
+          ROS_ERROR_THROTTLE(1.0, "NaN/Inf detected in target_thrust[%d]: rp=%.4f, bt=%.4f, yw=%.4f, bt_rate=%.4f, yw_rate=%.4f. Holding previous value %.4f",
+                             i, roll_pitch_term_[i], base_thrust_term_[i], yaw_term_[i],
+                             base_thrust_decreasing_rate, yaw_decreasing_rate, target_thrust_[i]);
+#endif
+          /* keep target_thrust_[i] unchanged (last valid value) */
+        }
+    }
 
   /* convert to target pwm and calculate target gimbal angles */
   /* TODO: adjust not only for gimbalrotor but also for fixed rotor */

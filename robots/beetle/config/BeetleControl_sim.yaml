@@ -27,16 +27,25 @@ controller:
   #   thrust_p_gain[i][axis] = torque_alloc_inv[i][axis] * cascade_*_p
   #   thrust_d_gain[i][axis] = torque_alloc_inv[i][axis] * cascade_*_d
   #
-  # Start conservative: these act as "local stabilizers", not "second main controller".
-  # Independent mode single-beetle gains: P=8, D=5 (from roll/pitch section below).
-  # Formation mode needs higher gains due to larger inertia (Iyy≈5.98 vs single≈0.01).
-  # But spinal P+D only handles LOCAL attitude tracking; the heavy lifting
-  # (formation allocation, position control) is done by PC.
-  cascade_roll_p: 8.0      # [rad/s²/rad] torque-level P gain for roll
-  cascade_roll_d: 5.0      # [rad/s²/(rad/s)] torque-level D gain for roll
-  cascade_pitch_p: 8.0     # [rad/s²/rad] torque-level P gain for pitch
-  cascade_pitch_d: 5.0     # [rad/s²/(rad/s)] torque-level D gain for pitch
-  cascade_yaw_d: 4.0       # [rad/s²/(rad/s)] torque-level D gain for yaw
+  # Formation inertia is ~600× larger than single beetle (Iyy≈5.98 vs ≈0.01),
+  # and the 6×24 pseudoinverse (alloc_inv) has element magnitudes ~10-100× smaller
+  # than the trimmed 4×8 single-robot matrix. Together, the effective per-motor
+  # attitude gain = alloc_inv × cascade_gain is far too small at cascade_*=8/5.
+  #
+  # Strategy: increase gradually. Round 1 = 10× (from 8→80, 5→50).
+  # Target: roll_pitch_term_[i] should reach ~1/10 of base_thrust_term_[i].
+  # If still too weak, increase to 20× or 30× in subsequent rounds.
+  # Watch for: high-frequency sawtooth in target_thrust → indicates overshoot.
+  # Round2: 3× (from baseline 8/5). Max row inv_rot_X≈0.129, so
+  #   thrust_p_max = 0.129 × 25 ≈ 3.2 → errA=0.05 → rp≈0.16N ≈ 1% bt (stable boundary)
+  # Round3: 3.5× — tracking err 2.1mrad still has margin, bt0 peak=0.195 < 0.3 safe
+  cascade_roll_p: 28.0     # [rad/s²/rad] torque-level P gain for roll  (Round3: 3.5×)
+  cascade_roll_d: 18.0     # [rad/s²/(rad/s)] torque-level D gain for roll  (Round3: 3.5×)
+  cascade_pitch_p: 28.0    # [rad/s²/rad] torque-level P gain for pitch  (Round3: 3.5×)
+  cascade_pitch_d: 18.0    # [rad/s²/(rad/s)] torque-level D gain for pitch  (Round3: 3.5×)
+  cascade_yaw_d: 2.5       # [rad/s²/(rad/s)] torque-level D gain for yaw (Round4: 4.0→2.5, reduce yaw damping)
+  yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
+  tgt_angle_lpf_alpha: 0.3  # LPF for target roll/pitch/yaw sent to spinal (0=no filter, 1=frozen; ~8Hz cutoff @40Hz)
 
   external_force_upper_limit: 0.0
   external_force_lower_limit: 0.0
@@ -52,7 +61,10 @@ controller:
   xy:
     p_gain: 2.0
     i_gain: 0.2
-    d_gain: 4.0
+    d_gain: 2.5       # F-6: 3.0→2.5  D_body_y (std=0.016) is now the largest D-term
+                       # across all axes. 17% gain cut + stronger LPF to reduce bt0/tgtA.
+    err_d_lpf_cutoff_freq: 3.5  # F-6: 6→3.5Hz  Same strategy as Z (F-5).
+                                # Slightly higher than Z's 3Hz since XY needs faster response.
     limit_sum: 8.0  # each module share ≈ F_total/3/mass ≈ 2.2 m/s², PID ~2-3 → ~5 total
     limit_p: 12.0
     limit_i: 8.0  # match limit_sum to prevent integral windup
@@ -61,7 +73,12 @@ controller:
   z:
     p_gain: 5.0
     i_gain: 1.0
-    d_gain: 2.5
+    d_gain: 2.0       # F-5a: 2.5→2.0  Z D-term accounts for 100% of pid_body_z variance
+                       # (std=0.014, pk-pk=0.072), which dominates bt0 oscillation.
+                       # 20% gain reduction + stronger LPF aims to cut D_body_z std by ~44%.
+    err_d_lpf_cutoff_freq: 3.0  # F-5b: 6→3Hz  More aggressive filtering on Z velocity error.
+                                # 3Hz still passes real altitude disturbances (< ~1Hz)
+                                # but rejects 5-10Hz sensor noise that was leaking through.
     limit_err_p: 1.0
     limit_sum: 25.0 # N for clamping thrust force
     limit_p: 25.0

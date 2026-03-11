@@ -93,6 +93,9 @@ public:
    *  Call this when exiting unified mode. */
   void resetCascadeAllocSent() { cascade_alloc_sent_ = false; }
 
+  /** @brief Reset target-angle LPF state. Call when entering unified mode. */
+  void resetTargetAngleLpf() { tgt_angle_lpf_initialized_ = false; }
+
   /** @brief Update formation CoG offset and inertia from current TF. */
   bool updateFormationGeometry();
 
@@ -174,6 +177,13 @@ private:
   double target_roll_;
   double target_pitch_;
   double candidate_yaw_term_;
+
+  // LPF state for target angles (suppress 40Hz jitter → spinal)
+  double target_roll_lpf_;
+  double target_pitch_lpf_;
+  double candidate_yaw_term_lpf_;
+  double tgt_angle_lpf_alpha_;    // LPF coefficient: 0→pass-through, 1→freeze
+  bool   tgt_angle_lpf_initialized_;
 
   // Per-module commands
   std::map<int, ModuleCommand> module_commands_;

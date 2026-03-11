@@ -23,6 +23,11 @@ BeetleUnifiedController::BeetleUnifiedController()
     target_roll_(0),
     target_pitch_(0),
     candidate_yaw_term_(0),
+    target_roll_lpf_(0),
+    target_pitch_lpf_(0),
+    candidate_yaw_term_lpf_(0),
+    tgt_angle_lpf_alpha_(0.3),
+    tgt_angle_lpf_initialized_(false),
     cascade_alloc_sent_(false),
     has_cascade_gain_cache_(false),
     cached_cascade_roll_p_(0),
@@ -78,6 +83,7 @@ void BeetleUnifiedController::rosParamInit()
   ros::NodeHandle control_nh(nh_, "controller");
   control_nh.param<int>("gimbal_dof", gimbal_dof_, 1);
   control_nh.param<bool>("gimbal_calc_in_fc", gimbal_calc_in_fc_, false);
+  control_nh.param<double>("tgt_angle_lpf_alpha", tgt_angle_lpf_alpha_, 0.3);
 }
 
 bool BeetleUnifiedController::updateFormationGeometry()
@@ -175,6 +181,26 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     candidate_yaw_term_ = total_wrench_acc(5) * max_yaw_scale;
   }
 
+  // Low-pass filter target angles to suppress 40Hz jitter before sending to spinal.
+  // Spinal's 1000Hz P+D would amplify frame-to-frame noise in tgtA → rotor oscillation.
+  // alpha=0 → no filtering (pass-through), alpha=1 → fully frozen.
+  {
+    if (!tgt_angle_lpf_initialized_) {
+      target_roll_lpf_ = target_roll_;
+      target_pitch_lpf_ = target_pitch_;
+      candidate_yaw_term_lpf_ = candidate_yaw_term_;
+      tgt_angle_lpf_initialized_ = true;
+    } else {
+      double a = tgt_angle_lpf_alpha_;
+      target_roll_lpf_  = a * target_roll_lpf_  + (1.0 - a) * target_roll_;
+      target_pitch_lpf_ = a * target_pitch_lpf_ + (1.0 - a) * target_pitch_;
+      candidate_yaw_term_lpf_ = a * candidate_yaw_term_lpf_ + (1.0 - a) * candidate_yaw_term_;
+    }
+    target_roll_  = target_roll_lpf_;
+    target_pitch_ = target_pitch_lpf_;
+    candidate_yaw_term_ = candidate_yaw_term_lpf_;
+  }
+
   // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
 
@@ -208,6 +234,36 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
              cached_cascade_roll_p_, cached_cascade_roll_d_,
              cached_cascade_pitch_p_, cached_cascade_pitch_d_,
              cached_cascade_yaw_d_);
+
+    // D-3 diagnostic: dump inv_rot matrix and resulting thrust gains for analysis
+    {
+      int rows_per_mod = motor_num_per_module_ * rotor_coef_;
+      std::vector<int> ids = navigator_->getAssemblyIds();
+      for (size_t m = 0; m < ids.size(); m++) {
+        for (int i = 0; i < rows_per_mod; i++) {
+          int row = m * rows_per_mod + i;
+          ROS_WARN("[D3_ALLOC] mod=%d row=%d inv_rot=(%.6f, %.6f, %.6f) "
+                   "thrust_p_X=%.6f thrust_p_Y=%.6f thrust_d_X=%.6f thrust_d_Y=%.6f thrust_d_Z=%.6f",
+                   ids[m], i,
+                   integrated_map_inv_rot_(row, 0),
+                   integrated_map_inv_rot_(row, 1),
+                   integrated_map_inv_rot_(row, 2),
+                   integrated_map_inv_rot_(row, 0) * cached_cascade_roll_p_,
+                   integrated_map_inv_rot_(row, 1) * cached_cascade_pitch_p_,
+                   integrated_map_inv_rot_(row, 0) * cached_cascade_roll_d_,
+                   integrated_map_inv_rot_(row, 1) * cached_cascade_pitch_d_,
+                   integrated_map_inv_rot_(row, 2) * cached_cascade_yaw_d_);
+        }
+      }
+      // Also dump the full integrated_map_ for reference
+      ROS_WARN("[D3_MAP] integrated_map (%ldx%ld):", integrated_map_.rows(), integrated_map_.cols());
+      for (int r = 0; r < integrated_map_.rows(); r++) {
+        std::string row_str;
+        for (int c = 0; c < integrated_map_.cols(); c++)
+          row_str += std::to_string(integrated_map_(r, c)) + " ";
+        ROS_WARN("[D3_MAP] row%d: %s", r, row_str.c_str());
+      }
+    }
   }
 
   return true;

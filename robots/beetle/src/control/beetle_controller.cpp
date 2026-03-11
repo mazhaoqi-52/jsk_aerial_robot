@@ -25,7 +25,8 @@ namespace aerial_robot_control
     cascade_roll_d_(5.0),
     cascade_pitch_p_(8.0),
     cascade_pitch_d_(5.0),
-    cascade_yaw_d_(4.0),
+    cascade_yaw_d_(2.5),
+    yaw_alloc_weight_(1.0),
     last_unified_z_i_ss_(0.8),
     has_unified_z_i_ss_(false),
     z_i_seed_default_(0.8),
@@ -552,6 +553,13 @@ namespace aerial_robot_control
       // Store for external wrench estimator
       setTargetWrenchAccCog(target_wrench_acc);
 
+      // --- Yaw allocation weight: reduce yaw PID noise coupling into base_thrust ---
+      // Scale wrench_acc(5) AFTER storing for ext-wrench estimator (which needs true value)
+      // but BEFORE allocation. candidate_yaw_term inside computeUnifiedAllocation also
+      // uses the scaled value, so both paths (base_thrust and yaw_term) are consistent.
+      double yaw_raw = target_wrench_acc(5);
+      target_wrench_acc(5) *= yaw_alloc_weight_;
+
       // --- Run unified 6-DOF allocation ---
       bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, desired_external_wrench_);
 
@@ -585,9 +593,64 @@ namespace aerial_robot_control
       if (unified_transition_count_ >= 0)
         unified_transition_count_++;
 
-      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d",
+      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d yaw_w=%.2f(raw=%.4f)",
                         target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
-                        target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok);
+                        target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok,
+                        yaw_alloc_weight_, yaw_raw);
+
+      // D-2 diagnostic: PC-side cascade outputs for oscillation analysis
+      ROS_INFO_THROTTLE(0.1, "[PC_D2] tgtRP=(%.5f,%.5f) yawTerm=%.5f wrenchRP=(%.5f,%.5f) wrenchYaw=%.5f I_rp=(%.5f,%.5f)",
+                        unified_controller_->getTargetRoll(),
+                        unified_controller_->getTargetPitch(),
+                        unified_controller_->getCandidateYawTerm(),
+                        target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
+                        pid_controllers_.at(ROLL).getITerm(),
+                        pid_controllers_.at(PITCH).getITerm());
+
+      // D-4 diagnostic: decompose target_angle jitter sources
+      // target_roll/pitch come from atan2(wrench_acc.head(3)), which = pos_PID_body + gravity_body.
+      // We need to know: how much jitter comes from XY PID D-term vs gravity FF rotation?
+      {
+        // Position PID decomposition (world frame)
+        double xP = pid_controllers_.at(X).getPTerm(), xI = pid_controllers_.at(X).getITerm(), xD = pid_controllers_.at(X).getDTerm();
+        double yP = pid_controllers_.at(Y).getPTerm(), yI = pid_controllers_.at(Y).getITerm(), yD = pid_controllers_.at(Y).getDTerm();
+        double zP = pid_controllers_.at(Z).getPTerm(), zI = pid_controllers_.at(Z).getITerm(), zD = pid_controllers_.at(Z).getDTerm();
+        // Body-frame decomposition
+        tf::Vector3 pid_w(pid_controllers_.at(X).result(),
+                          pid_controllers_.at(Y).result(),
+                          pid_controllers_.at(Z).result());
+        tf::Vector3 d_only_w(xD, yD, zD);
+        tf::Matrix3x3 rot_inv = estimator_->getOrientation(Frame::COG, estimate_mode_).inverse();
+        tf::Vector3 pid_body = rot_inv * pid_w;
+        tf::Vector3 d_body = rot_inv * d_only_w;
+        tf::Vector3 grav_w(0, 0, aerial_robot_estimation::G);
+        tf::Vector3 grav_body = rot_inv * grav_w;
+
+        // What target_roll/pitch would be from gravity alone vs pid alone
+        Eigen::Vector3d acc_total(pid_body.x() + grav_body.x(),
+                                  pid_body.y() + grav_body.y(),
+                                  pid_body.z() + grav_body.z());
+        Eigen::Vector3d acc_grav_only(grav_body.x(), grav_body.y(), grav_body.z());
+
+        double tgt_r = atan2(-acc_total.y(), sqrt(acc_total.x()*acc_total.x() + acc_total.z()*acc_total.z()));
+        double tgt_p = atan2(acc_total.x(), acc_total.z());
+        double tgt_r_grav = atan2(-acc_grav_only.y(), sqrt(acc_grav_only.x()*acc_grav_only.x() + acc_grav_only.z()*acc_grav_only.z()));
+        double tgt_p_grav = atan2(acc_grav_only.x(), acc_grav_only.z());
+
+        ROS_INFO_THROTTLE(0.1, "[PC_D4] tgtR=%.5f tgtP=%.5f | grav_only_R=%.5f grav_only_P=%.5f | "
+                          "pid_delta_R=%.5f pid_delta_P=%.5f | "
+                          "D_body=(%.4f,%.4f,%.4f) | pid_body=(%.4f,%.4f,%.4f) | grav_body=(%.4f,%.4f,%.4f)",
+                          tgt_r, tgt_p,
+                          tgt_r_grav, tgt_p_grav,
+                          tgt_r - tgt_r_grav, tgt_p - tgt_p_grav,
+                          d_body.x(), d_body.y(), d_body.z(),
+                          pid_body.x(), pid_body.y(), pid_body.z(),
+                          grav_body.x(), grav_body.y(), grav_body.z());
+
+        // Also log raw XY PID P/I/D terms (world frame) to see D-term noise
+        ROS_INFO_THROTTLE(0.1, "[PC_D4b] X(P=%.4f I=%.4f D=%.4f) Y(P=%.4f I=%.4f D=%.4f) Z(P=%.4f I=%.4f D=%.4f)",
+                          xP, xI, xD, yP, yI, yD, zP, zI, zD);
+      }
 
       // Steady-state diagnostics: attitude error, position error, I-terms, saturation
       ROS_INFO_THROTTLE(5.0, "[UnifiedCtrl DIAG] roll_err=%.4f pitch_err=%.4f yaw_err=%.4f "
@@ -730,6 +793,7 @@ namespace aerial_robot_control
         follower_ready_sent_ = false;
         prev_unified_control_mode_ = false;
         unified_controller_->resetCascadeAllocSent();
+        unified_controller_->resetTargetAngleLpf();
         beetle_navigator_->setUnifiedControlMode(false);
 
         // Fall through to independent control below
@@ -762,6 +826,7 @@ namespace aerial_robot_control
     spinal_gains_zeroed_ = false;
     gains_switched_ = false;  // ensure flag is consistent even if restoreIndependentGains was skipped
     unified_controller_->resetCascadeAllocSent();
+    unified_controller_->resetTargetAngleLpf();
     unified_controller_->resetFollowerReady();
     beetle_navigator_->setUnifiedControlMode(false);  // notify navigator
 
@@ -1389,7 +1454,11 @@ namespace aerial_robot_control
     getParam<double>(control_nh, "cascade_roll_d", cascade_roll_d_, 5.0);
     getParam<double>(control_nh, "cascade_pitch_p", cascade_pitch_p_, 8.0);
     getParam<double>(control_nh, "cascade_pitch_d", cascade_pitch_d_, 5.0);
-    getParam<double>(control_nh, "cascade_yaw_d", cascade_yaw_d_, 4.0);
+    getParam<double>(control_nh, "cascade_yaw_d", cascade_yaw_d_, 2.5);
+
+    // Yaw allocation weight: scale wrench_acc(5) before pseudoinverse allocation.
+    // 1.0 = original behavior, <1.0 = reduce yaw noise coupling into base_thrust.
+    getParam<double>(control_nh, "yaw_alloc_weight", yaw_alloc_weight_, 1.0);
 
     // Z I-term seed default for unified mode switch (Plan E')
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);

@@ -36,6 +36,7 @@
 #pragma once
 
 #include <boost/algorithm/clamp.hpp>
+#include <cmath>
 #include <string>
 
 using boost::algorithm::clamp;
@@ -53,7 +54,8 @@ namespace aerial_robot_control
       name_(name), result_(0), err_p_(0), err_p_prev_(0), err_i_(0), err_i_prev_(0), err_d_(0),
       target_p_(0), target_d_(0), val_p_(0), val_d_(0),
       p_term_(0), i_term_(0), d_term_(0),
-      i_comp_term_(0), persistent_ff_term_(0)
+      i_comp_term_(0), persistent_ff_term_(0),
+      err_d_lpf_cutoff_freq_(0), err_d_filtered_(0), err_d_lpf_initialized_(false)
     {
       setGains(p_gain, i_gain, d_gain);
       setLimits(limit_sum, limit_p, limit_i, limit_d, limit_err_p, limit_err_i, limit_err_d);
@@ -65,7 +67,30 @@ namespace aerial_robot_control
     {
       err_p_ = clamp(err_p, -limit_err_p_, limit_err_p_);
       err_i_prev_ = err_i_;
-      err_d_ = clamp(err_d, -limit_err_d_, limit_err_d_);
+
+      // Apply optional first-order LPF on err_d (velocity error)
+      // When cutoff_freq > 0 and du > 0, filter is active
+      double err_d_raw = clamp(err_d, -limit_err_d_, limit_err_d_);
+      if (err_d_lpf_cutoff_freq_ > 0 && du > 0)
+        {
+          if (!err_d_lpf_initialized_)
+            {
+              err_d_filtered_ = err_d_raw;
+              err_d_lpf_initialized_ = true;
+            }
+          else
+            {
+              double rc = 1.0 / (2.0 * M_PI * err_d_lpf_cutoff_freq_);
+              double alpha = du / (du + rc);
+              err_d_filtered_ = alpha * err_d_raw + (1.0 - alpha) * err_d_filtered_;
+            }
+          err_d_ = err_d_filtered_;
+        }
+      else
+        {
+          err_d_ = err_d_raw;
+        }
+
       err_i_ = clamp(err_i_ + err_p_ * du, -limit_err_i_, limit_err_i_) + i_comp_term_;
 
       p_term_ = clamp(err_p_ * p_gain_, -limit_p_, limit_p_);
@@ -100,6 +125,8 @@ namespace aerial_robot_control
       result_ = 0;
       i_comp_term_ = 0;
       persistent_ff_term_ = 0;
+      err_d_filtered_ = 0;
+      err_d_lpf_initialized_ = false;
     }
 
     const double& getPGain() const { return p_gain_; }
@@ -157,6 +184,9 @@ namespace aerial_robot_control
     const double& getITerm() const { return i_term_; }
     const double& getDTerm() const { return d_term_; }
 
+    void setErrDLpfCutoffFreq(const double freq) { err_d_lpf_cutoff_freq_ = freq; }
+    const double& getErrDLpfCutoffFreq() const { return err_d_lpf_cutoff_freq_; }
+
   protected:
 
     std::string name_;
@@ -171,6 +201,11 @@ namespace aerial_robot_control
     double val_p_, val_d_;
     double i_comp_term_;
     double persistent_ff_term_;
+
+    // First-order LPF for err_d (velocity error filtering)
+    double err_d_lpf_cutoff_freq_;  // Hz, 0 = disabled
+    double err_d_filtered_;
+    bool err_d_lpf_initialized_;
 
   };
 

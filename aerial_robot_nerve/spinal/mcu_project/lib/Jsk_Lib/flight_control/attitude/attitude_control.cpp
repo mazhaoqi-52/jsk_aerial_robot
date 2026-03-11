@@ -428,6 +428,21 @@ void AttitudeController::update(void)
 
 #ifdef SIMULATION
         anti_gyro_pub_.publish(anti_gyro_msg);
+
+        /* D-1 diagnostic: spinal inner-loop state for oscillation analysis */
+        {
+          static int d1_cnt = 0;
+          if (++d1_cnt >= 100) { // every 100ms at 1000Hz
+            d1_cnt = 0;
+            ROS_INFO("[SPINAL_D1] tgtA=(%.4f,%.4f) errA=(%.5f,%.5f) errI=(%.5f,%.5f) rp0=%.4f bt0=%.4f yw0=%.4f tt0=%.4f",
+                     target_angle_[X], target_angle_[Y],
+                     target_angle_[X] - angles[X], target_angle_[Y] - angles[Y],
+                     error_angle_i_[X], error_angle_i_[Y],
+                     roll_pitch_term_[0], base_thrust_term_[0],
+                     yaw_term_[0],
+                     roll_pitch_term_[0] + base_thrust_term_[0] + yaw_term_[0]);
+          }
+        }
 #endif
       }
 

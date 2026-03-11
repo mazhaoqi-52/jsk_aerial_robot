@@ -108,6 +108,7 @@ namespace aerial_robot_control
     double limit_sum, limit_p, limit_i, limit_d;
     double limit_err_p, limit_err_i, limit_err_d;
     double p_gain, i_gain, d_gain;
+    double err_d_lpf_cutoff_freq;
 
     auto loadParam = [&, this](ros::NodeHandle nh)
       {
@@ -122,6 +123,7 @@ namespace aerial_robot_control
         getParam<double>(nh, "p_gain", p_gain, 0.0);
         getParam<double>(nh, "i_gain", i_gain, 0.0);
         getParam<double>(nh, "d_gain", d_gain, 0.0);
+        getParam<double>(nh, "err_d_lpf_cutoff_freq", err_d_lpf_cutoff_freq, 0.0);
       };
 
     /* xy */
@@ -129,7 +131,9 @@ namespace aerial_robot_control
       {
         loadParam(xy_nh);
         pid_controllers_.push_back(PID("x", p_gain, i_gain, d_gain, limit_sum, limit_p, limit_i, limit_d, limit_err_p, limit_err_i, limit_err_d));
+        pid_controllers_.back().setErrDLpfCutoffFreq(err_d_lpf_cutoff_freq);
         pid_controllers_.push_back(PID("y", p_gain, i_gain, d_gain, limit_sum, limit_p, limit_i, limit_d, limit_err_p, limit_err_i, limit_err_d));
+        pid_controllers_.back().setErrDLpfCutoffFreq(err_d_lpf_cutoff_freq);
 
         std::vector<int> indices = {X, Y};
         pid_reconf_servers_.push_back(boost::make_shared<PidControlDynamicConfig>(xy_nh));
@@ -139,11 +143,13 @@ namespace aerial_robot_control
       {
         loadParam(x_nh);
         pid_controllers_.push_back(PID("x", p_gain, i_gain, d_gain, limit_sum, limit_p, limit_i, limit_d, limit_err_p, limit_err_i, limit_err_d));
+        pid_controllers_.back().setErrDLpfCutoffFreq(err_d_lpf_cutoff_freq);
         pid_reconf_servers_.push_back(boost::make_shared<PidControlDynamicConfig>(x_nh));
         pid_reconf_servers_.back()->setCallback(boost::bind(&PoseLinearController::cfgPidCallback, this, _1, _2, std::vector<int>(1, X)));
 
         loadParam(y_nh);
         pid_controllers_.push_back(PID("y", p_gain, i_gain, d_gain, limit_sum, limit_p, limit_i, limit_d, limit_err_p, limit_err_i, limit_err_d));
+        pid_controllers_.back().setErrDLpfCutoffFreq(err_d_lpf_cutoff_freq);
         pid_reconf_servers_.push_back(boost::make_shared<PidControlDynamicConfig>(y_nh));
         pid_reconf_servers_.back()->setCallback(boost::bind(&PoseLinearController::cfgPidCallback, this, _1, _2, std::vector<int>(1, Y)));
       }
@@ -153,6 +159,7 @@ namespace aerial_robot_control
     if(force_landing_descending_rate_ >= 0) force_landing_descending_rate_ = -0.1;
     loadParam(z_nh);
     pid_controllers_.push_back(PID("z", p_gain, i_gain, d_gain, limit_sum, limit_p, limit_i, limit_d, limit_err_p, limit_err_i, limit_err_d));
+    pid_controllers_.back().setErrDLpfCutoffFreq(err_d_lpf_cutoff_freq);
     pid_reconf_servers_.push_back(boost::make_shared<PidControlDynamicConfig>(z_nh));
     pid_reconf_servers_.back()->setCallback(boost::bind(&PoseLinearController::cfgPidCallback, this, _1, _2, std::vector<int>(1, Z)));
 

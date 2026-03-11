@@ -13,7 +13,7 @@
 
 #ifdef SIMULATION
 #include <sensor_msgs/JointState.h>
-AttitudeController::AttitudeController(): DELTA_T(0), prev_time_(-1), sim_voltage_(0), gimbal_dof_(0), rotor_coef_(1)
+AttitudeController::AttitudeController(): DELTA_T(0), prev_time_(-1), sim_voltage_(0)
 {
 }
 
@@ -211,21 +211,6 @@ void AttitudeController::pwmsControl(void)
       pwm_pub_last_time_ = HAL_GetTick();
       pwms_pub_.publish(&pwms_msg_);
     }
-
-  /* nerve comm type */
-#if NERVE_COMM
-  for(int i = 0; i < motor_number_; i++) {
-#if MOTOR_TEST
-
-    if (i == (HAL_GetTick() / 2000) % motor_number_)
-      Spine::setMotorPwm(200, i);
-    else
-      Spine::setMotorPwm(0, i);
-#else
-    Spine::setMotorPwm(target_pwm_[i] * 2000 - 1000, i);
-#endif
-  }
-#endif
 
   if(dshot_)
     {

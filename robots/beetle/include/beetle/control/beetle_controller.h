@@ -8,6 +8,7 @@
 #include <gimbalrotor/control/gimbalrotor_controller.h>
 #include <beetle/sensor/imu.h>
 #include <beetle/control/beetle_unified_controller.h>
+#include <beetle/control/formation_momentum_observer.h>
 #include <std_srvs/SetBool.h>
 
 namespace aerial_robot_control
@@ -44,6 +45,11 @@ namespace aerial_robot_control
     std::shared_ptr<BeetleUnifiedController> unified_controller_;
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
+
+    // Formation-level momentum observer (Phase U2)
+    // Runs only in unified LEADER mode; uses realized wrench from allocation.
+    // V1: 3D force estimation, debug-only (no control feedback).
+    std::shared_ptr<FormationMomentumObserver> formation_observer_;
 
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;

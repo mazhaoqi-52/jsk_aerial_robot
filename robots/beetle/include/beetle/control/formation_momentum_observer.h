@@ -1,0 +1,189 @@
+// -*- mode: c++ -*-
+// Formation-level momentum observer for assembled beetle formation.
+//
+// Design rationale:
+//   - Separate class from single-module observer (different semantics)
+//   - Uses formation mass/inertia, not single-module parameters
+//   - Observer input = "realized wrench" from allocation (A * f), not PID commands
+//   - Cascade-agnostic: no dependency on which PID terms are in PC vs spinal
+//   - Auto bias calibration: after observer converges during unloaded hover,
+//     records steady-state estimate as baseline and subtracts it from output.
+//     This cancels the inherent offset from PID I-term compensating model error,
+//     analogous to original per-module observer's differential cancellation.
+//
+// Version 1 (Phase U2):
+//   - 3D external force estimation only (no torque)
+//   - Debug-only: publishes topic, no feedback to control
+//
+// Version 2 (Phase U3):
+//   - Full 6D wrench estimation (force + torque)
+//   - Still debug-only
+//
+// Version 3 (future):
+//   - Low-frequency feedforward compensation (Z, then pitch, then full 6D)
+
+#pragma once
+
+#include <ros/ros.h>
+#include <Eigen/Dense>
+#include <geometry_msgs/WrenchStamped.h>
+#include <geometry_msgs/Vector3Stamped.h>
+#include <aerial_robot_model/utils/math_utils.h>
+
+namespace aerial_robot_control
+{
+
+class FormationMomentumObserver
+{
+public:
+  FormationMomentumObserver();
+  ~FormationMomentumObserver() = default;
+
+  /**
+   * @brief Initialize the observer with ROS handles and parameters.
+   * @param nh  Node handle for publishing debug topics.
+   */
+  void initialize(ros::NodeHandle nh);
+
+  /**
+   * @brief Reset observer state (call on mode switch or when entering unified mode).
+   */
+  void reset();
+
+  /**
+   * @brief Main update: estimate external wrench on the formation.
+   *
+   * Implements a generalized-momentum observer:
+   *   p(t) = [M * v_w;  I * omega_body]
+   *   integrate_term += (J * tau_realized - N + f_ext_hat) * dt
+   *   f_ext_hat = K_obs * (p(t) - p(0) - integrate_term)
+   *
+   * where:
+   *   tau_realized = realized wrench from allocation (A * f), NOT PID command
+   *   N = gravity + gyroscopic terms
+   *   K_obs = diagonal observer gain matrix
+   *
+   * @param formation_mass         Total mass of the assembled formation [kg].
+   * @param formation_inertia      3x3 inertia matrix of the formation about formation CoG [kg·m²].
+   * @param cog_rot                3x3 rotation matrix: formation body → world.
+   * @param vel_w                  Formation CoG linear velocity in world frame [m/s].
+   * @param omega_body             Formation angular velocity in body frame [rad/s].
+   * @param realized_wrench_body   6D realized wrench in body frame [Fx,Fy,Fz,Tx,Ty,Tz] (N, N·m).
+   *                               Computed as: integrated_map * target_vectoring_f * [M; I]
+   *                               (i.e., allocation result converted back to force/torque space).
+   * @param dt                     Time step [s].
+   */
+  void update(double formation_mass,
+              const Eigen::Matrix3d& formation_inertia,
+              const Eigen::Matrix3d& cog_rot,
+              const Eigen::Vector3d& vel_w,
+              const Eigen::Vector3d& omega_body,
+              const Eigen::VectorXd& realized_wrench_body,
+              double dt);
+
+  // ---- Accessors (debug / future compensation) ----
+
+  /** @brief Get estimated external force in world frame [N] (bias-subtracted). */
+  Eigen::Vector3d getEstExternalForceWorld() const { return est_ext_force_w_ - bias_force_w_; }
+
+  /** @brief Get raw (pre-bias-subtraction) estimated external force in world frame [N]. */
+  const Eigen::Vector3d& getRawEstExternalForceWorld() const { return est_ext_force_w_; }
+
+  /** @brief Get estimated external force in body frame [N] (bias-subtracted). */
+  Eigen::Vector3d getEstExternalForceBody() const { return last_cog_rot_.transpose() * (est_ext_force_w_ - bias_force_w_); }
+
+  /** @brief Get estimated external torque in body frame [N·m] (bias-subtracted, V2). */
+  Eigen::Vector3d getEstExternalTorqueBody() const { return est_ext_torque_body_ - bias_torque_body_; }
+
+  /** @brief Get raw (pre-bias-subtraction) estimated external torque in body frame [N·m]. */
+  const Eigen::Vector3d& getRawEstExternalTorqueBody() const { return est_ext_torque_body_; }
+
+  /** @brief Get full 6D estimated external wrench (bias-subtracted).
+   *  [force_world(3); torque_body(3)] for V1, force only; torque=0. */
+  Eigen::VectorXd getEstExternalWrench6D() const;
+
+  /** @brief Is the observer initialized (has received at least one update)? */
+  bool isInitialized() const { return initialized_; }
+
+  /** @brief Is the observer active (receiving updates and producing estimates)? */
+  bool isActive() const { return active_; }
+
+  /** @brief Set the observer to active/inactive. When inactive, update() is a no-op. */
+  void setActive(bool active) { active_ = active; }
+
+  /** @brief Is the bias calibrated? */
+  bool isBiasCalibrated() const { return bias_calibrated_; }
+
+  /** @brief Get the current bias value [N] (world frame). */
+  const Eigen::Vector3d& getBias() const { return bias_force_w_; }
+
+private:
+  ros::NodeHandle nh_;
+
+  // ---- Observer state ----
+  bool initialized_;        // true after first update() call
+  bool active_;             // external enable/disable
+
+  // Momentum observer internal state
+  Eigen::Vector3d init_linear_momentum_;     // p_lin(t=0)
+  Eigen::Vector3d integrate_term_force_;     // accumulated integral for force channel
+  Eigen::Vector3d est_ext_force_w_;          // estimated external force in world frame
+
+  // V2: angular momentum observer (placeholder, zeroed in V1)
+  Eigen::Vector3d init_angular_momentum_;    // p_ang(t=0)
+  Eigen::Vector3d integrate_term_torque_;    // accumulated integral for torque channel
+  Eigen::Vector3d est_ext_torque_body_;      // estimated external torque in body frame
+
+  // ---- Bias calibration ----
+  // After the observer converges during unloaded hover, record the steady-state
+  // estimate as a bias baseline. Output = raw_estimate - bias.
+  // This cancels the inherent offset from PID I-term model-error compensation,
+  // analogous to how the original per-module observer uses differential
+  // (individual - average) to cancel common-mode bias.
+  bool bias_calibrated_;                     // true once force bias calibration completes
+  bool bias_calibrating_;                    // true during force bias accumulation
+  int  bias_sample_count_;                   // samples accumulated for force bias
+  Eigen::Vector3d bias_accumulator_;         // sum of raw force estimates during calibration
+  Eigen::Vector3d bias_force_w_;             // calibrated force bias (subtracted from output)
+
+  bool bias_torque_calibrated_;              // true once torque bias calibration completes
+  bool bias_torque_calibrating_;             // true during torque bias accumulation
+  int  bias_torque_sample_count_;            // samples accumulated for torque bias
+  Eigen::Vector3d bias_torque_accumulator_;  // sum of raw torque estimates during calibration
+  Eigen::Vector3d bias_torque_body_;         // calibrated torque bias (subtracted from output)
+
+  double bias_settle_time_;                  // seconds to wait before starting calibration
+  int    bias_calib_samples_;                // number of samples to average for bias
+  int    update_count_;                      // total update() calls since initialization
+
+  // Last rotation matrix (cached for body↔world conversion)
+  Eigen::Matrix3d last_cog_rot_;
+
+  // ---- Observer gains ----
+  // Diagonal gain matrix K_obs: higher = faster response but more noise.
+  // Recommended starting point: 3–5 for force, 2–3 for torque.
+  double force_observer_gain_;
+  double torque_observer_gain_;  // V2: not used in V1
+
+  // ---- Enable flags ----
+  bool enable_force_observer_;   // V1: default true
+  bool enable_torque_observer_;  // V2: default false (placeholder)
+
+  // ---- ROS publishers (debug-only) ----
+  ros::Publisher est_ext_force_world_pub_;     // geometry_msgs/Vector3Stamped
+  ros::Publisher est_ext_force_body_pub_;      // geometry_msgs/Vector3Stamped
+  ros::Publisher est_ext_torque_body_pub_;     // geometry_msgs/Vector3Stamped (V2)
+  ros::Publisher est_ext_wrench_pub_;          // geometry_msgs/WrenchStamped (full 6D)
+  ros::Publisher observer_residual_pub_;       // geometry_msgs/Vector3Stamped (force residual)
+  ros::Publisher observer_residual_torque_pub_; // geometry_msgs/Vector3Stamped (torque residual, V2)
+  ros::Publisher realized_wrench_debug_pub_;   // geometry_msgs/WrenchStamped (input for verification)
+
+  // ---- Internal helpers ----
+  void publishDebug(const ros::Time& stamp,
+                    const Eigen::Vector3d& residual_force,
+                    const Eigen::Vector3d& residual_torque);
+
+  void loadParams();
+};
+
+} // namespace aerial_robot_control

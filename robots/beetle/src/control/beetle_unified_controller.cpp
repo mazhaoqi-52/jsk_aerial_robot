@@ -380,6 +380,44 @@ bool BeetleUnifiedController::isAllocationSaturated() const
   return false;
 }
 
+Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
+{
+  // Compute realized wrench from allocation: w_acc = A * f, then scale back to force/torque.
+  //
+  // integrated_map_ is in "acc-space":
+  //   top 3 rows: (1/M) * force_allocation
+  //   bottom 3 rows: I^{-1} * torque_allocation
+  //
+  // So: w_acc = integrated_map_ * target_vectoring_f_
+  //     F = M * w_acc.head(3)
+  //     T = I * w_acc.tail(3)
+
+  Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
+
+  if (integrated_map_.rows() != 6 || target_vectoring_f_.size() == 0) {
+    return realized;
+  }
+
+  if (integrated_map_.cols() != target_vectoring_f_.size()) {
+    ROS_WARN_THROTTLE(2.0, "[UnifiedCtrl] getRealizedWrenchBody: dimension mismatch: "
+                      "map=%ldx%ld, vf=%ld",
+                      integrated_map_.rows(), integrated_map_.cols(),
+                      target_vectoring_f_.size());
+    return realized;
+  }
+
+  // w_acc = A * f  (6D acceleration-space wrench)
+  Eigen::VectorXd w_acc = integrated_map_ * target_vectoring_f_;
+
+  // Convert from acc-space back to force/torque:
+  //   F_body = M * w_acc.head(3)
+  //   T_body = I * w_acc.tail(3)
+  realized.head(3) = formation_mass_ * w_acc.head(3);
+  realized.tail(3) = formation_inertia_ * w_acc.tail(3);
+
+  return realized;
+}
+
 void BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 {
   // Send the rotational part of the formation-level allocation pseudoinverse

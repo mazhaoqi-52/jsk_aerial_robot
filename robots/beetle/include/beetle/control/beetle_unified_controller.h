@@ -125,6 +125,25 @@ public:
   const Eigen::VectorXd& getTargetVectoringForce() const { return target_vectoring_f_; }
   const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
 
+  /**
+   * @brief Compute the realized 6D wrench in body (CoG) frame from the allocation result.
+   *
+   * This is the ACTUAL wrench being applied to the formation, computed as:
+   *   w_realized_acc = A * f   (integrated_map_ * target_vectoring_f_)
+   * then converted from acc-space to force/torque space:
+   *   F = M * w_realized_acc.head(3)
+   *   T = I * w_realized_acc.tail(3)
+   *
+   * This is the correct observer input for cascade mode because it:
+   *   - Includes all PID terms (P+D from spinal are embedded in the base_thrust)
+   *   - Is formation-level (uses formation allocation matrix)
+   *   - Is cascade-agnostic (no dependency on PC vs spinal PID split)
+   *
+   * @return 6D wrench [Fx,Fy,Fz,Tx,Ty,Tz] in body frame (N, N·m).
+   *         Returns zero vector if allocation has not been computed yet.
+   */
+  Eigen::VectorXd getRealizedWrenchBody() const;
+
   /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
   bool isAllocationSaturated() const;
 

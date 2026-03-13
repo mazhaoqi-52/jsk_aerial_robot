@@ -93,6 +93,7 @@ public:
   inline const ap::Matrix3f getOffsetRotation()  { return offset_rot_; }
 
   void setMotorNumber(uint16_t motor_number);
+  void resetMotorNumber() { motor_number_ = 0; }
   void setGimbalDof(uint8_t gimbal_dof){gimbal_dof_ = gimbal_dof; }
   void setRotorCoef(uint8_t rotor_coef){rotor_coef_ = rotor_coef; }
   uint16_t getGimbalDof(){return gimbal_dof_; }

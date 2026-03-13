@@ -74,6 +74,51 @@ void GimbalrotorNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstP
     setTargetPitch(msg->target_pitch);
 }
 
+void GimbalrotorNavigator::setFinalTargetBaselinkRotCallback(const spinal::DesireCoordConstPtr & msg)
+{
+  final_target_baselink_rot_.setValue(msg->roll, msg->pitch, msg->yaw);
+}
+
+void GimbalrotorNavigator::setFinalTargetBaselinkRPY(tf::Vector3 final_target_baselink_rpy)
+{
+  final_target_baselink_rot_.setRPY(final_target_baselink_rpy.x(), final_target_baselink_rpy.y(), final_target_baselink_rpy.z());
+}
+
+void GimbalrotorNavigator::forceSetTargetBaselinkRPY(tf::Vector3 target_baselink_rpy)
+{
+  final_target_baselink_rot_.setRPY(target_baselink_rpy.x(), target_baselink_rpy.y(), target_baselink_rpy.z());
+  curr_target_baselink_rot_.setRPY(target_baselink_rpy.x(), target_baselink_rpy.y(), target_baselink_rpy.z());
+
+  KDL::Rotation rot;
+  tf::quaternionTFToKDL(curr_target_baselink_rot_, rot);
+  robot_model_->setCogDesireOrientation(rot);
+
+  // send to spinal
+  spinal::DesireCoord msg;
+  double r, p, y;
+  tf::Matrix3x3(curr_target_baselink_rot_).getRPY(r, p, y);
+  msg.roll = r;
+  msg.pitch = p;
+  msg.yaw = y;
+  target_baselink_rpy_pub_.publish(msg);
+}
+
+tf::Vector3 GimbalrotorNavigator::getCurrTargetBaselinkRPY()
+{
+  double r, p, y;
+  tf::Matrix3x3(curr_target_baselink_rot_).getRPY(r, p, y);
+  tf::Vector3 curr_target_baselink_rpy(r, p, y);
+  return curr_target_baselink_rpy;
+}
+
+tf::Vector3 GimbalrotorNavigator::getFinalTargetBaselinkRPY()
+{
+  double r, p, y;
+  tf::Matrix3x3(final_target_baselink_rot_).getRPY(r, p, y);
+  tf::Vector3 final_target_baselink_rpy(r, p, y);
+  return final_target_baselink_rpy;
+}
+
 void GimbalrotorNavigator::baselinkRotationProcess()
 {
   if (curr_target_baselink_rot_ == final_target_baselink_rot_)

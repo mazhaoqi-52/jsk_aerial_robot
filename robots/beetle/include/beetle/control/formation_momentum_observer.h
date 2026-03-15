@@ -83,23 +83,23 @@ public:
 
   // ---- Accessors (debug / future compensation) ----
 
-  /** @brief Get estimated external force in world frame [N] (bias-subtracted). */
-  Eigen::Vector3d getEstExternalForceWorld() const { return est_ext_force_w_ - bias_force_w_; }
+  /** @brief Get estimated external force in world frame [N] (LPF-filtered, bias-subtracted). */
+  Eigen::Vector3d getEstExternalForceWorld() const { return est_ext_force_w_filt_ - bias_force_w_; }
 
-  /** @brief Get raw (pre-bias-subtraction) estimated external force in world frame [N]. */
+  /** @brief Get raw (pre-LPF, pre-bias) estimated external force in world frame [N]. */
   const Eigen::Vector3d& getRawEstExternalForceWorld() const { return est_ext_force_w_; }
 
-  /** @brief Get estimated external force in body frame [N] (bias-subtracted). */
-  Eigen::Vector3d getEstExternalForceBody() const { return last_cog_rot_.transpose() * (est_ext_force_w_ - bias_force_w_); }
+  /** @brief Get estimated external force in body frame [N] (LPF-filtered, bias-subtracted). */
+  Eigen::Vector3d getEstExternalForceBody() const { return last_cog_rot_.transpose() * (est_ext_force_w_filt_ - bias_force_w_); }
 
-  /** @brief Get estimated external torque in body frame [N·m] (bias-subtracted, V2). */
-  Eigen::Vector3d getEstExternalTorqueBody() const { return est_ext_torque_body_ - bias_torque_body_; }
+  /** @brief Get estimated external torque in body frame [N·m] (LPF-filtered, bias-subtracted, V2). */
+  Eigen::Vector3d getEstExternalTorqueBody() const { return est_ext_torque_body_filt_ - bias_torque_body_; }
 
-  /** @brief Get raw (pre-bias-subtraction) estimated external torque in body frame [N·m]. */
+  /** @brief Get raw (pre-LPF, pre-bias) estimated external torque in body frame [N·m]. */
   const Eigen::Vector3d& getRawEstExternalTorqueBody() const { return est_ext_torque_body_; }
 
-  /** @brief Get full 6D estimated external wrench (bias-subtracted).
-   *  [force_world(3); torque_body(3)] for V1, force only; torque=0. */
+  /** @brief Get full 6D estimated external wrench (bias-subtracted) in formation_body frame.
+   *  [force_body(3); torque_body(3)]. torque is zero when torque observer is disabled. */
   Eigen::VectorXd getEstExternalWrench6D() const;
 
   /** @brief Is the observer initialized (has received at least one update)? */
@@ -165,13 +165,23 @@ private:
   double force_observer_gain_;
   double torque_observer_gain_;  // V2: not used in V1
 
+  // ---- Output LPF on force estimate ----
+  // Applied AFTER computing raw estimate; internal feedback still uses raw value.
+  // lower freq = less noise but slower response to real external forces.
+  double est_force_lpf_cutoff_freq_;     // Hz
+  bool   est_force_lpf_initialized_;     // false until first update
+  Eigen::Vector3d est_ext_force_w_filt_; // LPF-smoothed estimate (published / returned by accessors)
+
+  // ---- Output LPF on torque estimate (mirrors force channel) ----
+  double est_torque_lpf_cutoff_freq_;         // Hz
+  bool   est_torque_lpf_initialized_;         // false until first update
+  Eigen::Vector3d est_ext_torque_body_filt_;  // LPF-smoothed torque estimate
+
   // ---- Enable flags ----
   bool enable_force_observer_;   // V1: default true
   bool enable_torque_observer_;  // V2: default false (placeholder)
 
   // ---- ROS publishers (debug-only) ----
-  ros::Publisher est_ext_force_world_pub_;     // geometry_msgs/Vector3Stamped
-  ros::Publisher est_ext_force_body_pub_;      // geometry_msgs/Vector3Stamped
   ros::Publisher est_ext_torque_body_pub_;     // geometry_msgs/Vector3Stamped (V2)
   ros::Publisher est_ext_wrench_pub_;          // geometry_msgs/WrenchStamped (full 6D)
   ros::Publisher observer_residual_pub_;       // geometry_msgs/Vector3Stamped (force residual)

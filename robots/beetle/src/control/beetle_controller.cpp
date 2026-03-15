@@ -34,7 +34,11 @@ namespace aerial_robot_control
     has_unified_pitch_i_ss_(false),
     pitch_i_seed_default_(-0.55),
     has_cached_independent_cmd_(false),
-    gains_switched_(false)
+    gains_switched_(false),
+    formation_obs_comp_enable_(false),
+    formation_obs_comp_z_gain_(1.0),
+    formation_obs_comp_xy_gain_(1.0),
+    formation_obs_comp_torque_gain_(1.0)
   {
   }
 
@@ -210,6 +214,13 @@ namespace aerial_robot_control
       formation_observer_->reset();
       ROS_INFO("[UnifiedCtrl] Formation observer deactivated (reset + inactive)");
     }
+    // UO-4: clear observer feedforward on mode exit to avoid stale values
+    pid_controllers_.at(X).setPersistentFF(0.0);
+    pid_controllers_.at(Y).setPersistentFF(0.0);
+    pid_controllers_.at(Z).setPersistentFF(0.0);
+    pid_controllers_.at(ROLL).setPersistentFF(0.0);
+    pid_controllers_.at(PITCH).setPersistentFF(0.0);
+    pid_controllers_.at(YAW).setPersistentFF(0.0);
   }
 
   void BeetleController::initUnifiedLeaderMode()
@@ -390,6 +401,26 @@ namespace aerial_robot_control
 
       // --- Position PID (X/Y/Z) with formation CoG ---
       double du = ros::Time::now().toSec() - control_timestamp_;
+
+      // UO-4: inject formation observer X/Y horizontal force as feedforward.
+      // f_ext_body → world frame via cog_rot → divide by M → negate (oppose disturbance).
+      // Only active when: comp enabled, bias calibrated, not force-landing.
+      if (formation_obs_comp_enable_ &&
+          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          !navigator_->getForceLandingFlag())
+      {
+        Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
+        tf::Vector3 f_world = cog_rot * tf::Vector3(f_body.x(), f_body.y(), f_body.z());
+        double mass = std::max(unified_controller_->getFormationMass(), 0.01);
+        pid_controllers_.at(X).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.x() / mass);
+        pid_controllers_.at(Y).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.y() / mass);
+      }
+      else
+      {
+        pid_controllers_.at(X).setPersistentFF(0.0);
+        pid_controllers_.at(Y).setPersistentFF(0.0);
+      }
+
       switch(navigator_->getXyControlMode()) {
         case aerial_robot_navigation::POS_CONTROL_MODE:
           pid_controllers_.at(X).update(target_formation_pos.x() - formation_pos.x(), du,
@@ -421,6 +452,28 @@ namespace aerial_robot_control
         err_v_z = 0;
         target_acc_.setZ(0);
       }
+
+      // UO-4: inject formation observer estimated external force as slow Z feedforward.
+      // Compensation: if observer detects downward load (f_body_z < 0), add upward FF.
+      // Only active when: comp enabled, bias calibrated, not force-landing.
+      // Sign: ff = -f_ext_body_z / M  (oppose the estimated load direction).
+      // NOTE: verify sign with E2 experiment before trusting for real compensation.
+      if (formation_obs_comp_enable_ &&
+          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          !navigator_->getForceLandingFlag())
+      {
+        double fz_body = formation_observer_->getEstExternalForceBody().z();
+        double ff_z = -formation_obs_comp_z_gain_ * fz_body /
+                      std::max(unified_controller_->getFormationMass(), 0.01);
+        pid_controllers_.at(Z).setPersistentFF(ff_z);
+        ROS_INFO_THROTTLE(2.0, "[UO4_FF] f_body_z=%.3f N → ff_z=%.4f m/s²",
+                          fz_body, ff_z);
+      }
+      else
+      {
+        pid_controllers_.at(Z).setPersistentFF(0.0);
+      }
+
       pid_controllers_.at(Z).update(err_z, du, err_v_z, target_acc_.z());
       // In unified mode, Z I-term is allowed to be negative (explicit gravity FF handles g,
       // so I-term only compensates model bias which can be positive or negative).
@@ -464,6 +517,27 @@ namespace aerial_robot_control
       // --- Attitude PID (Roll/Pitch/Yaw) ---
       double du_rp = du;
       if(!start_rp_integration_) du_rp = 0;
+
+      // UO-4: inject formation observer torque estimate as Roll/Pitch/Yaw feedforward.
+      // tau_ext (N·m, body) → alpha_ext (rad/s²) via I^{-1}; negate to oppose the disturbance.
+      if (formation_obs_comp_enable_ &&
+          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          !navigator_->getForceLandingFlag())
+      {
+        Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
+        Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
+        double tgain = formation_obs_comp_torque_gain_;
+        pid_controllers_.at(ROLL).setPersistentFF(-tgain * alpha_ext.x());
+        pid_controllers_.at(PITCH).setPersistentFF(-tgain * alpha_ext.y());
+        pid_controllers_.at(YAW).setPersistentFF(-tgain * alpha_ext.z());
+      }
+      else
+      {
+        pid_controllers_.at(ROLL).setPersistentFF(0.0);
+        pid_controllers_.at(PITCH).setPersistentFF(0.0);
+        pid_controllers_.at(YAW).setPersistentFF(0.0);
+      }
+
       pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp,
                                        target_omega_.x() - omega_.x(), target_ang_acc_.x());
       pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
@@ -623,13 +697,13 @@ namespace aerial_robot_control
           const Eigen::Vector3d& cog_offset = unified_controller_->getFormationCogOffset();
           Eigen::Vector3d offset_w = cog_rot_eigen * cog_offset;
 
-          // Leader velocity (world frame)
-          Eigen::Vector3d vel_leader_w;
-          tf::vectorTFToEigen(vel_, vel_leader_w);
-
-          // Angular velocity in body frame
-          Eigen::Vector3d omega_body;
-          tf::vectorTFToEigen(omega_, omega_body);
+          // Use IMU-filtered signals (same as single-module observer) to avoid
+          // formation inertia amplifying raw IMU noise (~50x without filtering).
+          auto imu_handler_obs = boost::dynamic_pointer_cast<sensor_plugin::Imu>(
+              estimator_->getImuHandler(0));
+          Eigen::Vector3d vel_leader_w, omega_body;
+          tf::vectorTFToEigen(imu_handler_obs->getFilteredVelCog(), vel_leader_w);
+          tf::vectorTFToEigen(imu_handler_obs->getFilteredOmegaCog(), omega_body);
 
           // Formation CoG velocity: v_f = v_leader + omega_w × r_offset_w
           Eigen::Vector3d omega_w = cog_rot_eigen * omega_body;
@@ -1510,10 +1584,21 @@ namespace aerial_robot_control
     getParam<double>(u_pitch_nh, "limit_p", unified_pitch_gains_.limit_p, 50.0);
     getParam<double>(u_pitch_nh, "limit_i", unified_pitch_gains_.limit_i, 10.0);
     getParam<double>(u_pitch_nh, "limit_d", unified_pitch_gains_.limit_d, 50.0);
+
+    // UO-4: formation observer feedforward compensation
+    ros::NodeHandle obs_comp_nh(control_nh, "formation_observer_comp");
+    getParam<bool>(obs_comp_nh,   "enable",   formation_obs_comp_enable_,  false);
+    getParam<double>(obs_comp_nh, "z_gain",   formation_obs_comp_z_gain_,  1.0);
+    getParam<double>(obs_comp_nh, "xy_gain",     formation_obs_comp_xy_gain_,    1.0);
+    getParam<double>(obs_comp_nh, "torque_gain", formation_obs_comp_torque_gain_, 1.0);
   }
 
   void BeetleController::externalWrenchEstimate()
   {
+    // In unified mode the formation-level observer (FormationMomentumObserver) handles
+    // estimation. Single-module observer has no formation-level semantics here.
+    if (unified_control_mode_) return;
+
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&

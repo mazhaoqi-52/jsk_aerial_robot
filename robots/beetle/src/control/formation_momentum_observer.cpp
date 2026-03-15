@@ -38,9 +38,15 @@ FormationMomentumObserver::FormationMomentumObserver()
     init_linear_momentum_(Eigen::Vector3d::Zero()),
     integrate_term_force_(Eigen::Vector3d::Zero()),
     est_ext_force_w_(Eigen::Vector3d::Zero()),
+    est_ext_force_w_filt_(Eigen::Vector3d::Zero()),
+    est_force_lpf_cutoff_freq_(2.0),
+    est_force_lpf_initialized_(false),
     init_angular_momentum_(Eigen::Vector3d::Zero()),
     integrate_term_torque_(Eigen::Vector3d::Zero()),
     est_ext_torque_body_(Eigen::Vector3d::Zero()),
+    est_ext_torque_body_filt_(Eigen::Vector3d::Zero()),
+    est_torque_lpf_cutoff_freq_(2.0),
+    est_torque_lpf_initialized_(false),
     last_cog_rot_(Eigen::Matrix3d::Identity()),
     force_observer_gain_(3.0),
     torque_observer_gain_(2.5),
@@ -71,8 +77,6 @@ void FormationMomentumObserver::initialize(ros::NodeHandle nh)
   // Formation observer is a system-level concept (not per-module), so we publish
   // to a global namespace without the /beetleX/ prefix.
   ros::NodeHandle obs_nh("/assemble/formation_observer");
-  est_ext_force_world_pub_   = obs_nh.advertise<geometry_msgs::Vector3Stamped>("est_ext_force_world", 1);
-  est_ext_force_body_pub_    = obs_nh.advertise<geometry_msgs::Vector3Stamped>("est_ext_force_body", 1);
   est_ext_torque_body_pub_   = obs_nh.advertise<geometry_msgs::Vector3Stamped>("est_ext_torque_body", 1);
   est_ext_wrench_pub_        = obs_nh.advertise<geometry_msgs::WrenchStamped>("est_ext_wrench", 1);
   observer_residual_pub_     = obs_nh.advertise<geometry_msgs::Vector3Stamped>("residual_force", 1);
@@ -94,6 +98,8 @@ void FormationMomentumObserver::loadParams()
   obs_nh.param<bool>("enable_torque_observer", enable_torque_observer_, false);
   obs_nh.param<double>("bias_settle_time", bias_settle_time_, 3.0);
   obs_nh.param<int>("bias_calib_samples", bias_calib_samples_, 40);
+  obs_nh.param<double>("est_force_lpf_cutoff_freq",  est_force_lpf_cutoff_freq_,  2.0);
+  obs_nh.param<double>("est_torque_lpf_cutoff_freq", est_torque_lpf_cutoff_freq_, 2.0);
 }
 
 void FormationMomentumObserver::reset()
@@ -102,10 +108,14 @@ void FormationMomentumObserver::reset()
   init_linear_momentum_ = Eigen::Vector3d::Zero();
   integrate_term_force_ = Eigen::Vector3d::Zero();
   est_ext_force_w_ = Eigen::Vector3d::Zero();
+  est_ext_force_w_filt_ = Eigen::Vector3d::Zero();
+  est_force_lpf_initialized_ = false;
 
   init_angular_momentum_ = Eigen::Vector3d::Zero();
   integrate_term_torque_ = Eigen::Vector3d::Zero();
   est_ext_torque_body_ = Eigen::Vector3d::Zero();
+  est_ext_torque_body_filt_ = Eigen::Vector3d::Zero();
+  est_torque_lpf_initialized_ = false;
 
   last_cog_rot_ = Eigen::Matrix3d::Identity();
 
@@ -179,10 +189,25 @@ void FormationMomentumObserver::update(
     //    integrate_term_f += (f_realized_w - N_f + f_ext_hat) * dt
     integrate_term_force_ += (realized_force_w - gravity_force_w + est_ext_force_w_) * dt;
 
-    // 6. Observer output (raw, before bias subtraction):
-    //    f_ext_hat = K_f * (p_lin - p_lin_0 - integrate_term_f)
+    // 6. Observer output (raw, internal feedback uses this directly):
     residual = p_lin - init_linear_momentum_ - integrate_term_force_;
     est_ext_force_w_ = force_observer_gain_ * residual;
+
+    // 6b. Output LPF: smooth the raw estimate for publishing/accessors.
+    //     Internal feedback (step 5) keeps using raw est_ext_force_w_ to
+    //     avoid changing observer dynamics.
+    if (!est_force_lpf_initialized_)
+    {
+      est_ext_force_w_filt_ = est_ext_force_w_;
+      est_force_lpf_initialized_ = true;
+    }
+    else
+    {
+      // First-order LPF: alpha = τ/(τ+dt),  τ = 1/(2π·fc)
+      double tau = 1.0 / (2.0 * M_PI * est_force_lpf_cutoff_freq_);
+      double alpha = tau / (tau + dt);
+      est_ext_force_w_filt_ = alpha * est_ext_force_w_filt_ + (1.0 - alpha) * est_ext_force_w_;
+    }
 
     // 7. Bias auto-calibration
     if (!bias_calibrated_)
@@ -202,7 +227,7 @@ void FormationMomentumObserver::update(
 
       if (bias_calibrating_)
       {
-        bias_accumulator_ += est_ext_force_w_;
+        bias_accumulator_ += est_ext_force_w_filt_;  // use LPF value: DC matches output
         bias_sample_count_++;
 
         if (bias_sample_count_ >= bias_calib_samples_)
@@ -216,13 +241,13 @@ void FormationMomentumObserver::update(
       }
     }
 
-    Eigen::Vector3d f_ext_corrected = est_ext_force_w_ - bias_force_w_;
-    ROS_INFO_THROTTLE(2.0, "[FormObs_F] raw=(%.3f,%.3f,%.3f) bias=(%.3f,%.3f,%.3f) "
-                      "corrected=(%.3f,%.3f,%.3f) |f|=%.3f calib=%s",
+    Eigen::Vector3d f_filt_corrected = est_ext_force_w_filt_ - bias_force_w_;
+    ROS_INFO_THROTTLE(2.0, "[FormObs_F] raw=(%.3f,%.3f,%.3f) filt=(%.3f,%.3f,%.3f) "
+                      "bias=(%.3f,%.3f,%.3f) |filt|=%.3f calib=%s",
                       est_ext_force_w_.x(), est_ext_force_w_.y(), est_ext_force_w_.z(),
+                      f_filt_corrected.x(), f_filt_corrected.y(), f_filt_corrected.z(),
                       bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z(),
-                      f_ext_corrected.x(), f_ext_corrected.y(), f_ext_corrected.z(),
-                      f_ext_corrected.norm(),
+                      f_filt_corrected.norm(),
                       bias_calibrated_ ? "YES" : (bias_calibrating_ ? "SAMPLING" : "SETTLING"));
   }
 
@@ -275,6 +300,19 @@ void FormationMomentumObserver::update(
     residual_torque = p_ang - init_angular_momentum_ - integrate_term_torque_;
     est_ext_torque_body_ = torque_observer_gain_ * residual_torque;
 
+    // 6b. Output LPF (mirrors force channel; internal feedback uses raw value).
+    if (!est_torque_lpf_initialized_)
+    {
+      est_ext_torque_body_filt_ = est_ext_torque_body_;
+      est_torque_lpf_initialized_ = true;
+    }
+    else
+    {
+      double tau_t = 1.0 / (2.0 * M_PI * est_torque_lpf_cutoff_freq_);
+      double alpha_t = tau_t / (tau_t + dt);
+      est_ext_torque_body_filt_ = alpha_t * est_ext_torque_body_filt_ + (1.0 - alpha_t) * est_ext_torque_body_;
+    }
+
     // 7. Torque bias auto-calibration (same settle/sample scheme as force)
     if (!bias_torque_calibrated_)
     {
@@ -292,7 +330,7 @@ void FormationMomentumObserver::update(
 
       if (bias_torque_calibrating_)
       {
-        bias_torque_accumulator_ += est_ext_torque_body_;
+        bias_torque_accumulator_ += est_ext_torque_body_filt_;  // use LPF value
         bias_torque_sample_count_++;
 
         if (bias_torque_sample_count_ >= bias_calib_samples_)
@@ -342,34 +380,12 @@ void FormationMomentumObserver::publishDebug(
     const Eigen::Vector3d& residual_force,
     const Eigen::Vector3d& residual_torque)
 {
-  // Bias-subtracted estimates for all published topics
-  Eigen::Vector3d f_ext_corrected = est_ext_force_w_ - bias_force_w_;
+  // Bias-subtracted, LPF-filtered estimates for all published topics
+  Eigen::Vector3d f_ext_corrected = est_ext_force_w_filt_ - bias_force_w_;
 
-  // Estimated external force — world frame (bias-subtracted)
-  {
-    geometry_msgs::Vector3Stamped msg;
-    msg.header.stamp = stamp;
-    msg.header.frame_id = "world";
-    msg.vector.x = f_ext_corrected.x();
-    msg.vector.y = f_ext_corrected.y();
-    msg.vector.z = f_ext_corrected.z();
-    est_ext_force_world_pub_.publish(msg);
-  }
-
-  // Estimated external force — body frame (bias-subtracted)
-  {
-    Eigen::Vector3d force_body = last_cog_rot_.transpose() * f_ext_corrected;
-    geometry_msgs::Vector3Stamped msg;
-    msg.header.stamp = stamp;
-    msg.header.frame_id = "formation_body";
-    msg.vector.x = force_body.x();
-    msg.vector.y = force_body.y();
-    msg.vector.z = force_body.z();
-    est_ext_force_body_pub_.publish(msg);
-  }
-
-  // Estimated external torque — body frame (bias-subtracted)
-  Eigen::Vector3d t_ext_corrected = est_ext_torque_body_ - bias_torque_body_;
+  // Estimated external torque — body frame (LPF-filtered, bias-subtracted)
+  Eigen::Vector3d t_ext_corrected = est_ext_torque_body_filt_ - bias_torque_body_;
+  if (enable_torque_observer_)
   {
     geometry_msgs::Vector3Stamped msg;
     msg.header.stamp = stamp;
@@ -380,17 +396,21 @@ void FormationMomentumObserver::publishDebug(
     est_ext_torque_body_pub_.publish(msg);
   }
 
-  // Full 6D wrench (force_world + torque_body) — bias-subtracted
+  // Full 6D wrench in formation_body frame (bias-subtracted).
+  // Both force and torque are in body frame for consistent interpretation.
   {
+    Eigen::Vector3d force_body = last_cog_rot_.transpose() * f_ext_corrected;
     geometry_msgs::WrenchStamped msg;
     msg.header.stamp = stamp;
-    msg.header.frame_id = "world";
-    msg.wrench.force.x = f_ext_corrected.x();
-    msg.wrench.force.y = f_ext_corrected.y();
-    msg.wrench.force.z = f_ext_corrected.z();
-    msg.wrench.torque.x = t_ext_corrected.x();
-    msg.wrench.torque.y = t_ext_corrected.y();
-    msg.wrench.torque.z = t_ext_corrected.z();
+    msg.header.frame_id = "formation_body";
+    msg.wrench.force.x = force_body.x();
+    msg.wrench.force.y = force_body.y();
+    msg.wrench.force.z = force_body.z();
+    if (enable_torque_observer_) {
+      msg.wrench.torque.x = t_ext_corrected.x();
+      msg.wrench.torque.y = t_ext_corrected.y();
+      msg.wrench.torque.z = t_ext_corrected.z();
+    }
     est_ext_wrench_pub_.publish(msg);
   }
 
@@ -405,7 +425,8 @@ void FormationMomentumObserver::publishDebug(
     observer_residual_pub_.publish(msg);
   }
 
-  // Observer residual — torque (raw, before gain multiplication)
+  // Observer residual — torque (only when torque observer is active)
+  if (enable_torque_observer_)
   {
     geometry_msgs::Vector3Stamped msg;
     msg.header.stamp = stamp;
@@ -420,8 +441,9 @@ void FormationMomentumObserver::publishDebug(
 Eigen::VectorXd FormationMomentumObserver::getEstExternalWrench6D() const
 {
   Eigen::VectorXd wrench = Eigen::VectorXd::Zero(6);
-  wrench.head(3) = est_ext_force_w_ - bias_force_w_;  // bias-subtracted
-  wrench.tail(3) = est_ext_torque_body_ - bias_torque_body_;
+  // Force: rotate world-frame estimate to body frame
+  wrench.head(3) = last_cog_rot_.transpose() * (est_ext_force_w_ - bias_force_w_);
+  wrench.tail(3) = est_ext_torque_body_filt_ - bias_torque_body_;
   return wrench;
 }
 

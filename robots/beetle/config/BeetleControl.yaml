@@ -23,8 +23,20 @@ controller:
     torque_observer_gain: 2.5
     enable_force_observer: true
     enable_torque_observer: true
+    est_force_lpf_cutoff_freq: 1.0   # Hz: output LPF on force estimate
+    est_torque_lpf_cutoff_freq: 2.0  # Hz: output LPF on torque estimate
+
+  # ========== UO-4: Formation observer feedforward compensation ==========
+  # Enable ONLY after E2 validation (known-mass test confirms correct Z estimation).
+  # Sign: if observer detects downward load (f_body_z < 0), FF adds upward thrust.
+  # z_gain: scale factor [0,1]; start with 0.3–0.5 to be conservative.
+  formation_observer_comp:
+    enable: false
+    z_gain: 0.5      # Z feedforward gain [0,1]; validated with E2
+    xy_gain: 0.3      # X/Y feedforward gain [0,1]; start conservative (horizontal less reliable)
+    torque_gain: 0.5  # Roll/Pitch/Yaw torque feedforward gain [0,1]; start conservative
     bias_settle_time: 3.0
-    bias_calib_samples: 40
+    bias_calib_samples: 200  # ~4s @ 50Hz: larger window reduces bias estimation error
 
   # ========== Cascade control for unified mode ==========
   # Torque-level gains sent to spinal via RollPitchYawTerms.

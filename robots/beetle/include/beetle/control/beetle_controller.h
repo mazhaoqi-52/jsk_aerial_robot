@@ -51,6 +51,14 @@ namespace aerial_robot_control
     // V1: 3D force estimation, debug-only (no control feedback).
     std::shared_ptr<FormationMomentumObserver> formation_observer_;
 
+    // UO-4: formation observer feedforward compensation (Phase UO-4)
+    // Injects LPF-filtered, bias-subtracted external force estimate as slow FF
+    // into the position PID. Enable only after bias is calibrated and E2 validation passes.
+    bool   formation_obs_comp_enable_;   // master switch (default false)
+    double formation_obs_comp_z_gain_;   // scaling factor for Z compensation [0,1]
+    double formation_obs_comp_xy_gain_;      // scaling factor for X/Y compensation [0,1]
+    double formation_obs_comp_torque_gain_;   // scaling factor for Roll/Pitch/Yaw torque compensation [0,1]
+
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;
     bool setUnifiedModeCb(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res);

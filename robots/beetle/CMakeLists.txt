@@ -17,6 +17,7 @@ find_package(catkin REQUIRED COMPONENTS
   )
 
 find_package(Eigen3 REQUIRED)
+find_package(OsqpEigen REQUIRED)
 
 add_message_files(FILES
   TaggedWrench.msg
@@ -39,6 +40,7 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
+  ${OsqpEigen_INCLUDE_DIRS}
   )
 
 add_library(beetle_sensor_pluginlib  src/sensor/imu.cpp)
@@ -46,7 +48,7 @@ target_link_libraries(beetle_sensor_pluginlib ${catkin_LIBRARIES})
 add_dependencies(beetle_sensor_pluginlib aerial_robot_msgs_generate_messages_cpp spinal_generate_messages_cpp beetle_generate_messages_cpp)
 
 add_library(beetle_controller src/control/beetle_controller.cpp src/control/beetle_unified_controller.cpp src/control/formation_momentum_observer.cpp)
-target_link_libraries(beetle_controller beetle_sensor_pluginlib ${catkin_LIBRARIES})
+target_link_libraries(beetle_controller beetle_sensor_pluginlib ${catkin_LIBRARIES} ${OsqpEigen_LIBRARIES})
 
 add_library(beetle_robot_model src/model/beetle_robot_model.cpp)
 target_link_libraries(beetle_robot_model ${catkin_LIBRARIES})

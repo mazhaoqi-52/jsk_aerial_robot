@@ -10,6 +10,7 @@ namespace aerial_robot_control
     pre_module_state_(SEPARATED),
     des_wrench_pub_flag_(false),
     desired_external_wrench_(Eigen::VectorXd::Zero(6)),
+    formation_desired_wrench_(Eigen::VectorXd::Zero(6)),
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
     unified_cmd_received_(false),
@@ -88,6 +89,7 @@ namespace aerial_robot_control
     wrench_comp_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("debug/wrench_comp/pid", 1);
     des_inter_wrench_pub_ = nh_.advertise<beetle::TaggedWrenches>("des_inter_wnrech", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
+    formation_desired_wrench_sub_ = nh_.subscribe("formation_desired_wrench", 1, &BeetleController::formationDesiredWrenchCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
@@ -221,6 +223,7 @@ namespace aerial_robot_control
     pid_controllers_.at(ROLL).setPersistentFF(0.0);
     pid_controllers_.at(PITCH).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
+    formation_desired_wrench_.setZero();
   }
 
   void BeetleController::initUnifiedLeaderMode()
@@ -333,6 +336,7 @@ namespace aerial_robot_control
     ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, sent cascade gains + alloc_inv to all spinals, "
              "applied unified PID gains, waiting for %d FOLLOWERs, t=%.4f",
              unified_controller_->pendingFollowerCount(), ros::Time::now().toSec());
+    formation_desired_wrench_.setZero();
   }
 
   void BeetleController::controlCore()
@@ -654,7 +658,7 @@ namespace aerial_robot_control
       target_wrench_acc(5) *= yaw_alloc_weight_;
 
       // --- Run unified 6-DOF allocation ---
-      bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, desired_external_wrench_);
+      bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_);
 
       if (ok) {
         // Publish commands to all FOLLOWERs
@@ -1832,6 +1836,19 @@ namespace aerial_robot_control
     res.message = req.data ? "unified mode enabled" : "unified mode disabled";
     ROS_INFO("[BeetleController] set_unified_mode service: %s", res.message.c_str());
     return true;
+  }
+
+  void BeetleController::formationDesiredWrenchCallback(const geometry_msgs::WrenchStamped& msg)
+  {
+    // Receive desired formation-level wrench (formation body frame, full 6D).
+    // Only used in unified LEADER mode via computeUnifiedAllocation().
+    // Independent-mode per-module distribution uses desiredExternalWrenchCallback() instead.
+    formation_desired_wrench_(0) = msg.wrench.force.x;
+    formation_desired_wrench_(1) = msg.wrench.force.y;
+    formation_desired_wrench_(2) = msg.wrench.force.z;
+    formation_desired_wrench_(3) = msg.wrench.torque.x;
+    formation_desired_wrench_(4) = msg.wrench.torque.y;
+    formation_desired_wrench_(5) = msg.wrench.torque.z;
   }
 
 } //namespace aerial_robot_controller

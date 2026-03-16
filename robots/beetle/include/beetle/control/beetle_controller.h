@@ -205,6 +205,12 @@ namespace aerial_robot_control
     // Desired external wrench for the whole assembly (body frame)
     Eigen::VectorXd desired_external_wrench_;
 
+    // Formation-level desired wrench for unified mode (full 6D, formation body frame).
+    // Unlike desired_external_wrench_ which holds a 1/N per-module share (independent mode),
+    // this holds the FULL wrench and is passed directly to computeUnifiedAllocation().
+    Eigen::VectorXd formation_desired_wrench_;
+    ros::Subscriber formation_desired_wrench_sub_;
+
     double comp_term_update_freq_;
     double prev_comp_update_time_;
     double wrench_comp_p_gain_;
@@ -230,6 +236,7 @@ namespace aerial_robot_control
     
     virtual void ffInterWrenchCallback(const beetle::TaggedWrench & msg);
     void desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg);
+    void formationDesiredWrenchCallback(const geometry_msgs::WrenchStamped& msg);
     void rosParamInit() override;
     void externalWrenchEstimate() override;
     void reset() override;

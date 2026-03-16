@@ -59,6 +59,12 @@ controller:
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
   tgt_angle_lpf_alpha: 0.3  # LPF for target roll/pitch/yaw sent to spinal (0=no filter, 1=frozen; ~8Hz cutoff @40Hz)
 
+  # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
+  use_constrained_alloc: true
+  alloc_lambda: 1.0e-4          # regularization weight
+  alloc_t_max: 20.0             # per-rotor thrust upper bound [N]
+  alloc_gimbal_limit_deg: 90.0  # gimbal angle hard limit [deg]
+
   external_force_upper_limit: 0.0
   external_force_lower_limit: 0.0
   external_torque_lower_limit: 0.0

@@ -4,6 +4,7 @@
 // PC retains I-term only for roll/pitch.
 
 #include <beetle/control/beetle_unified_controller.h>
+#include <OsqpEigen/OsqpEigen.h>
 #include <tf_conversions/tf_kdl.h>
 #include <tf_conversions/tf_eigen.h>
 #include <tf2_ros/buffer.h>
@@ -35,9 +36,17 @@ BeetleUnifiedController::BeetleUnifiedController()
     cached_cascade_pitch_p_(0),
     cached_cascade_pitch_d_(0),
     cached_cascade_yaw_d_(0),
-    follower_ready_wait_count_(0)
+    follower_ready_wait_count_(0),
+    use_constrained_alloc_(false),
+    alloc_lambda_(1e-4),
+    alloc_t_max_(20.0),
+    alloc_gimbal_limit_rad_(M_PI / 2.0),
+    qp_n_vars_(-1),
+    qp_solver_(std::make_unique<OsqpEigen::Solver>())
 {
 }
+
+BeetleUnifiedController::~BeetleUnifiedController() = default;
 
 void BeetleUnifiedController::initialize(
     ros::NodeHandle nh,
@@ -84,6 +93,12 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<int>("gimbal_dof", gimbal_dof_, 1);
   control_nh.param<bool>("gimbal_calc_in_fc", gimbal_calc_in_fc_, false);
   control_nh.param<double>("tgt_angle_lpf_alpha", tgt_angle_lpf_alpha_, 0.3);
+  control_nh.param<bool>("use_constrained_alloc", use_constrained_alloc_, false);
+  control_nh.param<double>("alloc_lambda", alloc_lambda_, 1e-4);
+  control_nh.param<double>("alloc_t_max", alloc_t_max_, 20.0);
+  double gimbal_limit_deg;
+  control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
+  alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
 }
 
 bool BeetleUnifiedController::updateFormationGeometry()
@@ -153,7 +168,11 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Allocate: vectoring_f = pseudoinverse * 6D_wrench_acc
   // In cascade mode, the wrench_acc torque channels contain ONLY I-term
   // (P+D done by spinal). So base_thrust = allocation of (position PID + I-term only).
-  target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
+  bool qp_ok = use_constrained_alloc_ &&
+               solveConstrainedThrusts(integrated_map_, total_wrench_acc, target_vectoring_f_);
+  if (!qp_ok) {
+    target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
+  }
 
   // Compute target angles for spinal inner loop
   // (underactuated: derive from position PID target acceleration)
@@ -265,6 +284,142 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       }
     }
   }
+
+  return true;
+}
+
+bool BeetleUnifiedController::solveConstrainedThrusts(
+    const Eigen::MatrixXd& alloc_matrix,
+    const Eigen::VectorXd& w_total,
+    Eigen::VectorXd& vectoring_f_out)
+{
+  // alloc_matrix: 6 x (rotor_coef_ * n_rotors)
+  // w_total: 6D desired wrench-acc
+  // vectoring_f_out: (rotor_coef_ * n_rotors) output
+
+  int cols = alloc_matrix.cols();
+  if (cols == 0 || rotor_coef_ == 0 || cols % rotor_coef_ != 0) {
+    ROS_WARN_THROTTLE(2.0, "[UnifiedCtrl QP] Invalid alloc_matrix cols=%d, rotor_coef=%d", cols, rotor_coef_);
+    return false;
+  }
+
+  int n_rotors = cols / rotor_coef_;
+
+  // Step 1: get unconstrained directions via pseudoinverse (for vectoring angle reference)
+  Eigen::VectorXd f_ps = aerial_robot_model::pseudoinverse(alloc_matrix) * w_total;
+
+  // Step 2: build reduced B matrix (6 x n_rotors)
+  // Each column i of B = A[:, rotor_coef_*i : rotor_coef_*(i+1)] * unit_direction_i
+  Eigen::MatrixXd B(6, n_rotors);
+  Eigen::MatrixXd D(rotor_coef_, n_rotors); // unit directions per rotor
+  for (int i = 0; i < n_rotors; i++) {
+    Eigen::VectorXd fi = f_ps.segment(rotor_coef_ * i, rotor_coef_);
+    double norm_fi = fi.norm();
+    Eigen::VectorXd di;
+    if (norm_fi > 1e-9) {
+      di = fi / norm_fi;
+      // For 1-DOF gimbal: enforce angle limit  |atan2(-fx, fz)| <= alloc_gimbal_limit_rad_
+      // Convention: f = [f_x, f_z], angle = atan2(-f_x, f_z)
+      if (rotor_coef_ == 2) {
+        double angle = std::atan2(-di(0), di(1));
+        double clamped = std::max(-alloc_gimbal_limit_rad_,
+                                  std::min( alloc_gimbal_limit_rad_, angle));
+        di(0) = -std::sin(clamped);  // f_x = -sin(theta)
+        di(1) =  std::cos(clamped);  // f_z =  cos(theta) >= 0 when |theta| <= pi/2
+      }
+    } else {
+      di = Eigen::VectorXd::Zero(rotor_coef_);
+      di(rotor_coef_ - 1) = 1.0; // default: point in last axis (z), angle=0
+    }
+    D.col(i) = di;
+    B.col(i) = alloc_matrix.block(0, rotor_coef_ * i, 6, rotor_coef_) * di;
+  }
+
+  // Step 3: build QP matrices
+  // Objective: min_{t} 0.5 * t' * P * t + q' * t
+  //   P = B'B + lambda*I,  q = -B'*w_total
+  Eigen::MatrixXd P_dense = B.transpose() * B + alloc_lambda_ * Eigen::MatrixXd::Identity(n_rotors, n_rotors);
+  Eigen::VectorXd q_vec = -B.transpose() * w_total;
+
+  // Step 4: init or reinit solver if topology changed
+  bool need_init = (qp_n_vars_ != n_rotors);
+  if (need_init) {
+    qp_solver_->clearSolver();
+    qp_solver_->settings()->setVerbosity(false);
+    qp_solver_->settings()->setWarmStart(true);
+    qp_solver_->settings()->setMaxIteraction(200);
+    qp_solver_->settings()->setAbsoluteTolerance(1e-5);
+    qp_solver_->settings()->setRelativeTolerance(1e-4);
+    qp_solver_->data()->setNumberOfVariables(n_rotors);
+    qp_solver_->data()->setNumberOfConstraints(n_rotors);
+
+    // Hessian (upper triangle only, as sparse)
+    Eigen::SparseMatrix<double> P_sparse(n_rotors, n_rotors);
+    std::vector<Eigen::Triplet<double>> P_trips;
+    for (int r = 0; r < n_rotors; r++) {
+      for (int c = r; c < n_rotors; c++) {
+        if (std::abs(P_dense(r, c)) > 1e-12)
+          P_trips.emplace_back(r, c, P_dense(r, c));
+      }
+    }
+    P_sparse.setFromTriplets(P_trips.begin(), P_trips.end());
+    if (!qp_solver_->data()->setHessianMatrix(P_sparse)) return false;
+    if (!qp_solver_->data()->setGradient(q_vec)) return false;
+
+    // Linear constraints: I*t (bounds only)
+    Eigen::SparseMatrix<double> A_sparse(n_rotors, n_rotors);
+    A_sparse.setIdentity();
+    if (!qp_solver_->data()->setLinearConstraintsMatrix(A_sparse)) return false;
+
+    Eigen::VectorXd lb = Eigen::VectorXd::Zero(n_rotors);
+    Eigen::VectorXd ub = Eigen::VectorXd::Constant(n_rotors, alloc_t_max_);
+    if (!qp_solver_->data()->setLowerBound(lb)) return false;
+    if (!qp_solver_->data()->setUpperBound(ub)) return false;
+
+    if (!qp_solver_->initSolver()) {
+      ROS_WARN("[UnifiedCtrl QP] initSolver failed");
+      return false;
+    }
+    qp_n_vars_ = n_rotors;
+  } else {
+    // Update P and q only
+    Eigen::SparseMatrix<double> P_sparse(n_rotors, n_rotors);
+    std::vector<Eigen::Triplet<double>> P_trips;
+    for (int r = 0; r < n_rotors; r++) {
+      for (int c = r; c < n_rotors; c++) {
+        if (std::abs(P_dense(r, c)) > 1e-12)
+          P_trips.emplace_back(r, c, P_dense(r, c));
+      }
+    }
+    P_sparse.setFromTriplets(P_trips.begin(), P_trips.end());
+    if (!qp_solver_->updateHessianMatrix(P_sparse)) return false;
+    if (!qp_solver_->updateGradient(q_vec)) return false;
+  }
+
+  // Step 5: solve
+  if (!qp_solver_->solve()) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] solve() failed");
+    return false;
+  }
+  Eigen::VectorXd t_sol = qp_solver_->getSolution();
+  if (t_sol.size() != n_rotors) return false;
+
+  // Step 6: reconstruct full vectoring force vector
+  vectoring_f_out.resize(cols);
+  for (int i = 0; i < n_rotors; i++) {
+    vectoring_f_out.segment(rotor_coef_ * i, rotor_coef_) = t_sol(i) * D.col(i);
+  }
+
+  // Debug: log residual
+  Eigen::VectorXd residual = alloc_matrix * vectoring_f_out - w_total;
+  ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl QP] residual norm=%.4f, t=[%s]",
+                     residual.norm(),
+                     [&]() {
+                       std::string s;
+                       for (int i = 0; i < n_rotors; i++)
+                         s += std::to_string(t_sol(i)) + " ";
+                       return s;
+                     }().c_str());
 
   return true;
 }

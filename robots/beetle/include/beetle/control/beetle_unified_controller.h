@@ -20,7 +20,12 @@
 
 #include <ros/ros.h>
 #include <Eigen/Dense>
+#include <memory>
 #include <set>
+
+// Forward-declare OsqpEigen::Solver so downstream packages that include this
+// header (e.g. ninja) do not need to link against OsqpEigen.
+namespace OsqpEigen { class Solver; }
 #include <spinal/FourAxisCommand.h>
 #include <spinal/TorqueAllocationMatrixInv.h>
 #include <spinal/RollPitchYawTerms.h>
@@ -42,7 +47,7 @@ class BeetleUnifiedController
 {
 public:
   BeetleUnifiedController();
-  ~BeetleUnifiedController() = default;
+  ~BeetleUnifiedController();  // defined in .cpp where OsqpEigen::Solver is complete
 
   void initialize(ros::NodeHandle nh,
                   boost::shared_ptr<BeetleRobotModel> robot_model,
@@ -246,6 +251,32 @@ private:
 
   void extractThrustAndGimbal(const Eigen::VectorXd& vectoring_f,
                               const std::vector<int>& assembled_ids);
+
+  // QP-based constrained allocation (F2)
+  bool use_constrained_alloc_;        // if true, use OsqpEigen QP; fallback to pseudoinverse
+  double alloc_lambda_;               // regularization weight
+  double alloc_t_max_;                // per-rotor thrust upper bound [N]
+  double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad], default π/2 (±90°)
+  int qp_n_vars_;                     // number of QP variables (= total rotors), -1 = uninit
+  std::unique_ptr<OsqpEigen::Solver> qp_solver_;  // persistent solver (re-initialized when topology changes)
+
+  /**
+   * @brief Solve for per-rotor scalar thrusts using constrained QP.
+   *
+   * Formulation:
+   *   min_{t} ||B*t - w_total||^2 + lambda*||t||^2
+   *   s.t.  0 <= t_i <= T_max  for all i
+   * where B is the reduced (6 x n_rotors) matrix derived from alloc_matrix
+   * using per-rotor vectoring directions from an initial pseudoinverse pass.
+   *
+   * @param alloc_matrix  Full allocation matrix A (6 x rotor_coef*n_rotors)
+   * @param w_total       Desired 6D wrench-acceleration vector
+   * @param vectoring_f_out  Output: full (rotor_coef*n_rotors) vectoring force vector
+   * @return true on success, false on failure (caller should fall back to pseudoinverse)
+   */
+  bool solveConstrainedThrusts(const Eigen::MatrixXd& alloc_matrix,
+                               const Eigen::VectorXd& w_total,
+                               Eigen::VectorXd& vectoring_f_out);
 
   void rosParamInit();
 };

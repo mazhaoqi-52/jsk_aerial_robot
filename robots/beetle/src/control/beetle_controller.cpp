@@ -658,6 +658,8 @@ namespace aerial_robot_control
       target_wrench_acc(5) *= yaw_alloc_weight_;
 
       // --- Run unified 6-DOF allocation ---
+      // formation_desired_wrench_ is set via the formation_desired_wrench topic (feedforward).
+      // It carries the full 6D contact wrench for manipulation tasks (pulling, valve rotation).
       bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_);
 
       if (ok) {
@@ -1595,6 +1597,7 @@ namespace aerial_robot_control
     getParam<double>(obs_comp_nh, "z_gain",   formation_obs_comp_z_gain_,  1.0);
     getParam<double>(obs_comp_nh, "xy_gain",     formation_obs_comp_xy_gain_,    1.0);
     getParam<double>(obs_comp_nh, "torque_gain", formation_obs_comp_torque_gain_, 1.0);
+
   }
 
   void BeetleController::externalWrenchEstimate()

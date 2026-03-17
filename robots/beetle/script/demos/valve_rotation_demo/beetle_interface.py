@@ -93,6 +93,8 @@ class BeetleInterface(object):
         self.halt_pub = rospy.Publisher('teleop_command/halt', Empty, queue_size=1)
         self.tagged_wrench_pub = rospy.Publisher(f'/beetle{module_id}/tagged_wrench', TaggedWrench, queue_size=1)
         self.desired_ext_wrench_pub = rospy.Publisher(f'/beetle{module_id}/desired_external_wrench', WrenchStamped, queue_size=1)
+        if assembly_mode:
+            self.formation_wrench_pub = rospy.Publisher(f'/beetle{module_id}/formation_desired_wrench', WrenchStamped, queue_size=1)
         
         # Setup subscribers
         if assembly_mode:
@@ -325,13 +327,25 @@ class BeetleInterface(object):
         self.target_pos = pos
     
     def addExternalWrench(self, force, torque, frame_id="world"):
-        """Apply desired external wrench for the whole assembly (body frame).
+        """Apply desired external wrench.
         
-        Uses desired_external_wrench topic -> C++ auto-distributes to per-module
-        ff_inter_wrench_list_ for wrench_comp feedforward.
+        In assembly_mode: publishes to formation_desired_wrench (unified allocation).
+          If frame_id="world", rotates force/torque to formation body frame first.
+        Otherwise: publishes to desired_external_wrench (independent wrench_comp).
         """
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
+        
+        # Unified mode needs formation body frame; rotate world→body if needed
+        if self.assembly_mode and hasattr(self, 'formation_wrench_pub') and frame_id == "world":
+            rpy = self.getAssemblyRPY()
+            yaw = rpy[2] if rpy else 0.0
+            c, s = math.cos(yaw), math.sin(yaw)
+            fx, fy = force_list[0], force_list[1]
+            force_list = [ c*fx + s*fy, -s*fx + c*fy, force_list[2]]
+            tx, ty = torque_list[0], torque_list[1]
+            torque_list = [c*tx + s*ty, -s*tx + c*ty, torque_list[2]]
+            frame_id = "fc"
         
         ff_msg = WrenchStamped()
         ff_msg.header.stamp = rospy.Time.now()
@@ -346,7 +360,10 @@ class BeetleInterface(object):
         self.external_wrench_active = True
         self.current_ff_force = force_list
         self.current_ff_torque = torque_list
-        self.desired_ext_wrench_pub.publish(ff_msg)
+        if self.assembly_mode and hasattr(self, 'formation_wrench_pub'):
+            self.formation_wrench_pub.publish(ff_msg)
+        else:
+            self.desired_ext_wrench_pub.publish(ff_msg)
     
     def clearExternalWrench(self):
         """Clear external wrench application."""
@@ -354,23 +371,11 @@ class BeetleInterface(object):
             zero_msg = WrenchStamped()
             zero_msg.header.stamp = rospy.Time.now()
             zero_msg.header.frame_id = "world"
-            self.desired_ext_wrench_pub.publish(zero_msg)
+            if self.assembly_mode and hasattr(self, 'formation_wrench_pub'):
+                self.formation_wrench_pub.publish(zero_msg)
+            else:
+                self.desired_ext_wrench_pub.publish(zero_msg)
             self.external_wrench_active = False
-    
-    def updateExternalWrench(self, force, torque):
-        """Update currently active external wrench."""
-        if self.external_wrench_active:
-            self.addExternalWrench(force, torque)
-    
-    def getExternalWrenchStatus(self):
-        """Get current external wrench status."""
-        if self.external_wrench_active:
-            return {
-                'active': True,
-                'force': list(getattr(self, 'current_ff_force', [0, 0, 0])),
-                'torque': list(getattr(self, 'current_ff_torque', [0, 0, 0]))
-            }
-        return {'active': False, 'force': [0, 0, 0], 'torque': [0, 0, 0]}
     
     def executeTrajectoryWithWrench(self, pos, rot, linear_vel, angular_vel, force, torque):
         """Combined SE(3) control with external wrench feedforward."""

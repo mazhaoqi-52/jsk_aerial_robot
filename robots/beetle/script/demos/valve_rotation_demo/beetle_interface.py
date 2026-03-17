@@ -326,23 +326,29 @@ class BeetleInterface(object):
         self.nav_pub.publish(nav_msg)
         self.target_pos = pos
     
+    def isUnifiedMode(self):
+        """Query C++ runtime: is unified_control_mode currently active on the leader?"""
+        return rospy.get_param(f'/beetle{self.module_id}/controller/unified_control_mode', False)
+
     def addExternalWrench(self, force, torque, frame_id="world"):
         """Apply desired external wrench.
         
-        In assembly_mode: publishes to formation_desired_wrench (unified allocation).
-          If frame_id="world", rotates force/torque to formation body frame first.
-        Otherwise: publishes to desired_external_wrench (independent wrench_comp).
+        In assembly_mode, always rotates world-frame input to formation body frame (fc).
+        Then routes to:
+          - formation_desired_wrench  when isUnifiedMode() is True  (unified allocation)
+          - desired_external_wrench   when isUnifiedMode() is False (lead-follower wrench_comp)
+        Outside assembly_mode: publishes to desired_external_wrench as-is.
         """
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
         
-        # Unified mode needs formation body frame; rotate world→body if needed
-        if self.assembly_mode and hasattr(self, 'formation_wrench_pub') and frame_id == "world":
+        # Both unified and lead-follower paths need body-frame data; rotate world→body
+        if self.assembly_mode and frame_id == "world":
             rpy = self.getAssemblyRPY()
             yaw = rpy[2] if rpy else 0.0
             c, s = math.cos(yaw), math.sin(yaw)
             fx, fy = force_list[0], force_list[1]
-            force_list = [ c*fx + s*fy, -s*fx + c*fy, force_list[2]]
+            force_list = [c*fx + s*fy, -s*fx + c*fy, force_list[2]]
             tx, ty = torque_list[0], torque_list[1]
             torque_list = [c*tx + s*ty, -s*tx + c*ty, torque_list[2]]
             frame_id = "fc"
@@ -360,7 +366,7 @@ class BeetleInterface(object):
         self.external_wrench_active = True
         self.current_ff_force = force_list
         self.current_ff_torque = torque_list
-        if self.assembly_mode and hasattr(self, 'formation_wrench_pub'):
+        if self.assembly_mode and hasattr(self, 'formation_wrench_pub') and self.isUnifiedMode():
             self.formation_wrench_pub.publish(ff_msg)
         else:
             self.desired_ext_wrench_pub.publish(ff_msg)
@@ -370,8 +376,8 @@ class BeetleInterface(object):
         if self.external_wrench_active:
             zero_msg = WrenchStamped()
             zero_msg.header.stamp = rospy.Time.now()
-            zero_msg.header.frame_id = "world"
-            if self.assembly_mode and hasattr(self, 'formation_wrench_pub'):
+            zero_msg.header.frame_id = "fc"
+            if self.assembly_mode and hasattr(self, 'formation_wrench_pub') and self.isUnifiedMode():
                 self.formation_wrench_pub.publish(zero_msg)
             else:
                 self.desired_ext_wrench_pub.publish(zero_msg)

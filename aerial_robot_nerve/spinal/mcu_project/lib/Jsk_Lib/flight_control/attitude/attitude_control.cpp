@@ -1214,6 +1214,7 @@ void AttitudeController::pwmConversion()
     {
     case 2:
       {
+        if(motor_number_ == 0) break; // not yet initialized; skip to avoid empty message
         sensor_msgs::JointState gimbal_control_msg;
         gimbal_control_msg.header.stamp = ros::Time::now();
         for(int i = 0; i < motor_number_ / (rotor_coef_); i++){
@@ -1225,6 +1226,7 @@ void AttitudeController::pwmConversion()
       }
     case 1:
       {
+        if(motor_number_ == 0) break; // not yet initialized; skip to avoid empty message
         sensor_msgs::JointState gimbal_control_msg;
         gimbal_control_msg.header.stamp = ros::Time::now();
         for(int i = 0; i < motor_number_ / (rotor_coef_); i++){

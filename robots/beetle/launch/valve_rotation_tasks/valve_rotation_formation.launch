@@ -1,68 +1,51 @@
 <?xml version="1.0"?>
 <launch>
-  <!-- Environment settings -->
-  <arg name="real_machine" default="false"/>
-  <arg name="simulation" default="true"/>
+  ###########  launch config  ###########
+  <arg name="real_machine" default="False"/>
+  <arg name="simulation"   default="True"/>
 
-  <!-- Formation parameters -->
-  <arg name="module_ids" default="1,2" />
-  <arg name="rotation_angle" default="1.571" /> <!-- 90 degrees in radians -->
-  <arg name="approach_height" default="0.48" /> <!-- Adjusted for end-effector offset compensation -->
-  
-  <!-- Valve parameters -->
-  <arg name="valve_ns" default="valve"/>
-  <arg name="valve_id" default="85"/>
-  <arg name="valve_x" default="3"/>
-  <arg name="valve_y" default="0"/>
-  <arg name="valve_z" default="0"/>
+  ###########  Formation modules  ###########
+  <arg name="module_ids" default="1,2"
+       doc="Comma-separated beetle module IDs, e.g. 2,3 or 2,3,1"/>
+
+  ###########  Valve  ###########
+  <arg name="valve_ns"  default="valve"/>
+  <arg name="valve_id"  default="85"/>
+  <arg name="valve_x"   default="3"/>
+  <arg name="valve_y"   default="0"/>
+  <arg name="valve_z"   default="0"/>
   <arg name="valve_yaw" default="0"/>
-  
-  <!-- Debug mode -->
-  <arg name="debug" default="false" />
-  
-  <!-- Unified control mode: LEADER allocates for all N*4 rotors -->
-  <arg name="unified_control_mode" default="false" />
-  
-  <!-- Include valve position setup -->
+
   <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
-    <arg name="real_machine" value="$(arg real_machine)" />
-    <arg name="simulation" value="$(arg simulation)" />
-    <arg name="robot_ns" value="$(arg valve_ns)" />
-    <arg name="robot_id" value="$(arg valve_id)"/>
-    <arg name="valve_x" value="$(arg valve_x)" />
-    <arg name="valve_y" value="$(arg valve_y)" />
-    <arg name="valve_z" value="$(arg valve_z)" />
-    <arg name="valve_yaw" value="$(arg valve_yaw)" />
+    <arg name="real_machine" value="$(arg real_machine)"/>
+    <arg name="simulation"   value="$(arg simulation)"/>
+    <arg name="robot_ns"     value="$(arg valve_ns)"/>
+    <arg name="robot_id"     value="$(arg valve_id)"/>
+    <arg name="valve_x"      value="$(arg valve_x)"/>
+    <arg name="valve_y"      value="$(arg valve_y)"/>
+    <arg name="valve_z"      value="$(arg valve_z)"/>
+    <arg name="valve_yaw"    value="$(arg valve_yaw)"/>
   </include>
-  
-  <!-- Controller parameters for formation valve rotation -->
-  <!-- Set unified_control_mode for each module namespace -->
-  <group if="$(eval len(arg('module_ids').split(',')) > 0)">
-    <param name="/beetle$(eval arg('module_ids').split(',')[0].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
-  </group>
-  <group if="$(eval len(arg('module_ids').split(',')) > 1)">
-    <param name="/beetle$(eval arg('module_ids').split(',')[1].strip())/controller/unified_control_mode" value="$(arg unified_control_mode)" />
-  </group>
-  <param name="controller/valve_rotation_feedforward/enabled" value="true" />
-  <param name="controller/valve_rotation_feedforward/force_z" value="-5.0" />
-  <param name="controller/valve_rotation_feedforward/torque_z" value="3.0" />
-  
-  <!-- Assembly CoG publisher node -->
-  <node name="assembly_cog_publisher" pkg="beetle" type="assembly_cog_publisher.py"
-        output="screen">
-    <param name="module_ids" value="$(arg module_ids)" />
-    <param name="publish_rate" value="50.0" /> <!-- 50Hz -->
-    <param name="timeout_threshold" value="0.5" /> <!-- 0.5s timeout -->
-  </node>
-  
-  <!-- Formation valve rotation node -->
+
+  ###########  Parameters  ###########
+  <arg name="rotation_angle"  default="1.571"
+       doc="Total rotation target in radians (default 90 deg)"/>
+  <arg name="approach_height" default="0.48"
+       doc="Valve approach height (m), adjusted for EE offset"/>
+  <arg name="debug" default="false"/>
+
+  <param name="controller/valve_rotation_feedforward/enabled"  value="true"/>
+  <param name="controller/valve_rotation_feedforward/force_z"  value="-5.0"/>
+  <param name="controller/valve_rotation_feedforward/torque_z" value="3.0"/>
+
+  ###########  Demo  ###########
   <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_clean.py"
         output="screen">
-    <param name="module_ids" value="$(arg module_ids)" />
-    <param name="rotation_angle" value="$(arg rotation_angle)" />
-    <param name="approach_height" value="$(arg approach_height)" />
-    <param name="simulation" value="$(arg simulation)" />
-    <param name="real_machine" value="$(arg real_machine)" />
-    <param name="debug" value="$(arg debug)" />
+    <param name="module_ids"      value="$(arg module_ids)"/>
+    <param name="rotation_angle"  value="$(arg rotation_angle)"/>
+    <param name="approach_height" value="$(arg approach_height)"/>
+    <param name="simulation"      value="$(arg simulation)"/>
+    <param name="real_machine"    value="$(arg real_machine)"/>
+    <param name="debug"           value="$(arg debug)"/>
   </node>
 </launch>

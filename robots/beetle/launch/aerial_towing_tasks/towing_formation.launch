@@ -1,65 +1,52 @@
 <?xml version="1.0"?>
 <launch>
-  <!-- Environment settings -->
-  <arg name="real_machine" default="false"/>
-  <arg name="simulation" default="true"/>
+  ###########  launch config  ###########
+  <arg name="real_machine" default="False"/>
+  <arg name="simulation"   default="True"/>
 
-  <!-- Formation parameters -->
-  <arg name="module_ids" default="2,3,1" />
-  
-  <!-- Load parameters -->
-  <arg name="load_ns" default="load"/>
-  <arg name="load_id" default="86"/>
-  <arg name="load_x" default="3"/>
-  <arg name="load_y" default="0"/>
-  <arg name="load_z" default="0"/>
-  <arg name="load_yaw" default="0"/>
+  ###########  Formation modules  ###########
+  <arg name="module_ids" default="2,3,1"
+       doc="Comma-separated beetle module IDs, e.g. 2,3 or 2,3,1"/>
+
+  ###########  Load  ###########
+  <arg name="load_ns"       default="load"/>
+  <arg name="load_id"       default="86"/>
+  <arg name="load_x"        default="3"/>
+  <arg name="load_y"        default="0"/>
+  <arg name="load_z"        default="0"/>
+  <arg name="load_yaw"      default="0"/>
   <arg name="load_friction" default="0.5"/>
-  
-  <!-- Towing parameters -->
-  <arg name="towing_distance" default="1.0"/> <!-- meters -->
-  <arg name="towing_force" default="5.0"/> <!-- Newtons -->
-  
-  <!-- Debug mode -->
-  <arg name="debug" default="false" />
-  
-  <!-- Unified control mode: LEADER allocates for all N*4 rotors -->
-  <arg name="unified_control_mode" default="false" />
-  
-  <!-- Include load position setup -->
+
   <include file="$(find beetle)/launch/aerial_towing_tasks/load_pos.launch">
-    <arg name="real_machine" value="$(arg real_machine)" />
-    <arg name="simulation" value="$(arg simulation)" />
-    <arg name="robot_ns" value="$(arg load_ns)" />
-    <arg name="load_id" value="$(arg load_id)"/>
-    <arg name="load_x" value="$(arg load_x)" />
-    <arg name="load_y" value="$(arg load_y)" />
-    <arg name="load_z" value="$(arg load_z)" />
-    <arg name="load_yaw" value="$(arg load_yaw)" />
-    <arg name="load_friction" value="$(arg load_friction)" />
+    <arg name="real_machine"  value="$(arg real_machine)"/>
+    <arg name="simulation"    value="$(arg simulation)"/>
+    <arg name="robot_ns"      value="$(arg load_ns)"/>
+    <arg name="load_id"       value="$(arg load_id)"/>
+    <arg name="load_x"        value="$(arg load_x)"/>
+    <arg name="load_y"        value="$(arg load_y)"/>
+    <arg name="load_z"        value="$(arg load_z)"/>
+    <arg name="load_yaw"      value="$(arg load_yaw)"/>
+    <arg name="load_friction" value="$(arg load_friction)"/>
   </include>
-  
-  <!-- Controller parameters for formation towing -->
-  <param name="controller/unified_control_mode" value="$(arg unified_control_mode)" />
-  <param name="controller/towing_feedforward/enabled" value="true" />
-  <param name="controller/towing_feedforward/force_x" value="$(arg towing_force)" />
-  
-  <!-- Assembly CoG publisher node -->
-  <node name="assembly_cog_publisher" pkg="beetle" type="assembly_cog_publisher.py"
-        output="screen">
-    <param name="module_ids" value="$(arg module_ids)" />
-    <param name="publish_rate" value="50.0" />
-    <param name="timeout_threshold" value="0.5" />
-  </node>
-  
-  <!-- Formation load towing node -->
+
+  ###########  Parameters  ###########
+  <arg name="towing_distance" default="1.0"
+       doc="Target towing distance (m)"/>
+  <arg name="towing_force"    default="5.0"
+       doc="Initial towing force (N), ramps adaptively"/>
+  <arg name="debug" default="false"/>
+
+  <param name="controller/towing_feedforward/enabled" value="true"/>
+  <param name="controller/towing_feedforward/force_x" value="$(arg towing_force)"/>
+
+  ###########  Demo  ###########
   <node name="formation_load_towing" pkg="beetle" type="load_towing_formation.py"
-        output="screen" cwd="node">
-    <param name="module_ids" value="$(arg module_ids)" />
-    <param name="towing_distance" value="$(arg towing_distance)" />
-    <param name="towing_force" value="$(arg towing_force)" />
-    <param name="simulation" value="$(arg simulation)" />
-    <param name="real_machine" value="$(arg real_machine)" />
-    <param name="debug" value="$(arg debug)" />
+        output="screen">
+    <param name="module_ids"      value="$(arg module_ids)"/>
+    <param name="towing_distance" value="$(arg towing_distance)"/>
+    <param name="towing_force"    value="$(arg towing_force)"/>
+    <param name="simulation"      value="$(arg simulation)"/>
+    <param name="real_machine"    value="$(arg real_machine)"/>
+    <param name="debug"           value="$(arg debug)"/>
   </node>
 </launch>

@@ -1165,7 +1165,7 @@ class FormationInitializeStartPositionState(FormationSingleUAVStateBase):
     def __init__(self):
         FormationSingleUAVStateBase.__init__(self, 
             outcomes=['succeeded', 'failed'], 
-            output_keys=['start_position', 'start_yaw', 'valve_position', 'valve_yaw'])
+            output_keys=['start_position', 'start_ee_position', 'start_yaw', 'valve_position', 'valve_yaw'])
     
     def execute(self, userdata):
         rospy.loginfo("=== Formation Initialize Start Position State ===")
@@ -1191,6 +1191,7 @@ class FormationInitializeStartPositionState(FormationSingleUAVStateBase):
         
         # Store positions in userdata
         userdata.start_position = assembly_pos
+        userdata.start_ee_position = self.get_end_effector_position()
         userdata.start_yaw = assembly_yaw
         userdata.valve_position = valve_pos
         userdata.valve_yaw = valve_yaw
@@ -2348,7 +2349,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
     def __init__(self):
         FormationSingleUAVStateBase.__init__(self,
             outcomes=['succeeded', 'failed'],
-            input_keys=['valve_position', 'start_position', 'start_yaw', 'trajectory_state'],
+            input_keys=['valve_position', 'start_position', 'start_ee_position', 'start_yaw', 'trajectory_state'],
             output_keys=['disengagement_position'])
     
     def execute(self, userdata):
@@ -2360,6 +2361,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             return 'failed'
         
         start_assembly_pos = getattr(userdata, 'start_position', None)
+        start_ee_pos = getattr(userdata, 'start_ee_position', None)
         start_yaw = getattr(userdata, 'start_yaw', 0.0)
         trajectory_state = getattr(userdata, 'trajectory_state', {}) or {}
         
@@ -2442,8 +2444,8 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         rospy.loginfo("[Phase 2] Ascending to start height")
         
         # Determine target Z height
-        if start_assembly_pos is not None:
-            target_z = start_assembly_pos[2] + 0.1  # 10cm above start
+        if start_ee_pos is not None:
+            target_z = start_ee_pos[2] + 0.1  # 10cm above start EE height
         else:
             target_z = current_pos[2] + 0.15  # 15cm up as fallback
         
@@ -2475,7 +2477,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
         # Phase 3: Return to start XY position
         rospy.loginfo("[Phase 3] Returning to start XY position")
         
-        if start_assembly_pos is not None:
+        if start_ee_pos is not None:
             # Phase 3A: First adjust yaw to start_yaw (yaw-only convergence)
             rospy.loginfo(f"[Phase 3A] Adjusting yaw to {math.degrees(start_yaw):.1f}° before XY movement")
             yaw_adjust_target = (current_pos[0], current_pos[1], current_pos[2])
@@ -2505,7 +2507,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
             
             # Phase 3B: Now perform XY movement with yaw locked at start_yaw
             rospy.loginfo(f"[Phase 3B] XY movement to start position (yaw locked at {math.degrees(start_yaw):.1f}°)")
-            return_target = (start_assembly_pos[0], start_assembly_pos[1], current_pos[2])
+            return_target = (start_ee_pos[0], start_ee_pos[1], start_ee_pos[2])
             rospy.loginfo(f"Target: ({return_target[0]:.3f}, {return_target[1]:.3f}, {return_target[2]:.3f})")
             
             # Calculate XY distance for trajectory selection

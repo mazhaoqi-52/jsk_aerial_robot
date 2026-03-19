@@ -13,7 +13,7 @@ import rospy
 import smach
 import smach_ros
 import numpy as np
-from geometry_msgs.msg import PoseStamped, WrenchStamped
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav
 from tf.transformations import euler_from_quaternion
@@ -726,8 +726,7 @@ class DescendAndInsertState(TowingStateBase):
             current_pos, 
             insertion_pos, 
             insertion_yaw,
-            descent_speed=0.03,  # Slower descent (gentler insertion)
-            xy_hold_tolerance=0.05  # 50mm: tolerate small XY residuals to avoid retry-abort at the first step
+            descent_speed=0.03  # Slower descent (gentler insertion)
         )
         
         if not success:
@@ -827,16 +826,19 @@ class TowingWithFeedforwardState(TowingStateBase):
             input_keys=['towing_start_position', 'towing_direction', 'hook_yaw'],
             output_keys=['towing_end_position'])
     
-    @staticmethod
-    def _clear_desired_wrench(desired_wrench_pub):
-        """Publish zero desired_external_wrench to clear feedforward."""
-        rospy.loginfo("Clearing desired external wrench (publishing zeros)")
-        zero_msg = WrenchStamped()
-        zero_msg.header.frame_id = "body"
+    def _clear_external_wrench(self):
+        """Clear external wrench feedforward via BeetleInterface.
+        
+        Sends multiple zero-wrench messages for reliability, then marks
+        wrench as inactive. Wrench topic is automatically selected based
+        on unified/leader-follower mode.
+        """
+        rospy.loginfo("Clearing external wrench feedforward")
+        zero = [0.0, 0.0, 0.0]
         for _ in range(10):
-            zero_msg.header.stamp = rospy.Time.now()
-            desired_wrench_pub.publish(zero_msg)
+            self.beetle.addExternalWrench(zero, zero)
             rospy.sleep(0.04)
+        self.beetle.clearExternalWrench()
     
     def execute(self, userdata):
         rospy.loginfo("=== Towing With Feedforward State ===")
@@ -851,22 +853,13 @@ class TowingWithFeedforwardState(TowingStateBase):
         rospy.loginfo(f"Towing direction: {towing_dir}")
         rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
         
-        # ---- Desired external wrench feedforward setup ----
-        # Publish to /beetle{leader}/desired_external_wrench to specify the total
-        # external force the assembly should produce. C++ auto-distributes to
-        # per-module ff_inter_wrench_list_ for wrench_comp feedforward.
-        #
-        # Force value = trajectory_gen.current_force (adaptive: starts 0, ramps up on stall)
-        # Direction = body frame towing direction (Z=0 to avoid Z-drift)
-        
-        module_ids = self.formation_adapter.module_ids
-        sorted_ids = sorted(module_ids)
-        leader_id = sorted_ids[len(sorted_ids) // 2]
-        desired_wrench_pub = rospy.Publisher(
-            f'/beetle{leader_id}/desired_external_wrench', WrenchStamped, queue_size=1)
-        rospy.sleep(0.3)  # Allow publisher registration
-        
-        rospy.loginfo(f"Desired external wrench publisher created for leader {leader_id}")
+        # ---- Wrench feedforward via BeetleInterface ----
+        # BeetleInterface.addExternalWrench() automatically routes to:
+        #   - formation_desired_wrench  when unified_control_mode is active
+        #   - desired_external_wrench   when leader-follower (wrench_comp) is active
+        # It also handles world→body frame rotation internally.
+        control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
+        rospy.loginfo(f"Wrench feedforward via BeetleInterface (mode: {control_mode})")
         
         trajectory_gen = LinearTowingTrajectoryGenerator(
             start_pos=start_pos,
@@ -925,13 +918,13 @@ class TowingWithFeedforwardState(TowingStateBase):
             if state_info['stall_counter'] >= STALL_TIMEOUT_COUNT:
                 rospy.logwarn(f"Towing aborted: stalled for {state_info['stall_counter']} "
                              f"consecutive windows ({state_info['stall_counter']*5}s no progress)")
-                self._clear_desired_wrench(desired_wrench_pub)
+                self._clear_external_wrench()
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
             if elapsed > ABSOLUTE_MAX_TIME:
                 rospy.logwarn(f"Towing absolute timeout after {elapsed:.1f}s")
-                self._clear_desired_wrench(desired_wrench_pub)
+                self._clear_external_wrench()
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
@@ -960,30 +953,16 @@ class TowingWithFeedforwardState(TowingStateBase):
                 linear_vel=target_state['linear_velocity']
             )
             
-            # ---- Publish desired external wrench (total force for assembly) ----
-            # C++ auto-distributes to per-module ff_inter for wrench_comp.
-            # target_state['force'] is in world frame: [fx, fy, fz]
-            # Rotate XY to body frame; Z passes through (yaw rotation doesn't affect Z)
+            # ---- Publish desired external wrench via BeetleInterface ----
+            # addExternalWrench() handles world→body rotation and unified/LF topic routing.
             ff_world = target_state['force']
-            assembly_yaw = self.get_assembly_yaw() or maintain_yaw
-            cos_y = math.cos(assembly_yaw)
-            sin_y = math.sin(assembly_yaw)
-            ff_body_x =  cos_y * ff_world[0] + sin_y * ff_world[1]
-            ff_body_y = -sin_y * ff_world[0] + cos_y * ff_world[1]
-            ff_body_z = ff_world[2]
-            
-            ff_msg = WrenchStamped()
-            ff_msg.header.stamp = rospy.Time.now()
-            ff_msg.header.frame_id = "body"
-            ff_msg.wrench.force.x = ff_body_x
-            ff_msg.wrench.force.y = ff_body_y
-            ff_msg.wrench.force.z = ff_body_z
-            desired_wrench_pub.publish(ff_msg)
+            self.beetle.addExternalWrench(force=ff_world, torque=[0.0, 0.0, 0.0])
             
             # Debug: log ff force and progress every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
-                rospy.loginfo(f"[Towing FF] ff_body=({ff_body_x:.2f},{ff_body_y:.2f},{ff_body_z:.2f})N, "
-                             f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%")
+                rospy.loginfo(f"[Towing FF] ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N, "
+                             f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%, "
+                             f"mode={'unified' if self.beetle.isUnifiedMode() else 'LF'}")
             
             # Log progress every 5s
             if int(elapsed) % 5 == 0 and int(elapsed * 10) % 50 == 0:
@@ -994,7 +973,7 @@ class TowingWithFeedforwardState(TowingStateBase):
             control_rate.sleep()
         
         # ---- Clear feedforward after towing completes ----
-        self._clear_desired_wrench(desired_wrench_pub)
+        self._clear_external_wrench()
         
         # Ensure pitch compensation stays disabled (already disabled, but defensive)
         self.formation_adapter.set_pitch_compensation(False)
@@ -1027,63 +1006,41 @@ class DisengageAndReturnState(TowingStateBase):
             rospy.logerr("Cannot get current position")
             return 'failed'
         
-        # Phase 0: Stabilize attitude after load release
-        # During towing, pitch/roll PID integral terms accumulated to compensate for load forces.
-        # After disengagement, these integral terms need time to decay back to zero.
-        # Send position hold command and wait for attitude convergence.
-        rospy.loginfo("[Phase 0] Stabilizing attitude after load release")
+        # Phase 0: Brief stabilization after load release
+        rospy.loginfo("[Phase 0] Stabilizing after load release")
         
-        stabilize_duration = 5.0  # seconds
+        stabilize_duration = 3.0
         stabilize_start = rospy.Time.now()
         
         while (rospy.Time.now() - stabilize_start).to_sec() < stabilize_duration:
-            # Hold current position
             current_pos = self.get_end_effector_position()
             if current_pos:
                 self.send_assembly_command_from_end_effector(current_pos, current_yaw)
             
-            # Monitor attitude convergence
-            try:
-                rpy = self.beetle.getAssemblyRPY()
-                if rpy is not None:
-                    roll, pitch, yaw = rpy
-                    elapsed = (rospy.Time.now() - stabilize_start).to_sec()
-                    rospy.loginfo_throttle(0.5, f"[Phase 0] t={elapsed:.1f}s, Attitude: "
-                                                f"roll={np.degrees(roll):.2f}°, "
-                                                f"pitch={np.degrees(pitch):.2f}°, "
-                                                f"yaw={np.degrees(yaw):.2f}°")
-                else:
-                    rospy.logwarn_throttle(2.0, "[Phase 0] getAssemblyRPY() returned None")
-            except Exception as e:
-                rospy.logwarn_throttle(2.0, f"[Phase 0] Failed to get RPY: {e}")
-            
+            elapsed = (rospy.Time.now() - stabilize_start).to_sec()
+            rpy = self.beetle.getAssemblyRPY()
+            if rpy is not None:
+                rospy.loginfo_throttle(0.5, f"[Phase 0] t={elapsed:.1f}s, "
+                    f"roll={np.degrees(rpy[0]):.2f}°, pitch={np.degrees(rpy[1]):.2f}°, "
+                    f"pos={FormationUtils.format_vec(current_pos)}")
             rospy.sleep(0.1)
         
         rospy.loginfo(f"[Phase 0] Stabilization complete after {stabilize_duration}s")
+        
+        # DEBUG: log position drift to confirm PID integral residual
+        post_stab_pos = self.get_end_effector_position()
+        if post_stab_pos and current_pos:
+            drift = np.array(post_stab_pos) - np.array(current_pos)
+            rospy.loginfo(f"[DEBUG] Position drift during stabilization: "
+                         f"({drift[0]*1000:.1f}, {drift[1]*1000:.1f}, {drift[2]*1000:.1f})mm")
 
-        # Phase 0.5: Reverse disengage — move opposite to towing direction to unhook
-        towing_dir = np.array(userdata.towing_direction)
-        DISENGAGE_DISTANCE = 0.06  # 60mm reverse to clear the box wall
+        # Phase 1: Ascend to start height to fully clear the box
+        # The fang may still be hooked on the box wall; ascending to the
+        # original start_pos height guarantees physical clearance.
         current_pos = self.get_end_effector_position()
-        disengage_target = (
-            current_pos[0] - towing_dir[0] * DISENGAGE_DISTANCE,
-            current_pos[1] - towing_dir[1] * DISENGAGE_DISTANCE,
-            current_pos[2]
-        )
-        rospy.loginfo(f"[Phase 0.5] Reverse disengage: moving {DISENGAGE_DISTANCE*1000:.0f}mm "
-                      f"opposite to towing dir {towing_dir}")
-        
-        success = self.active_position_convergence(
-            disengage_target, target_yaw=current_yaw,
-            pos_thresh=0.03, yaw_thresh=0.1, timeout=10.0,
-            max_linear_vel=0.03  # Slow and gentle
-        )
-        rospy.sleep(0.5)
-        
-        # Phase 1: Ascend to safe height
-        current_pos = self.get_end_effector_position()
-        rospy.loginfo("[Phase 1] Ascending to safe height")
-        safe_height = current_pos[2] + 0.15  # 150mm up
+        safe_height = start_pos[2]
+        rospy.loginfo(f"[Phase 1] Ascending to start height {safe_height:.3f}m "
+                      f"(current {current_pos[2]:.3f}m, delta {(safe_height - current_pos[2])*1000:.0f}mm)")
         ascent_target = (current_pos[0], current_pos[1], safe_height)
         
         success = self.active_position_convergence(

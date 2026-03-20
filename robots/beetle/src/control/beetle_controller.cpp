@@ -34,6 +34,10 @@ namespace aerial_robot_control
     last_unified_pitch_i_ss_(-1.5),
     has_unified_pitch_i_ss_(false),
     pitch_i_seed_default_(-0.55),
+    z_ki_boost_frames_(60),
+    z_ki_boost_factor_(2.0),
+    z_ki_boost_frames_default_(60),
+    z_ki_boost_factor_default_(2.0),
     has_cached_independent_cmd_(false),
     gains_switched_(false),
     formation_obs_comp_enable_(false),
@@ -216,6 +220,20 @@ namespace aerial_robot_control
       formation_observer_->reset();
       ROS_INFO("[UnifiedCtrl] Formation observer deactivated (reset + inactive)");
     }
+
+    // P0-fix: Re-init single-module momentum observer on unified exit.
+    // During unified mode, externalWrenchEstimate() returns early, so
+    // prev_est_wrench_timestamp_ is frozen at the pre-unified value.
+    // Without reset, the first post-exit call sees dt = entire unified duration
+    // → integrate_term_ explodes → est_external_wrench_ corrupted
+    // → wrench_comp → ICompTerm(PITCH) → pitch crash.
+    // Setting timestamp to 0 triggers the re-init path (new init_sum_momentum_).
+    prev_est_wrench_timestamp_ = 0;
+    integrate_term_ = Eigen::VectorXd::Zero(6);
+    est_external_wrench_ = Eigen::VectorXd::Zero(6);
+    init_sum_momentum_ = Eigen::VectorXd::Zero(6);
+    ROS_INFO("[UnifiedCtrl] Single-module observer re-initialized (timestamp/integrate/est zeroed)");
+
     // UO-4: clear observer feedforward on mode exit to avoid stale values
     pid_controllers_.at(X).setPersistentFF(0.0);
     pid_controllers_.at(Y).setPersistentFF(0.0);
@@ -262,6 +280,9 @@ namespace aerial_robot_control
     navigator_->setTargetOmegaZ(0);
     beetle_navigator_->setUnifiedControlMode(true);
 
+    // P2: Determine module count for per-N seed/boost bucketing
+    int N_modules = static_cast<int>(beetle_navigator_->getAssemblyIds().size());
+
     if (from_hover) {
       // ===== Hover → Unified: migrate existing I-terms carefully =====
 
@@ -274,7 +295,11 @@ namespace aerial_robot_control
 
         double new_roll_i = rp_i_keep_ratio_ * old_roll_i;
 
-        double pitch_seed = has_unified_pitch_i_ss_ ? last_unified_pitch_i_ss_ : pitch_i_seed_default_;
+        // P2: Select pitch seed by N, fall back to global default
+        double pitch_seed_default_n = pitch_i_seed_default_;
+        if (pitch_i_seed_by_n_.count(N_modules))
+          pitch_seed_default_n = pitch_i_seed_by_n_.at(N_modules);
+        double pitch_seed = has_unified_pitch_i_ss_ ? last_unified_pitch_i_ss_ : pitch_seed_default_n;
         double new_pitch_i = rp_i_keep_ratio_ * old_pitch_i + PITCH_SEED_GAIN * pitch_seed;
 
         // Clamp to unified-mode I limits (err_i domain = limit_i / Ki)
@@ -315,7 +340,12 @@ namespace aerial_robot_control
         double gravity_ff_z = gravity_cog_mig.z();
 
         double i_output_degrav = i_output_old - gravity_ff_z;
-        double seed_value = has_unified_z_i_ss_ ? last_unified_z_i_ss_ : z_i_seed_default_;
+
+        // P2: Select Z seed by N, fall back to global default
+        double z_seed_default_n = z_i_seed_default_;
+        if (z_i_seed_by_n_.count(N_modules))
+          z_seed_default_n = z_i_seed_by_n_.at(N_modules);
+        double seed_value = has_unified_z_i_ss_ ? last_unified_z_i_ss_ : z_seed_default_n;
         double i_output_seeded = i_output_degrav + Z_SEED_GAIN * seed_value;
 
         double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
@@ -326,15 +356,25 @@ namespace aerial_robot_control
 
         pid_controllers_.at(Z).setErrI(iz_new);
         z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
-        z_ki_boost_count_ = Z_KI_BOOST_FRAMES;
+
+        // P2: Select Z boost params by N
+        z_ki_boost_frames_ = z_ki_boost_frames_default_;
+        z_ki_boost_factor_ = z_ki_boost_factor_default_;
+        if (z_ki_boost_frames_by_n_.count(N_modules))
+          z_ki_boost_frames_ = z_ki_boost_frames_by_n_.at(N_modules);
+        if (z_ki_boost_factor_by_n_.count(N_modules))
+          z_ki_boost_factor_ = z_ki_boost_factor_by_n_.at(N_modules);
+        z_ki_boost_count_ = z_ki_boost_frames_;
+
         ROS_WARN("[UnifiedCtrl] Z de-gravity + seed (hover→unified): i_old=%.4f, gravity_ff=%.4f, "
-                 "i_degrav=%.4f, seed=%.4f(×%.1f=%s), i_seeded=%.4f, err_i=%.4f "
+                 "i_degrav=%.4f, seed=%.4f(×%.1f=%s, N=%d), i_seeded=%.4f, err_i=%.4f "
                  "(limit=±%.1f), freeze=%d, boost=%d(×%.1f)",
                  i_output_old, gravity_ff_z, i_output_degrav,
                  seed_value, Z_SEED_GAIN,
                  has_unified_z_i_ss_ ? "adaptive" : "default",
+                 N_modules,
                  i_output_seeded, iz_new, iz_limit,
-                 z_integral_freeze_count_, z_ki_boost_count_, Z_KI_BOOST_FACTOR);
+                 z_integral_freeze_count_, z_ki_boost_count_, z_ki_boost_factor_);
       }
     } else {
       // ===== Ground start → Unified: I-terms start from zero =====
@@ -351,8 +391,17 @@ namespace aerial_robot_control
       z_ki_boost_count_ = 0;
       rp_integral_freeze_count_ = 0;
       rp_ki_boost_count_ = 0;
-      ROS_WARN("[UnifiedCtrl] Ground start: all I-terms zeroed, no freeze/boost (naviState=%d)",
-               navigator_->getNaviState());
+
+      // P2: Still initialize per-N boost params for later use
+      z_ki_boost_frames_ = z_ki_boost_frames_default_;
+      z_ki_boost_factor_ = z_ki_boost_factor_default_;
+      if (z_ki_boost_frames_by_n_.count(N_modules))
+        z_ki_boost_frames_ = z_ki_boost_frames_by_n_.at(N_modules);
+      if (z_ki_boost_factor_by_n_.count(N_modules))
+        z_ki_boost_factor_ = z_ki_boost_factor_by_n_.at(N_modules);
+
+      ROS_WARN("[UnifiedCtrl] Ground start: all I-terms zeroed, no freeze/boost (naviState=%d, N=%d)",
+               navigator_->getNaviState(), N_modules);
     }
 
     sendCascadeSetup();
@@ -535,7 +584,7 @@ namespace aerial_robot_control
         if (!unified_controller_->isAllocationSaturated()) {
           // Apply boost: add extra (boost_factor - 1) × err_p × dt to err_i
           double clamped_err_p = pid_controllers_.at(Z).getErrP();  // already clamped by PID::update
-          double extra_increment = clamped_err_p * du * (Z_KI_BOOST_FACTOR - 1.0);
+          double extra_increment = clamped_err_p * du * (z_ki_boost_factor_ - 1.0);
           double new_err_i = pid_controllers_.at(Z).getErrI() + extra_increment;
 
           // Respect err_i limits
@@ -1599,9 +1648,50 @@ namespace aerial_robot_control
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);
     last_unified_z_i_ss_ = z_i_seed_default_;
 
+    // P2: Per-N seed bucketing — load z_i_seed_by_n/n2, z_i_seed_by_n/n3, etc.
+    {
+      ros::NodeHandle seed_nh(control_nh, "z_i_seed_by_n");
+      for (int n = 2; n <= 6; n++) {
+        double val;
+        if (seed_nh.getParam("n" + std::to_string(n), val)) {
+          z_i_seed_by_n_[n] = val;
+          ROS_INFO("[SeedBucket] z_i_seed_by_n[%d] = %.4f", n, val);
+        }
+      }
+    }
+
     // Pitch I-term seed default for unified mode switch (same philosophy as Z seed)
     getParam<double>(control_nh, "pitch_i_seed_default", pitch_i_seed_default_, -0.55);
     last_unified_pitch_i_ss_ = pitch_i_seed_default_;
+
+    // P2: Per-N pitch seed bucketing
+    {
+      ros::NodeHandle seed_nh(control_nh, "pitch_i_seed_by_n");
+      for (int n = 2; n <= 6; n++) {
+        double val;
+        if (seed_nh.getParam("n" + std::to_string(n), val)) {
+          pitch_i_seed_by_n_[n] = val;
+          ROS_INFO("[SeedBucket] pitch_i_seed_by_n[%d] = %.4f", n, val);
+        }
+      }
+    }
+
+    // P2: Per-N Z boost parameters
+    getParam<int>(control_nh, "z_ki_boost_frames_default", z_ki_boost_frames_default_, 60);
+    getParam<double>(control_nh, "z_ki_boost_factor_default", z_ki_boost_factor_default_, 2.0);
+    z_ki_boost_frames_ = z_ki_boost_frames_default_;
+    z_ki_boost_factor_ = z_ki_boost_factor_default_;
+    {
+      ros::NodeHandle boost_nh(control_nh, "z_ki_boost_by_n");
+      for (int n = 2; n <= 6; n++) {
+        int frames;
+        double factor;
+        if (boost_nh.getParam("n" + std::to_string(n) + "/frames", frames))
+          z_ki_boost_frames_by_n_[n] = frames;
+        if (boost_nh.getParam("n" + std::to_string(n) + "/factor", factor))
+          z_ki_boost_factor_by_n_[n] = factor;
+      }
+    }
 
     // Roll/Pitch I-term keep ratio for unified mode switch
     // Fraction of independent-mode I-term to preserve at switch (0=clear, 1=full keep)

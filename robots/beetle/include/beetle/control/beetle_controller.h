@@ -69,9 +69,8 @@ namespace aerial_robot_control
     // Ki-boost for Z axis after mode switch (D' scheme):
     // Temporarily multiply Z integral update rate to accelerate bias convergence.
     // With seed preload, boost only needs to cover residual error → gentler settings.
+    // P2: boost duration and factor are now per-N (see z_ki_boost_frames_by_n_).
     int z_ki_boost_count_;            // frames remaining in boost phase (0 = normal)
-    static constexpr int Z_KI_BOOST_FRAMES = 60;   // boost duration: 60 frames = 1.5s @40Hz
-    static constexpr double Z_KI_BOOST_FACTOR = 2.0;  // effective Ki multiplier during boost
 
     // Roll/Pitch I-term transition support for unified mode switch:
     // Same philosophy as Z axis — freeze then boost — but with different parameters
@@ -89,10 +88,15 @@ namespace aerial_robot_control
     // at mode switch. Seeds are adaptively updated from the most recent unified-mode
     // steady state, or use configurable defaults.
     //
+    // P2: Seed defaults are bucketed by module count N (2-module vs 3-module have
+    // very different allocation geometry and efficiency). The maps are keyed by N;
+    // if the current N is not found, falls back to the global default.
+    //
     // Z axis: bias ≈ 0.86–0.94 (formation efficiency offset under explicit gravity FF)
     double last_unified_z_i_ss_;      // most recent unified steady-state Z I-term
     bool has_unified_z_i_ss_;         // true after at least one SS sample recorded
-    double z_i_seed_default_;         // default seed when no history (from YAML, e.g. 0.8)
+    double z_i_seed_default_;         // global fallback when N not in map
+    std::map<int, double> z_i_seed_by_n_;     // per-N seed defaults from YAML
     static constexpr double Z_SEED_GAIN = 0.8;       // inject 80% of seed to be conservative
     static constexpr double Z_SEED_LPF_ALPHA = 0.05; // low-pass filter for SS tracking
     //
@@ -100,9 +104,18 @@ namespace aerial_robot_control
     // All pitch seed values are in err_i domain (consistent with setErrI at injection).
     double last_unified_pitch_i_ss_;  // most recent unified steady-state pitch err_i
     bool has_unified_pitch_i_ss_;     // true after at least one SS sample recorded
-    double pitch_i_seed_default_;     // default seed when no history (from YAML, e.g. -0.55)
+    double pitch_i_seed_default_;     // global fallback when N not in map
+    std::map<int, double> pitch_i_seed_by_n_; // per-N seed defaults from YAML
     static constexpr double PITCH_SEED_GAIN = 0.8;       // inject 80% of seed
     static constexpr double PITCH_SEED_LPF_ALPHA = 0.02; // slower LPF than Z (pitch more sensitive)
+    //
+    // Per-N Z boost parameters: 2-module needs stronger/longer boost than 3-module.
+    int z_ki_boost_frames_;           // current N-specific boost duration
+    double z_ki_boost_factor_;        // current N-specific boost factor
+    int z_ki_boost_frames_default_;   // global fallback
+    double z_ki_boost_factor_default_;
+    std::map<int, int> z_ki_boost_frames_by_n_;
+    std::map<int, double> z_ki_boost_factor_by_n_;
 
     bool spinal_gains_zeroed_;        // track whether we sent zero rpy/gain to spinal
 

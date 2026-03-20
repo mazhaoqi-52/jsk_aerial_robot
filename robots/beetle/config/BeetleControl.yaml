@@ -12,8 +12,25 @@ controller:
   # wrench_estimate_flag: false
   comp_term_update_freq: 40
   unified_control_mode: false
-  z_i_seed_default: 0.8    # Z I-term seed for unified mode switch (Plan E')
-  pitch_i_seed_default: -0.55  # Pitch I-term seed in err_i domain (SS i_term≈-2.7, Ki=5 → err_i≈-0.54)
+  z_i_seed_default: 0.8    # Z I-term seed fallback (used when N not in z_i_seed_by_n)
+  pitch_i_seed_default: -0.55  # Pitch I-term seed fallback (err_i domain)
+
+  # P2: Per-module-count seed bucketing.
+  z_i_seed_by_n:
+    n2: 1.2
+    n3: 0.8
+  pitch_i_seed_by_n:
+    n2: -0.70
+    n3: -0.55
+  z_ki_boost_frames_default: 60
+  z_ki_boost_factor_default: 2.0
+  z_ki_boost_by_n:
+    n2:
+      frames: 90
+      factor: 3.0
+    n3:
+      frames: 60
+      factor: 2.0
 
   # ========== Formation Momentum Observer (Phase U2) ==========
   # Formation-level external wrench estimation using realized wrench from allocation.
@@ -53,7 +70,7 @@ controller:
   use_constrained_alloc: false
   alloc_lambda: 1.0e-4          # regularization weight (larger → softer, smaller → tighter tracking)
   alloc_t_max: 20.0             # per-rotor thrust upper bound [N]
-  alloc_gimbal_limit_deg: 90.0  # gimbal angle hard limit [deg] (hardware ±90° for beetle)
+  alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

@@ -40,7 +40,7 @@ class SwitchState(smach.State):
                  neighboring_id = 2,
                  female_servo_id = 5,
                  separate_dir = -1):
-        smach.State.__init__(self, outcomes=['done'])
+        smach.State.__init__(self, outcomes=['done','emergency'])
 
         self.robot_name = robot_name 
         self.robot_id = robot_id 
@@ -69,32 +69,38 @@ class SwitchState(smach.State):
         else:
             self.docking_pub = rospy.Publisher('/' + self.robot_name  + '/docking_cmd', Bool, queue_size = 1)
 
+        # subscriber
+        self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
+
         #messeges
         self.flag_msg = KeyValue()
         self.docking_msg = Bool()
+        self.emergency_flag = False
         time.sleep(0.5)
 
     def execute(self, userdata):
+        if self.emergency_flag:
+            return 'emergency'
         if not self.real_machine:
             try:
                 link_detacher = GazeboLinkDetacher(self.neighboring, 'root', self.robot_name, 'root')
-                # link_detacher = GazeboLinkDetacher(self.robot_name, 'root', self.neighboring, 'root')
-
                 link_detacher.detach_links()
             except rospy.ServiceException:
-                rospy.loginfo("Dettacher failed")  
-        time.sleep(1)  
+                rospy.loginfo("Dettacher failed")
+        time.sleep(1)
+        # Notify both robots to switch to single mode
         self.flag_msg.key = str(self.robot_id)
         self.flag_msg.value = '0'
         self.flag_pub.publish(self.flag_msg)
-        rospy.loginfo("ok-1")
+        self.flag_msg.key = str(self.neighboring_id)
+        self.flag_msg.value = '0'
+        self.flag_pub_neighboring.publish(self.flag_msg)
+        rospy.loginfo("[SwitchState] assembly_flag=0 published for both robots")
         if self.real_machine:
             if(self.separate_dir > 0):
-                rospy.loginfo("ok0")
                 self.dynamixel_servo.sendTargetAngle(self.unlock_servo_angle_female)
                 self.dynamixel_servo_neighboring.sendTargetAngle(self.unlock_servo_angle_male)
             else:
-                rospy.loginfo("ok-1")
                 self.dynamixel_servo.sendTargetAngle(self.unlock_servo_angle_male)
                 self.dynamixel_servo_neighboring.sendTargetAngle(self.unlock_servo_angle_female)
         else:
@@ -102,6 +108,9 @@ class SwitchState(smach.State):
             self.docking_pub.publish(self.docking_msg)
         time.sleep(5.0)
         return 'done'
+
+    def emergencyCb(self,msg):
+        self.emergency_flag = True
 
 class SeparateState(smach.State):
     # keep away target robot from leader
@@ -112,7 +121,10 @@ class SeparateState(smach.State):
                  neighboring = 'beetle2',
                  target_dist_from_neighboring = 1.25):
 
-        smach.State.__init__(self, outcomes=['done','in_process'])
+        smach.State.__init__(self, outcomes=['done','in_process','emergency'])
+
+        self.emergency_flag = False
+        self.run_rate = rospy.Rate(40)
 
         self.robot_name = robot_name
         self.robot_id = robot_id
@@ -128,15 +140,19 @@ class SeparateState(smach.State):
         self.nav_pub = rospy.Publisher('/' + self.robot_name+"/uav/nav", FlightNav, queue_size=10)
         self.nav_pub_neighboring = rospy.Publisher('/' + self.neighboring+"/uav/nav", FlightNav, queue_size=10)
 
+        # subscriber
+        self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
+
         #messages
         self.nav_msg = FlightNav()
-        
+
     def execute(self, userdata):
+        if self.emergency_flag:
+            return 'emergency'
         x_dist = 0
         try:
             tf_from_neighboring = self.listener.lookupTransform('/' + self.neighboring+'/root', '/' + self.robot_name+'/root', rospy.Time(0))
             x_dist = math.fabs(tf_from_neighboring[0][0])
-            rospy.loginfo("tf is fine")
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
             x_dist = 0
             rospy.loginfo('out')
@@ -147,41 +163,12 @@ class SeparateState(smach.State):
             self.nav_msg.pos_xy_nav_mode= 1
             self.nav_msg.target_vel_x = self.separate_vel
             self.nav_pub.publish(self.nav_msg)
+            self.run_rate.sleep()
             return 'in_process'
         else:
             self.nav_msg.pos_xy_nav_mode= 6
             self.nav_pub.publish(self.nav_msg)
             return 'done'
 
-
-#### main class ####
-class DisassembleDemo():
-    def __init__(self):
-        # rospy.init_node("disassemble_demo")
-        if not rospy.core.is_initialized():  # 检查是否已初始化
-            rospy.init_node("disassemble_demo")
-
-    def main(self):
-        sm_top = smach.StateMachine(outcomes=['succeeded'])
-        with sm_top:
-            smach.StateMachine.add('SwitchState', SwitchState(), transitions={'done':'SeparateState'})
-
-            smach.StateMachine.add('SeparateState', SeparateState(), transitions={'done':'succeeded','in_process':'SeparateState'})
- 
-        sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
-        sis.start()
-        outcome = sm_top.execute()
-        # rospy.spin()
-        # sis.stop()
-        # 保持ROS节点运行
-        while not rospy.is_shutdown() and outcome not in ['succeeded', 'interupted']:
-            rospy.sleep(0.1)  
-            sis.stop()
-            return outcome  
-
-if __name__ == '__main__':
-    try:
-        logging.getLogger('rosout').addFilter(Filter())
-        disassemble_demo = DisassembleDemo();
-        disassemble_demo.main()
-    except rospy.ROSInterruptException: pass
+    def emergencyCb(self,msg):
+        self.emergency_flag = True

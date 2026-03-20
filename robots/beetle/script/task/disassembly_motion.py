@@ -21,30 +21,43 @@ class DisassemblyDemo():
                 target_follower_id = self.module_ids[i]
                 target_leader_id = self.module_ids[i+1]
                 motion_prefix = str(target_follower_id) + '_' + str(target_leader_id)
-                sub_sm = smach.StateMachine(outcomes=['succeeded_'+motion_prefix])
-                direction = 1 if target_follower_id > target_leader_id else -1
+                sub_sm = smach.StateMachine(outcomes=['succeeded_'+motion_prefix,'interupted_'+motion_prefix])
+                # module_ids order represents X-axis position from small to large
+                # assembly locks follower.male + neighboring.female (attach_dir=1)
+                # disassembly must unlock the same pair, so separate_dir = -1
+                direction = -1
                 with sub_sm:
-                    smach.StateMachine.add('SwitchState'+  motion_prefix,
-                                           SwitchState(robot_name = 'beetle'+str(target_follower_id), robot_id = target_follower_id, neighboring = 'beetle'+str(target_leader_id), neighboring_id = target_leader_id, separate_dir = direction),
-                                           transitions={'done':'SeparateState'+motion_prefix})
+                    smach.StateMachine.add('SwitchState'+ motion_prefix,
+                                           SwitchState(robot_name = 'beetle'+str(target_follower_id), robot_id = target_follower_id, neighboring = 'beetle'+str(target_leader_id), neighboring_id = target_leader_id, separate_dir = direction, real_machine = self.real_machine),
+                                           transitions={'done':'SeparateState'+motion_prefix, 'emergency':'interupted_'+motion_prefix})
 
                     smach.StateMachine.add('SeparateState'+motion_prefix,
                                            SeparateState(robot_name = 'beetle'+str(target_follower_id), robot_id = target_follower_id, neighboring = 'beetle'+str(target_leader_id)),
-                                           transitions={'done':'succeeded_'+motion_prefix,'in_process':'SeparateState'+motion_prefix})
+                                           transitions={'done':'succeeded_'+motion_prefix, 'in_process':'SeparateState'+motion_prefix, 'emergency':'interupted_'+motion_prefix})
                 if(i == len(self.module_ids)-2):
                     smach.StateMachine.add('SUB'+str(i),
                                            sub_sm,
-                                           transitions={'succeeded_'+motion_prefix:'succeeded'})
+                                           transitions={'succeeded_'+motion_prefix:'succeeded', 'interupted_'+motion_prefix:'interupted'})
                 else:
                     smach.StateMachine.add('SUB'+str(i),
                                            sub_sm,
-                                           transitions={'succeeded_'+motion_prefix:'SUB'+str(i+1)})
+                                           transitions={'succeeded_'+motion_prefix:'SUB'+str(i+1), 'interupted_'+motion_prefix:'interupted'})
 
         sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
         sis.start()
-        outcome = sm_top.execute()
-        rospy.spin()
-        sis.stop()
+
+        try:
+            outcome = sm_top.execute()
+            rospy.loginfo(f"Disassembly demo state machine completed with outcome: {outcome}")
+            return outcome
+        except Exception as e:
+            rospy.logerr(f"Error during disassembly demo execution: {e}")
+            return 'interupted'
+        finally:
+            try:
+                sis.stop()
+            except:
+                pass
 if __name__ == '__main__':
     rospy.init_node("disassembly_motion")
     modules_str = rospy.get_param("module_ids", default="")

@@ -228,96 +228,131 @@ namespace aerial_robot_control
 
   void BeetleController::initUnifiedLeaderMode()
   {
-    // Reset target position/yaw to current state at mode switch.
-    // PID error = (target_pos + R*offset) - (cur_pos + R*offset) = target_pos - cur_pos,
-    // so setting target_pos = cur_pos gives zero initial error.
     tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
     unified_controller_->updateFormationGeometry();
 
+    // Determine whether we are switching from stable hover (I-terms accumulated)
+    // or starting from the ground (I-terms ≈ 0, no migration needed).
+    bool from_hover = (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
+
     navigator_->setXyControlMode(aerial_robot_navigation::POS_CONTROL_MODE);
-    navigator_->setTargetPosX(cur_pos.x());
-    navigator_->setTargetPosY(cur_pos.y());
-    navigator_->setTargetPosZ(cur_pos.z());
     navigator_->setTargetVelX(0);
     navigator_->setTargetVelY(0);
     navigator_->setTargetAccX(0);
     navigator_->setTargetAccY(0);
+
+    if (from_hover) {
+      // Hover → Unified: reset target position to current state so PID starts with zero error.
+      navigator_->setTargetPosX(cur_pos.x());
+      navigator_->setTargetPosY(cur_pos.y());
+      navigator_->setTargetPosZ(cur_pos.z());
+    } else {
+      // Ground start: preserve the navigator's existing target_pos_z (set by motorArming
+      // to takeoff_height_). Only reset XY to current position. The takeoff ramp
+      // in BaseNavigator needs target_z = takeoff_height to know where to climb to.
+      navigator_->setTargetPosX(cur_pos.x());
+      navigator_->setTargetPosY(cur_pos.y());
+      // Do NOT override target_pos_z — keep the takeoff_height set by motorArming().
+      ROS_INFO("[UnifiedCtrl] Ground start: preserving target_z=%.3f (takeoff_height), cur_z=%.3f",
+               navigator_->getTargetPos().z(), cur_pos.z());
+    }
 
     double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
     navigator_->setTargetYaw(cur_yaw);
     navigator_->setTargetOmegaZ(0);
     beetle_navigator_->setUnifiedControlMode(true);
 
-    // --- Roll/Pitch I-term: partial retention + seed injection + freeze/boost ---
-    // Pitch has significant SS bias in unified mode (formation geometry offset),
-    // so we preload a seed. Roll bias ≈ 0 → partial retention only.
-    {
-      double old_roll_i = pid_controllers_.at(ROLL).getErrI();
-      double old_pitch_i = pid_controllers_.at(PITCH).getErrI();
+    if (from_hover) {
+      // ===== Hover → Unified: migrate existing I-terms carefully =====
 
-      double new_roll_i = rp_i_keep_ratio_ * old_roll_i;
+      // --- Roll/Pitch I-term: partial retention + seed injection + freeze/boost ---
+      // Pitch has significant SS bias in unified mode (formation geometry offset),
+      // so we preload a seed. Roll bias ≈ 0 → partial retention only.
+      {
+        double old_roll_i = pid_controllers_.at(ROLL).getErrI();
+        double old_pitch_i = pid_controllers_.at(PITCH).getErrI();
 
-      double pitch_seed = has_unified_pitch_i_ss_ ? last_unified_pitch_i_ss_ : pitch_i_seed_default_;
-      double new_pitch_i = rp_i_keep_ratio_ * old_pitch_i + PITCH_SEED_GAIN * pitch_seed;
+        double new_roll_i = rp_i_keep_ratio_ * old_roll_i;
 
-      // Clamp to unified-mode I limits (err_i domain = limit_i / Ki)
-      double Ki_roll = std::max(unified_roll_gains_.i, 1e-6);
-      double Ki_pitch = std::max(unified_pitch_gains_.i, 1e-6);
-      double roll_i_limit = unified_roll_gains_.limit_i / Ki_roll;
-      double pitch_i_limit = unified_pitch_gains_.limit_i / Ki_pitch;
-      new_roll_i = boost::algorithm::clamp(new_roll_i, -roll_i_limit, roll_i_limit);
-      new_pitch_i = boost::algorithm::clamp(new_pitch_i, -pitch_i_limit, pitch_i_limit);
+        double pitch_seed = has_unified_pitch_i_ss_ ? last_unified_pitch_i_ss_ : pitch_i_seed_default_;
+        double new_pitch_i = rp_i_keep_ratio_ * old_pitch_i + PITCH_SEED_GAIN * pitch_seed;
 
-      pid_controllers_.at(ROLL).setErrI(new_roll_i);
-      pid_controllers_.at(PITCH).setErrI(new_pitch_i);
-      rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
-      rp_ki_boost_count_ = RP_KI_BOOST_FRAMES;
+        // Clamp to unified-mode I limits (err_i domain = limit_i / Ki)
+        double Ki_roll = std::max(unified_roll_gains_.i, 1e-6);
+        double Ki_pitch = std::max(unified_pitch_gains_.i, 1e-6);
+        double roll_i_limit = unified_roll_gains_.limit_i / Ki_roll;
+        double pitch_i_limit = unified_pitch_gains_.limit_i / Ki_pitch;
+        new_roll_i = boost::algorithm::clamp(new_roll_i, -roll_i_limit, roll_i_limit);
+        new_pitch_i = boost::algorithm::clamp(new_pitch_i, -pitch_i_limit, pitch_i_limit);
 
-      ROS_WARN("[UnifiedCtrl] RP I-term transition: "
-               "roll_i: old=%.4f → new=%.4f (keep×%.1f), "
-               "pitch_i: old=%.4f → new=%.4f (keep×%.1f + seed=%.4f×%.1f=%s), "
-               "freeze=%d, boost=%d(×%.1f)",
-               old_roll_i, new_roll_i, rp_i_keep_ratio_,
-               old_pitch_i, new_pitch_i, rp_i_keep_ratio_,
-               pitch_seed, PITCH_SEED_GAIN,
-               has_unified_pitch_i_ss_ ? "adaptive" : "default",
-               rp_integral_freeze_count_, rp_ki_boost_count_, RP_KI_BOOST_FACTOR);
-    }
-    pid_controllers_.at(X).setErrI(0);
-    pid_controllers_.at(Y).setErrI(0);
+        pid_controllers_.at(ROLL).setErrI(new_roll_i);
+        pid_controllers_.at(PITCH).setErrI(new_pitch_i);
+        rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
+        rp_ki_boost_count_ = RP_KI_BOOST_FRAMES;
 
-    // --- Z I-term: de-gravity + seed injection (Plan E') ---
-    // Independent mode I-term ≈ G (implicit gravity). Unified mode has explicit
-    // gravity FF, so de-gravity subtracts it, then seed injects unified-mode bias.
-    {
-      double i_output_old = pid_controllers_.at(Z).getITerm();
+        ROS_WARN("[UnifiedCtrl] RP I-term transition (hover→unified): "
+                 "roll_i: old=%.4f → new=%.4f (keep×%.1f), "
+                 "pitch_i: old=%.4f → new=%.4f (keep×%.1f + seed=%.4f×%.1f=%s), "
+                 "freeze=%d, boost=%d(×%.1f)",
+                 old_roll_i, new_roll_i, rp_i_keep_ratio_,
+                 old_pitch_i, new_pitch_i, rp_i_keep_ratio_,
+                 pitch_seed, PITCH_SEED_GAIN,
+                 has_unified_pitch_i_ss_ ? "adaptive" : "default",
+                 rp_integral_freeze_count_, rp_ki_boost_count_, RP_KI_BOOST_FACTOR);
+      }
+      pid_controllers_.at(X).setErrI(0);
+      pid_controllers_.at(Y).setErrI(0);
 
-      tf::Matrix3x3 uav_rot_mig = estimator_->getOrientation(Frame::COG, estimate_mode_);
-      tf::Vector3 gravity_w_mig(0, 0, aerial_robot_estimation::G);
-      tf::Vector3 gravity_cog_mig = uav_rot_mig.inverse() * gravity_w_mig;
-      double gravity_ff_z = gravity_cog_mig.z();
+      // --- Z I-term: de-gravity + seed injection (Plan E') ---
+      // Independent mode I-term ≈ G (implicit gravity). Unified mode has explicit
+      // gravity FF, so de-gravity subtracts it, then seed injects unified-mode bias.
+      {
+        double i_output_old = pid_controllers_.at(Z).getITerm();
 
-      double i_output_degrav = i_output_old - gravity_ff_z;
-      double seed_value = has_unified_z_i_ss_ ? last_unified_z_i_ss_ : z_i_seed_default_;
-      double i_output_seeded = i_output_degrav + Z_SEED_GAIN * seed_value;
+        tf::Matrix3x3 uav_rot_mig = estimator_->getOrientation(Frame::COG, estimate_mode_);
+        tf::Vector3 gravity_w_mig(0, 0, aerial_robot_estimation::G);
+        tf::Vector3 gravity_cog_mig = uav_rot_mig.inverse() * gravity_w_mig;
+        double gravity_ff_z = gravity_cog_mig.z();
 
-      double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
-      double iz_new = i_output_seeded / Ki;
-      double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
-      if (!std::isfinite(iz_new)) iz_new = 0.0;
-      iz_new = boost::algorithm::clamp(iz_new, -iz_limit, iz_limit);
+        double i_output_degrav = i_output_old - gravity_ff_z;
+        double seed_value = has_unified_z_i_ss_ ? last_unified_z_i_ss_ : z_i_seed_default_;
+        double i_output_seeded = i_output_degrav + Z_SEED_GAIN * seed_value;
 
-      pid_controllers_.at(Z).setErrI(iz_new);
-      z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
-      z_ki_boost_count_ = Z_KI_BOOST_FRAMES;
-      ROS_WARN("[UnifiedCtrl] Z de-gravity + seed: i_old=%.4f, gravity_ff=%.4f, "
-               "i_degrav=%.4f, seed=%.4f(×%.1f=%s), i_seeded=%.4f, err_i=%.4f "
-               "(limit=±%.1f), freeze=%d, boost=%d(×%.1f)",
-               i_output_old, gravity_ff_z, i_output_degrav,
-               seed_value, Z_SEED_GAIN,
-               has_unified_z_i_ss_ ? "adaptive" : "default",
-               i_output_seeded, iz_new, iz_limit,
-               z_integral_freeze_count_, z_ki_boost_count_, Z_KI_BOOST_FACTOR);
+        double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
+        double iz_new = i_output_seeded / Ki;
+        double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
+        if (!std::isfinite(iz_new)) iz_new = 0.0;
+        iz_new = boost::algorithm::clamp(iz_new, -iz_limit, iz_limit);
+
+        pid_controllers_.at(Z).setErrI(iz_new);
+        z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
+        z_ki_boost_count_ = Z_KI_BOOST_FRAMES;
+        ROS_WARN("[UnifiedCtrl] Z de-gravity + seed (hover→unified): i_old=%.4f, gravity_ff=%.4f, "
+                 "i_degrav=%.4f, seed=%.4f(×%.1f=%s), i_seeded=%.4f, err_i=%.4f "
+                 "(limit=±%.1f), freeze=%d, boost=%d(×%.1f)",
+                 i_output_old, gravity_ff_z, i_output_degrav,
+                 seed_value, Z_SEED_GAIN,
+                 has_unified_z_i_ss_ ? "adaptive" : "default",
+                 i_output_seeded, iz_new, iz_limit,
+                 z_integral_freeze_count_, z_ki_boost_count_, Z_KI_BOOST_FACTOR);
+      }
+    } else {
+      // ===== Ground start → Unified: I-terms start from zero =====
+      // PID hasn't accumulated meaningful I-terms yet (robot is on the ground).
+      // Unified controlCore() already has explicit gravity FF in wrench_acc,
+      // so Z PID can accumulate from zero just like a normal independent takeoff.
+      // No freeze/boost needed — there's no prior steady-state to migrate from.
+      pid_controllers_.at(X).setErrI(0);
+      pid_controllers_.at(Y).setErrI(0);
+      pid_controllers_.at(Z).setErrI(0);
+      pid_controllers_.at(ROLL).setErrI(0);
+      pid_controllers_.at(PITCH).setErrI(0);
+      z_integral_freeze_count_ = 0;
+      z_ki_boost_count_ = 0;
+      rp_integral_freeze_count_ = 0;
+      rp_ki_boost_count_ = 0;
+      ROS_WARN("[UnifiedCtrl] Ground start: all I-terms zeroed, no freeze/boost (naviState=%d)",
+               navigator_->getNaviState());
     }
 
     sendCascadeSetup();

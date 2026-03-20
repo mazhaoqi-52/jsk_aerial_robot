@@ -603,6 +603,17 @@ namespace aerial_robot_control
       }
 
       // --- Attitude PID (Roll/Pitch/Yaw) ---
+      // Unified path bypasses PoseLinearController::controlCore(), so replicate
+      // the start_rp_integration_ height check here (same logic as base class).
+      if (!start_rp_integration_) {
+        if (pos_.z() - navigator_->getInitHeight() > start_rp_integration_height_) {
+          start_rp_integration_ = true;
+          spinal::FlightConfigCmd flight_config_cmd;
+          flight_config_cmd.cmd = spinal::FlightConfigCmd::INTEGRATION_CONTROL_ON_CMD;
+          navigator_->getFlightConfigPublisher().publish(flight_config_cmd);
+          ROS_WARN("[UnifiedCtrl] start roll/pitch I control (height threshold passed)");
+        }
+      }
       double du_rp = du;
       if(!start_rp_integration_) du_rp = 0;
 
@@ -679,26 +690,30 @@ namespace aerial_robot_control
       // PID still runs (position tracking), allocation still runs (FOLLOWERs get commands
       // which will trigger their ready ack), but I-terms are held constant.
       if (!unified_controller_->allFollowersReady()) {
-        // Revert all I-terms to pre-update values (same as freeze logic)
-        pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
-        pid_controllers_.at(ROLL).setErrI(pid_controllers_.at(ROLL).getPrevErrI());
-        pid_controllers_.at(PITCH).setErrI(pid_controllers_.at(PITCH).getPrevErrI());
-        pid_controllers_.at(X).setErrI(pid_controllers_.at(X).getPrevErrI());
-        pid_controllers_.at(Y).setErrI(pid_controllers_.at(Y).getPrevErrI());
+        // Hover → Unified: freeze I-terms to prevent buildup while inner loops aren't synced.
+        // Ground start (TAKEOFF_STATE): skip freeze — I-terms start from zero, freezing
+        // only delays Z integral accumulation and slows the thrust ramp.
+        if (navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE) {
+          pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
+          pid_controllers_.at(ROLL).setErrI(pid_controllers_.at(ROLL).getPrevErrI());
+          pid_controllers_.at(PITCH).setErrI(pid_controllers_.at(PITCH).getPrevErrI());
+          pid_controllers_.at(X).setErrI(pid_controllers_.at(X).getPrevErrI());
+          pid_controllers_.at(Y).setErrI(pid_controllers_.at(Y).getPrevErrI());
 
-        // Keep freeze/boost timers paused — they'll start ticking once followers are ready
-        if (z_integral_freeze_count_ == 0 && z_ki_boost_count_ == 0) {
-          z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;  // restart freeze when ready
-        }
-        if (rp_integral_freeze_count_ == 0 && rp_ki_boost_count_ == 0) {
-          rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
+          if (z_integral_freeze_count_ == 0 && z_ki_boost_count_ == 0) {
+            z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
+          }
+          if (rp_integral_freeze_count_ == 0 && rp_ki_boost_count_ == 0) {
+            rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
+          }
         }
 
         unified_controller_->incrementFollowerReadyWait();
         ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl LEADER] Waiting for %d FOLLOWERs to report ready "
-                          "(frame %d, I-terms frozen)",
+                          "(frame %d, I-terms %s)",
                           unified_controller_->pendingFollowerCount(),
-                          unified_controller_->getFollowerReadyWaitCount());
+                          unified_controller_->getFollowerReadyWaitCount(),
+                          (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) ? "accumulating" : "frozen");
       }
 
       // --- Build 6-DOF target wrench in acceleration space ---

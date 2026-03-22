@@ -348,130 +348,6 @@ class TowingStateBase(FormationSingleUAVStateBase):
         """Get load box top Z coordinate."""
         return self.load_interface.get_load_top_z()
     
-    def execute_smooth_descent_trajectory(self, trajectory_points):
-        """
-        Execute trajectory with smooth flow-through mode for Z descent.
-        Only waits for convergence at the last 2 points for precision landing.
-        
-        This avoids the "stuttering" effect of waiting at every waypoint.
-        """
-        rospy.loginfo(f"Executing Smooth Descent Trajectory: {len(trajectory_points)} points (flow-through mode)")
-        total_points = len(trajectory_points)
-        control_rate = rospy.Rate(25)  # 25Hz control loop
-        
-        for i, (pos, yaw, velocity, vel_magnitude) in enumerate(trajectory_points):
-            is_final_two = (i >= total_points - 2)
-            
-            # Log progress periodically
-            if i % 5 == 0 or is_final_two:
-                mode = "precision" if is_final_two else "flow-through"
-                rospy.loginfo(f"Point {i+1}/{total_points} ({mode}): pos={FormationUtils.format_vec(pos)}, "
-                             f"yaw={math.degrees(yaw):.1f}°, vel={vel_magnitude:.3f}m/s")
-            
-            if is_final_two:
-                # Last 2 points: wait for precise convergence with gentle velocity
-                # CRITICAL: Use max_linear_vel to avoid trajectory decomposition "impact"
-                pos_thresh, yaw_thresh, timeout = (0.08, 0.08, 15.0)
-                rospy.loginfo(f"Converging to point {i+1} with precision (gentle descent)...")
-                success = self.active_position_convergence(
-                    pos, yaw, pos_thresh, yaw_thresh, timeout,
-                    max_linear_vel=0.02,  # Limit to 20mm/s for gentle final approach
-                    max_angular_vel=0.03
-                )
-                
-                if not success:
-                    rospy.logwarn(f"Point {i+1} convergence incomplete - continuing")
-                
-                # Stabilize at final point
-                if i == total_points - 1:
-                    rospy.loginfo(f"Stabilizing final point for 1.5s")
-                    stabilize_end = rospy.Time.now().to_sec() + 1.5
-                    rate_stabilize = rospy.Rate(25)
-                    while rospy.Time.now().to_sec() < stabilize_end and not rospy.is_shutdown():
-                        self.send_assembly_command_from_end_effector(pos, yaw)
-                        rate_stabilize.sleep()
-                
-                rospy.sleep(0.1)
-            else:
-                # Flow-through mode: send command and continue without waiting
-                # Send command with velocity for smooth motion
-                self.send_assembly_command_from_end_effector(
-                    pos, yaw,
-                    linear_vel=velocity,
-                    angular_vel=0.0
-                )
-                
-                # Brief pause to allow command to be sent
-                control_rate.sleep()
-        
-        rospy.loginfo("Smooth descent trajectory execution completed")
-        return True
-    
-    def execute_polynomial_trajectory(self, trajectory_points):
-        """
-        Execute polynomial trajectory using active convergence for each point.
-        Enhanced version with dynamic timeout based on distance.
-        """
-        rospy.loginfo(f"Executing Formation Polynomial Trajectory: {len(trajectory_points)} points")
-        total_points = len(trajectory_points)
-        
-        for i, (pos, yaw, velocity, vel_magnitude) in enumerate(trajectory_points):
-            is_final = (i >= total_points - 2)
-            
-            # Log progress
-            if i % 3 == 0 or i == total_points - 1:
-                mode = "precision" if is_final else "trajectory"
-                rospy.loginfo(f"Point {i+1}/{total_points} ({mode}): pos={FormationUtils.format_vec(pos)}, yaw={math.degrees(yaw):.1f}°")
-            
-            # Get current position to calculate distance
-            current_pos = self.get_end_effector_position()
-            if current_pos is not None:
-                distance = np.linalg.norm(np.array(pos) - np.array(current_pos))
-            else:
-                distance = 0.5  # Default assumption if position unavailable
-            
-            # Dynamic timeout based on distance with generous margins
-            # Conservative velocity assumptions to ensure sufficient timeout
-            if is_final:
-                # Final points: high precision, generous timeout
-                pos_thresh = 0.08
-                yaw_thresh = 0.08
-                # Assume 15mm/s velocity + 100% safety margin
-                base_timeout = max(distance / 0.015 * 2.0, 20.0)
-            else:
-                # Intermediate points: balanced threshold, safe timeout
-                pos_thresh = 0.08  # Reduced from 0.12 to avoid cumulative error
-                yaw_thresh = 0.15
-                # Assume 20mm/s velocity + 150% safety margin for long distances
-                if distance > 0.2:  # 200mm+
-                    base_timeout = max(distance / 0.020 * 2.5, 15.0)
-                else:
-                    base_timeout = max(distance / 0.025 * 2.0, 8.0)
-            
-            timeout = base_timeout
-            
-            rospy.loginfo(f"Converging to point {i+1}: dist={distance*1000:.1f}mm, timeout={timeout:.1f}s")
-            
-            success = self.active_position_convergence(pos, yaw, pos_thresh, yaw_thresh, timeout)
-            
-            if not success:
-                rospy.logwarn(f"Point {i+1} convergence issue - continuing")
-            
-            # Stabilize precision points
-            if is_final:
-                rospy.loginfo(f"Stabilizing point {i+1} for 2s")
-                stabilize_end = rospy.Time.now().to_sec() + 2.0
-                rate = rospy.Rate(10)
-                while rospy.Time.now().to_sec() < stabilize_end and not rospy.is_shutdown():
-                    self.send_assembly_command_from_end_effector(pos, yaw)
-                    rate.sleep()
-            
-            # Dynamic pause
-            rospy.sleep(0.2 if is_final else 0.067)
-        
-        rospy.loginfo("Polynomial trajectory execution completed")
-        return True
-    
     def calculate_approach_side(self, assembly_pos, load_pos):
         """
         Calculate which side of the load to approach (nearest edge midpoint).
@@ -623,7 +499,6 @@ class ApproachLoadState(TowingStateBase):
             start_pos=current_pos,
             target_pos=phase1_target,
             target_yaw=current_yaw,  # Keep current yaw during XY movement
-            num_points=15,
             lock_yaw=True
         )
 
@@ -658,18 +533,16 @@ class ApproachLoadState(TowingStateBase):
         descent_distance = abs(current_pos[2] - approach_height)
         rospy.loginfo(f"Descent distance: {descent_distance*1000:.1f}mm")
 
-        # Use polynomial trajectory for smooth descent with controlled acceleration/deceleration
-        trajectory_points = self.generate_polynomial_trajectory(
+        # Use streaming polynomial trajectory for smooth descent
+        traj_desc = self.generate_polynomial_trajectory(
             start_pos=current_pos,
             target_pos=phase3_target,
             target_yaw=target_yaw,
-            num_points=20,  # More points for smoother Z descent
             lock_yaw=True   # Lock yaw during descent, focus on Z axis
         )
 
-        if trajectory_points:
-            # Execute trajectory with flow-through mode: only converge at the last 2 points
-            self.execute_smooth_descent_trajectory(trajectory_points)
+        if traj_desc:
+            self.execute_polynomial_trajectory(traj_desc)
 
         # Final precision convergence with gentle velocity to avoid "impact"
         rospy.loginfo("Final precision positioning with gentle velocity...")
@@ -1068,17 +941,16 @@ class DisengageAndReturnState(TowingStateBase):
         current_pos = self.get_end_effector_position()
         return_target = (start_pos[0], start_pos[1], current_pos[2])
         
-        # Use polynomial trajectory for smooth return
-        trajectory_points = self.generate_polynomial_trajectory(
+        # Use streaming polynomial trajectory for smooth return
+        traj_desc = self.generate_polynomial_trajectory(
             start_pos=current_pos,
             target_pos=return_target,
             target_yaw=start_yaw,
-            num_points=15,
             lock_yaw=True
         )
         
-        if trajectory_points:
-            self.execute_polynomial_trajectory(trajectory_points)
+        if traj_desc:
+            self.execute_polynomial_trajectory(traj_desc)
         
         success = self.active_position_convergence(
             return_target, target_yaw=start_yaw,

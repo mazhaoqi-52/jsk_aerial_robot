@@ -19,7 +19,7 @@ class NModuleTFCalculator:
         # Parse module IDs and determine assembly parameters
         self.module_ids = [int(x.strip()) for x in module_ids_str.split(',')]
         self.number_of_modules = len(self.module_ids)
-        self.leader_id = max(self.module_ids)  # Leader is the UAV with highest ID (carries end-effector)
+        self.leader_id = self.module_ids[-1]  # Leader is the last in the chain (carries end-effector)
         
         rospy.loginfo(f"Initialized NModuleTFCalculator:")
         rospy.loginfo(f"  Module IDs: {self.module_ids}")
@@ -57,9 +57,8 @@ class NModuleTFCalculator:
         # For n modules: positions are at -d*(n-1)/2, -d*(n-3)/2, ..., +d*(n-1)/2
         # where d = module_distance
         
-        # Sort module IDs and find leader's index (leader has highest ID)
-        sorted_modules = sorted(self.module_ids)
-        leader_index = sorted_modules.index(self.leader_id)
+        # Use input order as physical arrangement (X-axis small to large)
+        leader_index = self.module_ids.index(self.leader_id)
         
         # Leader's position relative to assembly center
         # Assembly center is at index position (n-1)/2

@@ -144,22 +144,32 @@ controller:
     need_d_control: true
 
   # Unified-mode PID gains for roll/pitch.
-  # These are applied ONLY when entering unified control mode (leader does full 6-DOF PID).
-  # When exiting unified mode, the original per-module gains are restored.
+  # Applied ONLY when entering unified control mode; restored on exit.
+  # Roll/Pitch: only i_gain is used on PC (P+D handled by spinal cascade).
   unified_roll:
-    p_gain: 36.0
     i_gain: 1.0
-    d_gain: 12.0
     limit_sum: 50.0
-    limit_p: 50.0
     limit_i: 10.0
-    limit_d: 50.0
 
   unified_pitch:
-    p_gain: 36.0
     i_gain: 5.0
-    d_gain: 12.0
     limit_sum: 50.0
-    limit_p: 50.0
     limit_i: 10.0
-    limit_d: 50.0
+
+  unified_xy:
+    p_gain: 10.0
+    i_gain: 0.2
+    d_gain: 4.0
+    limit_sum: 8.0
+    limit_p: 12.0
+    limit_i: 5.0
+    limit_d: 12.0
+
+  unified_z:
+    p_gain: 8.0
+    i_gain: 1.5
+    d_gain: 4.0
+    limit_sum: 25.0
+    limit_p: 25.0
+    limit_i: 20.0
+    limit_d: 25.0

@@ -120,6 +120,15 @@ namespace aerial_robot_control
     pid_reconf_servers_.push_back(boost::make_shared<PidControlDynamicConfig>(wrench_nh));
     pid_reconf_servers_.back()->setCallback(boost::bind(&BeetleController::cfgPidCallback, this, _1, _2, indices));
 
+    // Unified-mode XY/Z dynamic reconfigure servers
+    ros::NodeHandle unified_xy_nh(control_nh, "unified_xy");
+    unified_xy_reconf_server_ = boost::make_shared<PidControlDynamicConfig>(unified_xy_nh);
+    unified_xy_reconf_server_->setCallback(boost::bind(&BeetleController::cfgUnifiedPidCallback, this, _1, _2, std::vector<int>{X, Y}, boost::ref(unified_xy_gains_)));
+
+    ros::NodeHandle unified_z_nh(control_nh, "unified_z");
+    unified_z_reconf_server_ = boost::make_shared<PidControlDynamicConfig>(unified_z_nh);
+    unified_z_reconf_server_->setCallback(boost::bind(&BeetleController::cfgUnifiedPidCallback, this, _1, _2, std::vector<int>{Z}, boost::ref(unified_z_gains_)));
+
     prev_comp_update_time_ = -1;
 
     // Initialize unified controller (unified_control_mode_ is read by rosParamInit)
@@ -1490,10 +1499,17 @@ namespace aerial_robot_control
     // Save current (independent) gains
     auto& roll_pid = pid_controllers_.at(ROLL);
     auto& pitch_pid = pid_controllers_.at(PITCH);
+    auto& x_pid = pid_controllers_.at(X);
+    auto& y_pid = pid_controllers_.at(Y);
+    auto& z_pid = pid_controllers_.at(Z);
     saved_roll_gains_ = {roll_pid.getPGain(), roll_pid.getIGain(), roll_pid.getDGain(),
                          roll_pid.getLimitSum(), roll_pid.getLimitP(), roll_pid.getLimitI(), roll_pid.getLimitD()};
     saved_pitch_gains_ = {pitch_pid.getPGain(), pitch_pid.getIGain(), pitch_pid.getDGain(),
                           pitch_pid.getLimitSum(), pitch_pid.getLimitP(), pitch_pid.getLimitI(), pitch_pid.getLimitD()};
+    saved_xy_gains_ = {x_pid.getPGain(), x_pid.getIGain(), x_pid.getDGain(),
+                       x_pid.getLimitSum(), x_pid.getLimitP(), x_pid.getLimitI(), x_pid.getLimitD()};
+    saved_z_gains_ = {z_pid.getPGain(), z_pid.getIGain(), z_pid.getDGain(),
+                      z_pid.getLimitSum(), z_pid.getLimitP(), z_pid.getLimitI(), z_pid.getLimitD()};
 
     // Apply unified (formation) gains.
     // CASCADE MODE: wrench_acc only uses getITerm() for roll/pitch — P and D
@@ -1512,11 +1528,31 @@ namespace aerial_robot_control
     pitch_pid.setLimitI(unified_pitch_gains_.limit_i);
     pitch_pid.setLimitD(0.0);
 
+    // Apply unified XY gains
+    x_pid.setGains(unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d);
+    x_pid.setLimitSum(unified_xy_gains_.limit_sum);
+    x_pid.setLimitP(unified_xy_gains_.limit_p);
+    x_pid.setLimitI(unified_xy_gains_.limit_i);
+    x_pid.setLimitD(unified_xy_gains_.limit_d);
+    y_pid.setGains(unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d);
+    y_pid.setLimitSum(unified_xy_gains_.limit_sum);
+    y_pid.setLimitP(unified_xy_gains_.limit_p);
+    y_pid.setLimitI(unified_xy_gains_.limit_i);
+    y_pid.setLimitD(unified_xy_gains_.limit_d);
+
+    // Apply unified Z gains
+    z_pid.setGains(unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d);
+    z_pid.setLimitSum(unified_z_gains_.limit_sum);
+    z_pid.setLimitP(unified_z_gains_.limit_p);
+    z_pid.setLimitI(unified_z_gains_.limit_i);
+    z_pid.setLimitD(unified_z_gains_.limit_d);
+
     gains_switched_ = true;
-    ROS_WARN("[UnifiedCtrl] Applied unified roll/pitch gains: P=0 I=%.1f D=0 limit_i=%.1f "
-             "(cascade: P+D on spinal, I-only on PC) (was P=%.1f I=%.1f D=%.1f)",
-             unified_roll_gains_.i, unified_roll_gains_.limit_i,
-             saved_pitch_gains_.p, saved_pitch_gains_.i, saved_pitch_gains_.d);
+    ROS_WARN("[UnifiedCtrl] Applied unified gains: roll/pitch I=%.1f/%.1f, "
+             "xy P=%.1f I=%.1f D=%.1f, z P=%.1f I=%.1f D=%.1f",
+             unified_roll_gains_.i, unified_pitch_gains_.i,
+             unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d,
+             unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d);
   }
 
   void BeetleController::restoreIndependentGains()
@@ -1525,6 +1561,9 @@ namespace aerial_robot_control
 
     auto& roll_pid = pid_controllers_.at(ROLL);
     auto& pitch_pid = pid_controllers_.at(PITCH);
+    auto& x_pid = pid_controllers_.at(X);
+    auto& y_pid = pid_controllers_.at(Y);
+    auto& z_pid = pid_controllers_.at(Z);
 
     roll_pid.setGains(saved_roll_gains_.p, saved_roll_gains_.i, saved_roll_gains_.d);
     roll_pid.setLimitSum(saved_roll_gains_.limit_sum);
@@ -1538,9 +1577,72 @@ namespace aerial_robot_control
     pitch_pid.setLimitI(saved_pitch_gains_.limit_i);
     pitch_pid.setLimitD(saved_pitch_gains_.limit_d);
 
+    // Restore independent XY gains
+    x_pid.setGains(saved_xy_gains_.p, saved_xy_gains_.i, saved_xy_gains_.d);
+    x_pid.setLimitSum(saved_xy_gains_.limit_sum);
+    x_pid.setLimitP(saved_xy_gains_.limit_p);
+    x_pid.setLimitI(saved_xy_gains_.limit_i);
+    x_pid.setLimitD(saved_xy_gains_.limit_d);
+    y_pid.setGains(saved_xy_gains_.p, saved_xy_gains_.i, saved_xy_gains_.d);
+    y_pid.setLimitSum(saved_xy_gains_.limit_sum);
+    y_pid.setLimitP(saved_xy_gains_.limit_p);
+    y_pid.setLimitI(saved_xy_gains_.limit_i);
+    y_pid.setLimitD(saved_xy_gains_.limit_d);
+
+    // Restore independent Z gains
+    z_pid.setGains(saved_z_gains_.p, saved_z_gains_.i, saved_z_gains_.d);
+    z_pid.setLimitSum(saved_z_gains_.limit_sum);
+    z_pid.setLimitP(saved_z_gains_.limit_p);
+    z_pid.setLimitI(saved_z_gains_.limit_i);
+    z_pid.setLimitD(saved_z_gains_.limit_d);
+
     gains_switched_ = false;
-    ROS_WARN("[UnifiedCtrl] Restored independent roll/pitch gains: P=%.1f D=%.1f",
-             saved_pitch_gains_.p, saved_pitch_gains_.d);
+    ROS_WARN("[UnifiedCtrl] Restored independent gains: pitch P=%.1f D=%.1f, xy P=%.1f D=%.1f, z P=%.1f D=%.1f",
+             saved_pitch_gains_.p, saved_pitch_gains_.d,
+             saved_xy_gains_.p, saved_xy_gains_.d,
+             saved_z_gains_.p, saved_z_gains_.d);
+  }
+
+  void BeetleController::cfgUnifiedPidCallback(aerial_robot_control::PIDConfig &config, uint32_t level, std::vector<int> controller_indices, AxisGainSet& gain_set)
+  {
+    using Levels = aerial_robot_msgs::DynamicReconfigureLevels;
+    if(!config.pid_control_flag) return;
+
+    switch(level)
+      {
+      case Levels::RECONFIGURE_P_GAIN:
+        gain_set.p = config.p_gain;
+        break;
+      case Levels::RECONFIGURE_I_GAIN:
+        gain_set.i = config.i_gain;
+        break;
+      case Levels::RECONFIGURE_D_GAIN:
+        gain_set.d = config.d_gain;
+        break;
+      default:
+        return;
+      }
+
+    // If unified mode is active, push the new gain to live pid_controllers_ immediately
+    if (gains_switched_)
+      {
+        for (const auto& index : controller_indices)
+          {
+            switch(level)
+              {
+              case Levels::RECONFIGURE_P_GAIN:
+                pid_controllers_.at(index).setPGain(config.p_gain);
+                break;
+              case Levels::RECONFIGURE_I_GAIN:
+                pid_controllers_.at(index).setIGain(config.i_gain);
+                break;
+              case Levels::RECONFIGURE_D_GAIN:
+                pid_controllers_.at(index).setDGain(config.d_gain);
+                break;
+              }
+            ROS_INFO_STREAM("[UnifiedCtrl] change unified gain for controller '" << pid_controllers_.at(index).getName() << "'");
+          }
+      }
   }
 
   void BeetleController::calcInteractionWrench()
@@ -1713,23 +1815,36 @@ namespace aerial_robot_control
     getParam<double>(control_nh, "rp_i_keep_ratio", rp_i_keep_ratio_, 0.5);
 
     // Load unified-mode PID gains for roll/pitch (formation pendulum compensation)
+    // Only i_gain, limit_sum, limit_i are used — PC outer loop runs I-only;
+    // P and D are handled by spinal cascade (cascade_roll_p/d, cascade_pitch_p/d).
     ros::NodeHandle u_roll_nh(control_nh, "unified_roll");
-    getParam<double>(u_roll_nh, "p_gain", unified_roll_gains_.p, 36.0);
     getParam<double>(u_roll_nh, "i_gain", unified_roll_gains_.i, 1.0);
-    getParam<double>(u_roll_nh, "d_gain", unified_roll_gains_.d, 12.0);
     getParam<double>(u_roll_nh, "limit_sum", unified_roll_gains_.limit_sum, 50.0);
-    getParam<double>(u_roll_nh, "limit_p", unified_roll_gains_.limit_p, 50.0);
     getParam<double>(u_roll_nh, "limit_i", unified_roll_gains_.limit_i, 10.0);
-    getParam<double>(u_roll_nh, "limit_d", unified_roll_gains_.limit_d, 50.0);
 
     ros::NodeHandle u_pitch_nh(control_nh, "unified_pitch");
-    getParam<double>(u_pitch_nh, "p_gain", unified_pitch_gains_.p, 36.0);
     getParam<double>(u_pitch_nh, "i_gain", unified_pitch_gains_.i, 1.0);
-    getParam<double>(u_pitch_nh, "d_gain", unified_pitch_gains_.d, 12.0);
     getParam<double>(u_pitch_nh, "limit_sum", unified_pitch_gains_.limit_sum, 50.0);
-    getParam<double>(u_pitch_nh, "limit_p", unified_pitch_gains_.limit_p, 50.0);
     getParam<double>(u_pitch_nh, "limit_i", unified_pitch_gains_.limit_i, 10.0);
-    getParam<double>(u_pitch_nh, "limit_d", unified_pitch_gains_.limit_d, 50.0);
+
+    // Load unified-mode PID gains for XY and Z (used when formation is assembled)
+    ros::NodeHandle u_xy_nh(control_nh, "unified_xy");
+    getParam<double>(u_xy_nh, "p_gain", unified_xy_gains_.p, 2.0);
+    getParam<double>(u_xy_nh, "i_gain", unified_xy_gains_.i, 0.2);
+    getParam<double>(u_xy_nh, "d_gain", unified_xy_gains_.d, 2.5);
+    getParam<double>(u_xy_nh, "limit_sum", unified_xy_gains_.limit_sum, 8.0);
+    getParam<double>(u_xy_nh, "limit_p", unified_xy_gains_.limit_p, 12.0);
+    getParam<double>(u_xy_nh, "limit_i", unified_xy_gains_.limit_i, 8.0);
+    getParam<double>(u_xy_nh, "limit_d", unified_xy_gains_.limit_d, 12.0);
+
+    ros::NodeHandle u_z_nh(control_nh, "unified_z");
+    getParam<double>(u_z_nh, "p_gain", unified_z_gains_.p, 5.0);
+    getParam<double>(u_z_nh, "i_gain", unified_z_gains_.i, 1.0);
+    getParam<double>(u_z_nh, "d_gain", unified_z_gains_.d, 2.0);
+    getParam<double>(u_z_nh, "limit_sum", unified_z_gains_.limit_sum, 25.0);
+    getParam<double>(u_z_nh, "limit_p", unified_z_gains_.limit_p, 25.0);
+    getParam<double>(u_z_nh, "limit_i", unified_z_gains_.limit_i, 20.0);
+    getParam<double>(u_z_nh, "limit_d", unified_z_gains_.limit_d, 25.0);
 
     // UO-4: formation observer feedforward compensation
     ros::NodeHandle obs_comp_nh(control_nh, "formation_observer_comp");

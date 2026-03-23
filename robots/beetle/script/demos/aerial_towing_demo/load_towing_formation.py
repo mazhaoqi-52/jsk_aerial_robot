@@ -222,11 +222,11 @@ class LinearTowingTrajectoryGenerator:
             inst_vel = self.current_distance / max(0.1, current_time - self.start_time)
         
         if inst_vel < self.target_velocity * 0.5:
-            # Below 50% target: ramp up +0.5N/cycle = +12.5N/s at 25Hz
-            self.current_force = min(self.max_force, self.current_force + 0.5)
+            # Below 50% target: ramp up +0.04N/cycle = +1.0N/s at 25Hz
+            self.current_force = min(self.max_force, self.current_force + 0.04)
         elif inst_vel > self.target_velocity * 0.8:
-            # Above 80% target: decay -0.2N/cycle = -5N/s at 25Hz
-            self.current_force = max(0.0, self.current_force - 0.2)
+            # Above 80% target: decay -0.02N/cycle = -0.5N/s at 25Hz
+            self.current_force = max(0.0, self.current_force - 0.02)
         # Between 50%-80%: hold current force (hysteresis band)
         
         return {
@@ -468,8 +468,8 @@ class ApproachLoadState(TowingStateBase):
         load_top_z = load_center_z + LOAD_BOX_HEIGHT / 2
         approach_height = load_top_z + APPROACH_HEIGHT_OFFSET
 
-        # Position slightly inside the box edge (overshoot by 30mm for insertion)
-        overshoot = 0.03  # 30mm inside box edge
+        # Position slightly inside the box edge (overshoot by 50mm for insertion)
+        overshoot = 0.05  # 50mm inside box edge (30mm margin after 20mm wall thickness)
         approach_xy = edge_pos[:2] - approach_dir[:2] * overshoot
 
         # Calculate target yaw: facing into the box (opposite of approach direction)
@@ -900,16 +900,23 @@ class DisengageAndReturnState(TowingStateBase):
         
         rospy.loginfo(f"[Phase 0] Stabilization complete after {stabilize_duration}s")
         
-        # DEBUG: log position drift to confirm PID integral residual
-        post_stab_pos = self.get_end_effector_position()
-        if post_stab_pos and current_pos:
-            drift = np.array(post_stab_pos) - np.array(current_pos)
-            rospy.loginfo(f"[DEBUG] Position drift during stabilization: "
-                         f"({drift[0]*1000:.1f}, {drift[1]*1000:.1f}, {drift[2]*1000:.1f})mm")
+        # Phase 0.5: Retract along towing reverse direction to disengage hook
+        towing_dir = np.array(userdata.towing_direction)
+        retract_dir = -towing_dir  # reverse of towing = back into box, then past wall
+        retract_distance = 0.08  # 80mm
+        current_pos = self.get_end_effector_position()
+        retract_target = np.array(current_pos) + retract_dir * retract_distance
+        rospy.loginfo(f"[Phase 0.5] Retracting {retract_distance*1000:.0f}mm along "
+                      f"{retract_dir} to disengage hook")
+
+        success = self.active_position_convergence(
+            retract_target, target_yaw=current_yaw,
+            pos_thresh=0.03, yaw_thresh=0.1, timeout=10.0,
+            max_linear_vel=0.03
+        )
+        rospy.sleep(0.5)
 
         # Phase 1: Ascend to start height to fully clear the box
-        # The fang may still be hooked on the box wall; ascending to the
-        # original start_pos height guarantees physical clearance.
         current_pos = self.get_end_effector_position()
         safe_height = start_pos[2]
         rospy.loginfo(f"[Phase 1] Ascending to start height {safe_height:.3f}m "

@@ -10,7 +10,7 @@
   
   <!-- Load properties -->
   <xacro:property name="load_mass" value="2.0" />   <!-- kg -->
-  <xacro:arg name="load_friction" default="3.0" /> <!-- N, force needed to move -->
+  <xacro:arg name="load_friction" default="15.0" /> <!-- N, force needed to move -->
   
   <!-- Inertia approximation (treating as hollow box) -->
   <xacro:property name="ixx" value="${(1.0/12.0) * load_mass * (box_width*box_width + box_height*box_height)}" />
@@ -148,9 +148,9 @@
   <!-- ============== Gazebo Materials ============== -->
   <gazebo reference="load_box">
     <material>Gazebo/Orange</material>
-    <!-- 碰撞表面属性 - 高摩擦防止滑动 -->
-    <mu1>10.0</mu1>
-    <mu2>10.0</mu2>
+    <!-- 碰撞表面属性 - 极低摩擦，滑动阻力由prismatic joint friction控制 -->
+    <mu1>0.001</mu1>
+    <mu2>0.001</mu2>
     <kp>1000000.0</kp>
     <kd>100.0</kd>
     <minDepth>0.001</minDepth>

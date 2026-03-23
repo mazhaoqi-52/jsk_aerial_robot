@@ -841,6 +841,8 @@ void BeetleNavigator::calcCenterOfMoving()
   std::sort(assembled_modules_ids_.begin(), assembled_modules_ids_.end());
   int leader_index = std::round((assembled_modules_ids_.size())/2.0) -1;
   if(!leader_fix_flag_) leader_id_ = assembled_modules_ids_[leader_index];
+  // Expose leader_id to rosparam so Python scripts can route wrench to the correct module
+  nh_.setParam("assembly_leader_id", leader_id_);
   if(my_id_ == leader_id_ && control_flag_){
     module_state_ = LEADER;
   }else if(control_flag_){

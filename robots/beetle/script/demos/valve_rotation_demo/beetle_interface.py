@@ -92,9 +92,17 @@ class BeetleInterface(object):
         self.land_pub = rospy.Publisher('teleop_command/land', Empty, queue_size=1)
         self.halt_pub = rospy.Publisher('teleop_command/halt', Empty, queue_size=1)
         self.tagged_wrench_pub = rospy.Publisher(f'/beetle{module_id}/tagged_wrench', TaggedWrench, queue_size=1)
-        self.desired_ext_wrench_pub = rospy.Publisher(f'/beetle{module_id}/desired_external_wrench', WrenchStamped, queue_size=1)
+        # Wrench must be routed to the C++ LEADER (centre-of-sorted-IDs), which may
+        # differ from the Python "leader" (end-effector module = last in chain).
+        # C++ beetle_navigation publishes assembly_leader_id to rosparam.
+        wrench_target_id = rospy.get_param(f'/beetle{module_id}/assembly_leader_id', module_id) if assembly_mode else module_id
+        self.wrench_target_id = wrench_target_id
+        self.desired_ext_wrench_pub = rospy.Publisher(f'/beetle{wrench_target_id}/desired_external_wrench', WrenchStamped, queue_size=1)
         if assembly_mode:
-            self.formation_wrench_pub = rospy.Publisher(f'/beetle{module_id}/formation_desired_wrench', WrenchStamped, queue_size=1)
+            self.formation_wrench_pub = rospy.Publisher(f'/beetle{wrench_target_id}/formation_desired_wrench', WrenchStamped, queue_size=1)
+        if assembly_mode and wrench_target_id != module_id:
+            rospy.logwarn(f"[BeetleInterface] Wrench routed to C++ LEADER beetle{wrench_target_id} "
+                          f"(Python EE module={module_id})")
         
         # Setup subscribers
         if assembly_mode:

@@ -15,7 +15,7 @@
   <arg name="load_y"        default="0"/>
   <arg name="load_z"        default="0"/>
   <arg name="load_yaw"      default="0"/>
-  <arg name="load_friction" default="0.5"/>
+  <arg name="load_friction" default="15.0"/>
 
   <include file="$(find beetle)/launch/aerial_towing_tasks/load_pos.launch">
     <arg name="real_machine"  value="$(arg real_machine)"/>

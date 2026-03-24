@@ -28,8 +28,10 @@
   </include>
 
   ###########  Parameters  ###########
-  <arg name="rotation_angle"  default="1.571"
-       doc="Total rotation target in radians (default 90 deg)"/>
+  <arg name="rotation_angle_deg" default="90"
+       doc="Total rotation target in degrees"/>
+  <arg name="valve_rotation_direction" default="cw"
+       doc="Valve rotation direction: cw/ccw"/>
   <arg name="approach_height" default="0.48"
        doc="Valve approach height (m), adjusted for EE offset"/>
   <arg name="debug" default="false"/>
@@ -42,7 +44,8 @@
   <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_clean.py"
         output="screen">
     <param name="module_ids"      value="$(arg module_ids)"/>
-    <param name="rotation_angle"  value="$(arg rotation_angle)"/>
+     <param name="rotation_angle_deg" value="$(arg rotation_angle_deg)"/>
+    <param name="valve_rotation_direction" value="$(arg valve_rotation_direction)"/>
     <param name="approach_height" value="$(arg approach_height)"/>
     <param name="simulation"      value="$(arg simulation)"/>
     <param name="real_machine"    value="$(arg real_machine)"/>

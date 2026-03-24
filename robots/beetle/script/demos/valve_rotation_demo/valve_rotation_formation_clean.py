@@ -135,6 +135,28 @@ class FormationUtils:
         
         return valve_rotation, valve_angular_velocity, False, last_valve_yaw, last_check_time
 
+    @staticmethod
+    def monitor_cumulative_valve_rotation(current_valve_yaw, last_valve_yaw,
+                                          last_check_time, current_time,
+                                          cumulative_rotation, rotation_direction,
+                                          update_interval=0.2):
+        """
+        Monitor cumulative valve rotation progress in the commanded direction.
+        Returns: (cumulative_rotation, valve_angular_velocity, should_update, new_last_yaw, new_last_time)
+        """
+        valve_angular_velocity = 0.0
+        should_update = current_time > last_check_time + update_interval
+
+        if should_update:
+            dt = current_time - last_check_time
+            delta_yaw = FormationUtils._angle_diff(current_valve_yaw, last_valve_yaw)
+            directed_delta = rotation_direction * delta_yaw
+            cumulative_rotation = max(0.0, cumulative_rotation + directed_delta)
+            valve_angular_velocity = max(0.0, directed_delta / dt)
+            return cumulative_rotation, valve_angular_velocity, True, current_valve_yaw, current_time
+
+        return cumulative_rotation, valve_angular_velocity, False, last_valve_yaw, last_check_time
+
 
 class FormationAdapter:
     """Dynamic adapter for multi-UAV formation with configurable module_ids"""
@@ -1541,7 +1563,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 class FormationRotateValveState(FormationSingleUAVStateBase):
     """Formation valve contact and rotation using streaming circular trajectory."""
 
-    def __init__(self, rotation_direction=1):
+    def __init__(self, rotation_direction=1, target_rotation=math.radians(90.0)):
         FormationSingleUAVStateBase.__init__(
             self,
             outcomes=['succeeded', 'failed', 'emergency'],
@@ -1549,7 +1571,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             output_keys=['trajectory_state', 'contact_final_torque']
         )
         self.rotation_direction = rotation_direction
-        self.target_rotation = math.radians(90.0)
+        self.target_rotation = abs(target_rotation)
         self.max_rotation_time = 60.0
         self.contact_angular_velocity = 0.1   # rad/s for contact phase
         self.rotation_angular_velocity = 0.1  # rad/s for rotation phase
@@ -1720,10 +1742,10 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"Feedforward: enabled={ff_enabled}, force_z={ff_force_z}, "
                       f"torque_z_max={TORQUE_MAX:.1f} N·m (adaptive from {current_torque:.1f})")
 
-        initial_valve_yaw = self.initial_valve_yaw
-        start_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, initial_valve_yaw)
+        start_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
         last_valve_yaw = start_valve_yaw
         last_valve_check_time = rospy.get_time()
+        cumulative_rotation = 0.0
         max_rotation_detected = 0.0
 
         rate = rospy.Rate(25)
@@ -1734,11 +1756,14 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
             # Monitor valve rotation
             cur_time = rospy.get_time()
-            cur_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, initial_valve_yaw)
+            cur_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, start_valve_yaw)
             valve_rot, valve_omega, updated, last_valve_yaw, last_valve_check_time = \
-                FormationUtils.monitor_valve_rotation(
-                    cur_valve_yaw, initial_valve_yaw, last_valve_yaw,
-                    last_valve_check_time, cur_time, update_interval=0.2)
+                FormationUtils.monitor_cumulative_valve_rotation(
+                    cur_valve_yaw, last_valve_yaw,
+                    last_valve_check_time, cur_time,
+                    cumulative_rotation, self.rotation_direction,
+                    update_interval=0.2)
+            cumulative_rotation = valve_rot
             max_rotation_detected = max(max_rotation_detected, valve_rot)
 
             # Check completion
@@ -1758,7 +1783,9 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
             # Timeout
             if t > self.max_rotation_time:
-                rospy.logwarn(f"Rotation timeout after {t:.1f}s, achieved: {math.degrees(valve_rot):.1f}°")
+                rospy.logwarn(
+                    f"Rotation timeout after {t:.1f}s, current: {math.degrees(valve_rot):.1f}°, "
+                    f"max: {math.degrees(max_rotation_detected):.1f}°")
                 break
 
             # --- Adaptive torque based on valve response ---
@@ -2003,22 +2030,38 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
 # Main execution function
 def main():
     rospy.init_node('formation_valve_rotation')
+
+    # Get target rotation angle (degrees)
+    rotation_angle_deg_param = rospy.get_param("~rotation_angle_deg", 90.0)
+    try:
+        rotation_angle_deg = float(rotation_angle_deg_param)
+    except (TypeError, ValueError):
+        rospy.logwarn(f"Invalid rotation_angle_deg '{rotation_angle_deg_param}', fallback to 90 deg")
+        rotation_angle_deg = 90.0
+
+    if rotation_angle_deg == 0.0:
+        rospy.logwarn("rotation_angle_deg is 0.0 deg; no effective valve rotation target")
+    elif rotation_angle_deg < 0.0:
+        rospy.logwarn(f"rotation_angle_deg ({rotation_angle_deg}) is negative; using its absolute value")
+
+    target_rotation = math.radians(abs(rotation_angle_deg))
     
     # Get rotation direction from parameter
-    direction_param = rospy.get_param("~valve_rotation_direction", "clockwise")
+    direction_param = rospy.get_param("~valve_rotation_direction", "cw")
     direction_normalized = direction_param.strip().lower()
     if direction_normalized in ["clockwise", "cw", "右转", "顺时针"]:
         rotation_direction = -1
-        direction_label = "Clockwise (negative yaw)"
+        direction_label = "CW (negative yaw)"
     elif direction_normalized in ["counterclockwise", "counter-clockwise", "ccw", "左转", "逆时针"]:
         rotation_direction = 1
-        direction_label = "Counter-clockwise (positive yaw)"
+        direction_label = "CCW (positive yaw)"
     else:
         rotation_direction = 1
-        direction_label = f"Counter-clockwise (fallback for '{direction_param}')"
-        rospy.logwarn(f"Unknown valve rotation direction '{direction_param}', defaulting to counter-clockwise")
+        direction_label = f"CCW (fallback for '{direction_param}')"
+        rospy.logwarn(f"Unknown valve rotation direction '{direction_param}', defaulting to 'ccw'")
 
     rospy.loginfo(f"Formation valve rotation direction: {direction_label}")
+    rospy.loginfo(f"Formation valve target rotation: {math.degrees(target_rotation):.1f}° ({target_rotation:.3f} rad)")
     
     try:
         # Create Formation SMACH state machine
@@ -2040,7 +2083,8 @@ def main():
             
             # Step 4: Contact and rotate the valve (unified state)
             smach.StateMachine.add('FORMATION_ROTATE_VALVE',
-                                   FormationRotateValveState(rotation_direction=rotation_direction),
+                                   FormationRotateValveState(rotation_direction=rotation_direction,
+                                                             target_rotation=target_rotation),
                                    transitions={'succeeded': 'FORMATION_DISENGAGE',
                                                'failed': 'failure',
                                                'emergency': 'failure'})

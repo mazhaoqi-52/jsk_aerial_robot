@@ -125,9 +125,9 @@ if __name__=="__main__":
         force_landing_pub = MultiPublisher(force_landing_topics, Empty, queue_size=1)
         nav_pub = MultiPublisher(nav_topics, FlightNav, queue_size=1)
 
-        xy_vel   = rospy.get_param("~xy_vel", 0.04)
-        yaw_vel  = rospy.get_param("~yaw_vel", 0.02)
-        z_vel = rospy.get_param("~z_vel", 0.04)
+        xy_vel   = rospy.get_param("~xy_vel", 0.2)
+        yaw_vel  = rospy.get_param("~yaw_vel", 0.2)
+        z_vel = rospy.get_param("~z_vel", 0.1)
 
         motion_start_pub = MultiPublisher(['task_start'], Empty, queue_size=1)
         current_z_vel = 0.0

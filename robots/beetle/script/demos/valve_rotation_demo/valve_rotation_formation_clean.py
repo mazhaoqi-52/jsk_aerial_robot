@@ -729,7 +729,8 @@ class FormationSingleUAVStateBase(smach.State):
             final_threshold = 0.080  # 80mm final threshold (keep consistent)
             step_pos_thresh = base_threshold - (base_threshold - final_threshold) * progress
             step_pos_thresh = max(step_pos_thresh, 0.080)  # Never go below 80mm
-            step_yaw_thresh = 0.052  # 3 degrees
+            step_yaw_thresh_strict = 0.044  # 2.5 degrees - strict target
+            step_yaw_thresh_lenient = 0.087  # 5 degrees - fallback
             is_final_step = current_z <= target_z + 1e-4 or remaining_descent <= step_size + 1e-6
             is_second_last_step = (planned_steps - step_count) == 2
             is_third_last_step = (planned_steps - step_count) == 3
@@ -751,16 +752,22 @@ class FormationSingleUAVStateBase(smach.State):
                 step_timeout = 12.0
                 step_max_attempts = 80
 
-            # Unified convergence strategy for all steps (removed max_pos_step to prevent control instability)
+            # Try strict 2.5° first; fallback to 5° if timeout
             step_converged = self.active_position_convergence(
                 target_pos=step_target,
                 target_yaw=final_yaw,
                 pos_thresh=step_pos_thresh,
-                yaw_thresh=step_yaw_thresh,
+                yaw_thresh=step_yaw_thresh_strict,
                 timeout=step_timeout
-                # NOTE: max_pos_step removed - it caused Step 8 divergence in testing
-                # The 20mm step limit prevented quick correction when coordinate transform fluctuates
             )
+            if not step_converged:
+                # Check lenient fallback: accept if within 5°
+                pos_ok, yaw_ok, _, _, yaw_err = self._check_positioning_error(
+                    step_target, final_yaw, pos_thresh=step_pos_thresh, yaw_thresh=step_yaw_thresh_lenient
+                )
+                if pos_ok and yaw_ok:
+                    rospy.logwarn(f"[Z Descent] Step {step_count}: 2.5° not reached, yaw={math.degrees(yaw_err):.1f}° < 5° - accepting")
+                    step_converged = True
 
             if not step_converged:
                 achieved_position = self.get_end_effector_position() or tuple(step_target)
@@ -1085,9 +1092,16 @@ class FormationInitializeStartPositionState(FormationSingleUAVStateBase):
             rospy.logerr("Assembly position not available")
             return 'failed'
         
-        # Get valve position from leader UAV's sensors
-        valve_pos = self.beetle.getValvePos()
-        valve_yaw = self.beetle.getValveYaw()
+        # Poll for valve position (mocap may need extra time to start publishing)
+        valve_pos = None
+        valve_yaw = None
+        deadline = rospy.get_time() + 10.0
+        while rospy.get_time() < deadline and not rospy.is_shutdown():
+            valve_pos = self.beetle.getValvePos()
+            valve_yaw = self.beetle.getValveYaw()
+            if valve_pos is not None and valve_yaw is not None:
+                break
+            rospy.sleep(0.5)
         
         if valve_pos is None:
             rospy.logerr("Valve position not available")
@@ -1242,10 +1256,6 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.logerr("Phase 3B failed")
             return 'failed'
         rospy.loginfo("Phase 3B complete: Spoke alignment achieved")
-
-        # Stabilization pause before Z descent
-        rospy.loginfo("Waiting 2s for stabilization before Z descent...")
-        rospy.sleep(2.0)
 
         # PHASE 4: Z DESCENT TO OPTIMIZER HEIGHT
         final_target_pos = (safe_ee_pos[0], safe_ee_pos[1], safe_ee_pos[2])
@@ -1455,24 +1465,34 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         for attempt in range(1, 4):
             rospy.loginfo(f"[Phase3B] Attempt {attempt}/3 - Yaw to {math.degrees(spoke_yaw):.1f}°")
             
+            # Strict: try 2.5° with full timeout (large rotation needs time)
             success = self.active_position_convergence(
                 target_pos=locked_pos, target_yaw=spoke_yaw,
-                pos_thresh=0.050, yaw_thresh=0.087, timeout=35.0,
-                max_yaw_step=math.radians(3.0)
+                pos_thresh=0.050, yaw_thresh=0.044, timeout=35.0,
+                max_yaw_step=math.radians(10.0)
             )
             
             if success:
                 pos_ok, yaw_ok, xy_error, z_error, yaw_error = self._check_positioning_error(
+                    locked_pos, spoke_yaw, pos_thresh=0.050, yaw_thresh=0.044
+                )
+                if pos_ok and yaw_ok:
+                    rospy.loginfo(f"Phase 3B successful (strict 2.5°): XY={xy_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f}°")
+                    return True
+            else:
+                # Lenient fallback: accept if within 5°
+                pos_ok, yaw_ok, xy_error, z_error, yaw_error = self._check_positioning_error(
                     locked_pos, spoke_yaw, pos_thresh=0.050, yaw_thresh=0.087
                 )
                 if pos_ok and yaw_ok:
-                    rospy.loginfo(f"Phase 3B successful: XY={xy_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f}°")
+                    rospy.logwarn(f"[Phase3B] 2.5° not reached, yaw={math.degrees(yaw_error):.1f}° < 5° - accepting")
                     return True
-                
-                if not pos_ok:
-                    rospy.logwarn(f"[Phase3B] Position drift, correcting...")
-                    final_yaw = self.get_end_effector_yaw()
-                    self._execute_formation_phase3a_xy_positioning(locked_pos, final_yaw)
+            
+            pos_ok, _, xy_error, _, _ = self._check_positioning_error(locked_pos, pos_thresh=0.050)
+            if not pos_ok:
+                rospy.logwarn(f"[Phase3B] Position drift, correcting...")
+                final_yaw = self.get_end_effector_yaw()
+                self._execute_formation_phase3a_xy_positioning(locked_pos, final_yaw)
         
         rospy.logerr("Phase 3B failed after 3 attempts")
         return False
@@ -1521,13 +1541,22 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         self._last_phase4_contact_position = convergence_target
 
         rospy.loginfo("[Phase4] Performing final insertion pose convergence")
+        # Strict: try 2.5° within 5s
         final_success = self.active_position_convergence(
             target_pos=convergence_target,
             target_yaw=final_yaw,
             pos_thresh=0.080,  # 80mm convergence threshold (RELAXED for formation)
-            yaw_thresh=0.087,  # 5 degrees (0.087 rad) - relaxed threshold
-            timeout=12.0
+            yaw_thresh=0.044,  # 2.5 degrees (0.044 rad)
+            timeout=5.0
         )
+        if not final_success:
+            # Lenient fallback: accept if within 5°
+            pos_ok, yaw_ok, xy_err, z_err, yaw_err = self._check_positioning_error(
+                convergence_target, final_yaw, pos_thresh=0.080, yaw_thresh=0.087
+            )
+            if pos_ok and yaw_ok:
+                rospy.logwarn(f"[Phase4] 2.5° not reached in 5s, yaw={math.degrees(yaw_err):.1f}° < 5° - accepting")
+                final_success = True
 
         # CRITICAL: Regardless of final_success, always save the actual insertion depth Z coordinate reached
         # Store Z coordinate for Contact/Rotation phases to avoid pitch errors
@@ -1952,7 +1981,7 @@ class FormationDisengageFromValveState(FormationSingleUAVStateBase):
                 timeout=60.0,
                 max_linear_vel=0.02,
                 max_angular_vel=0.05,
-                max_yaw_step=0.05,
+                max_yaw_step=math.radians(10.0),
                 yaw_only=True  # Only check yaw convergence
             )
             

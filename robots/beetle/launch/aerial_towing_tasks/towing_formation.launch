@@ -30,7 +30,7 @@
   </include>
 
   ###########  Parameters  ###########
-  <arg name="towing_distance" default="1.0"
+  <arg name="towing_distance" default="0.6"
        doc="Target towing distance (m)"/>
   <arg name="towing_force"    default="5.0"
        doc="Initial towing force (N), ramps adaptively"/>

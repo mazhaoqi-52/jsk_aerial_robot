@@ -669,7 +669,7 @@ class FormationSingleUAVStateBase(smach.State):
         rospy.loginfo(f"[Z Descent] {total_descent*1000:.1f}mm at {descent_speed*1000:.0f}mm/s")
 
         # Generate Z-only polynomial trajectory (XY locked, yaw locked)
-        duration = max(total_descent / descent_speed, 5.0) / 0.7  # safety factor
+        duration = max(total_descent / descent_speed, 2.0) / 0.7  # safety factor
         traj_z = PolynomialTrajectory(duration=duration)
         traj_z.is_scalar = True
         traj_z.coeffs_scalar = traj_z.compute_coefficients(start_z, target_z)

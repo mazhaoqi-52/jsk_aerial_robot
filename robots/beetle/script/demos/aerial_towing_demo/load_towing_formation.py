@@ -48,8 +48,8 @@ LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 INSERTION_DEPTH = 0.04   # 40mm deeper insertion in DESCEND_AND_INSERT
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
-TOWING_DISTANCE = 0.5    # towing distance (0.5m sufficient for validation)
-TOWING_MAX_FORCE = 20.0  # Maximum adaptive force (starts from 0, increases when stalled)
+TOWING_DISTANCE = 0.6    # towing distance (m), overridden by ~towing_distance param
+TOWING_MAX_FORCE = 5.0   # max adaptive force (N), overridden by ~towing_force param
 # Approach height above box top for entering the load area.
 # Default is 50mm. Tune as needed; with box_top_z=0.65m:
 # - offset 0.15 -> approach 0.80m
@@ -276,46 +276,52 @@ class LinearTowingTrajectoryGenerator:
 
 
 class LoadInterface:
-    """Interface for load box position tracking."""
+    """Interface for load box position tracking (simulation and real machine)."""
     
     def __init__(self):
         self.load_pos = None
-        self.load_odom = None
+        self.load_yaw = 0.0
         self.position_received = threading.Event()
         
-        # Subscribe to load odometry
-        rospy.Subscriber('/load/odom', Odometry, self._load_odom_cb, queue_size=1)
-        rospy.loginfo("LoadInterface: Subscribed to /load/odom")
+        is_simulation = rospy.get_param("~simulation", True)
+        if is_simulation:
+            rospy.Subscriber('/load/odom', Odometry, self._load_sim_cb, queue_size=1)
+        else:
+            rospy.Subscriber('/load/mocap/pose', PoseStamped, self._load_cb, queue_size=1)
+        rospy.loginfo(f"LoadInterface: mode={'simulation' if is_simulation else 'real_machine'}")
     
-    def _load_odom_cb(self, msg):
-        """Callback for load odometry."""
-        pos = msg.pose.pose.position
+    def _load_cb(self, msg):
+        """Callback for real machine (PoseStamped from mocap)."""
+        pos = msg.pose.position
+        ori = msg.pose.orientation
         self.load_pos = np.array([pos.x, pos.y, pos.z])
-        self.load_odom = msg
-        
+        self.load_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
         if not self.position_received.is_set():
-            rospy.loginfo(f"Load position received: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
+            rospy.loginfo(f"Load position received: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}), yaw={math.degrees(self.load_yaw):.1f}°")
+            self.position_received.set()
+    
+    def _load_sim_cb(self, msg):
+        """Callback for simulation (Odometry from Gazebo)."""
+        pos = msg.pose.pose.position
+        ori = msg.pose.pose.orientation
+        self.load_pos = np.array([pos.x, pos.y, pos.z])
+        self.load_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
+        if not self.position_received.is_set():
+            rospy.loginfo(f"Load position received: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}), yaw={math.degrees(self.load_yaw):.1f}°")
             self.position_received.set()
     
     def get_load_position(self):
-        """Get current load position."""
         return self.load_pos
     
-    def get_load_center_xy(self):
-        """Get load center XY position."""
-        if self.load_pos is not None:
-            return self.load_pos[:2]
-        return None
+    def get_load_yaw(self):
+        return self.load_yaw
     
     def get_load_top_z(self):
-        """Get load box top Z coordinate (open top)."""
         if self.load_pos is not None:
-            # Load center is at box_height/2, top is at center + height/2
             return self.load_pos[2] + LOAD_BOX_HEIGHT / 2
         return None
     
     def wait_for_load(self, timeout=10.0):
-        """Wait for load position data."""
         rospy.loginfo("Waiting for load position...")
         if self.position_received.wait(timeout):
             rospy.loginfo("Load position available")
@@ -349,7 +355,7 @@ class TowingStateBase(FormationSingleUAVStateBase):
     def calculate_approach_side(self, assembly_pos, load_pos):
         """
         Calculate which side of the load to approach (nearest edge midpoint).
-        Approach direction is perpendicular to the selected edge, pointing outward.
+        Accounts for load yaw: edges and approach directions are rotated accordingly.
         
         Returns:
             tuple: (approach_direction_vector, side_name, edge_midpoint_position)
@@ -357,26 +363,32 @@ class TowingStateBase(FormationSingleUAVStateBase):
         if assembly_pos is None or load_pos is None:
             return None, None, None
         
+        load_yaw = self.load_interface.get_load_yaw()
+        cos_y, sin_y = math.cos(load_yaw), math.sin(load_yaw)
+        
+        def rotate_2d(v):
+            return np.array([cos_y*v[0] - sin_y*v[1], sin_y*v[0] + cos_y*v[1], v[2]])
+        
         half_length = LOAD_BOX_LENGTH / 2
         half_width = LOAD_BOX_WIDTH / 2
         
-        # Calculate each edge midpoint position
-        edge_midpoints = {
-            '+X': np.array([load_pos[0] + half_length, load_pos[1], load_pos[2]]),
-            '-X': np.array([load_pos[0] - half_length, load_pos[1], load_pos[2]]),
-            '+Y': np.array([load_pos[0], load_pos[1] + half_width, load_pos[2]]),
-            '-Y': np.array([load_pos[0], load_pos[1] - half_width, load_pos[2]]),
+        # Local frame edge offsets and outward directions, rotated by load_yaw
+        local_edges = {
+            '+X': np.array([half_length, 0, 0]),
+            '-X': np.array([-half_length, 0, 0]),
+            '+Y': np.array([0, half_width, 0]),
+            '-Y': np.array([0, -half_width, 0]),
         }
-        
-        # Approach direction: perpendicular to edge, pointing outward
-        approach_dirs = {
+        local_dirs = {
             '+X': np.array([1, 0, 0]),
             '-X': np.array([-1, 0, 0]),
             '+Y': np.array([0, 1, 0]),
             '-Y': np.array([0, -1, 0]),
         }
         
-        # Calculate distance from assembly to each edge midpoint, select nearest
+        edge_midpoints = {side: load_pos + rotate_2d(off) for side, off in local_edges.items()}
+        approach_dirs = {side: rotate_2d(d) for side, d in local_dirs.items()}
+        
         distances = {side: np.linalg.norm(np.array(assembly_pos) - midpoint) 
                      for side, midpoint in edge_midpoints.items()}
         
@@ -385,6 +397,8 @@ class TowingStateBase(FormationSingleUAVStateBase):
         approach_dir = approach_dirs[nearest_side]
         
         rospy.loginfo(f"Approach side: {nearest_side}, direction: {approach_dir}, edge: {edge_pos}")
+        if abs(load_yaw) > 0.01:
+            rospy.loginfo(f"Load yaw: {math.degrees(load_yaw):.1f}° (edges rotated)")
         return approach_dir, nearest_side, edge_pos
 
 
@@ -427,9 +441,9 @@ class TowingInitializeState(TowingStateBase):
             rospy.logerr("Failed to calculate approach direction")
             return 'failed'
         
-        # Store in userdata
-        userdata.start_position = assembly_pos
-        userdata.start_yaw = assembly_yaw
+        # Store in userdata (use EE frame — all movement commands operate in EE coordinates)
+        userdata.start_position = self.get_end_effector_position()
+        userdata.start_yaw = self.get_end_effector_yaw()
         userdata.load_position = load_pos
         userdata.approach_direction = approach_dir
         userdata.approach_side = side_name
@@ -522,44 +536,7 @@ class ApproachLoadState(TowingStateBase):
         if not success:
             rospy.logwarn("Phase 2 yaw adjustment incomplete, continuing...")
 
-        # Phase 3: Z descent to approach height (keep XY) - Use polynomial trajectory for smooth descent
-        rospy.loginfo(f"[Phase 3] Descending to approach height {approach_height:.3f}m using polynomial trajectory")
-        current_pos = self.get_end_effector_position()
-        phase3_target = np.array([current_pos[0], current_pos[1], approach_height])
-
-        # Calculate descent distance
-        descent_distance = abs(current_pos[2] - approach_height)
-        rospy.loginfo(f"Descent distance: {descent_distance*1000:.1f}mm")
-
-        # Use streaming polynomial trajectory for smooth descent
-        traj_desc = self.generate_polynomial_trajectory(
-            start_pos=current_pos,
-            target_pos=phase3_target,
-            target_yaw=target_yaw,
-            lock_yaw=True   # Lock yaw during descent, focus on Z axis
-        )
-
-        if traj_desc:
-            self.execute_polynomial_trajectory(traj_desc)
-
-        # Final precision convergence with gentle velocity to avoid "impact"
-        rospy.loginfo("Final precision positioning with gentle velocity...")
-        success = self.active_position_convergence(
-            phase3_target, target_yaw=target_yaw,
-            pos_thresh=0.040, yaw_thresh=0.05, timeout=15.0,
-            max_linear_vel=0.015,  # Very gentle: 15mm/s for final adjustment
-            max_angular_vel=0.03
-        )
-        if not success:
-            rospy.logwarn("Phase 3 Z descent incomplete, continuing...")
-
-        # Stabilize
-        rospy.loginfo("Stabilizing at approach position...")
-        approach_pos = np.array([approach_xy[0], approach_xy[1], approach_height])
-        self.active_stabilization_wait(approach_pos, target_yaw, duration=2.0)
-
-        # Store the actual insertion target for the next state.
-        # DESCEND_AND_INSERT will go 40mm deeper than the approach height.
+        # Descent is handled entirely by DESCEND_AND_INSERT (single-stage descent)
         insertion_z = approach_height - INSERTION_DEPTH
         userdata.insertion_position = np.array([approach_xy[0], approach_xy[1], insertion_z])
         userdata.insertion_yaw = target_yaw
@@ -596,7 +573,7 @@ class DescendAndInsertState(TowingStateBase):
             current_pos, 
             insertion_pos, 
             insertion_yaw,
-            descent_speed=0.03  # Slower descent (gentler insertion)
+            descent_speed=0.10
         )
         
         if not success:
@@ -912,9 +889,9 @@ class DisengageAndReturnState(TowingStateBase):
         )
         rospy.sleep(0.5)
 
-        # Phase 1: Ascend to start height to fully clear the box
+        # Phase 1: Ensure at safe height (only ascend, never descend)
         current_pos = self.get_end_effector_position()
-        safe_height = start_pos[2]
+        safe_height = max(current_pos[2], start_pos[2])
         rospy.loginfo(f"[Phase 1] Ascending to start height {safe_height:.3f}m "
                       f"(current {current_pos[2]:.3f}m, delta {(safe_height - current_pos[2])*1000:.0f}mm)")
         ascent_target = (current_pos[0], current_pos[1], safe_height)
@@ -966,6 +943,10 @@ class DisengageAndReturnState(TowingStateBase):
 
 def main():
     rospy.init_node('formation_load_towing')
+    
+    global TOWING_DISTANCE, TOWING_MAX_FORCE
+    TOWING_DISTANCE = rospy.get_param("~towing_distance", 0.6)
+    TOWING_MAX_FORCE = rospy.get_param("~towing_force", 5.0)
     
     rospy.loginfo("=" * 60)
     rospy.loginfo("Formation Load Towing Task")

@@ -154,7 +154,7 @@ controller:
   unified_pitch:
     i_gain: 5.0
     limit_sum: 50.0
-    limit_i: 10.0
+    limit_i: 20.0
 
   unified_xy:
     p_gain: 10.0

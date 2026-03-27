@@ -37,10 +37,10 @@ from beetle_interface import BeetleInterface
 from trajectory import PolynomialTrajectory
 
 
-# ============== Load Box Parameters (from load.urdf) ==============
-LOAD_BOX_LENGTH = 0.5    # x dimension (m)
-LOAD_BOX_WIDTH = 0.3     # y dimension (m)
-LOAD_BOX_HEIGHT = 0.65   # z dimension (m)
+# ============== Load Box Parameters (measured actual box) ==============
+LOAD_BOX_LENGTH = 0.88   # x dimension (m)
+LOAD_BOX_WIDTH = 0.49    # y dimension (m)
+LOAD_BOX_HEIGHT = 0.86   # z dimension (m)
 LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 
 # ============== Towing Task Parameters ==============

@@ -2,10 +2,10 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="load">
 
   <!-- ============== Parameters ============== -->
-  <!-- Load box outer dimensions (m) -->
-  <xacro:property name="box_length" value="0.5" />  <!-- x -->
-  <xacro:property name="box_width" value="0.3" />   <!-- y -->
-  <xacro:property name="box_height" value="0.65" />  <!-- z -->
+  <!-- Load box outer dimensions (m), matched to measured real box -->
+  <xacro:property name="box_length" value="0.88" />  <!-- x -->
+  <xacro:property name="box_width" value="0.49" />   <!-- y -->
+  <xacro:property name="box_height" value="0.86" />  <!-- z -->
   <xacro:property name="wall_thickness" value="0.02" /> <!-- wall thickness -->
   
   <!-- Load properties -->

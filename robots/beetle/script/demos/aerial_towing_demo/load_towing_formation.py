@@ -44,10 +44,8 @@ LOAD_BOX_HEIGHT = 0.86   # z dimension (m)
 LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 
 # ============== Towing Task Parameters ==============
-# Note: end_effector_offset_z in n_modules_tf.py (0.074382) differs from actual fang tip offset (~0.041)
-# This causes ~33mm extra insertion. Compensate by reducing INSERTION_DEPTH.
-# Target actual insertion: 30mm, so set to approximately 0 or negative to compensate.
-INSERTION_DEPTH = 0.0    # Compensated insertion depth (actual ~30mm due to offset error)
+# Command an extra 40mm descent during insertion after reaching the approach height.
+INSERTION_DEPTH = 0.04   # 40mm deeper insertion in DESCEND_AND_INSERT
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
 TOWING_DISTANCE = 0.5    # towing distance (0.5m sufficient for validation)
@@ -468,8 +466,8 @@ class ApproachLoadState(TowingStateBase):
         load_top_z = load_center_z + LOAD_BOX_HEIGHT / 2
         approach_height = load_top_z + APPROACH_HEIGHT_OFFSET
 
-        # Position slightly inside the box edge (overshoot by 50mm for insertion)
-        overshoot = 0.05  # 50mm inside box edge (30mm margin after 20mm wall thickness)
+        # Position slightly inside the box edge (overshoot by 110mm for insertion)
+        overshoot = 0.11  # 110mm inside box edge
         approach_xy = edge_pos[:2] - approach_dir[:2] * overshoot
 
         # Calculate target yaw: facing into the box (opposite of approach direction)
@@ -560,10 +558,9 @@ class ApproachLoadState(TowingStateBase):
         approach_pos = np.array([approach_xy[0], approach_xy[1], approach_height])
         self.active_stabilization_wait(approach_pos, target_yaw, duration=2.0)
 
-        # Store for next state
-        # Z=approach_height is already "inserted" (end-effector inside the box opening).
-        # No further descent needed; RETRACT_AND_HOOK will operate at this height.
-        insertion_z = approach_height
+        # Store the actual insertion target for the next state.
+        # DESCEND_AND_INSERT will go 40mm deeper than the approach height.
+        insertion_z = approach_height - INSERTION_DEPTH
         userdata.insertion_position = np.array([approach_xy[0], approach_xy[1], insertion_z])
         userdata.insertion_yaw = target_yaw
 
@@ -594,8 +591,8 @@ class DescendAndInsertState(TowingStateBase):
             rospy.logerr("Cannot get current position")
             return 'failed'
         
-        # Use controlled Z descent
-        success, achieved_pos = self.controlled_z_descent(
+        # Use streaming Z descent
+        success, achieved_pos = self.streaming_z_descent(
             current_pos, 
             insertion_pos, 
             insertion_yaw,
@@ -607,11 +604,10 @@ class DescendAndInsertState(TowingStateBase):
             rospy.logerr("Z descent failed (aborted). Exiting state machine.")
             return 'failed'
         
-        # Verify insertion depth
+        # Verify achieved descent relative to the approach-height reference.
         if achieved_pos is not None:
-            # Positive means deeper into the box (below the planned top surface).
-            box_top_z = (userdata.insertion_position[2] + INSERTION_DEPTH)
-            actual_depth = box_top_z - achieved_pos[2]
+            reference_z = userdata.insertion_position[2] + INSERTION_DEPTH
+            actual_depth = reference_z - achieved_pos[2]
             rospy.loginfo(f"Achieved insertion: {actual_depth*1000:.1f}mm (positive=deeper)")
         
         # Stabilize at insertion position

@@ -499,11 +499,18 @@ class FormationSingleUAVStateBase(smach.State):
                 rospy.sleep(0.1)
                 continue
             
-            pos_error = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+            xy_error = math.sqrt((current_pos[0] - target_pos[0])**2 + (current_pos[1] - target_pos[1])**2)
+            z_error = abs(current_pos[2] - target_pos[2])
+            pos_error = math.sqrt(xy_error**2 + z_error**2)
             yaw_error = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
             
-            position_ok = pos_error < pos_thresh
+            position_ok = (xy_error < pos_thresh and z_error < 0.050)
             yaw_ok = yaw_error < yaw_thresh
+            
+            # Safety abort: if position diverges beyond 300mm, stop immediately
+            if not yaw_only and pos_error > 0.300:
+                rospy.logwarn(f"Position diverged to {pos_error*1000:.0f}mm, aborting convergence")
+                return False
             
             # If yaw_only mode, only check yaw convergence
             converged = (yaw_ok) if yaw_only else (position_ok and yaw_ok)
@@ -513,6 +520,9 @@ class FormationSingleUAVStateBase(smach.State):
                 if consecutive_good_readings >= required_consecutive:
                     rospy.loginfo(f"Convergence success: pos={pos_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f}°")
                     return True
+                # Keep sending hold command during confirmation to prevent drift
+                self.send_assembly_command_from_end_effector(
+                    target_end_effector_pos=target_pos, target_yaw=target_yaw)
             else:
                 consecutive_good_readings = 0
                 
@@ -628,9 +638,16 @@ class FormationSingleUAVStateBase(smach.State):
         )
 
 
-    def controlled_z_descent(self, start_pos, final_target, final_yaw, descent_speed=0.12):
-        """Controlled Z-axis descent in fixed steps with contact detection"""
-        rospy.loginfo("=== Formation Z Descent ===")
+    def streaming_z_descent(self, start_pos, final_target, final_yaw, descent_speed=0.05):
+        """Streaming Z descent with inline contact detection at 25Hz.
+
+        Uses polynomial trajectory for smooth continuous descent while monitoring
+        actual Z motion each cycle. If Z stops moving (contact), locks height.
+
+        Returns:
+            (success, achieved_position)
+        """
+        rospy.loginfo("=== Formation Streaming Z Descent ===")
 
         if start_pos is None or final_target is None:
             rospy.logerr("[Z Descent] Missing start or target position")
@@ -638,290 +655,153 @@ class FormationSingleUAVStateBase(smach.State):
 
         target_x, target_y, target_z = final_target
         start_z = start_pos[2]
-        total_z_descent = start_z - target_z
-        rospy.loginfo(f"[Z Descent] Total descent {total_z_descent*1000:.1f}mm")
+        total_descent = start_z - target_z
 
-        if total_z_descent <= 0.01:
+        if total_descent <= 0.01:
             rospy.loginfo("[Z Descent] Small descent, direct convergence")
-            self.send_assembly_command_from_end_effector((target_x, target_y, target_z), final_yaw)
+            self.send_assembly_command_from_end_effector(final_target, final_yaw)
             success = self.active_position_convergence(
-                (target_x, target_y, target_z),
-                target_yaw=final_yaw,
-                pos_thresh=0.080,  # RELAXED: 80mm (consistent with descent strategy)
-                yaw_thresh=0.087,  # RELAXED: 5 degrees (0.087 rad)
-                timeout=10.0
-            )
-            achieved = self.get_end_effector_position() or (target_x, target_y, target_z)
+                final_target, target_yaw=final_yaw,
+                pos_thresh=0.080, yaw_thresh=0.087, timeout=10.0)
+            achieved = self.get_end_effector_position() or final_target
             return success, achieved
 
-        # Step size parameters
-        fixed_step_size = 0.05
-        planned_steps = max(3, int(math.ceil(total_z_descent / fixed_step_size)))
-        max_single_step = 0.03
+        rospy.loginfo(f"[Z Descent] {total_descent*1000:.1f}mm at {descent_speed*1000:.0f}mm/s")
 
-        rospy.loginfo(f"[Z Descent] {planned_steps} steps planned, {fixed_step_size*1000:.1f}mm per step")
+        # Generate Z-only polynomial trajectory (XY locked, yaw locked)
+        duration = max(total_descent / descent_speed, 5.0) / 0.7  # safety factor
+        traj_z = PolynomialTrajectory(duration=duration)
+        traj_z.is_scalar = True
+        traj_z.coeffs_scalar = traj_z.compute_coefficients(start_z, target_z)
+        traj_z.start_value = start_z
+        traj_z.target_value = target_z
 
-        current_pos = start_pos
-        previous_z = current_pos[2]
-        total_descent_completed = 0.0
-        step_count = 0
-        progress_ratio = 0.0
-        max_step_iterations = max(planned_steps * 6, planned_steps + 40)
-        achieved_position = current_pos
-        contact_xy_tolerance = 0.080  # 80mm (RELAXED from 22mm for formation)
-        contact_z_tolerance = 0.05
-        plateau_z_tolerance = 0.25
-        plateau_progress_threshold = 0.4
-        stagnation_threshold = 0.012
-        contact_required_hits = 3
-        plateau_required_hits = 5
-        stagnation_hit_counter = 0
-        proximity_hit_counter = 0
-        final_descent_margin = 0.03
+        rospy.loginfo(f"[Z Descent] Trajectory T={duration:.1f}s, target_Z={target_z:.3f}m")
 
-        # Motion tracking for contact detection
-        consecutive_small_motions = 0
-        small_motion_threshold = 0.008
-        max_consecutive_small_motions = 2
+        # Contact detection state
+        small_motion_thresh = 0.008  # 8mm
+        consecutive_small = 0
+        required_small = 2
+        prev_actual_z = start_z
+        contact_pos = None
 
-        while previous_z - target_z > 1e-4:
-            if step_count >= max_step_iterations:
-                # Check if within tolerance despite timeout
-                current_pos = self.get_end_effector_position() or achieved_position
-                final_xy_error = math.sqrt((current_pos[0] - target_x)**2 + (current_pos[1] - target_y)**2)
-                final_z_error = abs(current_pos[2] - target_z)
-                
-                if final_xy_error <= 0.030 and final_z_error <= 0.020:
-                    rospy.logwarn(
-                        f"[Z Descent] Timeout but within tolerance: XY {final_xy_error*1000:.1f}mm, "
-                        f"Z {final_z_error*1000:.1f}mm"
-                    )
-                    return True, current_pos
-                
-                rospy.logerr("[Z Descent] Exceeded safety iteration limit")
-                return False, achieved_position
+        # XY adaptive pause: threshold narrows linearly with descent progress
+        xy_pause_far = 0.120   # 120mm at start (loose)
+        xy_pause_near = 0.050  # 50mm near valve (tight)
+        xy_resume_ratio = 0.6  # resume when error < 60% of pause threshold
+        xy_diverge_limit = 0.300  # absolute abort
+        paused = False
+        pause_z = None         # frozen cmd_z while paused
+        pause_elapsed = 0.0    # accumulated pause time
+        pause_timeout = 5.0    # max pause before abort
+        traj_time = 0.0        # trajectory time (freezes during pause)
 
-            remaining_descent = max(0.0, previous_z - target_z)
-            if remaining_descent <= final_descent_margin:
-                rospy.loginfo(f"[Z Descent] Remaining {remaining_descent*1000:.1f}mm within margin")
+        rate = rospy.Rate(25)
+        t0 = rospy.get_time()
+        dt = 1.0 / 25.0
+
+        while not rospy.is_shutdown():
+            wall_t = rospy.get_time() - t0
+            if traj_time >= duration:
                 break
 
-            # Adaptive step size for final approach
-            if remaining_descent <= 0.06:
-                adaptive_step_size = 0.015
-            elif remaining_descent <= 0.12:
-                adaptive_step_size = 0.025
+            # Commanded Z from trajectory (frozen when paused)
+            if not paused:
+                traj_time = min(wall_t - pause_elapsed, duration)
+            cmd_z = traj_z.evaluate_at_time(traj_time) if not paused else pause_z
+            cmd_pos = [target_x, target_y, cmd_z]
+
+            # Velocity: zero when paused, polynomial otherwise
+            vel_z = 0.0
+            if not paused:
+                nt = traj_time / duration
+                if 0 < nt < 1:
+                    T_vel = np.array([5*nt**4, 4*nt**3, 3*nt**2, 2*nt, 1, 0]) / duration
+                    vel_z = float(np.dot(traj_z.coeffs_scalar, T_vel))
+            vel = [0.0, 0.0, vel_z]
+
+            self.send_assembly_command_from_end_effector(cmd_pos, final_yaw, linear_vel=vel)
+
+            # Read actual position
+            actual_pos = self.get_end_effector_position()
+            if actual_pos is None:
+                rate.sleep()
+                continue
+
+            actual_z = actual_pos[2]
+            xy_error = math.sqrt((actual_pos[0] - target_x)**2 + (actual_pos[1] - target_y)**2)
+
+            # Safety: XY divergence abort
+            if xy_error > xy_diverge_limit:
+                rospy.logwarn(f"[Z Descent] XY diverged to {xy_error*1000:.0f}mm, aborting")
+                return False, actual_pos
+
+            # Adaptive XY pause threshold (linearly narrows with descent progress)
+            progress = min((start_z - actual_z) / total_descent, 1.0) if total_descent > 0 else 0
+            xy_pause_thresh = xy_pause_far + (xy_pause_near - xy_pause_far) * progress
+            xy_resume_thresh = xy_pause_thresh * xy_resume_ratio
+
+            if paused:
+                if xy_error < xy_resume_thresh:
+                    paused = False
+                    pause_elapsed += rospy.get_time() - pause_start
+                    rospy.loginfo(f"[Z Descent] XY recovered to {xy_error*1000:.0f}mm, resuming "
+                                 f"(thresh={xy_resume_thresh*1000:.0f}mm)")
+                elif rospy.get_time() - pause_start > pause_timeout:
+                    rospy.logwarn(f"[Z Descent] XY pause timeout {pause_timeout}s, "
+                                 f"XY_err={xy_error*1000:.0f}mm, aborting")
+                    return False, actual_pos
             else:
-                adaptive_step_size = fixed_step_size
-            
-            step_size = min(adaptive_step_size, max_single_step, remaining_descent)
-            current_z = previous_z - step_size
-            if current_z < target_z:
-                current_z = target_z
+                if xy_error > xy_pause_thresh:
+                    paused = True
+                    pause_z = cmd_z
+                    pause_start = rospy.get_time()
+                    rospy.logwarn(f"[Z Descent] XY drift {xy_error*1000:.0f}mm > "
+                                 f"thresh {xy_pause_thresh*1000:.0f}mm, pausing at Z={cmd_z:.3f}m")
 
-            step_count += 1
-            progress = progress_ratio
-
-            step_target = [target_x, target_y, current_z]
-
-            # RELAXED: Formation control requires much larger XY tolerance during descent
-            base_threshold = 0.080  # 80mm base threshold (RELAXED from 50mm)
-            final_threshold = 0.080  # 80mm final threshold (keep consistent)
-            step_pos_thresh = base_threshold - (base_threshold - final_threshold) * progress
-            step_pos_thresh = max(step_pos_thresh, 0.080)  # Never go below 80mm
-            step_yaw_thresh_strict = 0.044  # 2.5 degrees - strict target
-            step_yaw_thresh_lenient = 0.087  # 5 degrees - fallback
-            is_final_step = current_z <= target_z + 1e-4 or remaining_descent <= step_size + 1e-6
-            is_second_last_step = (planned_steps - step_count) == 2
-            is_third_last_step = (planned_steps - step_count) == 3
-
-            # Unified descent speed strategy
-            effective_descent_speed = 0.05
-            linear_vel = [0.0, 0.0, -effective_descent_speed]
-
-            rospy.loginfo(f"[Z Descent] Step {step_count}/{planned_steps} Z={step_target[2]:.3f}m, remain {remaining_descent*1000:.1f}mm, speed={effective_descent_speed:.3f}m/s")
-
-            self.send_assembly_command_from_end_effector(step_target, final_yaw, linear_vel=linear_vel, angular_vel=0.0)
-
-            # Extended timeout for final steps (keep longer timeout, but remove max_pos_step restriction)
-            if is_final_step or is_second_last_step or is_third_last_step:
-                step_timeout = 17.0
-                step_max_attempts = 100
-                rospy.loginfo(f"  Extended timeout: {step_timeout}s")
-            else:
-                step_timeout = 12.0
-                step_max_attempts = 80
-
-            # Try strict 2.5° first; fallback to 5° if timeout
-            step_converged = self.active_position_convergence(
-                target_pos=step_target,
-                target_yaw=final_yaw,
-                pos_thresh=step_pos_thresh,
-                yaw_thresh=step_yaw_thresh_strict,
-                timeout=step_timeout
-            )
-            if not step_converged:
-                # Check lenient fallback: accept if within 5°
-                pos_ok, yaw_ok, _, _, yaw_err = self._check_positioning_error(
-                    step_target, final_yaw, pos_thresh=step_pos_thresh, yaw_thresh=step_yaw_thresh_lenient
-                )
-                if pos_ok and yaw_ok:
-                    rospy.logwarn(f"[Z Descent] Step {step_count}: 2.5° not reached, yaw={math.degrees(yaw_err):.1f}° < 5° - accepting")
-                    step_converged = True
-
-            if not step_converged:
-                achieved_position = self.get_end_effector_position() or tuple(step_target)
-                xy_residual = math.sqrt(
-                    (achieved_position[0] - target_x)**2 +
-                    (achieved_position[1] - target_y)**2
-                )
-                z_residual = achieved_position[2] - target_z
-                last_motion = abs(previous_z - achieved_position[2])
-                attempted_descent_completed = max(0.0, start_z - achieved_position[2])
-                attempted_progress_ratio = (
-                    0.0 if total_z_descent <= 1e-6
-                    else min(1.0, attempted_descent_completed / total_z_descent)
-                )
-
-                # Check small motion during convergence failure
-                if last_motion <= small_motion_threshold:
-                    consecutive_small_motions += 1
-                    rospy.loginfo(f"[Z Descent] Small motion detected {consecutive_small_motions}/2: dZ={last_motion*1000:.1f}mm")
-                    
-                    if consecutive_small_motions >= max_consecutive_small_motions:
-                        # Physical contact detected - 2 consecutive small motions
-                        if xy_residual <= 0.030:
-                            rospy.loginfo(
-                                f"[Z Descent] Contact success: 2 small motions + XY {xy_residual*1000:.1f}mm ≤30mm"
-                            )
-                            rospy.loginfo(f"[Z Descent] Physical limit reached at Z={achieved_position[2]:.3f}m")
-                            rospy.loginfo(f"[Z Descent] Z residual {z_residual*1000:.1f}mm due to contact")
-                            return True, achieved_position
-                        elif z_residual <= 0.060 and xy_residual <= 0.040:
-                            rospy.loginfo(
-                                f"[Z Descent] Z tolerance success: Z_res={z_residual*1000:.1f}mm ≤60mm, "
-                                f"XY={xy_residual*1000:.1f}mm ≤40mm"
-                            )
-                            rospy.loginfo(f"[Z Descent] Accepting insertion depth Z={achieved_position[2]:.3f}m")
-                            return True, achieved_position
-                        else:
-                            rospy.logwarn(f"[Z Descent] Small motion but insufficient precision: XY={xy_residual*1000:.1f}mm, Z_res={z_residual*1000:.1f}mm")
+            # Contact detection: actual Z stopped AND command is significantly below actual
+            if not paused:
+                dz = abs(actual_z - prev_actual_z)
+                cmd_descended = start_z - cmd_z
+                cmd_actual_gap = actual_z - cmd_z
+                if (dz < small_motion_thresh
+                        and cmd_descended > 0.050
+                        and cmd_actual_gap > 0.030):
+                    consecutive_small += 1
+                    if consecutive_small >= required_small:
+                        contact_pos = actual_pos
+                        rospy.loginfo(f"[Z Descent] Contact detected at Z={actual_z:.3f}m "
+                                     f"(cmd_Z={cmd_z:.3f}m, gap={cmd_actual_gap*1000:.0f}mm, "
+                                     f"dZ={dz*1000:.1f}mm, XY_err={xy_error*1000:.1f}mm)")
+                        break
                 else:
-                    consecutive_small_motions = 0
+                    consecutive_small = 0
 
-                motion_within_threshold = last_motion <= stagnation_threshold
-                if motion_within_threshold:
-                    stagnation_hit_counter += 1
-                else:
-                    stagnation_hit_counter = 0
+            prev_actual_z = actual_z
 
-                within_proximity = (
-                    0.0 <= z_residual <= contact_z_tolerance
-                    and xy_residual <= contact_xy_tolerance
-                )
+            # Periodic logging
+            elapsed_int = int(wall_t)
+            if elapsed_int % 3 == 0 and abs(wall_t - round(wall_t)) < 0.025:
+                descended = start_z - actual_z
+                status = " [PAUSED]" if paused else ""
+                rospy.loginfo(f"[Z Descent] t={traj_time:.1f}/{duration:.1f}s Z={actual_z:.3f}m "
+                              f"descended={descended*1000:.0f}mm XY_err={xy_error*1000:.0f}mm"
+                              f" thresh={xy_pause_thresh*1000:.0f}mm{status}")
 
-                if within_proximity:
-                    proximity_hit_counter += 1
-                else:
-                    proximity_hit_counter = 0
+            rate.sleep()
 
-                contact_ready = (
-                    within_proximity
-                    and (
-                        (motion_within_threshold and stagnation_hit_counter >= contact_required_hits)
-                        or proximity_hit_counter >= contact_required_hits
-                    )
-                )
-                plateau_ready = motion_within_threshold and stagnation_hit_counter >= plateau_required_hits
+        # Determine achieved position
+        achieved = contact_pos or self.get_end_effector_position() or final_target
+        descended = start_z - achieved[2]
+        remaining = achieved[2] - target_z
 
-                within_contact_window = contact_ready
+        if contact_pos is not None:
+            rospy.loginfo(f"[Z Descent] Contact: descended {descended*1000:.0f}mm, "
+                          f"remaining {remaining*1000:.0f}mm (physical limit)")
+            return True, achieved
 
-                plateau_reached = (
-                    plateau_ready
-                    and within_proximity
-                    and 0.0 <= z_residual <= plateau_z_tolerance
-                    and xy_residual <= contact_xy_tolerance * 1.4
-                    and total_z_descent > 1e-4
-                    and attempted_progress_ratio >= plateau_progress_threshold
-                )
-
-                if within_contact_window or plateau_reached:
-                    contact_label = "Contact" if within_contact_window else "Plateau"
-                    rospy.logwarn(f"[Z Descent] {contact_label} at step {step_count}: XY {xy_residual*1000:.1f}mm, Z {z_residual*1000:.1f}mm, locking height")
-                    target_z = achieved_position[2]
-                    previous_z = achieved_position[2]
-                    proximity_hit_counter = 0
-                    stagnation_hit_counter = 0
-                    break
-
-                # Tolerance-oriented success check
-                z_tolerance_success = abs(z_residual) <= 0.040
-                xy_reasonable_success = xy_residual <= 0.030
-                
-                if z_tolerance_success and xy_reasonable_success:
-                    rospy.loginfo(f"[Z Descent] Tolerance success at step {step_count}: XY={xy_residual*1000:.1f}mm, Z_err={abs(z_residual)*1000:.1f}mm, Z={achieved_position[2]:.3f}m")
-                    return True, achieved_position
-                
-                rospy.logerr(f"[Z Descent] Step {step_count} failed: XY={xy_residual*1000:.1f}mm, Z_res={z_residual*1000:.1f}mm")
-                return False, achieved_position
-
-            current_pos = self.get_end_effector_position() or tuple(step_target)
-            actual_descent = max(0.0, previous_z - current_pos[2])
-            
-            # Consecutive small motion detection on success path
-            if actual_descent <= small_motion_threshold:
-                if step_converged:
-                    consecutive_small_motions += 1
-                    rospy.loginfo(f"[Z Descent] Small motion on success {consecutive_small_motions}/2: dZ={actual_descent*1000:.1f}mm")
-                
-                if consecutive_small_motions >= max_consecutive_small_motions:
-                    # Physical contact stable - 2 consecutive small motions
-                    current_xy_error = math.sqrt((current_pos[0] - target_x)**2 + (current_pos[1] - target_y)**2)
-                    current_z_error = abs(current_pos[2] - target_z)
-                    
-                    if current_xy_error <= 0.030:
-                        rospy.loginfo(f"[Z Descent] Contact stable: 2 small motions, XY {current_xy_error*1000:.1f}mm, Z={current_pos[2]:.3f}m")
-                        return True, current_pos
-                    else:
-                        rospy.logwarn(f"[Z Descent] Small motion but XY={current_xy_error*1000:.1f}mm>30mm, Z_err={current_z_error*1000:.1f}mm")
-            else:
-                if step_converged:
-                    consecutive_small_motions = 0
-            
-            if actual_descent < 1e-4 and remaining_descent > final_descent_margin:
-                rospy.logdebug(
-                    f"[Formation Z Descent] Step {step_count} 实际下降不足 0.1mm (remaining {remaining_descent*1000:.1f}mm)"
-                )
-            stagnation_hit_counter = 0
-            proximity_hit_counter = 0
-            xy_error = math.sqrt(
-                (current_pos[0] - step_target[0])**2 +
-                (current_pos[1] - step_target[1])**2
-            )
-            if xy_error > 0.080:  # RELAXED: 80mm threshold (consistent with descent tolerance)
-                rospy.logwarn(f"[Formation Z Descent] XY error {xy_error*1000:.1f}mm, applying XY correction")
-                correction_target = [step_target[0], step_target[1], current_pos[2]]
-                self.send_assembly_command_from_end_effector(correction_target, final_yaw)
-                corrected = self.active_position_convergence(
-                    target_pos=correction_target,
-                    target_yaw=final_yaw,
-                    pos_thresh=0.080,  # RELAXED: 80mm convergence threshold
-                    yaw_thresh=0.087,  # RELAXED: 5 degrees (0.087 rad)
-                    timeout=8.0
-                )
-                if not corrected:
-                    rospy.logerr("[Formation Z Descent] XY correction failed")
-                    return False, current_pos
-
-            previous_z = current_pos[2]
-            achieved_position = current_pos
-            total_descent_completed = max(0.0, start_z - previous_z)
-            progress_ratio = 0.0 if total_z_descent <= 1e-6 else min(1.0, total_descent_completed / total_z_descent)
-
-        achieved_position = self.get_end_effector_position() or achieved_position
-
-        rospy.loginfo("[Formation Z Descent] Completed all steps successfully")
-        return True, (target_x, target_y, achieved_position[2])
+        rospy.loginfo(f"[Z Descent] Trajectory complete, descended {descended*1000:.0f}mm")
+        return True, achieved
 
     def active_stabilization_wait(self, target_pos, target_yaw, duration, description="position stabilization"):
         """
@@ -1334,7 +1214,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         
         xy_error = math.sqrt((current_pos[0] - target_pos[0])**2 + (current_pos[1] - target_pos[1])**2)
         z_error = abs(current_pos[2] - target_pos[2])
-        pos_ok = (xy_error <= pos_thresh and z_error <= 0.030)
+        pos_ok = (xy_error <= pos_thresh and z_error <= 0.050)
         
         yaw_ok = True
         yaw_error = None
@@ -1468,7 +1348,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             # Strict: try 2.5° with full timeout (large rotation needs time)
             success = self.active_position_convergence(
                 target_pos=locked_pos, target_yaw=spoke_yaw,
-                pos_thresh=0.050, yaw_thresh=0.044, timeout=35.0,
+                pos_thresh=0.050, yaw_thresh=0.044, timeout=10.0,
                 max_yaw_step=math.radians(10.0)
             )
             
@@ -1513,7 +1393,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
         final_target_pos = (final_ee_pos[0], final_ee_pos[1], final_ee_pos[2])
 
-        descent_success, achieved_pos = self.controlled_z_descent(current_pos, final_target_pos, final_yaw)
+        descent_success, achieved_pos = self.streaming_z_descent(current_pos, final_target_pos, final_yaw)
         if not descent_success:
             fallback_pos = achieved_pos or self.get_end_effector_position()
             if fallback_pos is not None:

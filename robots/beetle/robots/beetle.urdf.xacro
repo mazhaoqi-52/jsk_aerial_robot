@@ -87,7 +87,7 @@
   </link>
 
   <!-- battery -->
-  <!-- <joint name="battery1_joint" type="fixed">
+  <joint name="battery1_joint" type="fixed">
     <parent link="base_link"/>
     <child link="battery1"/>
     <origin xyz="0 0.044 -0.01" rpy="0 0 0"/>
@@ -132,7 +132,7 @@
       </geometry>
     </visual>
   </link>
-   -->
+  
 
     
 </robot>

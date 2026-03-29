@@ -44,8 +44,8 @@ LOAD_BOX_HEIGHT = 0.86   # z dimension (m)
 LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 
 # ============== Towing Task Parameters ==============
-# Command an extra 40mm descent during insertion after reaching the approach height.
-INSERTION_DEPTH = 0.04   # 40mm deeper insertion in DESCEND_AND_INSERT
+# Command an extra 30mm descent during insertion after reaching the approach height.
+INSERTION_DEPTH = 0.03   # 30mm deeper insertion in DESCEND_AND_INSERT
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
 TOWING_DISTANCE = 0.6    # towing distance (m), overridden by ~towing_distance param
@@ -92,15 +92,19 @@ class LinearTowingTrajectoryGenerator:
         
         # State variables
         self.current_distance = 0.0
+        self.current_load_distance = 0.0
         self.current_velocity = 0.0
         self.target_pos = self.start_pos.copy()
+        self.load_start_pos = None
         
         # Velocity ramp-up parameters
         self.ramp_up_distance = 0.05  # 50mm ramp-up zone
         self.ramp_down_distance = 0.05  # 50mm ramp-down zone
         
-        # Force adaptation: starts from 0, increases when stalled (reactive control)
-        self.current_force = 0.0  # Start from 0N, not preset value
+        # Force adaptation: linear ramp over 3 stall windows (15s) to reach max_force.
+        # If load starts moving before max, lock at current force level.
+        self.current_force = 0.0
+        self.force_locked = False
         
         # Performance monitoring
         self.start_time = rospy.Time.now().to_sec()
@@ -142,16 +146,30 @@ class LinearTowingTrajectoryGenerator:
         # Limit time step
         safe_dt = min(actual_dt, 0.1)
         
-        # Calculate current distance traveled
+        # Calculate current end-effector distance traveled
         displacement = np.array(current_pos) - self.start_pos
         self.current_distance = np.dot(displacement[:2], self.towing_direction[:2])
+
+        # Track load displacement when available (primary towing success metric)
+        if load_pos is not None:
+            load_pos_arr = np.array(load_pos)
+            if self.load_start_pos is None:
+                self.load_start_pos = load_pos_arr.copy()
+                self.stall_last_check_time = current_time
+                self.stall_last_check_distance = 0.0
+                rospy.loginfo(f"[Towing] Load reference locked at {self.load_start_pos}")
+            load_displacement = load_pos_arr - self.load_start_pos
+            self.current_load_distance = np.dot(load_displacement[:2], self.towing_direction[:2])
+
+        # Prefer load displacement for progress/completion when available.
+        motion_distance = self.current_load_distance if self.load_start_pos is not None else self.current_distance
         
         # Velocity profile with ramp-up and ramp-down
-        remaining_distance = self.target_distance - self.current_distance
+        remaining_distance = self.target_distance - motion_distance
         
-        if self.current_distance < self.ramp_up_distance:
+        if motion_distance < self.ramp_up_distance:
             # Ramp up phase
-            velocity_factor = self.current_distance / self.ramp_up_distance
+            velocity_factor = motion_distance / self.ramp_up_distance
             self.current_velocity = self.target_velocity * max(0.2, velocity_factor)
         elif remaining_distance < self.ramp_down_distance:
             # Ramp down phase
@@ -200,41 +218,42 @@ class LinearTowingTrajectoryGenerator:
         # Stall detection using sliding window (for abort decision only)
         window_elapsed = current_time - self.stall_last_check_time
         if window_elapsed >= self.stall_window_time:
-            window_distance = self.current_distance - self.stall_last_check_distance
+            window_distance = motion_distance - self.stall_last_check_distance
             recent_velocity = window_distance / window_elapsed
             self._recent_velocity = recent_velocity
             self.stall_last_check_time = current_time
-            self.stall_last_check_distance = self.current_distance
+            self.stall_last_check_distance = motion_distance
             
             if recent_velocity < self.target_velocity * 0.05:  # < 5% of target
                 self.stall_counter += 1  # increments once per window
             else:
                 self.stall_counter = max(0, self.stall_counter - 1)
         
-        # Adaptive force based on recent windowed velocity (not global average)
-        # Use the same sliding window velocity computed above for stall detection.
-        # Between window updates, approximate with global average as fallback.
-        if hasattr(self, '_recent_velocity'):
-            inst_vel = self._recent_velocity
-        else:
-            inst_vel = self.current_distance / max(0.1, current_time - self.start_time)
-        
-        if inst_vel < self.target_velocity * 0.5:
-            # Below 50% target: ramp up +0.04N/cycle = +1.0N/s at 25Hz
-            self.current_force = min(self.max_force, self.current_force + 0.04)
-        elif inst_vel > self.target_velocity * 0.8:
-            # Above 80% target: decay -0.02N/cycle = -0.5N/s at 25Hz
-            self.current_force = max(0.0, self.current_force - 0.02)
-        # Between 50%-80%: hold current force (hysteresis band)
+        # Adaptive force: ramp up over 3 stall windows (15s), lock once load moves or max reached.
+        # Ramp rate = max_force / (3 * stall_window_time) / control_rate
+        if not self.force_locked:
+            # Check if load is moving (velocity > 5% of target) → lock at current force
+            vel_check = self._recent_velocity if hasattr(self, '_recent_velocity') else 0.0
+            if vel_check >= self.target_velocity * 0.05 and self.current_force > 0:
+                self.force_locked = True
+                rospy.loginfo(f"[Towing] Load moving, force locked at {self.current_force:.1f}N")
+            else:
+                ramp_time = 3.0 * self.stall_window_time  # 15s
+                force_increment = self.max_force / (ramp_time * self.control_rate)
+                self.current_force = min(self.max_force, self.current_force + force_increment)
+                if self.current_force >= self.max_force:
+                    self.force_locked = True
         
         return {
             'current_distance': self.current_distance,
+            'current_load_distance': self.current_load_distance,
             'target_distance': self.target_distance,
             'current_velocity': self.current_velocity,
             'current_force': self.current_force,
-            'progress': self.current_distance / self.target_distance,
+            'progress': motion_distance / self.target_distance,
             'stall_counter': self.stall_counter,
-            'z_offset': self.z_offset
+            'z_offset': self.z_offset,
+            'using_load_tracking': self.load_start_pos is not None
         }
     
     def generate_target_state(self, current_yaw):
@@ -268,11 +287,13 @@ class LinearTowingTrajectoryGenerator:
     
     def is_complete(self):
         """Check if towing is complete."""
-        return self.current_distance >= self.target_distance * 0.95
+        distance_for_completion = self.current_load_distance if self.load_start_pos is not None else self.current_distance
+        return distance_for_completion >= self.target_distance * 0.95
     
     def get_progress(self):
         """Get towing progress [0.0, 1.0]."""
-        return min(1.0, self.current_distance / self.target_distance)
+        distance_for_progress = self.current_load_distance if self.load_start_pos is not None else self.current_distance
+        return min(1.0, distance_for_progress / self.target_distance)
 
 
 class LoadInterface:
@@ -573,7 +594,7 @@ class DescendAndInsertState(TowingStateBase):
             current_pos, 
             insertion_pos, 
             insertion_yaw,
-            descent_speed=0.10
+            descent_speed=0.05
         )
         
         if not success:
@@ -757,7 +778,9 @@ class TowingWithFeedforwardState(TowingStateBase):
             
             # Check completion
             if trajectory_gen.is_complete():
-                rospy.loginfo(f"Towing complete! Distance: {state_info['current_distance']*1000:.0f}mm")
+                done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+                done_source = 'load' if state_info['using_load_tracking'] else 'ee'
+                rospy.loginfo(f"Towing complete! Distance: {done_dist*1000:.0f}mm ({done_source})")
                 break
             
             # Timeout: stall-based (consecutive stall windows) + absolute safety net
@@ -812,12 +835,21 @@ class TowingWithFeedforwardState(TowingStateBase):
             
             # Log progress every 5s
             if int(elapsed) % 5 == 0 and int(elapsed * 10) % 50 == 0:
+                dist_source = 'load' if state_info['using_load_tracking'] else 'ee'
+                dist_value = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
                 rospy.loginfo(f"Towing: {state_info['progress']*100:.1f}%, "
-                             f"dist={state_info['current_distance']*1000:.0f}mm, "
+                             f"dist={dist_value*1000:.0f}mm({dist_source}), "
                              f"ff={state_info['current_force']:.1f}N, time={elapsed:.1f}s")
             
             control_rate.sleep()
         
+        # If loop ends due to ROS shutdown/Ctrl-C, this is not a successful towing completion.
+        if rospy.is_shutdown():
+            self._clear_external_wrench()
+            userdata.towing_end_position = self.get_end_effector_position()
+            self.formation_adapter.set_pitch_compensation(False)
+            return 'timeout'
+
         # ---- Clear feedforward after towing completes ----
         self._clear_external_wrench()
         
@@ -876,7 +908,7 @@ class DisengageAndReturnState(TowingStateBase):
         # Phase 0.5: Retract along towing reverse direction to disengage hook
         towing_dir = np.array(userdata.towing_direction)
         retract_dir = -towing_dir  # reverse of towing = back into box, then past wall
-        retract_distance = 0.08  # 80mm
+        retract_distance = 0.12  # 120mm (increased by +40mm)
         current_pos = self.get_end_effector_position()
         retract_target = np.array(current_pos) + retract_dir * retract_distance
         rospy.loginfo(f"[Phase 0.5] Retracting {retract_distance*1000:.0f}mm along "

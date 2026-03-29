@@ -1016,12 +1016,23 @@ namespace aerial_robot_control
     // This exit path runs for BOTH LEADER and FOLLOWER when unified_control_mode_
     // becomes false. We must restore ALL state to avoid transient jumps that crash.
     //
+    // Skip when SEPARATED: unified control was never active, so there is nothing
+    // to restore. This allows setting unified_control_mode rosparam on the ground
+    // (before takeoff) without T4.4 immediately clearing it.
+    //
     // Critical items:
     //   1. Restore spinal attitude PID gains (setAttitudeGains restores independent-mode gains)
     //   2. Reset target position to CURRENT position (avoid P-term spike)
     //   3. Seed Z I-term with gravity (avoid altitude drop)
     //   4. Clear RP/XY I-terms (unified I-term values are meaningless for independent mode)
     //   5. Sync target_pos_candidate_ (used by CoG→CoM conversion in leader-follower mode)
+    if (module_state == SEPARATED) {
+      // Not assembled yet — unified control never ran, nothing to clean up.
+      // Preserve rosparam so unified mode activates after takeoff.
+      pre_module_state_ = module_state;
+      return;
+    }
+
     if (prev_unified_control_mode_) {
       ROS_WARN("[UnifiedCtrl] id=%d exiting unified mode → restoring independent hover state",
                beetle_navigator_->getMyID());

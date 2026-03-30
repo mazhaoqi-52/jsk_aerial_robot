@@ -386,20 +386,45 @@ namespace aerial_robot_control
                  z_integral_freeze_count_, z_ki_boost_count_, z_ki_boost_factor_);
       }
     } else {
-      // ===== Ground start → Unified: I-terms start from zero =====
+      // ===== Ground start → Unified: inject pitch I-seed =====
       // PID hasn't accumulated meaningful I-terms yet (robot is on the ground).
-      // Unified controlCore() already has explicit gravity FF in wrench_acc,
-      // so Z PID can accumulate from zero just like a normal independent takeoff.
-      // No freeze/boost needed — there's no prior steady-state to migrate from.
+      // Unified controlCore() has explicit gravity FF in wrench_acc for Z,
+      // so Z PID can accumulate from zero. But pitch needs an initial seed
+      // to compensate formation CoG offset from the first frame — otherwise
+      // cascade P+D alone (P=8, D=5) cannot hold pitch against the offset
+      // during the gravity ramp, causing pitch divergence on real hardware.
       pid_controllers_.at(X).setErrI(0);
       pid_controllers_.at(Y).setErrI(0);
       pid_controllers_.at(Z).setErrI(0);
       pid_controllers_.at(ROLL).setErrI(0);
-      pid_controllers_.at(PITCH).setErrI(0);
+
+      // Pitch I-seed: same logic as hover→unified, compensating CoG offset
+      {
+        double pitch_seed_default_n = pitch_i_seed_default_;
+        if (pitch_i_seed_by_n_.count(N_modules))
+          pitch_seed_default_n = pitch_i_seed_by_n_.at(N_modules);
+        double pitch_seed = has_unified_pitch_i_ss_ ? last_unified_pitch_i_ss_ : pitch_seed_default_n;
+        double new_pitch_i = PITCH_SEED_GAIN * pitch_seed;
+
+        // Clamp to unified-mode pitch I limit
+        double Ki_pitch = std::max(unified_pitch_gains_.i, 1e-6);
+        double pitch_i_limit = unified_pitch_gains_.limit_i / Ki_pitch;
+        new_pitch_i = boost::algorithm::clamp(new_pitch_i, -pitch_i_limit, pitch_i_limit);
+
+        pid_controllers_.at(PITCH).setErrI(new_pitch_i);
+        rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
+        rp_ki_boost_count_ = RP_KI_BOOST_FRAMES;
+
+        ROS_WARN("[UnifiedCtrl] Ground start: pitch I-seed=%.4f (x%.1f=%s, N=%d), "
+                 "err_i=%.4f (limit=+/-%.1f), freeze=%d, boost=%d(x%.1f)",
+                 pitch_seed, PITCH_SEED_GAIN,
+                 has_unified_pitch_i_ss_ ? "adaptive" : "default", N_modules,
+                 new_pitch_i, pitch_i_limit,
+                 rp_integral_freeze_count_, rp_ki_boost_count_, RP_KI_BOOST_FACTOR);
+      }
+
       z_integral_freeze_count_ = 0;
       z_ki_boost_count_ = 0;
-      rp_integral_freeze_count_ = 0;
-      rp_ki_boost_count_ = 0;
 
       // P2: Still initialize per-N boost params for later use
       z_ki_boost_frames_ = z_ki_boost_frames_default_;
@@ -409,7 +434,7 @@ namespace aerial_robot_control
       if (z_ki_boost_factor_by_n_.count(N_modules))
         z_ki_boost_factor_ = z_ki_boost_factor_by_n_.at(N_modules);
 
-      ROS_WARN("[UnifiedCtrl] Ground start: all I-terms zeroed, no freeze/boost (naviState=%d, N=%d)",
+      ROS_WARN("[UnifiedCtrl] Ground start: Z/Roll/XY I-terms zeroed (naviState=%d, N=%d)",
                navigator_->getNaviState(), N_modules);
     }
 
@@ -1013,9 +1038,15 @@ namespace aerial_robot_control
 
         // Fall through to independent control below
       } else {
-        // Never received any unified command — just waiting
-        ROS_WARN("[UnifiedCtrl FOLLOWER] id=%d, no valid unified cmd yet — fallback to independent hover",
-                 beetle_navigator_->getMyID());
+        // Never received any unified command — still waiting for LEADER's first publish.
+        // MUST return here to avoid falling through to T4.4 which would clear
+        // unified_control_mode rosparam and force this FOLLOWER back to independent.
+        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d, no valid unified cmd yet — waiting (age=%.3f)",
+                 beetle_navigator_->getMyID(),
+                 unified_cmd_received_ ? (ros::Time::now() - unified_cmd_stamp_).toSec() : -1.0);
+        pre_module_state_ = module_state;
+        prev_unified_control_mode_ = true;
+        return;
       }
     }
 

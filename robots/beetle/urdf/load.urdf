@@ -6,7 +6,7 @@
   <xacro:property name="box_length" value="0.88" />  <!-- x -->
   <xacro:property name="box_width" value="0.70" />   <!-- y set in a value bigger than beetle's width for simulation -->
   <xacro:property name="box_height" value="0.86" />  <!-- z -->
-  <xacro:property name="wall_thickness" value="0.04" /> <!-- wall thickness -->
+  <xacro:property name="wall_thickness" value="0.03" /> <!-- wall thickness -->
   
   <!-- Load properties -->
   <xacro:property name="load_mass" value="2.0" />   <!-- kg -->
@@ -61,8 +61,10 @@
   </joint>
 
   <!-- ============== Load Box Link (Open-top hollow box: 5 walls) ============== -->
+  <!-- ============== Load Box Link (cart-like shape) ============== -->
   <link name="load_box">
-    <!-- Bottom wall -->
+
+    <!-- Bottom plate -->
     <visual>
       <origin xyz="0 0 ${-box_height/2 + wall_thickness/2}" rpy="0 0 0"/>
       <geometry>
@@ -76,68 +78,70 @@
         <box size="${box_length} ${box_width} ${wall_thickness}"/>
       </geometry>
     </collision>
-    
-    <!-- Front wall (+X) -->
+
+    <!-- Back frame (-X face), hollow in the middle, thickness = 30 mm -->
+
+    <!-- Left vertical frame strip -->
     <visual>
-      <origin xyz="${box_length/2 - wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} ${box_width/2 - wall_thickness/2} 0" rpy="0 0 0"/>
       <geometry>
-        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+        <box size="${wall_thickness} ${wall_thickness} ${box_height}"/>
       </geometry>
       <material name="orange"/>
     </visual>
     <collision>
-      <origin xyz="${box_length/2 - wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} ${box_width/2 - wall_thickness/2} 0" rpy="0 0 0"/>
       <geometry>
-        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+        <box size="${wall_thickness} ${wall_thickness} ${box_height}"/>
       </geometry>
     </collision>
-    
-    <!-- Back wall (-X) -->
+
+    <!-- Right vertical frame strip -->
     <visual>
-      <origin xyz="${-box_length/2 + wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} ${-box_width/2 + wall_thickness/2} 0" rpy="0 0 0"/>
       <geometry>
-        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+        <box size="${wall_thickness} ${wall_thickness} ${box_height}"/>
       </geometry>
       <material name="orange"/>
     </visual>
     <collision>
-      <origin xyz="${-box_length/2 + wall_thickness/2} 0 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} ${-box_width/2 + wall_thickness/2} 0" rpy="0 0 0"/>
       <geometry>
-        <box size="${wall_thickness} ${box_width} ${box_height}"/>
+        <box size="${wall_thickness} ${wall_thickness} ${box_height}"/>
       </geometry>
     </collision>
-    
-    <!-- Left wall (+Y) -->
+
+    <!-- Top horizontal frame strip -->
     <visual>
-      <origin xyz="0 ${box_width/2 - wall_thickness/2} 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} 0 ${box_height/2 - wall_thickness/2}" rpy="0 0 0"/>
       <geometry>
-        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+        <box size="${wall_thickness} ${box_width - 2*wall_thickness} ${wall_thickness}"/>
       </geometry>
       <material name="orange"/>
     </visual>
     <collision>
-      <origin xyz="0 ${box_width/2 - wall_thickness/2} 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} 0 ${box_height/2 - wall_thickness/2}" rpy="0 0 0"/>
       <geometry>
-        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+        <box size="${wall_thickness} ${box_width - 2*wall_thickness} ${wall_thickness}"/>
       </geometry>
     </collision>
-    
-    <!-- Right wall (-Y) -->
+
+    <!-- Bottom horizontal frame strip on -X face -->
     <visual>
-      <origin xyz="0 ${-box_width/2 + wall_thickness/2} 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} 0 ${-box_height/2 + wall_thickness/2}" rpy="0 0 0"/>
       <geometry>
-        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+        <box size="${wall_thickness} ${box_width - 2*wall_thickness} ${wall_thickness}"/>
       </geometry>
       <material name="orange"/>
     </visual>
     <collision>
-      <origin xyz="0 ${-box_width/2 + wall_thickness/2} 0" rpy="0 0 0"/>
+      <origin xyz="${-box_length/2 + wall_thickness/2} 0 ${-box_height/2 + wall_thickness/2}" rpy="0 0 0"/>
       <geometry>
-        <box size="${box_length - 2*wall_thickness} ${wall_thickness} ${box_height}"/>
+        <box size="${wall_thickness} ${box_width - 2*wall_thickness} ${wall_thickness}"/>
       </geometry>
     </collision>
-    
-    <!-- Inertial (single, at center of mass) -->
+
+    <!-- Inertial (kept as simple approximation) -->
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <mass value="${load_mass}"/>

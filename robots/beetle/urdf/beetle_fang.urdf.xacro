@@ -112,6 +112,28 @@
           <cylinder radius="0.006" length="0.04412"/>
         </geometry>
       </collision>
+      <!-- ========================================================= -->
+      <!-- Optional hook collision boxes for gripping the frame       -->
+      <!-- Uncomment this block to enable hooks; comment it to disable -->
+      <!-- Hook size: x=40mm, y=20mm, z=5mm                           -->
+      <!-- Bottom face aligned with fang bottom end                   -->
+      <!-- Extends toward negative x direction in body frame          -->
+      <!-- ========================================================= -->
+      
+      <collision>
+        <origin xyz="-0.0188 0.075 -0.0718283" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.04 0.02 0.005"/>
+        </geometry>
+      </collision>
+
+      <collision>
+        <origin xyz="-0.01828 -0.075 -0.0718283" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.04 0.02 0.005"/>
+        </geometry>
+      </collision>
+     
     </link>
     <joint name="beetle_fang_joint" type="fixed">
       <parent link="base_link"/>

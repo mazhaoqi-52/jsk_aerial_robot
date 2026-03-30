@@ -745,11 +745,18 @@ namespace aerial_robot_control
 
       // Gravity feedforward: spinal's inner loop sees angles[0/1] as target roll/pitch,
       // but does NOT add gravity. PC must provide gravity compensation in body Z.
+      // During TAKEOFF_STATE, ramp gravity FF from 0→1 over ~0.5s (20 frames @40Hz)
+      // to avoid instantaneous full-thrust "pop-up". In HOVER/LAND the ramp is 1.0.
       {
         tf::Matrix3x3 uav_rot_ff = estimator_->getOrientation(Frame::COG, estimate_mode_);
         tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
         tf::Vector3 gravity_cog = uav_rot_ff.inverse() * gravity_w;
-        target_wrench_acc.head(3) += Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
+        double gravity_ramp = 1.0;
+        if (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) {
+          constexpr int GRAVITY_RAMP_FRAMES = 20;  // ~0.5s @40Hz
+          gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
+        }
+        target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
       }
 
       // NOTE: Gyro compensation (ω × I·ω) is NOT added here.
@@ -1026,35 +1033,30 @@ namespace aerial_robot_control
     //   3. Seed Z I-term with gravity (avoid altitude drop)
     //   4. Clear RP/XY I-terms (unified I-term values are meaningless for independent mode)
     //   5. Sync target_pos_candidate_ (used by CoG→CoM conversion in leader-follower mode)
-    if (module_state == SEPARATED) {
-      // Not assembled yet — unified control never ran, nothing to clean up.
-      // Preserve rosparam so unified mode activates after takeoff.
-      pre_module_state_ = module_state;
-      return;
-    }
+    // Skip T4.4 cleanup when SEPARATED: unified control was never active,
+    // nothing to restore. Preserves rosparam for ground-set unified mode.
+    // Let control flow continue to GimbalrotorController::controlCore() below.
+    if (module_state != SEPARATED) {
+      if (prev_unified_control_mode_) {
+        ROS_WARN("[UnifiedCtrl] id=%d exiting unified mode → restoring independent hover state",
+                 beetle_navigator_->getMyID());
+        resetToIndependentHover();
+      }
 
-    if (prev_unified_control_mode_) {
-      ROS_WARN("[UnifiedCtrl] id=%d exiting unified mode → restoring independent hover state",
-               beetle_navigator_->getMyID());
-      resetToIndependentHover();
-    }
+      prev_unified_control_mode_ = false;
+      follower_unified_active_ = false;
+      follower_ready_sent_ = false;
+      spinal_gains_zeroed_ = false;
+      gains_switched_ = false;
+      unified_controller_->resetCascadeAllocSent();
+      unified_controller_->resetTargetAngleLpf();
+      unified_controller_->resetFollowerReady();
+      beetle_navigator_->setUnifiedControlMode(false);
 
-    prev_unified_control_mode_ = false;
-    follower_unified_active_ = false;
-    follower_ready_sent_ = false;
-    spinal_gains_zeroed_ = false;
-    gains_switched_ = false;  // ensure flag is consistent even if restoreIndependentGains was skipped
-    unified_controller_->resetCascadeAllocSent();
-    unified_controller_->resetTargetAngleLpf();
-    unified_controller_->resetFollowerReady();
-    beetle_navigator_->setUnifiedControlMode(false);  // notify navigator
-
-    // P2.4: Write rosparam so ALL modules (including FOLLOWERs) see the exit
-    // on their next update() cycle. Without this, FOLLOWERs only exit when
-    // their local rosparam is changed externally or leader commands time out.
-    {
-      ros::NodeHandle control_nh(nh_, "controller");
-      control_nh.setParam("unified_control_mode", false);
+      {
+        ros::NodeHandle control_nh(nh_, "controller");
+        control_nh.setParam("unified_control_mode", false);
+      }
     }
     
     if(beetle_navigator_->getControlFlag() &&

@@ -336,7 +336,8 @@ class BeetleInterface(object):
     
     def isUnifiedMode(self):
         """Query C++ runtime: is unified_control_mode currently active on the leader?"""
-        return rospy.get_param(f'/beetle{self.module_id}/controller/unified_control_mode', False)
+        leader_id = self.wrench_target_id if hasattr(self, 'wrench_target_id') else self.module_id
+        return rospy.get_param(f'/beetle{leader_id}/controller/unified_control_mode', False)
 
     def addExternalWrench(self, force, torque, frame_id="world"):
         """Apply desired external wrench.

@@ -370,6 +370,10 @@ namespace aerial_robot_control
 
   void GimbalrotorController::sendTorqueAllocationMatrixInv()
   {
+    if (integrated_map_inv_rot_.rows() == 0 || integrated_map_inv_rot_.cols() == 0) {
+      ROS_WARN_THROTTLE(1.0, "sendTorqueAllocationMatrixInv: matrix not yet computed, skipping");
+      return;
+    }
     spinal::TorqueAllocationMatrixInv torque_allocation_matrix_inv_msg;
     torque_allocation_matrix_inv_msg.rows.resize(motor_num_ * rotor_coef_);
     Eigen::MatrixXd torque_allocation_matrix_inv = integrated_map_inv_rot_;

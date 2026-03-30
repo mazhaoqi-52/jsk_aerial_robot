@@ -45,7 +45,7 @@ LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 
 # ============== Towing Task Parameters ==============
 # Command an extra 30mm descent during insertion after reaching the approach height.
-INSERTION_DEPTH = 0.03   # 30mm deeper insertion in DESCEND_AND_INSERT
+INSERTION_DEPTH = 0.02   # 20mm deeper insertion in DESCEND_AND_INSERT
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
 TOWING_DISTANCE = 0.6    # towing distance (m), overridden by ~towing_distance param
@@ -101,6 +101,11 @@ class LinearTowingTrajectoryGenerator:
         self.ramp_up_distance = 0.05  # 50mm ramp-up zone
         self.ramp_down_distance = 0.05  # 50mm ramp-down zone
         
+        # Max lead distance: target position must not exceed actual EE position
+        # by more than this amount along towing direction, preventing PID saturation
+        # when the load is stuck or slow.
+        self.max_lead_distance = 0.17  # 170mm
+        
         # Force adaptation: linear ramp over 3 stall windows (15s) to reach max_force.
         # If load starts moving before max, lock at current force level.
         self.current_force = 0.0
@@ -115,15 +120,6 @@ class LinearTowingTrajectoryGenerator:
         self.stall_window_time = 5.0    # seconds per window
         self.stall_last_check_time = self.start_time
         self.stall_last_check_distance = 0.0
-        
-        # Z anti-windup: target Z pre-compensation to prevent I-term buildup
-        # When towing force is applied, the drone dips slightly; this offset
-        # pre-adjusts the target Z to reduce I-term accumulation.
-        self.z_offset = 0.0           # current Z offset applied to target (m)
-        self.z_offset_decay_rate = 0.003  # decay rate (m/s) — ~10s to recover 30mm
-        self.z_force_coupling = 0.0015    # m/N — Z offset per unit force
-        self.z_offset_decaying = False    # True once force stabilized, decay begins
-        self.z_force_stable_time = None   # time when force first reached max
         
         rospy.loginfo(f"LinearTowingTrajectory: dir={self.towing_direction}, "
                      f"dist={target_distance}m, vel={target_velocity}m/s, max_force={max_force}N")
@@ -186,34 +182,12 @@ class LinearTowingTrajectoryGenerator:
             np.dot(self.target_pos[:2] - self.start_pos[:2], self.towing_direction[:2]) + target_distance_increment
         )
         
+        # Clamp target so it never leads actual EE position by more than max_lead_distance.
+        # This prevents PID saturation when the load is stuck or slow.
+        new_target_distance = min(new_target_distance,
+                                  self.current_distance + self.max_lead_distance)
+        
         self.target_pos[:2] = self.start_pos[:2] + self.towing_direction[:2] * new_target_distance
-        
-        # Z anti-windup: manage target Z pre-compensation
-        # Phase 1 (force ramping): lower target Z to match expected pitch-induced drop
-        # Phase 2 (force stable >5s): gradually decay offset back to zero
-        force_at_max = (self.current_force >= self.max_force * 0.99)
-        
-        if not self.z_offset_decaying:
-            # Still in tracking phase
-            force_induced_offset = -self.z_force_coupling * self.current_force
-            self.z_offset = force_induced_offset
-            
-            # Check if force has been at max long enough to start decay
-            if force_at_max:
-                if self.z_force_stable_time is None:
-                    self.z_force_stable_time = current_time
-                elif current_time - self.z_force_stable_time > 5.0:
-                    # Force stable for 5s — Z transient should have settled
-                    self.z_offset_decaying = True
-                    rospy.loginfo(f"Z offset decay starting: z_offset={self.z_offset*1000:.1f}mm")
-            else:
-                self.z_force_stable_time = None  # reset if force drops
-        else:
-            # Decay phase: gradually return z_offset to zero
-            if self.z_offset < 0:
-                self.z_offset = min(0.0, self.z_offset + self.z_offset_decay_rate * safe_dt)
-        
-        self.target_pos[2] = self.start_pos[2] + self.z_offset
         
         # Stall detection using sliding window (for abort decision only)
         window_elapsed = current_time - self.stall_last_check_time
@@ -252,7 +226,6 @@ class LinearTowingTrajectoryGenerator:
             'current_force': self.current_force,
             'progress': motion_distance / self.target_distance,
             'stall_counter': self.stall_counter,
-            'z_offset': self.z_offset,
             'using_load_tracking': self.load_start_pos is not None
         }
     
@@ -810,11 +783,8 @@ class TowingWithFeedforwardState(TowingStateBase):
                 rpy_result = self.beetle.getAssemblyRPY()
                 pitch_deg = np.degrees(rpy_result[1]) if rpy_result is not None else 0.0
                 raw_z_err = target_state['position'][2] - current_pos[2]
-                z_comp = target_state['force'][2]
-                z_offset = state_info.get('z_offset', 0.0)
                 rospy.loginfo(f"[Towing Debug] target_pos={target_state['position']}, "
-                             f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f}°, "
-                             f"z_comp={z_comp:.3f}N, z_offset={z_offset*1000:.1f}mm")
+                             f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f}°")
             
             self.send_assembly_command_from_end_effector(
                 target_state['position'],
@@ -908,7 +878,7 @@ class DisengageAndReturnState(TowingStateBase):
         # Phase 0.5: Retract along towing reverse direction to disengage hook
         towing_dir = np.array(userdata.towing_direction)
         retract_dir = -towing_dir  # reverse of towing = back into box, then past wall
-        retract_distance = 0.12  # 120mm (increased by +40mm)
+        retract_distance = 0.13  # 130mm
         current_pos = self.get_end_effector_position()
         retract_target = np.array(current_pos) + retract_dir * retract_distance
         rospy.loginfo(f"[Phase 0.5] Retracting {retract_distance*1000:.0f}mm along "

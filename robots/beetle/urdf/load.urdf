@@ -6,7 +6,7 @@
   <xacro:property name="box_length" value="0.88" />  <!-- x -->
   <xacro:property name="box_width" value="0.70" />   <!-- y set in a value bigger than beetle's width for simulation -->
   <xacro:property name="box_height" value="0.86" />  <!-- z -->
-  <xacro:property name="wall_thickness" value="0.03" /> <!-- wall thickness -->
+  <xacro:property name="wall_thickness" value="0.015" /> <!-- wall thickness -->
   
   <!-- Load properties -->
   <xacro:property name="load_mass" value="2.0" />   <!-- kg -->

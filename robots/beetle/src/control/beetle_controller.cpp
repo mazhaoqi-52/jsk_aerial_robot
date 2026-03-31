@@ -951,6 +951,7 @@ namespace aerial_robot_control
         sendFollowerCascadeSetup();
         spinal_gains_zeroed_ = true;
         unified_transition_count_ = 0;
+        beetle_navigator_->setUnifiedControlMode(true);  // P3: skip CoG→CoM conversion
         ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d entering unified mode, sent cascade gains to own spinal, t=%.4f",
                  beetle_navigator_->getMyID(), ros::Time::now().toSec());
       }
@@ -1346,6 +1347,7 @@ namespace aerial_robot_control
             sendFollowerCascadeSetup();
             spinal_gains_zeroed_ = true;
             unified_transition_count_ = 0;
+            beetle_navigator_->setUnifiedControlMode(true);  // P3: skip CoG→CoM conversion
             ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d freeze: sent cascade gains to own spinal, awaiting unified cmd, t=%.4f",
                      beetle_navigator_->getMyID(), ros::Time::now().toSec());
           }

@@ -855,22 +855,23 @@ class DisengageAndReturnState(TowingStateBase):
             return 'failed'
         
         # Phase 0: Brief stabilization after load release
+        # Hold a FIXED target position to prevent upward drift from pitch transient
         rospy.loginfo("[Phase 0] Stabilizing after load release")
         
         stabilize_duration = 3.0
         stabilize_start = rospy.Time.now()
+        stabilize_target = current_pos  # fixed target, NOT updated each loop
         
         while (rospy.Time.now() - stabilize_start).to_sec() < stabilize_duration:
-            current_pos = self.get_end_effector_position()
-            if current_pos:
-                self.send_assembly_command_from_end_effector(current_pos, current_yaw)
+            self.send_assembly_command_from_end_effector(stabilize_target, current_yaw)
             
             elapsed = (rospy.Time.now() - stabilize_start).to_sec()
+            actual_pos = self.get_end_effector_position()
             rpy = self.beetle.getAssemblyRPY()
-            if rpy is not None:
+            if rpy is not None and actual_pos is not None:
                 rospy.loginfo_throttle(0.5, f"[Phase 0] t={elapsed:.1f}s, "
                     f"roll={np.degrees(rpy[0]):.2f}°, pitch={np.degrees(rpy[1]):.2f}°, "
-                    f"pos={FormationUtils.format_vec(current_pos)}")
+                    f"pos={FormationUtils.format_vec(actual_pos)}")
             rospy.sleep(0.1)
         
         rospy.loginfo(f"[Phase 0] Stabilization complete after {stabilize_duration}s")
@@ -891,12 +892,12 @@ class DisengageAndReturnState(TowingStateBase):
         )
         rospy.sleep(0.5)
 
-        # Phase 1: Ensure at safe height (only ascend, never descend)
+        # Phase 1: Return to start height (hook is already disengaged in Phase 0.5)
         current_pos = self.get_end_effector_position()
-        safe_height = max(current_pos[2], start_pos[2])
-        rospy.loginfo(f"[Phase 1] Ascending to start height {safe_height:.3f}m "
-                      f"(current {current_pos[2]:.3f}m, delta {(safe_height - current_pos[2])*1000:.0f}mm)")
-        ascent_target = (current_pos[0], current_pos[1], safe_height)
+        target_height = start_pos[2]
+        rospy.loginfo(f"[Phase 1] Returning to start height {target_height:.3f}m "
+                      f"(current {current_pos[2]:.3f}m, delta {(target_height - current_pos[2])*1000:.0f}mm)")
+        ascent_target = (current_pos[0], current_pos[1], target_height)
         
         success = self.active_position_convergence(
             ascent_target, target_yaw=current_yaw,
@@ -918,10 +919,10 @@ class DisengageAndReturnState(TowingStateBase):
         
         rospy.sleep(1.0)
         
-        # Phase 3: Return to start XY position
+        # Phase 3: Return to start position (XY + original Z)
         rospy.loginfo("[Phase 3] Returning to start position")
         current_pos = self.get_end_effector_position()
-        return_target = (start_pos[0], start_pos[1], current_pos[2])
+        return_target = (start_pos[0], start_pos[1], start_pos[2])
         
         # Use streaming polynomial trajectory for smooth return
         traj_desc = self.generate_polynomial_trajectory(

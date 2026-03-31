@@ -74,8 +74,9 @@ public:
 
   /** @brief Send torque_allocation_matrix_inv sub-blocks to each module's spinal.
    *  Each module receives only its own rows (motor_num_per_module_ * rotor_coef_ rows × 3 cols).
-   *  Called once at mode switch and periodically to handle late spinal startup. */
-  void sendTorqueAllocationMatrixInv();
+   *  Called once at mode switch and periodically to handle late spinal startup.
+   *  @return true if matrix was sent, false if not yet computed. */
+  bool sendTorqueAllocationMatrixInv();
 
   /** @brief Send cascade P/D attitude gains to each module's spinal.
    *  Uses motors.resize(1) path → spinal stores as torque-level gains and

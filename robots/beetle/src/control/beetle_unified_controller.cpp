@@ -573,7 +573,7 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   return realized;
 }
 
-void BeetleUnifiedController::sendTorqueAllocationMatrixInv()
+bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 {
   // Send the rotational part of the formation-level allocation pseudoinverse
   // to each module's spinal. Each module receives only its sub-block:
@@ -585,7 +585,7 @@ void BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 
   if (integrated_map_inv_rot_.rows() == 0) {
     ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] sendTorqueAllocationMatrixInv: inv_rot not computed yet");
-    return;
+    return false;
   }
 
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
@@ -616,6 +616,7 @@ void BeetleUnifiedController::sendTorqueAllocationMatrixInv()
            "inv_rot total rows=%ld cols=%ld",
            assembled_ids.size(), rows_per_module,
            integrated_map_inv_rot_.rows(), integrated_map_inv_rot_.cols());
+  return true;
 }
 
 void BeetleUnifiedController::sendCascadeGains(

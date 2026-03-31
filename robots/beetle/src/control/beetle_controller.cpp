@@ -1475,13 +1475,21 @@ namespace aerial_robot_control
         cascade_pitch_p_, cascade_pitch_d_,
         cascade_yaw_d_);
 
-    // Attempt to send now (may fail if matrix not yet computed — that's OK)
+    // Attempt to send now. If matrix is not yet computed, skip gains too —
+    // sending cascade gains with the old independent-mode allocation matrix
+    // causes thrustGainMapping() to produce wrong per-motor gains (P5 fix).
+    // The one-shot in computeUnifiedAllocation() will send matrix + gains
+    // together once the allocation is first successfully computed.
     unified_controller_->updateFormationGeometry();
-    unified_controller_->sendTorqueAllocationMatrixInv();
-    unified_controller_->sendCascadeGains(
-        cascade_roll_p_, cascade_roll_d_,
-        cascade_pitch_p_, cascade_pitch_d_,
-        cascade_yaw_d_);
+    bool matrix_sent = unified_controller_->sendTorqueAllocationMatrixInv();
+    if (matrix_sent) {
+      unified_controller_->sendCascadeGains(
+          cascade_roll_p_, cascade_roll_d_,
+          cascade_pitch_p_, cascade_pitch_d_,
+          cascade_yaw_d_);
+    } else {
+      ROS_WARN("[UnifiedCtrl] Cascade setup: matrix not ready, deferring gains to one-shot");
+    }
 
     // Publish gimbal_dof=1 to own spinal (LEADER).
     {
@@ -1490,8 +1498,9 @@ namespace aerial_robot_control
       gimbal_dof_pub_.publish(gimbal_dof_msg);
     }
 
-    ROS_INFO("[UnifiedCtrl] Cascade setup (LEADER): sent alloc_inv + gains"
-             "(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) to all %zu modules + gimbal_dof=1",
+    ROS_INFO("[UnifiedCtrl] Cascade setup (LEADER): alloc_inv %s, gains %s, "
+             "(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) %zu modules + gimbal_dof=1",
+             matrix_sent ? "SENT" : "DEFERRED", matrix_sent ? "SENT" : "DEFERRED",
              cascade_roll_p_, cascade_roll_d_, cascade_pitch_p_, cascade_pitch_d_, cascade_yaw_d_,
              beetle_navigator_->getAssemblyIds().size());
   }

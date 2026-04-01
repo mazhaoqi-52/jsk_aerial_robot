@@ -251,6 +251,14 @@ namespace aerial_robot_control
     ros::Publisher internal_wrench_pub_;
     ros::Publisher wrench_comp_pid_pub_;
     ros::Publisher des_inter_wrench_pub_;
+
+    // Assemble debug publishers (global /assemble/debug/ namespace)
+    ros::Publisher assemble_pid_pub_;
+    ros::Publisher assemble_vectoring_f_pub_;
+    ros::Publisher assemble_formation_wrench_pub_;
+    aerial_robot_msgs::PoseControlPid assemble_pid_msg_;
+    void publishAssembleDebug(const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
+                              const tf::Vector3& target_formation_pos, bool alloc_ok);
     void controlCore() override;
     bool update() override;
     

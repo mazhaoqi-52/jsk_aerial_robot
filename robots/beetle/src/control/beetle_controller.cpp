@@ -114,6 +114,21 @@ namespace aerial_robot_control
     pid_controllers_.push_back(PID("t_y", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
     pid_controllers_.push_back(PID("t_z", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
 
+    // Assemble debug publishers (global namespace)
+    assemble_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("/assemble/debug/pose/pid", 10);
+    assemble_vectoring_f_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/assemble/debug/vectoring_force", 1);
+    assemble_formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("/assemble/debug/formation_wrench", 1);
+    // Initialize assemble_pid_msg_ arrays
+    auto initPidField = [](aerial_robot_msgs::Pid& f) {
+      f.total.resize(1, 0); f.p_term.resize(1, 0); f.i_term.resize(1, 0); f.d_term.resize(1, 0);
+    };
+    initPidField(assemble_pid_msg_.x);
+    initPidField(assemble_pid_msg_.y);
+    initPidField(assemble_pid_msg_.z);
+    initPidField(assemble_pid_msg_.roll);
+    initPidField(assemble_pid_msg_.pitch);
+    initPidField(assemble_pid_msg_.yaw);
+
     ros::NodeHandle control_nh(nh_, "controller");
     ros::NodeHandle wrench_nh(control_nh, "wrench_comp");
     std::vector<int> indices = {FX, FY, FZ, TX, TY, TZ};
@@ -936,6 +951,9 @@ namespace aerial_robot_control
           has_unified_pitch_i_ss_ = true;
         }
       }
+
+      // --- Publish assemble debug info ---
+      publishAssembleDebug(formation_pos, formation_vel, target_formation_pos, ok);
 
       pre_module_state_ = module_state;
       return;  // Skip individual control path
@@ -2162,6 +2180,99 @@ namespace aerial_robot_control
     formation_desired_wrench_(3) = msg.wrench.torque.x;
     formation_desired_wrench_(4) = msg.wrench.torque.y;
     formation_desired_wrench_(5) = msg.wrench.torque.z;
+  }
+
+  void BeetleController::publishAssembleDebug(
+      const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
+      const tf::Vector3& target_formation_pos, bool alloc_ok)
+  {
+    // 1. PID debug: formation-level pose control PID
+    assemble_pid_msg_.header.stamp = ros::Time::now();
+
+    // X
+    assemble_pid_msg_.x.total.at(0) = pid_controllers_.at(X).result();
+    assemble_pid_msg_.x.p_term.at(0) = pid_controllers_.at(X).getPTerm();
+    assemble_pid_msg_.x.i_term.at(0) = pid_controllers_.at(X).getITerm();
+    assemble_pid_msg_.x.d_term.at(0) = pid_controllers_.at(X).getDTerm();
+    assemble_pid_msg_.x.target_p = target_formation_pos.x();
+    assemble_pid_msg_.x.err_p = target_formation_pos.x() - formation_pos.x();
+    assemble_pid_msg_.x.target_d = target_vel_.x();
+    assemble_pid_msg_.x.err_d = target_vel_.x() - formation_vel.x();
+
+    // Y
+    assemble_pid_msg_.y.total.at(0) = pid_controllers_.at(Y).result();
+    assemble_pid_msg_.y.p_term.at(0) = pid_controllers_.at(Y).getPTerm();
+    assemble_pid_msg_.y.i_term.at(0) = pid_controllers_.at(Y).getITerm();
+    assemble_pid_msg_.y.d_term.at(0) = pid_controllers_.at(Y).getDTerm();
+    assemble_pid_msg_.y.target_p = target_formation_pos.y();
+    assemble_pid_msg_.y.err_p = target_formation_pos.y() - formation_pos.y();
+    assemble_pid_msg_.y.target_d = target_vel_.y();
+    assemble_pid_msg_.y.err_d = target_vel_.y() - formation_vel.y();
+
+    // Z
+    assemble_pid_msg_.z.total.at(0) = pid_controllers_.at(Z).result();
+    assemble_pid_msg_.z.p_term.at(0) = pid_controllers_.at(Z).getPTerm();
+    assemble_pid_msg_.z.i_term.at(0) = pid_controllers_.at(Z).getITerm();
+    assemble_pid_msg_.z.d_term.at(0) = pid_controllers_.at(Z).getDTerm();
+    assemble_pid_msg_.z.target_p = target_formation_pos.z();
+    assemble_pid_msg_.z.err_p = target_formation_pos.z() - formation_pos.z();
+    assemble_pid_msg_.z.target_d = target_vel_.z();
+    assemble_pid_msg_.z.err_d = target_vel_.z() - formation_vel.z();
+
+    // Roll
+    assemble_pid_msg_.roll.total.at(0) = pid_controllers_.at(ROLL).result();
+    assemble_pid_msg_.roll.p_term.at(0) = pid_controllers_.at(ROLL).getPTerm();
+    assemble_pid_msg_.roll.i_term.at(0) = pid_controllers_.at(ROLL).getITerm();
+    assemble_pid_msg_.roll.d_term.at(0) = pid_controllers_.at(ROLL).getDTerm();
+    assemble_pid_msg_.roll.target_p = target_rpy_.x();
+    assemble_pid_msg_.roll.err_p = target_rpy_.x() - rpy_.x();
+    assemble_pid_msg_.roll.target_d = target_omega_.x();
+    assemble_pid_msg_.roll.err_d = target_omega_.x() - omega_.x();
+
+    // Pitch
+    assemble_pid_msg_.pitch.total.at(0) = pid_controllers_.at(PITCH).result();
+    assemble_pid_msg_.pitch.p_term.at(0) = pid_controllers_.at(PITCH).getPTerm();
+    assemble_pid_msg_.pitch.i_term.at(0) = pid_controllers_.at(PITCH).getITerm();
+    assemble_pid_msg_.pitch.d_term.at(0) = pid_controllers_.at(PITCH).getDTerm();
+    assemble_pid_msg_.pitch.target_p = target_rpy_.y();
+    assemble_pid_msg_.pitch.err_p = target_rpy_.y() - rpy_.y();
+    assemble_pid_msg_.pitch.target_d = target_omega_.y();
+    assemble_pid_msg_.pitch.err_d = target_omega_.y() - omega_.y();
+
+    // Yaw
+    assemble_pid_msg_.yaw.total.at(0) = pid_controllers_.at(YAW).result();
+    assemble_pid_msg_.yaw.p_term.at(0) = pid_controllers_.at(YAW).getPTerm();
+    assemble_pid_msg_.yaw.i_term.at(0) = pid_controllers_.at(YAW).getITerm();
+    assemble_pid_msg_.yaw.d_term.at(0) = pid_controllers_.at(YAW).getDTerm();
+    assemble_pid_msg_.yaw.target_p = target_rpy_.z();
+    assemble_pid_msg_.yaw.err_p = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
+    assemble_pid_msg_.yaw.target_d = target_omega_.z();
+    assemble_pid_msg_.yaw.err_d = target_omega_.z() - omega_.z();
+
+    assemble_pid_pub_.publish(assemble_pid_msg_);
+
+    // 2. Vectoring force
+    if (alloc_ok) {
+      const Eigen::VectorXd& vf = unified_controller_->getTargetVectoringForce();
+      std_msgs::Float32MultiArray vf_msg;
+      vf_msg.data.resize(vf.size());
+      for (int i = 0; i < vf.size(); i++)
+        vf_msg.data[i] = static_cast<float>(vf(i));
+      assemble_vectoring_f_pub_.publish(vf_msg);
+
+      // 3. Formation realized wrench
+      Eigen::VectorXd rw = unified_controller_->getRealizedWrenchBody();
+      geometry_msgs::WrenchStamped wrench_msg;
+      wrench_msg.header.stamp = ros::Time::now();
+      wrench_msg.header.frame_id = "assembly_cog";
+      wrench_msg.wrench.force.x = rw(0);
+      wrench_msg.wrench.force.y = rw(1);
+      wrench_msg.wrench.force.z = rw(2);
+      wrench_msg.wrench.torque.x = rw(3);
+      wrench_msg.wrench.torque.y = rw(4);
+      wrench_msg.wrench.torque.z = rw(5);
+      assemble_formation_wrench_pub_.publish(wrench_msg);
+    }
   }
 
 } //namespace aerial_robot_controller

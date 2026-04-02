@@ -111,6 +111,9 @@ public:
   /** @brief Set the observer to active/inactive. When inactive, update() is a no-op. */
   void setActive(bool active) { active_ = active; }
 
+  /** @brief Allow bias calibration only when the controller judges the formation to be hovering stably. */
+  void setBiasCalibrationAllowed(bool allowed);
+
   /** @brief Is the bias calibrated? */
   bool isBiasCalibrated() const { return bias_calibrated_; }
 
@@ -155,6 +158,8 @@ private:
   double bias_settle_time_;                  // seconds to wait before starting calibration
   int    bias_calib_samples_;                // number of samples to average for bias
   int    update_count_;                      // total update() calls since initialization
+  bool   bias_calibration_allowed_;          // true only while unified hover is active
+  int    bias_ready_count_;                  // hover-allowed frame counter for settle timing
 
   // Last rotation matrix (cached for body↔world conversion)
   Eigen::Matrix3d last_cog_rot_;

@@ -64,7 +64,9 @@ FormationMomentumObserver::FormationMomentumObserver()
     bias_torque_body_(Eigen::Vector3d::Zero()),
     bias_settle_time_(3.0),
     bias_calib_samples_(40),
-    update_count_(0)
+    update_count_(0),
+    bias_calibration_allowed_(false),
+    bias_ready_count_(0)
 {
 }
 
@@ -133,8 +135,40 @@ void FormationMomentumObserver::reset()
   bias_torque_body_ = Eigen::Vector3d::Zero();
 
   update_count_ = 0;
+  bias_calibration_allowed_ = false;
+  bias_ready_count_ = 0;
 
   ROS_INFO("[FormationObserver] State reset (including bias calibration)");
+}
+
+void FormationMomentumObserver::setBiasCalibrationAllowed(bool allowed)
+{
+  if (bias_calibration_allowed_ == allowed) return;
+
+  bias_calibration_allowed_ = allowed;
+  bias_ready_count_ = 0;
+
+  if (!allowed)
+  {
+    if (!bias_calibrated_)
+    {
+      bias_calibrating_ = false;
+      bias_sample_count_ = 0;
+      bias_accumulator_ = Eigen::Vector3d::Zero();
+    }
+
+    if (!bias_torque_calibrated_)
+    {
+      bias_torque_calibrating_ = false;
+      bias_torque_sample_count_ = 0;
+      bias_torque_accumulator_ = Eigen::Vector3d::Zero();
+    }
+
+    ROS_INFO("[FormationObserver] Bias calibration gated OFF (waiting for hover state)");
+    return;
+  }
+
+  ROS_INFO("[FormationObserver] Bias calibration gated ON (hover detected, settle timer starts now)");
 }
 
 void FormationMomentumObserver::update(
@@ -212,31 +246,34 @@ void FormationMomentumObserver::update(
     // 7. Bias auto-calibration
     if (!bias_calibrated_)
     {
-      int settle_frames = static_cast<int>(bias_settle_time_ / dt);
-      if (settle_frames < 10) settle_frames = 10;
-
-      if (!bias_calibrating_ && update_count_ >= settle_frames)
+      if (bias_calibration_allowed_)
       {
-        bias_calibrating_ = true;
-        bias_sample_count_ = 0;
-        bias_accumulator_ = Eigen::Vector3d::Zero();
-        ROS_INFO("[FormationObserver] Force bias calibration started after %d frames "
-                 "(settle=%.1fs), collecting %d samples...",
-                 update_count_, bias_settle_time_, bias_calib_samples_);
-      }
+        bias_ready_count_++;
+        int settle_frames = static_cast<int>(bias_settle_time_ / dt);
+        if (settle_frames < 10) settle_frames = 10;
 
-      if (bias_calibrating_)
-      {
-        bias_accumulator_ += est_ext_force_w_filt_;  // use LPF value: DC matches output
-        bias_sample_count_++;
-
-        if (bias_sample_count_ >= bias_calib_samples_)
+        if (!bias_calibrating_ && bias_ready_count_ >= settle_frames)
         {
-          bias_force_w_ = bias_accumulator_ / static_cast<double>(bias_calib_samples_);
-          bias_calibrated_ = true;
-          bias_calibrating_ = false;
-          ROS_INFO("[FormationObserver] Force bias calibrated: (%.3f, %.3f, %.3f) N",
-                   bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z());
+          bias_calibrating_ = true;
+          bias_sample_count_ = 0;
+          bias_accumulator_ = Eigen::Vector3d::Zero();
+          ROS_INFO("[FormationObserver] Force bias calibration started after hover settle (%d frames, %.1fs), collecting %d samples...",
+                   bias_ready_count_, bias_settle_time_, bias_calib_samples_);
+        }
+
+        if (bias_calibrating_)
+        {
+          bias_accumulator_ += est_ext_force_w_filt_;  // use LPF value: DC matches output
+          bias_sample_count_++;
+
+          if (bias_sample_count_ >= bias_calib_samples_)
+          {
+            bias_force_w_ = bias_accumulator_ / static_cast<double>(bias_calib_samples_);
+            bias_calibrated_ = true;
+            bias_calibrating_ = false;
+            ROS_INFO("[FormationObserver] Force bias calibrated: (%.3f, %.3f, %.3f) N",
+                     bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z());
+          }
         }
       }
     }
@@ -316,30 +353,33 @@ void FormationMomentumObserver::update(
     // 7. Torque bias auto-calibration (same settle/sample scheme as force)
     if (!bias_torque_calibrated_)
     {
-      int settle_frames = static_cast<int>(bias_settle_time_ / dt);
-      if (settle_frames < 10) settle_frames = 10;
-
-      if (!bias_torque_calibrating_ && update_count_ >= settle_frames)
+      if (bias_calibration_allowed_)
       {
-        bias_torque_calibrating_ = true;
-        bias_torque_sample_count_ = 0;
-        bias_torque_accumulator_ = Eigen::Vector3d::Zero();
-        ROS_INFO("[FormationObserver] Torque bias calibration started, collecting %d samples...",
-                 bias_calib_samples_);
-      }
+        int settle_frames = static_cast<int>(bias_settle_time_ / dt);
+        if (settle_frames < 10) settle_frames = 10;
 
-      if (bias_torque_calibrating_)
-      {
-        bias_torque_accumulator_ += est_ext_torque_body_filt_;  // use LPF value
-        bias_torque_sample_count_++;
-
-        if (bias_torque_sample_count_ >= bias_calib_samples_)
+        if (!bias_torque_calibrating_ && bias_ready_count_ >= settle_frames)
         {
-          bias_torque_body_ = bias_torque_accumulator_ / static_cast<double>(bias_calib_samples_);
-          bias_torque_calibrated_ = true;
-          bias_torque_calibrating_ = false;
-          ROS_INFO("[FormationObserver] Torque bias calibrated: (%.4f, %.4f, %.4f) Nm",
-                   bias_torque_body_.x(), bias_torque_body_.y(), bias_torque_body_.z());
+          bias_torque_calibrating_ = true;
+          bias_torque_sample_count_ = 0;
+          bias_torque_accumulator_ = Eigen::Vector3d::Zero();
+          ROS_INFO("[FormationObserver] Torque bias calibration started after hover settle, collecting %d samples...",
+                   bias_calib_samples_);
+        }
+
+        if (bias_torque_calibrating_)
+        {
+          bias_torque_accumulator_ += est_ext_torque_body_filt_;  // use LPF value
+          bias_torque_sample_count_++;
+
+          if (bias_torque_sample_count_ >= bias_calib_samples_)
+          {
+            bias_torque_body_ = bias_torque_accumulator_ / static_cast<double>(bias_calib_samples_);
+            bias_torque_calibrated_ = true;
+            bias_torque_calibrating_ = false;
+            ROS_INFO("[FormationObserver] Torque bias calibrated: (%.4f, %.4f, %.4f) Nm",
+                     bias_torque_body_.x(), bias_torque_body_.y(), bias_torque_body_.z());
+          }
         }
       }
     }

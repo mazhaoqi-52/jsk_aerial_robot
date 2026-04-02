@@ -873,6 +873,9 @@ namespace aerial_robot_control
           // Realized wrench from allocation (body frame)
           Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
 
+            formation_observer_->setBiasCalibrationAllowed(
+              navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
+
           // Observer dt: use the same du as PID (interval between controlCore calls).
           // NOTE: do NOT use (ros::Time::now() - control_timestamp_) here because
           // control_timestamp_ was already updated earlier in this same frame,

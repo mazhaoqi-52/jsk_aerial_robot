@@ -17,17 +17,17 @@ controller:
 
   # P2: Per-module-count seed bucketing.
   z_i_seed_by_n:
-    n2: 1.2
+    n2: 0.9
     n3: 0.8
   pitch_i_seed_by_n:
-    n2: -0.70
+    n2: -0.20
     n3: -0.55
   z_ki_boost_frames_default: 60
   z_ki_boost_factor_default: 2.0
   z_ki_boost_by_n:
     n2:
-      frames: 90
-      factor: 3.0
+      frames: 60
+      factor: 2.0
     n3:
       frames: 60
       factor: 2.0
@@ -42,6 +42,8 @@ controller:
     enable_torque_observer: true
     est_force_lpf_cutoff_freq: 1.0   # Hz: output LPF on force estimate
     est_torque_lpf_cutoff_freq: 2.0  # Hz: output LPF on torque estimate
+    bias_settle_time: 3.0
+    bias_calib_samples: 200  # effective only in this namespace; sampling is gated until unified-hover
 
   # ========== UO-4: Formation observer feedforward compensation ==========
   # Enable ONLY after E2 validation (known-mass test confirms correct Z estimation).
@@ -52,8 +54,6 @@ controller:
     z_gain: 0.5      # Z feedforward gain [0,1]; validated with E2
     xy_gain: 0.3      # X/Y feedforward gain [0,1]; start conservative (horizontal less reliable)
     torque_gain: 0.5  # Roll/Pitch/Yaw torque feedforward gain [0,1]; start conservative
-    bias_settle_time: 3.0
-    bias_calib_samples: 200  # ~4s @ 50Hz: larger window reduces bias estimation error
 
   # ========== Cascade control for unified mode ==========
   # Torque-level gains sent to spinal via RollPitchYawTerms.
@@ -67,7 +67,7 @@ controller:
   tgt_angle_lpf_alpha: 0.3
 
   # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
-  use_constrained_alloc: false
+  use_constrained_alloc: true
   alloc_lambda: 1.0e-4          # regularization weight (larger → softer, smaller → tighter tracking)
   alloc_t_max: 20.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
@@ -152,7 +152,7 @@ controller:
     limit_i: 10.0
 
   unified_pitch:
-    i_gain: 5.0
+    i_gain: 3.0
     limit_sum: 50.0
     limit_i: 20.0
 

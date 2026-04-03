@@ -733,6 +733,19 @@ namespace aerial_robot_control
 
       control_timestamp_ = ros::Time::now().toSec();
 
+      // Debug: periodically log unified PID state for oscillation diagnosis
+      ROS_DEBUG_THROTTLE(0.5, "[UnifiedCtrl PID] "
+               "pos_err(%.3f,%.3f,%.3f) "
+               "X[P=%.3f I=%.3f D=%.3f sum=%.3f] "
+               "Z[P=%.3f I=%.3f D=%.3f sum=%.3f] "
+               "gains_xy(P=%.1f I=%.1f D=%.1f)",
+               target_formation_pos.x() - formation_pos.x(),
+               target_formation_pos.y() - formation_pos.y(),
+               err_z,
+               pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(), pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).result(),
+               pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(), pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).result(),
+               unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d);
+
       // --- P2.1: FOLLOWER Ready Gate ---
       // If not all FOLLOWERs have reported ready, freeze ALL I-terms to prevent
       // the outer loop from building up corrections while inner loops aren't synced.
@@ -1662,6 +1675,21 @@ namespace aerial_robot_control
              unified_roll_gains_.i, unified_pitch_gains_.i,
              unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d,
              unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d);
+
+    // Debug: check damping ratio for oscillation diagnosis
+    // For a PD system: zeta = D / (2*sqrt(P)). zeta < 0.7 => likely oscillatory.
+    if (unified_xy_gains_.p > 0.0) {
+      double zeta_xy = unified_xy_gains_.d / (2.0 * std::sqrt(unified_xy_gains_.p));
+      ROS_INFO("[UnifiedCtrl] XY damping ratio zeta=%.3f (P=%.2f D=%.2f) %s",
+               zeta_xy, unified_xy_gains_.p, unified_xy_gains_.d,
+               zeta_xy < 0.7 ? "** UNDERDAMPED - may oscillate **" : "OK");
+    }
+    if (unified_z_gains_.p > 0.0) {
+      double zeta_z = unified_z_gains_.d / (2.0 * std::sqrt(unified_z_gains_.p));
+      ROS_INFO("[UnifiedCtrl] Z damping ratio zeta=%.3f (P=%.2f D=%.2f) %s",
+               zeta_z, unified_z_gains_.p, unified_z_gains_.d,
+               zeta_z < 0.7 ? "** UNDERDAMPED - may oscillate **" : "OK");
+    }
   }
 
   void BeetleController::restoreIndependentGains()
@@ -1751,6 +1779,15 @@ namespace aerial_robot_control
               }
             ROS_INFO_STREAM("[UnifiedCtrl] change unified gain for controller '" << pid_controllers_.at(index).getName() << "'");
           }
+
+        // Damping ratio check after gain change
+        if (gain_set.p > 0.0) {
+          double zeta = gain_set.d / (2.0 * std::sqrt(gain_set.p));
+          if (zeta < 0.7) {
+            ROS_WARN("[UnifiedCtrl] Damping ratio zeta=%.3f after gain change (P=%.2f D=%.2f) - UNDERDAMPED, oscillation likely!",
+                     zeta, gain_set.p, gain_set.d);
+          }
+        }
       }
   }
 

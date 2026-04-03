@@ -413,7 +413,9 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // --- Init or update solver ---
   bool need_init = (qp_n_vars_ != n_cols || qp_n_constraints_ != n_constraints);
   if (need_init) {
-    qp_solver_->clearSolver();
+    // Recreate solver to avoid OsqpEigen "already set" stderr warnings
+    // (clearSolver() does not reset the Data object's internal flags)
+    qp_solver_ = std::make_unique<OsqpEigen::Solver>();
     qp_solver_->settings()->setVerbosity(false);
     qp_solver_->settings()->setWarmStart(true);
     qp_solver_->settings()->setMaxIteraction(500);

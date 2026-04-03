@@ -161,7 +161,7 @@ controller:
 
   unified_xy:
     p_gain: 10.0
-    i_gain: 1.0
+    i_gain: 0.5
     d_gain: 4.0
     limit_sum: 8.0
     limit_p: 12.0

@@ -41,7 +41,9 @@ BeetleUnifiedController::BeetleUnifiedController()
     alloc_lambda_(1e-4),
     alloc_t_max_(20.0),
     alloc_gimbal_limit_rad_(M_PI / 2.0),
+    alloc_rate_limit_(0.0),
     qp_n_vars_(-1),
+    qp_n_constraints_(-1),
     qp_solver_(std::make_unique<OsqpEigen::Solver>())
 {
 }
@@ -96,6 +98,7 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<bool>("use_constrained_alloc", use_constrained_alloc_, false);
   control_nh.param<double>("alloc_lambda", alloc_lambda_, 1e-4);
   control_nh.param<double>("alloc_t_max", alloc_t_max_, 20.0);
+  control_nh.param<double>("alloc_rate_limit", alloc_rate_limit_, 0.0);
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
   alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
@@ -136,7 +139,8 @@ bool BeetleUnifiedController::updateFormationGeometry()
 
 bool BeetleUnifiedController::computeUnifiedAllocation(
     const Eigen::VectorXd& target_wrench_acc_cog,
-    const Eigen::VectorXd& desired_ext_wrench)
+  const Eigen::VectorXd& desired_ext_wrench,
+  double yaw_pid_raw)
 {
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) return false;
@@ -169,7 +173,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // In cascade mode, the wrench_acc torque channels contain ONLY I-term
   // (P+D done by spinal). So base_thrust = allocation of (position PID + I-term only).
   bool qp_ok = use_constrained_alloc_ &&
-               solveConstrainedThrusts(integrated_map_, total_wrench_acc, target_vectoring_f_);
+               solveFullVectorQP(integrated_map_, total_wrench_acc, target_vectoring_f_);
   if (!qp_ok) {
     target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
   }
@@ -195,9 +199,9 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       if (integrated_map_inv_(i * rotor_coef_, yaw_col) > max_yaw_scale)
         max_yaw_scale = integrated_map_inv_(i * rotor_coef_, yaw_col);
     }
-    // candidate_yaw_term = yaw_pid_result * max_yaw_scale
-    // (yaw PID result is wrench_acc(5), but we need the raw PID result before allocation)
-    candidate_yaw_term_ = total_wrench_acc(5) * max_yaw_scale;
+    // candidate_yaw_term is reconstructed from the raw yaw PID output.
+    // This keeps a dedicated yaw channel even when yaw is excluded from allocation.
+    candidate_yaw_term_ = yaw_pid_raw * max_yaw_scale;
   }
 
   // Low-pass filter target angles to suppress 40Hz jitter before sending to spinal.
@@ -288,138 +292,184 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   return true;
 }
 
-bool BeetleUnifiedController::solveConstrainedThrusts(
+bool BeetleUnifiedController::solveFullVectorQP(
     const Eigen::MatrixXd& alloc_matrix,
     const Eigen::VectorXd& w_total,
     Eigen::VectorXd& vectoring_f_out)
 {
-  // alloc_matrix: 6 x (rotor_coef_ * n_rotors)
-  // w_total: 6D desired wrench-acc
-  // vectoring_f_out: (rotor_coef_ * n_rotors) output
+  // Full-vector QP: decision variables are all force components f ∈ R^{n_cols}.
+  // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
+  //
+  // Objective:  min_f  0.5 * f' * P * f + q' * f
+  //   where P = A'A + λI,  q = -A'w
+  //
+  // Constraints (all linear, OSQP-compatible):
+  //   Per rotor i (rotor_coef=2, gimbal_dof=1):
+  //     (a) Gimbal angle:  f_x + tan(θ_max)*f_z ≥ 0   (angle ≥ -θ_max)
+  //                       -f_x + tan(θ_max)*f_z ≥ 0   (angle ≤ +θ_max)
+  //     (b) Component bounds: -T_max ≤ f_x ≤ T_max,  0 ≤ f_z ≤ T_max
+  //     (c) Rate limits (optional): f_j_prev - Δ ≤ f_j ≤ f_j_prev + Δ
 
-  int cols = alloc_matrix.cols();
-  if (cols == 0 || rotor_coef_ == 0 || cols % rotor_coef_ != 0) {
-    ROS_WARN_THROTTLE(2.0, "[UnifiedCtrl QP] Invalid alloc_matrix cols=%d, rotor_coef=%d", cols, rotor_coef_);
+  const int n_cols = alloc_matrix.cols();
+  if (n_cols == 0 || rotor_coef_ == 0 || n_cols % rotor_coef_ != 0) {
+    ROS_WARN_THROTTLE(2.0, "[UnifiedCtrl QP] Invalid alloc_matrix cols=%d, rotor_coef=%d",
+                      n_cols, rotor_coef_);
     return false;
   }
 
-  int n_rotors = cols / rotor_coef_;
+  const int n_rotors = n_cols / rotor_coef_;
+  const double tan_limit = std::tan(alloc_gimbal_limit_rad_);
+  const bool use_rate_limit = (alloc_rate_limit_ > 0.0 &&
+                               prev_vectoring_f_.size() == n_cols);
 
-  // Step 1: get unconstrained directions via pseudoinverse (for vectoring angle reference)
-  Eigen::VectorXd f_ps = aerial_robot_model::pseudoinverse(alloc_matrix) * w_total;
+  // --- Count constraints ---
+  // For rotor_coef == 2:
+  //   2 gimbal angle rows + 2 component-bound rows per rotor = 4 * n_rotors
+  //   + 2 rate-limit rows per rotor (if enabled) = 2 * n_rotors
+  int n_gimbal_rows = (rotor_coef_ == 2) ? 2 * n_rotors : 0;
+  int n_bound_rows = n_cols;  // one bound per variable
+  int n_rate_rows = use_rate_limit ? n_cols : 0;
+  int n_constraints = n_gimbal_rows + n_bound_rows + n_rate_rows;
 
-  // Step 2: build reduced B matrix (6 x n_rotors)
-  // Each column i of B = A[:, rotor_coef_*i : rotor_coef_*(i+1)] * unit_direction_i
-  Eigen::MatrixXd B(6, n_rotors);
-  Eigen::MatrixXd D(rotor_coef_, n_rotors); // unit directions per rotor
-  for (int i = 0; i < n_rotors; i++) {
-    Eigen::VectorXd fi = f_ps.segment(rotor_coef_ * i, rotor_coef_);
-    double norm_fi = fi.norm();
-    Eigen::VectorXd di;
-    if (norm_fi > 1e-9) {
-      di = fi / norm_fi;
-      // For 1-DOF gimbal: enforce angle limit  |atan2(-fx, fz)| <= alloc_gimbal_limit_rad_
-      // Convention: f = [f_x, f_z], angle = atan2(-f_x, f_z)
-      if (rotor_coef_ == 2) {
-        double angle = std::atan2(-di(0), di(1));
-        double clamped = std::max(-alloc_gimbal_limit_rad_,
-                                  std::min( alloc_gimbal_limit_rad_, angle));
-        di(0) = -std::sin(clamped);  // f_x = -sin(theta)
-        di(1) =  std::cos(clamped);  // f_z =  cos(theta) >= 0 when |theta| <= pi/2
-      }
-    } else {
-      di = Eigen::VectorXd::Zero(rotor_coef_);
-      di(rotor_coef_ - 1) = 1.0; // default: point in last axis (z), angle=0
+  // --- Build Hessian P = A'A + λI ---
+  Eigen::MatrixXd P_dense = alloc_matrix.transpose() * alloc_matrix
+                           + alloc_lambda_ * Eigen::MatrixXd::Identity(n_cols, n_cols);
+  Eigen::VectorXd q_vec = -alloc_matrix.transpose() * w_total;
+
+  // --- Build constraint matrix C and bounds [lb, ub] ---
+  // C * f ∈ [lb, ub]
+  std::vector<Eigen::Triplet<double>> C_trips;
+  C_trips.reserve(n_gimbal_rows * 2 + n_bound_rows + n_rate_rows);
+  Eigen::VectorXd lb(n_constraints), ub(n_constraints);
+
+  int row = 0;
+
+  // (a) Gimbal angle constraints (only for rotor_coef == 2)
+  // Convention: f_i = [f_x, f_z], gimbal angle θ = atan2(-f_x, f_z)
+  // |θ| ≤ θ_max  ⟺  f_x + tan(θ_max)*f_z ≥ 0  AND  -f_x + tan(θ_max)*f_z ≥ 0
+  // (valid when f_z ≥ 0, which is enforced by component bounds)
+  if (rotor_coef_ == 2) {
+    for (int i = 0; i < n_rotors; i++) {
+      int fx_idx = rotor_coef_ * i;      // f_x index
+      int fz_idx = rotor_coef_ * i + 1;  // f_z index
+
+      // Row: f_x + tan_limit * f_z ≥ 0
+      C_trips.emplace_back(row, fx_idx, 1.0);
+      C_trips.emplace_back(row, fz_idx, tan_limit);
+      lb(row) = 0.0;
+      ub(row) = OsqpEigen::INFTY;
+      row++;
+
+      // Row: -f_x + tan_limit * f_z ≥ 0
+      C_trips.emplace_back(row, fx_idx, -1.0);
+      C_trips.emplace_back(row, fz_idx, tan_limit);
+      lb(row) = 0.0;
+      ub(row) = OsqpEigen::INFTY;
+      row++;
     }
-    D.col(i) = di;
-    B.col(i) = alloc_matrix.block(0, rotor_coef_ * i, 6, rotor_coef_) * di;
   }
 
-  // Step 3: build QP matrices
-  // Objective: min_{t} 0.5 * t' * P * t + q' * t
-  //   P = B'B + lambda*I,  q = -B'*w_total
-  Eigen::MatrixXd P_dense = B.transpose() * B + alloc_lambda_ * Eigen::MatrixXd::Identity(n_rotors, n_rotors);
-  Eigen::VectorXd q_vec = -B.transpose() * w_total;
+  // (b) Component bounds: identity rows
+  for (int j = 0; j < n_cols; j++) {
+    C_trips.emplace_back(row, j, 1.0);
+    if (rotor_coef_ == 2 && (j % rotor_coef_ == 1)) {
+      // f_z: must be non-negative (thrust points "up" in rotor frame)
+      lb(row) = 0.0;
+      ub(row) = alloc_t_max_;
+    } else {
+      // f_x (lateral component): symmetric bounds
+      lb(row) = -alloc_t_max_;
+      ub(row) = alloc_t_max_;
+    }
+    row++;
+  }
 
-  // Step 4: init or reinit solver if topology changed
-  bool need_init = (qp_n_vars_ != n_rotors);
+  // (c) Rate limits (optional): |f_j - f_j_prev| ≤ Δ  ⟺  f_j_prev - Δ ≤ f_j ≤ f_j_prev + Δ
+  if (use_rate_limit) {
+    for (int j = 0; j < n_cols; j++) {
+      C_trips.emplace_back(row, j, 1.0);
+      lb(row) = prev_vectoring_f_(j) - alloc_rate_limit_;
+      ub(row) = prev_vectoring_f_(j) + alloc_rate_limit_;
+      row++;
+    }
+  }
+
+  // --- Build sparse matrices ---
+  Eigen::SparseMatrix<double> P_sparse(n_cols, n_cols);
+  {
+    std::vector<Eigen::Triplet<double>> P_trips;
+    for (int r = 0; r < n_cols; r++) {
+      for (int c = r; c < n_cols; c++) {
+        if (std::abs(P_dense(r, c)) > 1e-12)
+          P_trips.emplace_back(r, c, P_dense(r, c));
+      }
+    }
+    P_sparse.setFromTriplets(P_trips.begin(), P_trips.end());
+  }
+
+  Eigen::SparseMatrix<double> C_sparse(n_constraints, n_cols);
+  C_sparse.setFromTriplets(C_trips.begin(), C_trips.end());
+
+  // --- Init or update solver ---
+  bool need_init = (qp_n_vars_ != n_cols || qp_n_constraints_ != n_constraints);
   if (need_init) {
     qp_solver_->clearSolver();
     qp_solver_->settings()->setVerbosity(false);
     qp_solver_->settings()->setWarmStart(true);
-    qp_solver_->settings()->setMaxIteraction(200);
+    qp_solver_->settings()->setMaxIteraction(500);
     qp_solver_->settings()->setAbsoluteTolerance(1e-5);
     qp_solver_->settings()->setRelativeTolerance(1e-4);
-    qp_solver_->data()->setNumberOfVariables(n_rotors);
-    qp_solver_->data()->setNumberOfConstraints(n_rotors);
+    qp_solver_->settings()->setPolish(true);
+    qp_solver_->data()->setNumberOfVariables(n_cols);
+    qp_solver_->data()->setNumberOfConstraints(n_constraints);
 
-    // Hessian (upper triangle only, as sparse)
-    Eigen::SparseMatrix<double> P_sparse(n_rotors, n_rotors);
-    std::vector<Eigen::Triplet<double>> P_trips;
-    for (int r = 0; r < n_rotors; r++) {
-      for (int c = r; c < n_rotors; c++) {
-        if (std::abs(P_dense(r, c)) > 1e-12)
-          P_trips.emplace_back(r, c, P_dense(r, c));
-      }
-    }
-    P_sparse.setFromTriplets(P_trips.begin(), P_trips.end());
     if (!qp_solver_->data()->setHessianMatrix(P_sparse)) return false;
     if (!qp_solver_->data()->setGradient(q_vec)) return false;
-
-    // Linear constraints: I*t (bounds only)
-    Eigen::SparseMatrix<double> A_sparse(n_rotors, n_rotors);
-    A_sparse.setIdentity();
-    if (!qp_solver_->data()->setLinearConstraintsMatrix(A_sparse)) return false;
-
-    Eigen::VectorXd lb = Eigen::VectorXd::Zero(n_rotors);
-    Eigen::VectorXd ub = Eigen::VectorXd::Constant(n_rotors, alloc_t_max_);
+    if (!qp_solver_->data()->setLinearConstraintsMatrix(C_sparse)) return false;
     if (!qp_solver_->data()->setLowerBound(lb)) return false;
     if (!qp_solver_->data()->setUpperBound(ub)) return false;
 
     if (!qp_solver_->initSolver()) {
-      ROS_WARN("[UnifiedCtrl QP] initSolver failed");
+      ROS_WARN("[UnifiedCtrl QP] initSolver failed (n_vars=%d, n_constr=%d)",
+               n_cols, n_constraints);
       return false;
     }
-    qp_n_vars_ = n_rotors;
+    qp_n_vars_ = n_cols;
+    qp_n_constraints_ = n_constraints;
   } else {
-    // Update P and q only
-    Eigen::SparseMatrix<double> P_sparse(n_rotors, n_rotors);
-    std::vector<Eigen::Triplet<double>> P_trips;
-    for (int r = 0; r < n_rotors; r++) {
-      for (int c = r; c < n_rotors; c++) {
-        if (std::abs(P_dense(r, c)) > 1e-12)
-          P_trips.emplace_back(r, c, P_dense(r, c));
-      }
-    }
-    P_sparse.setFromTriplets(P_trips.begin(), P_trips.end());
     if (!qp_solver_->updateHessianMatrix(P_sparse)) return false;
     if (!qp_solver_->updateGradient(q_vec)) return false;
+    if (!qp_solver_->updateBounds(lb, ub)) return false;
   }
 
-  // Step 5: solve
+  // --- Solve ---
   if (!qp_solver_->solve()) {
     ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] solve() failed");
     return false;
   }
-  Eigen::VectorXd t_sol = qp_solver_->getSolution();
-  if (t_sol.size() != n_rotors) return false;
+  Eigen::VectorXd f_sol = qp_solver_->getSolution();
+  if (f_sol.size() != n_cols) return false;
 
-  // Step 6: reconstruct full vectoring force vector
-  vectoring_f_out.resize(cols);
-  for (int i = 0; i < n_rotors; i++) {
-    vectoring_f_out.segment(rotor_coef_ * i, rotor_coef_) = t_sol(i) * D.col(i);
+  vectoring_f_out = f_sol;
+
+  // Store for next step's rate limiting and warm start
+  prev_vectoring_f_ = f_sol;
+
+  // Debug: log residual and per-rotor thrust/angle
+  {
+    Eigen::VectorXd residual = alloc_matrix * vectoring_f_out - w_total;
+    ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl QP] residual_norm=%.4f n_rotors=%d",
+                       residual.norm(), n_rotors);
+    if (rotor_coef_ == 2) {
+      for (int i = 0; i < n_rotors; i++) {
+        double fx = f_sol(2 * i), fz = f_sol(2 * i + 1);
+        double tmag = std::sqrt(fx * fx + fz * fz);
+        double angle_deg = std::atan2(-fx, fz) * 180.0 / M_PI;
+        ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl QP] rotor%d: t=%.2f angle=%.1fdeg fx=%.2f fz=%.2f",
+                           i, tmag, angle_deg, fx, fz);
+      }
+    }
   }
-
-  // Debug: log residual
-  Eigen::VectorXd residual = alloc_matrix * vectoring_f_out - w_total;
-  ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl QP] residual norm=%.4f, t=[%s]",
-                     residual.norm(),
-                     [&]() {
-                       std::string s;
-                       for (int i = 0; i < n_rotors; i++)
-                         s += std::to_string(t_sol(i)) + " ";
-                       return s;
-                     }().c_str());
 
   return true;
 }

@@ -27,7 +27,7 @@ namespace aerial_robot_control
     cascade_pitch_p_(8.0),
     cascade_pitch_d_(5.0),
     cascade_yaw_d_(2.5),
-    yaw_alloc_weight_(1.0),
+    yaw_in_allocation_(false),
     last_unified_z_i_ss_(0.8),
     has_unified_z_i_ss_(false),
     z_i_seed_default_(0.8),
@@ -780,8 +780,11 @@ namespace aerial_robot_control
       // Roll/Pitch: I-term only (spinal does P+D at 1000Hz)
       target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
       target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
-      // Yaw: full PID result (no cascade)
-      target_wrench_acc(5) = pid_controllers_.at(YAW).result();
+      // Yaw handling in unified mode:
+      //  - yaw_in_allocation_=false: single-channel yaw (bypass allocation, spinal-only)
+      //  - yaw_in_allocation_=true : yaw participates in allocation
+      double yaw_pid_raw = pid_controllers_.at(YAW).result();
+      target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 
       // Gravity feedforward: spinal's inner loop sees angles[0/1] as target roll/pitch,
       // but does NOT add gravity. PC must provide gravity compensation in body Z.
@@ -805,17 +808,10 @@ namespace aerial_robot_control
       // Store for external wrench estimator
       setTargetWrenchAccCog(target_wrench_acc);
 
-      // --- Yaw allocation weight: reduce yaw PID noise coupling into base_thrust ---
-      // Scale wrench_acc(5) AFTER storing for ext-wrench estimator (which needs true value)
-      // but BEFORE allocation. candidate_yaw_term inside computeUnifiedAllocation also
-      // uses the scaled value, so both paths (base_thrust and yaw_term) are consistent.
-      double yaw_raw = target_wrench_acc(5);
-      target_wrench_acc(5) *= yaw_alloc_weight_;
-
       // --- Run unified 6-DOF allocation ---
       // formation_desired_wrench_ is set via the formation_desired_wrench topic (feedforward).
       // It carries the full 6D contact wrench for manipulation tasks (pulling, valve rotation).
-      bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_);
+      bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
 
       if (ok) {
         // Publish commands to all FOLLOWERs
@@ -894,10 +890,10 @@ namespace aerial_robot_control
       if (unified_transition_count_ >= 0)
         unified_transition_count_++;
 
-      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d yaw_w=%.2f(raw=%.4f)",
+      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d yaw_raw=%.4f yaw_alloc=%s",
                         target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
-                        target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok,
-                        yaw_alloc_weight_, yaw_raw);
+            target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok,
+            yaw_pid_raw, yaw_in_allocation_ ? "ON" : "OFF");
 
       // Formation observer diagnostic (Phase U2, debug-only)
       if (formation_observer_ && formation_observer_->isActive() && formation_observer_->isInitialized()) {
@@ -1056,6 +1052,7 @@ namespace aerial_robot_control
         prev_unified_control_mode_ = false;
         unified_controller_->resetCascadeAllocSent();
         unified_controller_->resetTargetAngleLpf();
+        unified_controller_->resetQPState();
         beetle_navigator_->setUnifiedControlMode(false);
 
         // Fall through to independent control below
@@ -1103,6 +1100,7 @@ namespace aerial_robot_control
       gains_switched_ = false;
       unified_controller_->resetCascadeAllocSent();
       unified_controller_->resetTargetAngleLpf();
+      unified_controller_->resetQPState();
       unified_controller_->resetFollowerReady();
       beetle_navigator_->setUnifiedControlMode(false);
 
@@ -1832,10 +1830,7 @@ namespace aerial_robot_control
     getParam<double>(control_nh, "cascade_pitch_p", cascade_pitch_p_, 8.0);
     getParam<double>(control_nh, "cascade_pitch_d", cascade_pitch_d_, 5.0);
     getParam<double>(control_nh, "cascade_yaw_d", cascade_yaw_d_, 2.5);
-
-    // Yaw allocation weight: scale wrench_acc(5) before pseudoinverse allocation.
-    // 1.0 = original behavior, <1.0 = reduce yaw noise coupling into base_thrust.
-    getParam<double>(control_nh, "yaw_alloc_weight", yaw_alloc_weight_, 1.0);
+    getParam<bool>(control_nh, "yaw_in_allocation", yaw_in_allocation_, false);
 
     // Z I-term seed default for unified mode switch (Plan E')
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);

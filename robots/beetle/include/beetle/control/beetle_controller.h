@@ -129,12 +129,7 @@ namespace aerial_robot_control
     double cascade_pitch_p_;   // spinal pitch P gain (torque-level)
     double cascade_pitch_d_;   // spinal pitch D gain (torque-level)
     double cascade_yaw_d_;     // spinal yaw D gain (torque-level)
-
-    // Yaw allocation weight: scale wrench_acc(5) before 6-DOF allocation.
-    // Reduces yaw PID noise coupling into base_thrust via pseudoinverse.
-    // 1.0 = no change (original), 0.0 = yaw has zero influence on allocation.
-    // candidate_yaw_term (independent yaw path to spinal) is also scaled consistently.
-    double yaw_alloc_weight_;
+    bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
 
     /** @brief LEADER-only: send cascade gains + allocation matrix inverse to ALL assembled
      *  modules' spinals. Uses unified_controller_'s publishers. Also sends gimbal_dof=1

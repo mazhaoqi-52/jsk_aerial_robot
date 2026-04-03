@@ -63,14 +63,17 @@ controller:
   cascade_pitch_p: 8.0
   cascade_pitch_d: 5.0
   cascade_yaw_d: 2.5
-  yaw_alloc_weight: 0.5
+  yaw_in_allocation: false  # false: single-channel yaw (spinal-only), true: include yaw in QP
   tgt_angle_lpf_alpha: 0.3
 
-  # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
+  # Full-vector constrained QP allocation
+  # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).
+  # Constraints: gimbal angle limits (linearized), component bounds, optional rate limits.
   use_constrained_alloc: true
   alloc_lambda: 1.0e-4          # regularization weight (larger → softer, smaller → tighter tracking)
   alloc_t_max: 20.0             # per-rotor thrust upper bound [N]
-  alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
+  alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
+  alloc_rate_limit: 5.0         # max force change per step [N/step], 0 = disabled
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

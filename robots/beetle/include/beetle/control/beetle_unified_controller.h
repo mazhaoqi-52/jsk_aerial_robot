@@ -65,7 +65,8 @@ public:
    * @return true if allocation succeeded, false otherwise.
    */
   bool computeUnifiedAllocation(const Eigen::VectorXd& target_wrench_acc_cog,
-                                const Eigen::VectorXd& desired_ext_wrench);
+                                const Eigen::VectorXd& desired_ext_wrench,
+                                double yaw_pid_raw);
 
   /** @brief Send computed commands to all modules via ROS topics.
    *  Cascade mode: base_thrust[motor_num*rotor_coef] + angles[roll,pitch,yaw_term].
@@ -101,6 +102,14 @@ public:
 
   /** @brief Reset target-angle LPF state. Call when entering unified mode. */
   void resetTargetAngleLpf() { tgt_angle_lpf_initialized_ = false; }
+
+  /** @brief Reset QP solver state (previous solution, solver internals).
+   *  Call when entering unified mode so rate limits start clean. */
+  void resetQPState() {
+    prev_vectoring_f_.resize(0);
+    qp_n_vars_ = -1;
+    qp_n_constraints_ = -1;
+  }
 
   /** @brief Update formation CoG offset and inertia from current TF. */
   bool updateFormationGeometry();
@@ -253,31 +262,39 @@ private:
   void extractThrustAndGimbal(const Eigen::VectorXd& vectoring_f,
                               const std::vector<int>& assembled_ids);
 
-  // QP-based constrained allocation (F2)
+  // Full-vector QP constrained allocation
+  // Decision variables: f ∈ R^{rotor_coef * n_rotors} (all force components).
+  // Constraints:
+  //   - Gimbal angle:  |f_x| ≤ tan(θ_max) * f_z  (linearized)
+  //   - Thrust bound:  each component within [-T_max, T_max], f_z ≥ 0
+  //   - Rate limit:    |f_j^k - f_j^{k-1}| ≤ Δf_max  (optional)
   bool use_constrained_alloc_;        // if true, use OsqpEigen QP; fallback to pseudoinverse
   double alloc_lambda_;               // regularization weight
   double alloc_t_max_;                // per-rotor thrust upper bound [N]
-  double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad], default π/2 (±90°)
-  int qp_n_vars_;                     // number of QP variables (= total rotors), -1 = uninit
-  std::unique_ptr<OsqpEigen::Solver> qp_solver_;  // persistent solver (re-initialized when topology changes)
+  double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
+  double alloc_rate_limit_;           // max force change per step [N/step], 0 = disabled
+  int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
+  int qp_n_constraints_;              // number of linear constraints, -1 = uninit
+  std::unique_ptr<OsqpEigen::Solver> qp_solver_;
+  Eigen::VectorXd prev_vectoring_f_;  // previous step's solution for rate limiting & warm start
 
   /**
-   * @brief Solve for per-rotor scalar thrusts using constrained QP.
+   * @brief Full-vector constrained QP allocation.
    *
    * Formulation:
-   *   min_{t} ||B*t - w_total||^2 + lambda*||t||^2
-   *   s.t.  0 <= t_i <= T_max  for all i
-   * where B is the reduced (6 x n_rotors) matrix derived from alloc_matrix
-   * using per-rotor vectoring directions from an initial pseudoinverse pass.
+   *   min_{f} ||A*f - w||^2 + λ||f||^2
+   *   s.t.  linear gimbal-angle constraints (per rotor)
+   *         component bounds
+   *         rate limits (if enabled)
    *
-   * @param alloc_matrix  Full allocation matrix A (6 x rotor_coef*n_rotors)
+   * @param alloc_matrix  Formation allocation matrix A (6 x n_cols)
    * @param w_total       Desired 6D wrench-acceleration vector
-   * @param vectoring_f_out  Output: full (rotor_coef*n_rotors) vectoring force vector
-   * @return true on success, false on failure (caller should fall back to pseudoinverse)
+   * @param vectoring_f_out  Output: full vectoring force vector (n_cols)
+   * @return true on success, false on failure (caller falls back to pseudoinverse)
    */
-  bool solveConstrainedThrusts(const Eigen::MatrixXd& alloc_matrix,
-                               const Eigen::VectorXd& w_total,
-                               Eigen::VectorXd& vectoring_f_out);
+  bool solveFullVectorQP(const Eigen::MatrixXd& alloc_matrix,
+                         const Eigen::VectorXd& w_total,
+                         Eigen::VectorXd& vectoring_f_out);
 
   void rosParamInit();
 };

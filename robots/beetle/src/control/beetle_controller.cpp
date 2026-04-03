@@ -1324,6 +1324,25 @@ namespace aerial_robot_control
       control_nh.getParam("unified_control_mode", unified_control_mode_);
     }
 
+    // ======== Auto-latch: FOLLOWER safety net ========
+    // If this module is a FOLLOWER and has recently received unified commands
+    // from the LEADER, but unified_control_mode_ is false (e.g. rosparam was
+    // overwritten by config reload, node restart, or race condition), force it on.
+    // This is a secondary check complementing the callback-level auto-latch.
+    if (!unified_control_mode_ && unified_cmd_received_ &&
+        beetle_navigator_->getModuleState() == FOLLOWER)
+    {
+      double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
+      if (age < 0.5) {
+        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] FOLLOWER id=%d auto-latch in update(): "
+                 "unified cmd fresh (age=%.3fs) but mode is off — forcing ON",
+                 beetle_navigator_->getMyID(), age);
+        unified_control_mode_ = true;
+        ros::NodeHandle ctrl_nh(nh_, "controller");
+        ctrl_nh.setParam("unified_control_mode", true);
+      }
+    }
+
     // ======== T4.3: Auto-exit unified mode on force landing / halt ========
     // When LEADER detects force_landing or halt (STOP_STATE) while in unified mode,
     // immediately clear unified_control_mode_ so BOTH LEADER and all FOLLOWERs
@@ -1470,6 +1489,22 @@ namespace aerial_robot_control
     unified_thrust_cmd_ = msg;
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = ros::Time::now();
+
+    // Auto-latch: if this FOLLOWER receives a unified command from the LEADER
+    // but unified_control_mode_ is false (e.g. rosparam was overwritten by a
+    // config reload or node restart), force-enable unified mode.
+    // This prevents the dangerous scenario where the FOLLOWER silently runs
+    // its independent controller while the LEADER expects unified coordination.
+    if (!unified_control_mode_ &&
+        beetle_navigator_->getModuleState() == FOLLOWER)
+    {
+      ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d AUTO-LATCH: received unified_thrust_cmd "
+               "while unified_control_mode is false — forcing unified mode ON",
+               beetle_navigator_->getMyID());
+      unified_control_mode_ = true;
+      ros::NodeHandle control_nh(nh_, "controller");
+      control_nh.setParam("unified_control_mode", true);
+    }
   }
 
   void BeetleController::sendCascadeSetup()

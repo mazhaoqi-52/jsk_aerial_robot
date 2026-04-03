@@ -71,7 +71,7 @@ controller:
   # Constraints: gimbal angle limits (linearized), component bounds, optional rate limits.
   use_constrained_alloc: true
   alloc_lambda: 1.0e-4          # regularization weight (larger → softer, smaller → tighter tracking)
-  alloc_t_max: 20.0             # per-rotor thrust upper bound [N]
+  alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   alloc_rate_limit: 5.0         # max force change per step [N/step], 0 = disabled
 

@@ -1625,13 +1625,17 @@ namespace aerial_robot_control
     auto& y_pid = pid_controllers_.at(Y);
     auto& z_pid = pid_controllers_.at(Z);
     saved_roll_gains_ = {roll_pid.getPGain(), roll_pid.getIGain(), roll_pid.getDGain(),
-                         roll_pid.getLimitSum(), roll_pid.getLimitP(), roll_pid.getLimitI(), roll_pid.getLimitD()};
+                         roll_pid.getLimitSum(), roll_pid.getLimitP(), roll_pid.getLimitI(), roll_pid.getLimitD(),
+                         roll_pid.getErrDLpfCutoffFreq()};
     saved_pitch_gains_ = {pitch_pid.getPGain(), pitch_pid.getIGain(), pitch_pid.getDGain(),
-                          pitch_pid.getLimitSum(), pitch_pid.getLimitP(), pitch_pid.getLimitI(), pitch_pid.getLimitD()};
+                          pitch_pid.getLimitSum(), pitch_pid.getLimitP(), pitch_pid.getLimitI(), pitch_pid.getLimitD(),
+                          pitch_pid.getErrDLpfCutoffFreq()};
     saved_xy_gains_ = {x_pid.getPGain(), x_pid.getIGain(), x_pid.getDGain(),
-                       x_pid.getLimitSum(), x_pid.getLimitP(), x_pid.getLimitI(), x_pid.getLimitD()};
+                       x_pid.getLimitSum(), x_pid.getLimitP(), x_pid.getLimitI(), x_pid.getLimitD(),
+                       x_pid.getErrDLpfCutoffFreq()};
     saved_z_gains_ = {z_pid.getPGain(), z_pid.getIGain(), z_pid.getDGain(),
-                      z_pid.getLimitSum(), z_pid.getLimitP(), z_pid.getLimitI(), z_pid.getLimitD()};
+                      z_pid.getLimitSum(), z_pid.getLimitP(), z_pid.getLimitI(), z_pid.getLimitD(),
+                      z_pid.getErrDLpfCutoffFreq()};
 
     // Apply unified (formation) gains.
     // CASCADE MODE: wrench_acc only uses getITerm() for roll/pitch — P and D
@@ -1661,6 +1665,12 @@ namespace aerial_robot_control
     y_pid.setLimitP(unified_xy_gains_.limit_p);
     y_pid.setLimitI(unified_xy_gains_.limit_i);
     y_pid.setLimitD(unified_xy_gains_.limit_d);
+
+    // Apply unified D-term LPF cutoff if configured (0 = keep existing)
+    if (unified_xy_gains_.err_d_lpf_cutoff_freq > 0.0) {
+      x_pid.setErrDLpfCutoffFreq(unified_xy_gains_.err_d_lpf_cutoff_freq);
+      y_pid.setErrDLpfCutoffFreq(unified_xy_gains_.err_d_lpf_cutoff_freq);
+    }
 
     // Apply unified Z gains
     z_pid.setGains(unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d);
@@ -1725,6 +1735,8 @@ namespace aerial_robot_control
     y_pid.setLimitP(saved_xy_gains_.limit_p);
     y_pid.setLimitI(saved_xy_gains_.limit_i);
     y_pid.setLimitD(saved_xy_gains_.limit_d);
+    x_pid.setErrDLpfCutoffFreq(saved_xy_gains_.err_d_lpf_cutoff_freq);
+    y_pid.setErrDLpfCutoffFreq(saved_xy_gains_.err_d_lpf_cutoff_freq);
 
     // Restore independent Z gains
     z_pid.setGains(saved_z_gains_.p, saved_z_gains_.i, saved_z_gains_.d);
@@ -1979,6 +1991,7 @@ namespace aerial_robot_control
     getParam<double>(u_xy_nh, "limit_p", unified_xy_gains_.limit_p, 12.0);
     getParam<double>(u_xy_nh, "limit_i", unified_xy_gains_.limit_i, 8.0);
     getParam<double>(u_xy_nh, "limit_d", unified_xy_gains_.limit_d, 12.0);
+    getParam<double>(u_xy_nh, "err_d_lpf_cutoff_freq", unified_xy_gains_.err_d_lpf_cutoff_freq, 0.0);
 
     ros::NodeHandle u_z_nh(control_nh, "unified_z");
     getParam<double>(u_z_nh, "p_gain", unified_z_gains_.p, 5.0);

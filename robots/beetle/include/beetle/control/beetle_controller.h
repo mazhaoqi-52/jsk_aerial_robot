@@ -155,6 +155,7 @@ namespace aerial_robot_control
     struct AxisGainSet {
       double p, i, d;
       double limit_sum, limit_p, limit_i, limit_d;
+      double err_d_lpf_cutoff_freq;  // D-term velocity error LPF cutoff [Hz], 0=disabled
     };
     AxisGainSet unified_roll_gains_, unified_pitch_gains_;
     AxisGainSet unified_xy_gains_, unified_z_gains_;  // unified-mode XY/Z gains

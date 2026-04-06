@@ -162,7 +162,7 @@ controller:
   unified_xy:
     p_gain: 10.0
     i_gain: 0.5
-    d_gain: 4.5        # ζ = 5.5/(2×√10) = 0.870 (was 4.0, ζ=0.632 underdamped)
+    d_gain: .5        # ζ = 5.5/(2×√10) = 0.870 (was 4.0, ζ=0.632 underdamped)
     err_d_lpf_cutoff_freq: 1.0  # 3.5→1.0 Hz: suppress D-term noise at low-freq oscillation (0.15-0.2Hz)
     limit_sum: 8.0
     limit_p: 12.0
@@ -177,3 +177,17 @@ controller:
     limit_p: 25.0
     limit_i: 20.0
     limit_d: 25.0
+
+  # Unified-mode yaw PID gains.
+  # Full P+I+D used on PC side; spinal adds D-only damping via cascade_yaw_d.
+  # When yaw_in_allocation=true, yaw PID output participates in 6-DOF QP allocation
+  # (same as GimbalRotor standard mode). Otherwise single-channel spinal broadcast.
+  unified_yaw:
+    p_gain: 15.0
+    i_gain: 1.0
+    d_gain: 10.0
+    limit_err_p: 0.4
+    limit_sum: 20.0
+    limit_p: 20.0
+    limit_i: 5.0
+    limit_d: 20.0

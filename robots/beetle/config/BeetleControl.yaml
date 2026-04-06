@@ -50,7 +50,7 @@ controller:
   # Sign: if observer detects downward load (f_body_z < 0), FF adds upward thrust.
   # z_gain: scale factor [0,1]; start with 0.3–0.5 to be conservative.
   formation_observer_comp:
-    enable: false
+    enable: true
     z_gain: 0.5      # Z feedforward gain [0,1]; validated with E2
     xy_gain: 0.3      # X/Y feedforward gain [0,1]; start conservative (horizontal less reliable)
     torque_gain: 0.5  # Roll/Pitch/Yaw torque feedforward gain [0,1]; start conservative
@@ -177,3 +177,17 @@ controller:
     limit_p: 25.0
     limit_i: 20.0
     limit_d: 25.0
+
+  # Unified-mode yaw PID gains.
+  # Full P+I+D used on PC side; spinal adds D-only damping via cascade_yaw_d.
+  # When yaw_in_allocation=true, yaw PID output participates in 6-DOF QP allocation
+  # (same as GimbalRotor standard mode). Otherwise single-channel spinal broadcast.
+  unified_yaw:
+    p_gain: 15.0
+    i_gain: 1.0
+    d_gain: 10.0
+    limit_err_p: 0.4
+    limit_sum: 20.0
+    limit_p: 20.0
+    limit_i: 5.0
+    limit_d: 20.0

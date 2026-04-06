@@ -159,13 +159,16 @@ namespace aerial_robot_control
     };
     AxisGainSet unified_roll_gains_, unified_pitch_gains_;
     AxisGainSet unified_xy_gains_, unified_z_gains_;  // unified-mode XY/Z gains
+    AxisGainSet unified_yaw_gains_;                     // unified-mode yaw gains
     AxisGainSet saved_roll_gains_, saved_pitch_gains_;  // backup of original gains
     AxisGainSet saved_xy_gains_, saved_z_gains_;        // backup of independent XY/Z gains
+    AxisGainSet saved_yaw_gains_;                       // backup of independent yaw gains
     bool gains_switched_;  // true when unified gains are active
 
-    // Dynamic reconfigure servers for unified-mode XY/Z PID
+    // Dynamic reconfigure servers for unified-mode XY/Z/Yaw PID
     boost::shared_ptr<PidControlDynamicConfig> unified_xy_reconf_server_;
     boost::shared_ptr<PidControlDynamicConfig> unified_z_reconf_server_;
+    boost::shared_ptr<PidControlDynamicConfig> unified_yaw_reconf_server_;
     void cfgUnifiedPidCallback(aerial_robot_control::PIDConfig &config, uint32_t level, std::vector<int> controller_indices, AxisGainSet& gain_set);
 
     // FOLLOWER unified mode: receive commands from LEADER

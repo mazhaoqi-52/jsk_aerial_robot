@@ -185,3 +185,13 @@ controller:
     limit_p: 25.0
     limit_i: 20.0
     limit_d: 25.0
+
+  unified_yaw:
+    p_gain: 5.0
+    i_gain: 1.0
+    d_gain: 4.0
+    limit_err_p: 0.4
+    limit_sum: 20.0
+    limit_p: 20.0
+    limit_i: 20.0
+    limit_d: 20.0

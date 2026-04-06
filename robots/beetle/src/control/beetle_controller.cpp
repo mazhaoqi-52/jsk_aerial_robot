@@ -144,6 +144,10 @@ namespace aerial_robot_control
     unified_z_reconf_server_ = boost::make_shared<PidControlDynamicConfig>(unified_z_nh);
     unified_z_reconf_server_->setCallback(boost::bind(&BeetleController::cfgUnifiedPidCallback, this, _1, _2, std::vector<int>{Z}, boost::ref(unified_z_gains_)));
 
+    ros::NodeHandle unified_yaw_nh(control_nh, "unified_yaw");
+    unified_yaw_reconf_server_ = boost::make_shared<PidControlDynamicConfig>(unified_yaw_nh);
+    unified_yaw_reconf_server_->setCallback(boost::bind(&BeetleController::cfgUnifiedPidCallback, this, _1, _2, std::vector<int>{YAW}, boost::ref(unified_yaw_gains_)));
+
     prev_comp_update_time_ = -1;
 
     // Initialize unified controller (unified_control_mode_ is read by rosParamInit)
@@ -1624,6 +1628,7 @@ namespace aerial_robot_control
     auto& x_pid = pid_controllers_.at(X);
     auto& y_pid = pid_controllers_.at(Y);
     auto& z_pid = pid_controllers_.at(Z);
+    auto& yaw_pid = pid_controllers_.at(YAW);
     saved_roll_gains_ = {roll_pid.getPGain(), roll_pid.getIGain(), roll_pid.getDGain(),
                          roll_pid.getLimitSum(), roll_pid.getLimitP(), roll_pid.getLimitI(), roll_pid.getLimitD(),
                          roll_pid.getErrDLpfCutoffFreq()};
@@ -1636,6 +1641,9 @@ namespace aerial_robot_control
     saved_z_gains_ = {z_pid.getPGain(), z_pid.getIGain(), z_pid.getDGain(),
                       z_pid.getLimitSum(), z_pid.getLimitP(), z_pid.getLimitI(), z_pid.getLimitD(),
                       z_pid.getErrDLpfCutoffFreq()};
+    saved_yaw_gains_ = {yaw_pid.getPGain(), yaw_pid.getIGain(), yaw_pid.getDGain(),
+                        yaw_pid.getLimitSum(), yaw_pid.getLimitP(), yaw_pid.getLimitI(), yaw_pid.getLimitD(),
+                        yaw_pid.getErrDLpfCutoffFreq()};
 
     // Apply unified (formation) gains.
     // CASCADE MODE: wrench_acc only uses getITerm() for roll/pitch — P and D
@@ -1679,12 +1687,20 @@ namespace aerial_robot_control
     z_pid.setLimitI(unified_z_gains_.limit_i);
     z_pid.setLimitD(unified_z_gains_.limit_d);
 
+    // Apply unified Yaw gains (full P+I+D on PC)
+    yaw_pid.setGains(unified_yaw_gains_.p, unified_yaw_gains_.i, unified_yaw_gains_.d);
+    yaw_pid.setLimitSum(unified_yaw_gains_.limit_sum);
+    yaw_pid.setLimitP(unified_yaw_gains_.limit_p);
+    yaw_pid.setLimitI(unified_yaw_gains_.limit_i);
+    yaw_pid.setLimitD(unified_yaw_gains_.limit_d);
+
     gains_switched_ = true;
     ROS_WARN("[UnifiedCtrl] Applied unified gains: roll/pitch I=%.1f/%.1f, "
-             "xy P=%.1f I=%.1f D=%.1f, z P=%.1f I=%.1f D=%.1f",
+             "xy P=%.1f I=%.1f D=%.1f, z P=%.1f I=%.1f D=%.1f, yaw P=%.1f I=%.1f D=%.1f",
              unified_roll_gains_.i, unified_pitch_gains_.i,
              unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d,
-             unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d);
+             unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d,
+             unified_yaw_gains_.p, unified_yaw_gains_.i, unified_yaw_gains_.d);
 
     // Debug: check damping ratio for oscillation diagnosis
     // For a PD system: zeta = D / (2*sqrt(P)). zeta < 0.7 => likely oscillatory.
@@ -1711,6 +1727,7 @@ namespace aerial_robot_control
     auto& x_pid = pid_controllers_.at(X);
     auto& y_pid = pid_controllers_.at(Y);
     auto& z_pid = pid_controllers_.at(Z);
+    auto& yaw_pid = pid_controllers_.at(YAW);
 
     roll_pid.setGains(saved_roll_gains_.p, saved_roll_gains_.i, saved_roll_gains_.d);
     roll_pid.setLimitSum(saved_roll_gains_.limit_sum);
@@ -1745,11 +1762,19 @@ namespace aerial_robot_control
     z_pid.setLimitI(saved_z_gains_.limit_i);
     z_pid.setLimitD(saved_z_gains_.limit_d);
 
+    // Restore independent Yaw gains
+    yaw_pid.setGains(saved_yaw_gains_.p, saved_yaw_gains_.i, saved_yaw_gains_.d);
+    yaw_pid.setLimitSum(saved_yaw_gains_.limit_sum);
+    yaw_pid.setLimitP(saved_yaw_gains_.limit_p);
+    yaw_pid.setLimitI(saved_yaw_gains_.limit_i);
+    yaw_pid.setLimitD(saved_yaw_gains_.limit_d);
+
     gains_switched_ = false;
-    ROS_WARN("[UnifiedCtrl] Restored independent gains: pitch P=%.1f D=%.1f, xy P=%.1f D=%.1f, z P=%.1f D=%.1f",
+    ROS_WARN("[UnifiedCtrl] Restored independent gains: pitch P=%.1f D=%.1f, xy P=%.1f D=%.1f, z P=%.1f D=%.1f, yaw P=%.1f D=%.1f",
              saved_pitch_gains_.p, saved_pitch_gains_.d,
              saved_xy_gains_.p, saved_xy_gains_.d,
-             saved_z_gains_.p, saved_z_gains_.d);
+             saved_z_gains_.p, saved_z_gains_.d,
+             saved_yaw_gains_.p, saved_yaw_gains_.d);
   }
 
   void BeetleController::cfgUnifiedPidCallback(aerial_robot_control::PIDConfig &config, uint32_t level, std::vector<int> controller_indices, AxisGainSet& gain_set)
@@ -2001,6 +2026,16 @@ namespace aerial_robot_control
     getParam<double>(u_z_nh, "limit_p", unified_z_gains_.limit_p, 25.0);
     getParam<double>(u_z_nh, "limit_i", unified_z_gains_.limit_i, 20.0);
     getParam<double>(u_z_nh, "limit_d", unified_z_gains_.limit_d, 25.0);
+
+    // Load unified-mode yaw PID gains (full P+I+D on PC side)
+    ros::NodeHandle u_yaw_nh(control_nh, "unified_yaw");
+    getParam<double>(u_yaw_nh, "p_gain", unified_yaw_gains_.p, 15.0);
+    getParam<double>(u_yaw_nh, "i_gain", unified_yaw_gains_.i, 1.0);
+    getParam<double>(u_yaw_nh, "d_gain", unified_yaw_gains_.d, 10.0);
+    getParam<double>(u_yaw_nh, "limit_sum", unified_yaw_gains_.limit_sum, 20.0);
+    getParam<double>(u_yaw_nh, "limit_p", unified_yaw_gains_.limit_p, 20.0);
+    getParam<double>(u_yaw_nh, "limit_i", unified_yaw_gains_.limit_i, 5.0);
+    getParam<double>(u_yaw_nh, "limit_d", unified_yaw_gains_.limit_d, 20.0);
 
     // UO-4: formation observer feedforward compensation
     ros::NodeHandle obs_comp_nh(control_nh, "formation_observer_comp");

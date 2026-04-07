@@ -139,6 +139,9 @@ public:
   double getCandidateYawTerm() const { return candidate_yaw_term_; }
   const Eigen::VectorXd& getTargetVectoringForce() const { return target_vectoring_f_; }
   const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
+  int getModuleIndex(int module_id) const;
+  bool buildModuleThrustCommand(int module_id, spinal::FourAxisCommand& thrust_msg) const;
+  bool buildModuleTorqueAllocationMatrixInv(int module_id, spinal::TorqueAllocationMatrixInv& msg) const;
 
   /**
    * @brief Compute the realized 6D wrench in body (CoG) frame from the allocation result.

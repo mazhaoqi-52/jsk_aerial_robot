@@ -516,6 +516,58 @@ void BeetleUnifiedController::extractThrustAndGimbal(
   }
 }
 
+int BeetleUnifiedController::getModuleIndex(int module_id) const
+{
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  for (size_t index = 0; index < assembled_ids.size(); index++) {
+    if (assembled_ids[index] == module_id) return static_cast<int>(index);
+  }
+  return -1;
+}
+
+bool BeetleUnifiedController::buildModuleThrustCommand(
+    int module_id,
+    spinal::FourAxisCommand& thrust_msg) const
+{
+  int module_index = getModuleIndex(module_id);
+  if (module_index < 0) return false;
+
+  int elems_per_module = motor_num_per_module_ * rotor_coef_;
+  int col_start = module_index * elems_per_module;
+  if (target_vectoring_f_.size() < col_start + elems_per_module) return false;
+
+  thrust_msg.base_thrust.resize(elems_per_module);
+  for (int i = 0; i < elems_per_module; i++) {
+    thrust_msg.base_thrust[i] = static_cast<float>(target_vectoring_f_(col_start + i));
+  }
+  thrust_msg.angles[0] = target_roll_;
+  thrust_msg.angles[1] = target_pitch_;
+  thrust_msg.angles[2] = candidate_yaw_term_;
+  return true;
+}
+
+bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInv(
+    int module_id,
+    spinal::TorqueAllocationMatrixInv& msg) const
+{
+  if (integrated_map_inv_rot_.rows() == 0) return false;
+
+  int module_index = getModuleIndex(module_id);
+  if (module_index < 0) return false;
+
+  int rows_per_module = motor_num_per_module_ * rotor_coef_;
+  int row_start = module_index * rows_per_module;
+  if (integrated_map_inv_rot_.rows() < row_start + rows_per_module) return false;
+
+  msg.rows.resize(rows_per_module);
+  for (int i = 0; i < rows_per_module; i++) {
+    msg.rows[i].x = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 0) * 1000);
+    msg.rows[i].y = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 1) * 1000);
+    msg.rows[i].z = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 2) * 1000);
+  }
+  return true;
+}
+
 void BeetleUnifiedController::publishCommands()
 {
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
@@ -529,35 +581,19 @@ void BeetleUnifiedController::publishCommands()
   // Spinal will add roll_pitch_term (from its own P+D) to base_thrust,
   // then do sqrt+atan2 to decompose into scalar thrust + gimbal angle.
 
-  int col = 0;
   for (size_t m = 0; m < assembled_ids.size(); m++) {
     int module_id = assembled_ids[m];
 
     // Skip LEADER — LEADER sends its own command in beetle_controller.cpp
     if (module_id == leader_id) {
-      col += motor_num_per_module_ * rotor_coef_;
       continue;
     }
 
     if (module_thrust_pubs_.count(module_id)) {
       spinal::FourAxisCommand thrust_msg;
-
-      // base_thrust: vectoring force components for this module's motors
-      // size = motor_num_per_module_ * rotor_coef_ (e.g. 4*2=8 for gimbal_dof=1)
-      thrust_msg.base_thrust.resize(motor_num_per_module_ * rotor_coef_);
-      for (int r = 0; r < motor_num_per_module_; r++) {
-        for (int c = 0; c < rotor_coef_; c++) {
-          thrust_msg.base_thrust[r * rotor_coef_ + c] =
-              static_cast<float>(target_vectoring_f_(col + r * rotor_coef_ + c));
-        }
+      if (buildModuleThrustCommand(module_id, thrust_msg)) {
+        module_thrust_pubs_[module_id].publish(thrust_msg);
       }
-
-      // Target angles for spinal inner-loop P+D tracking
-      thrust_msg.angles[0] = target_roll_;
-      thrust_msg.angles[1] = target_pitch_;
-      thrust_msg.angles[2] = candidate_yaw_term_;
-
-      module_thrust_pubs_[module_id].publish(thrust_msg);
     }
 
     // Also publish gimbal_dof=1 every frame to ensure spinal is in vectoring mode
@@ -566,8 +602,6 @@ void BeetleUnifiedController::publishCommands()
       dof_msg.data = gimbal_dof_;
       module_gimbal_dof_pubs_[module_id].publish(dof_msg);
     }
-
-    col += motor_num_per_module_ * rotor_coef_;
   }
 }
 
@@ -650,14 +684,12 @@ bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
     spinal::TorqueAllocationMatrixInv msg;
     msg.rows.resize(rows_per_module);
 
-    int row_start = m * rows_per_module;
-    for (int i = 0; i < rows_per_module; i++) {
-      if (integrated_map_inv_rot_.cwiseAbs().maxCoeff() > INT16_MAX * 0.001f) {
-        ROS_ERROR_THROTTLE(1.0, "[UnifiedCtrl] Torque Allocation Matrix overflow for module %d", module_id);
-      }
-      msg.rows[i].x = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 0) * 1000);
-      msg.rows[i].y = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 1) * 1000);
-      msg.rows[i].z = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 2) * 1000);
+    if (integrated_map_inv_rot_.cwiseAbs().maxCoeff() > INT16_MAX * 0.001f) {
+      ROS_ERROR_THROTTLE(1.0, "[UnifiedCtrl] Torque Allocation Matrix overflow for module %d", module_id);
+    }
+
+    if (!buildModuleTorqueAllocationMatrixInv(module_id, msg)) {
+      continue;
     }
 
     module_torque_alloc_inv_pubs_[module_id].publish(msg);

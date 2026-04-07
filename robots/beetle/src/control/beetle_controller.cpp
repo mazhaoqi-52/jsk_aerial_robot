@@ -15,6 +15,10 @@ namespace aerial_robot_control
     prev_unified_control_mode_(false),
     unified_cmd_received_(false),
     follower_unified_active_(false),
+    unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
+    unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
+    unified_reference_yaw_pid_raw_(0.0),
+    unified_reference_leader_id_(-1),
     unified_transition_count_(-1),
     z_integral_freeze_count_(0),
     z_ki_boost_count_(0),
@@ -153,12 +157,7 @@ namespace aerial_robot_control
     formation_observer_ = std::make_shared<FormationMomentumObserver>();
     formation_observer_->initialize(nh_);
 
-    // FOLLOWER: subscribe to unified commands from LEADER
-    // Topic names match what BeetleUnifiedController::publishCommands() publishes
-    std::string my_ns = std::string("/") + beetle_navigator_->getMyName()
-                        + std::to_string(beetle_navigator_->getMyID());
-    unified_thrust_sub_ = nh_.subscribe(my_ns + "/unified_thrust_cmd", 1,
-                                        &BeetleController::unifiedThrustCallback, this);
+    unified_reference_pub_ = nh_.advertise<beetle::UnifiedControlReference>("unified_control/reference", 1);
     // Publishers to this module's own spinal (same topic names as GimbalrotorController)
     follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
     follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
@@ -826,30 +825,11 @@ namespace aerial_robot_control
       bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
 
       if (ok) {
-        // Publish commands to all FOLLOWERs
-        unified_controller_->publishCommands();
-
-        // LEADER also sends its own command to its own spinal
-        // CASCADE format: vectoring base_thrust[motor_num*rotor_coef] + angles[roll, pitch, yaw_term]
-        int my_id = beetle_navigator_->getMyID();
-        std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
-        int my_index = -1;
-        for (size_t m = 0; m < assembled_ids.size(); m++) {
-          if (assembled_ids[m] == my_id) { my_index = m; break; }
-        }
-        if (my_index >= 0) {
-          const Eigen::VectorXd& vf = unified_controller_->getTargetVectoringForce();
-          int elems_per_module = motor_num_ * rotor_coef_;
-          int col_start = my_index * elems_per_module;
-          spinal::FourAxisCommand my_thrust_msg;
-          my_thrust_msg.base_thrust.resize(elems_per_module);
-          for (int i = 0; i < elems_per_module; i++)
-            my_thrust_msg.base_thrust[i] = static_cast<float>(vf(col_start + i));
-          my_thrust_msg.angles[0] = unified_controller_->getTargetRoll();
-          my_thrust_msg.angles[1] = unified_controller_->getTargetPitch();
-          my_thrust_msg.angles[2] = unified_controller_->getCandidateYawTerm();
-          follower_thrust_pub_.publish(my_thrust_msg);
-        }
+        // Stage-1 distributed unified mode:
+        // LEADER broadcasts a common reference, and every module computes the
+        // same unified allocation locally before picking its own block.
+        publishUnifiedReference(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
+        publishLocalUnifiedCommand();
 
         // ---- Formation Momentum Observer (Phase U2) ----
         // Feed the observer with formation-level data.
@@ -971,66 +951,71 @@ namespace aerial_robot_control
     }
 
     // ======== Unified Control Mode: FOLLOWER ========
-    // FOLLOWER receives thrust + gimbal commands from LEADER via ROS topics,
-    // then forwards them to its own spinal. No local PID.
+    // FOLLOWER receives a formation-level unified reference from LEADER,
+    // computes the same unified allocation locally, then picks its own block.
     if (unified_control_mode_ && module_state == FOLLOWER && module_state != SEPARATED) {
       if (!prev_unified_control_mode_) {
         // Set spinal to cascade mode on this FOLLOWER's own spinal only.
-        // LEADER handles sending to all modules; FOLLOWER only needs its own.
+        // Allocation/pickup runs locally after receiving the unified reference.
         sendFollowerCascadeSetup();
         spinal_gains_zeroed_ = true;
         unified_transition_count_ = 0;
         beetle_navigator_->setUnifiedControlMode(true);  // P3: skip CoG→CoM conversion
+        ensureUnifiedReferenceSubscription();
         ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d entering unified mode, sent cascade gains to own spinal, t=%.4f",
                  beetle_navigator_->getMyID(), ros::Time::now().toSec());
       }
 
-      bool have_valid_cmd = false;
-      if (unified_cmd_received_) {
-        double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
-        if (age < 0.5) have_valid_cmd = true;
-      }
+      ensureUnifiedReferenceSubscription();
+      bool have_valid_cmd = haveFreshUnifiedReference(0.5);
 
       if (have_valid_cmd) {
-        // Forward vectoring force commands to own spinal
-        follower_thrust_pub_.publish(unified_thrust_cmd_);
-        // Gimbal: when gimbal_calc_in_fc, spinal computes gimbal angles internally
-        // from the vectoring forces — no separate gimbal command needed.
-        follower_unified_active_ = true;
-        follower_cmd_timeout_count_ = 0;  // reset timeout counter
-
-        // FOLLOWER Ready Sync (P2.1): publish "I'm ready" once on first valid forward.
-        // This tells LEADER that this FOLLOWER has cascade gains set + is actively forwarding.
-        if (!follower_ready_sent_) {
-          // Lazy-create publisher to LEADER's namespace
-          int leader_id = beetle_navigator_->getLeaderID();
-          std::string leader_ns = std::string("/") + beetle_navigator_->getMyName()
-                                  + std::to_string(leader_id);
-          follower_ready_pub_ = nh_.advertise<std_msgs::Int32>(
-              leader_ns + "/unified_control/follower_ready", 1, true);  // latched
-          std_msgs::Int32 ready_msg;
-          ready_msg.data = beetle_navigator_->getMyID();
-          follower_ready_pub_.publish(ready_msg);
-          follower_ready_sent_ = true;
-          ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d published READY to %s",
-                   beetle_navigator_->getMyID(),
-                   (leader_ns + "/unified_control/follower_ready").c_str());
+        bool alloc_ok = unified_controller_->computeUnifiedAllocation(
+            unified_reference_wrench_acc_, unified_reference_desired_wrench_,
+            unified_reference_yaw_pid_raw_);
+        bool local_matrix_ok = false;
+        if (alloc_ok) {
+          local_matrix_ok = publishLocalUnifiedTorqueAllocationMatrixInv();
         }
 
-        ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d forwarding: thrust_sz=%zu",
-                          beetle_navigator_->getMyID(),
-                          unified_thrust_cmd_.base_thrust.size());
+        if (alloc_ok && local_matrix_ok && publishLocalUnifiedCommand()) {
+          follower_unified_active_ = true;
+          follower_cmd_timeout_count_ = 0;  // reset timeout counter
 
-        pre_module_state_ = module_state;
-        prev_unified_control_mode_ = true;
-        return;
+          // FOLLOWER Ready Sync (P2.1): publish "I'm ready" once on first valid local pickup.
+          if (!follower_ready_sent_) {
+            int leader_id = beetle_navigator_->getLeaderID();
+            std::string leader_ns = std::string("/") + beetle_navigator_->getMyName()
+                                    + std::to_string(leader_id);
+            follower_ready_pub_ = nh_.advertise<std_msgs::Int32>(
+                leader_ns + "/unified_control/follower_ready", 1, true);  // latched
+            std_msgs::Int32 ready_msg;
+            ready_msg.data = beetle_navigator_->getMyID();
+            follower_ready_pub_.publish(ready_msg);
+            follower_ready_sent_ = true;
+            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d published READY to %s",
+                     beetle_navigator_->getMyID(),
+                     (leader_ns + "/unified_control/follower_ready").c_str());
+          }
+
+          ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d local pickup: thrust_sz=%zu",
+                            beetle_navigator_->getMyID(),
+                            unified_thrust_cmd_.base_thrust.size());
+
+          pre_module_state_ = module_state;
+          prev_unified_control_mode_ = true;
+          return;
+        }
+
+        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d fresh reference but local allocation/matrix publish failed",
+                          beetle_navigator_->getMyID());
       }
 
       // ======== T4.1: FOLLOWER Heartbeat Timeout & Fallback ========
-      // Command is stale (age > 0.5s) or never received.
+      // Reference is stale (age > 0.5s) or never received.
       // Strategy depends on whether we were ever actively forwarding:
       if (follower_unified_active_) {
-        // We WERE forwarding — leader command has gone stale.
+        // We WERE actively forwarding local pickup output — leader reference has gone stale.
         // Increment timeout counter for graceful degradation.
         follower_cmd_timeout_count_++;
 
@@ -1038,7 +1023,7 @@ namespace aerial_robot_control
           // Phase 1: Hold last command (hold-last-sample).
           // Better than nothing for short glitches (< 0.5s = 20 frames @40Hz).
           follower_thrust_pub_.publish(unified_thrust_cmd_);
-          ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d HOLD-LAST: stale cmd, "
+          ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d HOLD-LAST: stale reference, "
                             "holding for %d/%d frames",
                             beetle_navigator_->getMyID(),
                             follower_cmd_timeout_count_, FOLLOWER_HOLD_LAST_FRAMES);
@@ -1048,8 +1033,8 @@ namespace aerial_robot_control
         }
 
         // Phase 2: Full fallback — restore independent hover.
-        // This is the "circuit breaker": leader is truly gone.
-        ROS_ERROR("[UnifiedCtrl FOLLOWER] id=%d FALLBACK: leader cmd timeout (%d frames), "
+        // This is the "circuit breaker": leader reference is truly gone.
+        ROS_ERROR("[UnifiedCtrl FOLLOWER] id=%d FALLBACK: leader reference timeout (%d frames), "
                   "restoring independent hover!",
                   beetle_navigator_->getMyID(), follower_cmd_timeout_count_);
 
@@ -1069,10 +1054,10 @@ namespace aerial_robot_control
 
         // Fall through to independent control below
       } else {
-        // Never received any unified command — still waiting for LEADER's first publish.
+        // Never received any unified reference — still waiting for LEADER's first publish.
         // MUST return here to avoid falling through to T4.4 which would clear
         // unified_control_mode rosparam and force this FOLLOWER back to independent.
-        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d, no valid unified cmd yet — waiting (age=%.3f)",
+        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d, no valid unified reference yet — waiting (age=%.3f)",
                  beetle_navigator_->getMyID(),
                  unified_cmd_received_ ? (ros::Time::now() - unified_cmd_stamp_).toSec() : -1.0);
         pre_module_state_ = module_state;
@@ -1337,7 +1322,7 @@ namespace aerial_robot_control
     }
 
     // ======== Auto-latch: FOLLOWER safety net ========
-    // If this module is a FOLLOWER and has recently received unified commands
+    // If this module is a FOLLOWER and has recently received unified references
     // from the LEADER, but unified_control_mode_ is false (e.g. rosparam was
     // overwritten by config reload, node restart, or race condition), force it on.
     // This is a secondary check complementing the callback-level auto-latch.
@@ -1347,7 +1332,7 @@ namespace aerial_robot_control
       double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
       if (age < 0.5) {
         ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] FOLLOWER id=%d auto-latch in update(): "
-                 "unified cmd fresh (age=%.3fs) but mode is off — forcing ON",
+                 "unified reference fresh (age=%.3fs) but mode is off — forcing ON",
                  beetle_navigator_->getMyID(), age);
         unified_control_mode_ = true;
         ros::NodeHandle ctrl_nh(nh_, "controller");
@@ -1383,11 +1368,8 @@ namespace aerial_robot_control
       // Note: In practice this rarely triggers because LEADER publishes unified
       // commands before FOLLOWERs detect the mode switch. Kept as a safety net.
       if (module_state == FOLLOWER && module_state != SEPARATED) {
-        bool have_valid_cmd = false;
-        if (unified_cmd_received_) {
-          double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
-          if (age < 0.5) have_valid_cmd = true;
-        }
+        ensureUnifiedReferenceSubscription();
+        bool have_valid_cmd = haveFreshUnifiedReference(0.5);
 
         if (!have_valid_cmd && !follower_unified_active_) {
           // Transition: set spinal damping-only immediately, then freeze on last hover output.
@@ -1398,7 +1380,7 @@ namespace aerial_robot_control
             spinal_gains_zeroed_ = true;
             unified_transition_count_ = 0;
             beetle_navigator_->setUnifiedControlMode(true);  // P3: skip CoG→CoM conversion
-            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d freeze: sent cascade gains to own spinal, awaiting unified cmd, t=%.4f",
+            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d freeze: sent cascade gains to own spinal, awaiting unified reference, t=%.4f",
                      beetle_navigator_->getMyID(), ros::Time::now().toSec());
           }
           prev_unified_control_mode_ = true;
@@ -1410,7 +1392,7 @@ namespace aerial_robot_control
             follower_thrust_pub_.publish(last_independent_thrust_cmd_);
             if (!gimbal_calc_in_fc_)
               follower_gimbal_pub_.publish(last_independent_gimbal_cmd_);
-            ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] FOLLOWER id=%d freeze: re-sending cached hover cmd (thrust_sz=%zu)",
+            ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] FOLLOWER id=%d freeze: re-sending cached hover cmd while waiting for unified reference (thrust_sz=%zu)",
                               beetle_navigator_->getMyID(), last_independent_thrust_cmd_.base_thrust.size());
           } else {
             ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] FOLLOWER id=%d freeze: no cached cmd yet, waiting",
@@ -1494,15 +1476,107 @@ namespace aerial_robot_control
     unified_cmd_received_ = false;
     follower_unified_active_ = false;
     follower_ready_sent_ = false;
+    unified_reference_sub_.shutdown();
+    unified_reference_leader_id_ = -1;
   }
 
-  void BeetleController::unifiedThrustCallback(const spinal::FourAxisCommand& msg)
+  void BeetleController::ensureUnifiedReferenceSubscription()
   {
-    unified_thrust_cmd_ = msg;
-    unified_cmd_received_ = true;
-    unified_cmd_stamp_ = ros::Time::now();
+    if (beetle_navigator_->getModuleState() != FOLLOWER) return;
 
-    // Auto-latch: if this FOLLOWER receives a unified command from the LEADER
+    int leader_id = beetle_navigator_->getLeaderID();
+    if (leader_id <= 0 || leader_id == beetle_navigator_->getMyID()) return;
+    if (leader_id == unified_reference_leader_id_) return;
+
+    std::string leader_ns = std::string("/") + beetle_navigator_->getMyName()
+                            + std::to_string(leader_id);
+    unified_reference_sub_.shutdown();
+    unified_reference_sub_ = nh_.subscribe(leader_ns + "/unified_control/reference", 1,
+                                           &BeetleController::unifiedReferenceCallback, this);
+    unified_reference_leader_id_ = leader_id;
+    unified_cmd_received_ = false;
+
+    ROS_INFO("[UnifiedCtrl] FOLLOWER id=%d subscribed to unified reference: %s",
+             beetle_navigator_->getMyID(),
+             (leader_ns + "/unified_control/reference").c_str());
+  }
+
+  bool BeetleController::haveFreshUnifiedReference(double max_age) const
+  {
+    if (!unified_cmd_received_) return false;
+    return (ros::Time::now() - unified_cmd_stamp_).toSec() < max_age;
+  }
+
+  bool BeetleController::publishLocalUnifiedCommand()
+  {
+    spinal::FourAxisCommand local_cmd;
+    if (!unified_controller_->buildModuleThrustCommand(beetle_navigator_->getMyID(), local_cmd)) {
+      ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] id=%d failed to pick local module block from unified allocation",
+                        beetle_navigator_->getMyID());
+      return false;
+    }
+
+    unified_thrust_cmd_ = local_cmd;
+    follower_thrust_pub_.publish(unified_thrust_cmd_);
+    return true;
+  }
+
+  bool BeetleController::publishLocalUnifiedTorqueAllocationMatrixInv()
+  {
+    spinal::TorqueAllocationMatrixInv msg;
+    if (!unified_controller_->buildModuleTorqueAllocationMatrixInv(beetle_navigator_->getMyID(), msg)) {
+      ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] id=%d failed to build local torque_allocation_matrix_inv",
+                        beetle_navigator_->getMyID());
+      return false;
+    }
+
+    torque_allocation_matrix_inv_pub_.publish(msg);
+    return true;
+  }
+
+  void BeetleController::publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
+                                                 const Eigen::VectorXd& desired_wrench,
+                                                 double yaw_pid_raw)
+  {
+    beetle::UnifiedControlReference msg;
+    msg.header.stamp = ros::Time::now();
+    msg.wrench_acc.force.x = target_wrench_acc(0);
+    msg.wrench_acc.force.y = target_wrench_acc(1);
+    msg.wrench_acc.force.z = target_wrench_acc(2);
+    msg.wrench_acc.torque.x = target_wrench_acc(3);
+    msg.wrench_acc.torque.y = target_wrench_acc(4);
+    msg.wrench_acc.torque.z = target_wrench_acc(5);
+    msg.desired_wrench.force.x = desired_wrench(0);
+    msg.desired_wrench.force.y = desired_wrench(1);
+    msg.desired_wrench.force.z = desired_wrench(2);
+    msg.desired_wrench.torque.x = desired_wrench(3);
+    msg.desired_wrench.torque.y = desired_wrench(4);
+    msg.desired_wrench.torque.z = desired_wrench(5);
+    msg.yaw_pid_raw = yaw_pid_raw;
+    unified_reference_pub_.publish(msg);
+  }
+
+  void BeetleController::unifiedReferenceCallback(const beetle::UnifiedControlReference& msg)
+  {
+    unified_reference_wrench_acc_(0) = msg.wrench_acc.force.x;
+    unified_reference_wrench_acc_(1) = msg.wrench_acc.force.y;
+    unified_reference_wrench_acc_(2) = msg.wrench_acc.force.z;
+    unified_reference_wrench_acc_(3) = msg.wrench_acc.torque.x;
+    unified_reference_wrench_acc_(4) = msg.wrench_acc.torque.y;
+    unified_reference_wrench_acc_(5) = msg.wrench_acc.torque.z;
+
+    unified_reference_desired_wrench_(0) = msg.desired_wrench.force.x;
+    unified_reference_desired_wrench_(1) = msg.desired_wrench.force.y;
+    unified_reference_desired_wrench_(2) = msg.desired_wrench.force.z;
+    unified_reference_desired_wrench_(3) = msg.desired_wrench.torque.x;
+    unified_reference_desired_wrench_(4) = msg.desired_wrench.torque.y;
+    unified_reference_desired_wrench_(5) = msg.desired_wrench.torque.z;
+    unified_reference_yaw_pid_raw_ = msg.yaw_pid_raw;
+
+    unified_cmd_received_ = true;
+    unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
+
+    // Auto-latch: if this FOLLOWER receives a unified reference from the LEADER
     // but unified_control_mode_ is false (e.g. rosparam was overwritten by a
     // config reload or node restart), force-enable unified mode.
     // This prevents the dangerous scenario where the FOLLOWER silently runs
@@ -1510,7 +1584,7 @@ namespace aerial_robot_control
     if (!unified_control_mode_ &&
         beetle_navigator_->getModuleState() == FOLLOWER)
     {
-      ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d AUTO-LATCH: received unified_thrust_cmd "
+      ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d AUTO-LATCH: received unified reference "
                "while unified_control_mode is false — forcing unified mode ON",
                beetle_navigator_->getMyID());
       unified_control_mode_ = true;

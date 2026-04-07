@@ -5,6 +5,7 @@
 #include <beetle/beetle_navigation.h>
 #include <beetle/TaggedWrench.h>
 #include <beetle/TaggedWrenches.h>
+#include <beetle/UnifiedControlReference.h>
 #include <gimbalrotor/control/gimbalrotor_controller.h>
 #include <beetle/sensor/imu.h>
 #include <beetle/control/beetle_unified_controller.h>
@@ -161,14 +162,20 @@ namespace aerial_robot_control
     boost::shared_ptr<PidControlDynamicConfig> unified_yaw_reconf_server_;
     void cfgUnifiedPidCallback(aerial_robot_control::PIDConfig &config, uint32_t level, std::vector<int> controller_indices, AxisGainSet& gain_set);
 
-    // FOLLOWER unified mode: receive commands from LEADER
-    ros::Subscriber unified_thrust_sub_;
+    // Unified reference broadcast: leader publishes a formation-level reference;
+    // each module computes allocation locally and picks its own block.
+    ros::Publisher unified_reference_pub_;
+    ros::Subscriber unified_reference_sub_;
     ros::Publisher follower_thrust_pub_;   // re-publish to own four_axes/command
     ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl (only when !gimbal_calc_in_fc)
     spinal::FourAxisCommand unified_thrust_cmd_;
     bool unified_cmd_received_;
     bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
+    Eigen::VectorXd unified_reference_wrench_acc_;
+    Eigen::VectorXd unified_reference_desired_wrench_;
+    double unified_reference_yaw_pid_raw_;
+    int unified_reference_leader_id_;
     int follower_cmd_timeout_count_ = 0;  // consecutive frames without valid unified cmd
     // T4.1: FOLLOWER holds last command for this many frames before full fallback.
     // At 40Hz, 20 frames = 0.5s — covers short ROS communication glitches.
@@ -178,7 +185,14 @@ namespace aerial_robot_control
     spinal::FourAxisCommand last_independent_thrust_cmd_;
     sensor_msgs::JointState last_independent_gimbal_cmd_;
     bool has_cached_independent_cmd_;  // true once we've cached at least one frame
-    void unifiedThrustCallback(const spinal::FourAxisCommand& msg);
+    void unifiedReferenceCallback(const beetle::UnifiedControlReference& msg);
+    void ensureUnifiedReferenceSubscription();
+    bool haveFreshUnifiedReference(double max_age) const;
+    bool publishLocalUnifiedCommand();
+    bool publishLocalUnifiedTorqueAllocationMatrixInv();
+    void publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
+                   const Eigen::VectorXd& desired_wrench,
+                   double yaw_pid_raw);
 
     // FOLLOWER Ready Sync (P2.1): publish "I'm ready" once cascade gains are set
     // and the first valid unified command has been forwarded to spinal.

@@ -22,6 +22,7 @@ find_package(OsqpEigen REQUIRED)
 add_message_files(FILES
   TaggedWrench.msg
   TaggedWrenches.msg
+  UnifiedControlReference.msg
   )
 
 catkin_python_setup()

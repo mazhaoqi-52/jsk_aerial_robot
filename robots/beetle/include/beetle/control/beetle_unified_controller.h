@@ -169,6 +169,7 @@ private:
   int gimbal_dof_;
   int rotor_coef_;
   bool gimbal_calc_in_fc_;
+  bool yaw_in_allocation_;
 
   // Formation state
   double formation_mass_;

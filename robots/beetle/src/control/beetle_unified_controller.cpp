@@ -18,6 +18,7 @@ BeetleUnifiedController::BeetleUnifiedController()
     gimbal_dof_(1),
     rotor_coef_(2),
     gimbal_calc_in_fc_(false),
+    yaw_in_allocation_(false),
     formation_mass_(0),
     formation_cog_offset_(Eigen::Vector3d::Zero()),
     formation_inertia_(Eigen::Matrix3d::Zero()),
@@ -86,6 +87,7 @@ void BeetleUnifiedController::rosParamInit()
   ros::NodeHandle control_nh(nh_, "controller");
   control_nh.param<int>("gimbal_dof", gimbal_dof_, 1);
   control_nh.param<bool>("gimbal_calc_in_fc", gimbal_calc_in_fc_, false);
+  control_nh.param<bool>("yaw_in_allocation", yaw_in_allocation_, false);
   control_nh.param<double>("tgt_angle_lpf_alpha", tgt_angle_lpf_alpha_, 0.3);
   control_nh.param<bool>("use_constrained_alloc", use_constrained_alloc_, false);
   control_nh.param<double>("alloc_lambda", alloc_lambda_, 1e-4);
@@ -181,9 +183,12 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     target_pitch_ = atan2(target_acc_body.x(), target_acc_body.z());
   }
 
-  // Compute candidate yaw term for spinal yaw reconstruction
-  {
-    // Find max yaw column entry to scale yaw PID result (same logic as gimbalrotor)
+  // Compute candidate yaw term for spinal yaw reconstruction.
+  // When yaw already participates in unified allocation, do NOT reconstruct the
+  // same yaw command again on spinal, otherwise the yaw effect is applied twice.
+  if (yaw_in_allocation_) {
+    candidate_yaw_term_ = 0.0;
+  } else {
     int yaw_col = 5; // yaw is the 6th column (index 5) in the 6-DOF wrench
     double max_yaw_scale = 0;
     int total_motors = assembled_ids.size() * motor_num_per_module_;
@@ -191,8 +196,6 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       if (integrated_map_inv_(i * rotor_coef_, yaw_col) > max_yaw_scale)
         max_yaw_scale = integrated_map_inv_(i * rotor_coef_, yaw_col);
     }
-    // candidate_yaw_term is reconstructed from the raw yaw PID output.
-    // This keeps a dedicated yaw channel even when yaw is excluded from allocation.
     candidate_yaw_term_ = yaw_pid_raw * max_yaw_scale;
   }
 

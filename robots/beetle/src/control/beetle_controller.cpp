@@ -884,6 +884,50 @@ namespace aerial_robot_control
             target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok,
             yaw_pid_raw, yaw_in_allocation_ ? "ON" : "OFF");
 
+      {
+        const auto& module_commands = unified_controller_->getModuleCommands();
+        double max_abs_gimbal_deg = 0.0;
+        double max_abs_fx = 0.0;
+        double max_abs_fz = 0.0;
+        double max_thrust = 0.0;
+
+        for (const auto& module_command : module_commands) {
+          for (double angle_rad : module_command.second.gimbal_angles) {
+            max_abs_gimbal_deg = std::max(max_abs_gimbal_deg,
+                                          std::abs(angle_rad) * 180.0 / M_PI);
+          }
+          for (float thrust : module_command.second.full_thrusts) {
+            max_thrust = std::max(max_thrust, static_cast<double>(std::abs(thrust)));
+          }
+        }
+
+        const Eigen::VectorXd& vectoring_force = unified_controller_->getTargetVectoringForce();
+        for (int index = 0; index + 1 < vectoring_force.size(); index += 2) {
+          max_abs_fx = std::max(max_abs_fx, std::abs(vectoring_force(index)));
+          max_abs_fz = std::max(max_abs_fz, std::abs(vectoring_force(index + 1)));
+        }
+
+        ROS_WARN_THROTTLE(0.5,
+                          "[UnifiedCtrl SERVO_DIAG] roll_tgt=%.3f pitch_tgt=%.3f yaw_raw=%.3f yaw_cmd=%.3f yaw_alloc=%s max_gimbal=%.1fdeg max_thrust=%.2f max|fx|=%.2f max|fz|=%.2f",
+                          unified_controller_->getTargetRoll(),
+                          unified_controller_->getTargetPitch(),
+                          yaw_pid_raw,
+                          unified_controller_->getCandidateYawTerm(),
+                          yaw_in_allocation_ ? "ON" : "OFF",
+                          max_abs_gimbal_deg,
+                          max_thrust,
+                          max_abs_fx,
+                          max_abs_fz);
+
+        if (yaw_in_allocation_ && std::abs(unified_controller_->getCandidateYawTerm()) > 0.5) {
+          ROS_WARN_THROTTLE(0.5,
+                            "[UnifiedCtrl YAW_DIAG] yaw is active in both allocation and spinal reconstruction: yaw_raw=%.3f target_wrench_yaw=%.3f candidate_yaw_term=%.3f",
+                            yaw_pid_raw,
+                            target_wrench_acc(5),
+                            unified_controller_->getCandidateYawTerm());
+        }
+      }
+
       // Formation observer diagnostic (Phase U2, debug-only)
       if (formation_observer_ && formation_observer_->isActive() && formation_observer_->isInitialized()) {
         const Eigen::Vector3d fext_w = formation_observer_->getEstExternalForceWorld();  // bias-subtracted

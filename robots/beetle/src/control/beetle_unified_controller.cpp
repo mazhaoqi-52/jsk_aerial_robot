@@ -36,7 +36,6 @@ BeetleUnifiedController::BeetleUnifiedController()
     cached_cascade_pitch_p_(0),
     cached_cascade_pitch_d_(0),
     cached_cascade_yaw_d_(0),
-    follower_ready_wait_count_(0),
     use_constrained_alloc_(false),
     alloc_lambda_(1e-4),
     alloc_t_max_(20.0),
@@ -69,7 +68,6 @@ void BeetleUnifiedController::initialize(
   std::string my_name = navigator_->getMyName();
   for (int i = 1; i <= max_modules; i++) {
     std::string ns = std::string("/") + my_name + std::to_string(i);
-    module_thrust_pubs_[i] = nh_.advertise<spinal::FourAxisCommand>(ns + "/unified_thrust_cmd", 1);
     module_torque_alloc_inv_pubs_[i] = nh_.advertise<spinal::TorqueAllocationMatrixInv>(
         ns + "/torque_allocation_matrix_inv", 1);
     module_rpy_gain_pubs_[i] = nh_.advertise<spinal::RollPitchYawTerms>(ns + "/rpy/gain", 1);
@@ -78,12 +76,6 @@ void BeetleUnifiedController::initialize(
 
   formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("unified_control/formation_wrench", 1);
   formation_vectoring_f_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/vectoring_force", 1);
-
-  // FOLLOWER Ready Sync: subscribe to ready signals from all modules.
-  // Each FOLLOWER publishes std_msgs::Int32 (containing its module ID) on this topic.
-  // Using a single global topic (relative to LEADER's namespace) for simplicity.
-  follower_ready_sub_ = nh_.subscribe("unified_control/follower_ready", 10,
-                                       &BeetleUnifiedController::followerReadyCallback, this);
 
   ROS_INFO("[UnifiedCtrl] Initialized: motor_per_module=%d, gimbal_dof=%d, rotor_coef=%d, gimbal_calc_in_fc=%d",
            motor_num_per_module_, gimbal_dof_, rotor_coef_, gimbal_calc_in_fc_);
@@ -568,43 +560,6 @@ bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInv(
   return true;
 }
 
-void BeetleUnifiedController::publishCommands()
-{
-  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
-  int leader_id = navigator_->getLeaderID();
-
-  // In cascade mode (gimbal_calc_in_fc=true), send:
-  //   base_thrust[motor_num * rotor_coef] = vectoring force components (NOT scalar magnitude)
-  //   angles[0] = target_roll
-  //   angles[1] = target_pitch
-  //   angles[2] = candidate_yaw_term
-  // Spinal will add roll_pitch_term (from its own P+D) to base_thrust,
-  // then do sqrt+atan2 to decompose into scalar thrust + gimbal angle.
-
-  for (size_t m = 0; m < assembled_ids.size(); m++) {
-    int module_id = assembled_ids[m];
-
-    // Skip LEADER — LEADER sends its own command in beetle_controller.cpp
-    if (module_id == leader_id) {
-      continue;
-    }
-
-    if (module_thrust_pubs_.count(module_id)) {
-      spinal::FourAxisCommand thrust_msg;
-      if (buildModuleThrustCommand(module_id, thrust_msg)) {
-        module_thrust_pubs_[module_id].publish(thrust_msg);
-      }
-    }
-
-    // Also publish gimbal_dof=1 every frame to ensure spinal is in vectoring mode
-    if (module_gimbal_dof_pubs_.count(module_id)) {
-      std_msgs::UInt8 dof_msg;
-      dof_msg.data = gimbal_dof_;
-      module_gimbal_dof_pubs_[module_id].publish(dof_msg);
-    }
-  }
-}
-
 bool BeetleUnifiedController::isAllocationSaturated() const
 {
   if (module_commands_.empty()) return false;
@@ -878,53 +833,6 @@ Eigen::Matrix3d BeetleUnifiedController::computeFormationInertia(
   }
 
   return formation_inertia;
-}
-
-// ---- FOLLOWER Ready Sync (P2.1) ----
-
-void BeetleUnifiedController::followerReadyCallback(const std_msgs::Int32& msg)
-{
-  int follower_id = msg.data;
-  if (follower_ready_set_.find(follower_id) == follower_ready_set_.end()) {
-    follower_ready_set_.insert(follower_id);
-    ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d reported READY (%zu/%zu followers ready)",
-             follower_id, follower_ready_set_.size(),
-             navigator_->getAssemblyIds().size() - 1);
-  }
-}
-
-bool BeetleUnifiedController::allFollowersReady() const
-{
-  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
-  if (assembled_ids.size() <= 1) return true;  // solo — no followers to wait for
-
-  // Timeout: proceed anyway after FOLLOWER_READY_TIMEOUT_FRAMES
-  if (follower_ready_wait_count_ >= FOLLOWER_READY_TIMEOUT_FRAMES) return true;
-
-  int leader_id = navigator_->getLeaderID();
-  for (int id : assembled_ids) {
-    if (id == leader_id) continue;
-    if (follower_ready_set_.find(id) == follower_ready_set_.end()) return false;
-  }
-  return true;
-}
-
-void BeetleUnifiedController::resetFollowerReady()
-{
-  follower_ready_set_.clear();
-  follower_ready_wait_count_ = 0;
-}
-
-int BeetleUnifiedController::pendingFollowerCount() const
-{
-  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
-  int leader_id = navigator_->getLeaderID();
-  int pending = 0;
-  for (int id : assembled_ids) {
-    if (id == leader_id) continue;
-    if (follower_ready_set_.find(id) == follower_ready_set_.end()) pending++;
-  }
-  return pending;
 }
 
 } // namespace aerial_robot_control

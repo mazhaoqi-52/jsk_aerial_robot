@@ -21,7 +21,6 @@
 #include <ros/ros.h>
 #include <Eigen/Dense>
 #include <memory>
-#include <set>
 
 // Forward-declare OsqpEigen::Solver so downstream packages that include this
 // header (e.g. ninja) do not need to link against OsqpEigen.
@@ -33,7 +32,6 @@ namespace OsqpEigen { class Solver; }
 #include <geometry_msgs/WrenchStamped.h>
 #include <std_msgs/Float32MultiArray.h>
 #include <std_msgs/UInt8.h>
-#include <std_msgs/Int32.h>
 
 #include <beetle/model/beetle_robot_model.h>
 #include <beetle/beetle_navigation.h>
@@ -67,11 +65,6 @@ public:
   bool computeUnifiedAllocation(const Eigen::VectorXd& target_wrench_acc_cog,
                                 const Eigen::VectorXd& desired_ext_wrench,
                                 double yaw_pid_raw);
-
-  /** @brief Send computed commands to all modules via ROS topics.
-   *  Cascade mode: base_thrust[motor_num*rotor_coef] + angles[roll,pitch,yaw_term].
-   *  Also publishes gimbal_dof=1 to each module's spinal. */
-  void publishCommands();
 
   /** @brief Send torque_allocation_matrix_inv sub-blocks to each module's spinal.
    *  Each module receives only its own rows (motor_num_per_module_ * rotor_coef_ rows × 3 cols).
@@ -165,28 +158,6 @@ public:
   /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
   bool isAllocationSaturated() const;
 
-  // ---- FOLLOWER Ready Sync (P2.1) ----
-  // LEADER waits for all FOLLOWERs to report ready before enabling outer-loop PID.
-  // FOLLOWERs publish their ID on /<myname><leader_id>/unified_control/follower_ready
-  // when they have sent cascade gains + forwarded the first valid unified command.
-
-  /** @brief Check if all expected FOLLOWERs have reported ready.
-   *  Returns true when every non-LEADER assembled module has acked,
-   *  OR when the timeout has elapsed. Always true if only 1 module (solo). */
-  bool allFollowersReady() const;
-
-  /** @brief Reset follower ready state. Call when entering/exiting unified mode. */
-  void resetFollowerReady();
-
-  /** @brief Number of followers still not ready. For logging. */
-  int pendingFollowerCount() const;
-
-  /** @brief Increment the wait frame counter (called each frame while waiting). */
-  void incrementFollowerReadyWait() { follower_ready_wait_count_++; }
-
-  /** @brief Get current wait frame count (for logging/timeout check). */
-  int getFollowerReadyWaitCount() const { return follower_ready_wait_count_; }
-
 private:
   ros::NodeHandle nh_;
   boost::shared_ptr<BeetleRobotModel> robot_model_;
@@ -235,7 +206,6 @@ private:
   double cached_cascade_yaw_d_;
 
   // ROS publishers per module
-  std::map<int, ros::Publisher> module_thrust_pubs_;   // unified_thrust_cmd (FourAxisCommand)
   std::map<int, ros::Publisher> module_torque_alloc_inv_pubs_;  // torque_allocation_matrix_inv
   std::map<int, ros::Publisher> module_rpy_gain_pubs_;          // rpy/gain
   std::map<int, ros::Publisher> module_gimbal_dof_pubs_;        // gimbal_dof
@@ -243,13 +213,6 @@ private:
   // Debug publishers
   ros::Publisher formation_wrench_pub_;
   ros::Publisher formation_vectoring_f_pub_;
-
-  // FOLLOWER Ready Sync state
-  ros::Subscriber follower_ready_sub_;               // subscribe to follower_ready topic
-  std::set<int> follower_ready_set_;                  // IDs of followers that reported ready
-  int follower_ready_wait_count_;                     // frames since reset (for timeout)
-  static constexpr int FOLLOWER_READY_TIMEOUT_FRAMES = 120;  // 3s @40Hz
-  void followerReadyCallback(const std_msgs::Int32& msg);
 
   // Internal methods
   Eigen::MatrixXd buildFormationAllocationMatrix(

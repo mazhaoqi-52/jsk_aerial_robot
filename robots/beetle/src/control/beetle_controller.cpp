@@ -19,6 +19,8 @@ namespace aerial_robot_control
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
     unified_reference_yaw_pid_raw_(0.0),
     unified_reference_leader_id_(-1),
+    unified_reference_warmup_count_(0),
+    unified_reference_warmup_frames_(20),
     unified_transition_count_(-1),
     z_integral_freeze_count_(0),
     z_ki_boost_count_(0),
@@ -161,10 +163,6 @@ namespace aerial_robot_control
     // Publishers to this module's own spinal (same topic names as GimbalrotorController)
     follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
     follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
-
-    // FOLLOWER Ready Sync (P2.1): publisher created lazily when entering unified mode,
-    // because we need to know the leader's namespace (leader_id may change).
-    follower_ready_sent_ = false;
 
     // Service for toggling unified control mode
     ros::NodeHandle srv_nh(nh_, "controller");
@@ -455,7 +453,7 @@ namespace aerial_robot_control
     applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
     spinal_gains_zeroed_ = true;
     unified_transition_count_ = 0;
-    unified_controller_->resetFollowerReady();  // P2.1: start fresh ready tracking
+    unified_reference_warmup_count_ = 0;
 
     // Phase U2: activate formation observer on entering unified LEADER mode
     if (formation_observer_) {
@@ -465,8 +463,8 @@ namespace aerial_robot_control
     }
 
     ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, sent cascade gains + alloc_inv to all spinals, "
-             "applied unified PID gains, waiting for %d FOLLOWERs, t=%.4f",
-             unified_controller_->pendingFollowerCount(), ros::Time::now().toSec());
+             "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
+             unified_reference_warmup_frames_, ros::Time::now().toSec());
     formation_desired_wrench_.setZero();
   }
 
@@ -744,12 +742,11 @@ namespace aerial_robot_control
                pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(), pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).result(),
                unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d);
 
-      // --- P2.1: FOLLOWER Ready Gate ---
-      // If not all FOLLOWERs have reported ready, freeze ALL I-terms to prevent
-      // the outer loop from building up corrections while inner loops aren't synced.
-      // PID still runs (position tracking), allocation still runs (FOLLOWERs get commands
-      // which will trigger their ready ack), but I-terms are held constant.
-      if (!unified_controller_->allFollowersReady()) {
+      // Stage-2 startup warmup:
+      // After entering unified mode, keep the leader-side I terms frozen for a short,
+      // purely local window so followers have time to receive the first shared
+      // reference and complete their own local allocation/pickup path.
+      if (unified_reference_warmup_count_ < unified_reference_warmup_frames_) {
         // Hover → Unified: freeze I-terms to prevent buildup while inner loops aren't synced.
         // Ground start (TAKEOFF_STATE): skip freeze — I-terms start from zero, freezing
         // only delays Z integral accumulation and slows the thrust ramp.
@@ -768,11 +765,11 @@ namespace aerial_robot_control
           }
         }
 
-        unified_controller_->incrementFollowerReadyWait();
-        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl LEADER] Waiting for %d FOLLOWERs to report ready "
-                          "(frame %d, I-terms %s)",
-                          unified_controller_->pendingFollowerCount(),
-                          unified_controller_->getFollowerReadyWaitCount(),
+        unified_reference_warmup_count_++;
+        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl LEADER] Local warmup active "
+                          "(%d/%d frames, I-terms %s)",
+                          unified_reference_warmup_count_,
+                          unified_reference_warmup_frames_,
                           (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) ? "accumulating" : "frozen");
       }
 
@@ -982,22 +979,6 @@ namespace aerial_robot_control
           follower_unified_active_ = true;
           follower_cmd_timeout_count_ = 0;  // reset timeout counter
 
-          // FOLLOWER Ready Sync (P2.1): publish "I'm ready" once on first valid local pickup.
-          if (!follower_ready_sent_) {
-            int leader_id = beetle_navigator_->getLeaderID();
-            std::string leader_ns = std::string("/") + beetle_navigator_->getMyName()
-                                    + std::to_string(leader_id);
-            follower_ready_pub_ = nh_.advertise<std_msgs::Int32>(
-                leader_ns + "/unified_control/follower_ready", 1, true);  // latched
-            std_msgs::Int32 ready_msg;
-            ready_msg.data = beetle_navigator_->getMyID();
-            follower_ready_pub_.publish(ready_msg);
-            follower_ready_sent_ = true;
-            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d published READY to %s",
-                     beetle_navigator_->getMyID(),
-                     (leader_ns + "/unified_control/follower_ready").c_str());
-          }
-
           ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d local pickup: thrust_sz=%zu",
                             beetle_navigator_->getMyID(),
                             unified_thrust_cmd_.base_thrust.size());
@@ -1045,7 +1026,6 @@ namespace aerial_robot_control
         follower_unified_active_ = false;
         unified_cmd_received_ = false;
         follower_cmd_timeout_count_ = 0;
-        follower_ready_sent_ = false;
         prev_unified_control_mode_ = false;
         unified_controller_->resetCascadeAllocSent();
         unified_controller_->resetTargetAngleLpf();
@@ -1092,13 +1072,12 @@ namespace aerial_robot_control
 
       prev_unified_control_mode_ = false;
       follower_unified_active_ = false;
-      follower_ready_sent_ = false;
       spinal_gains_zeroed_ = false;
       gains_switched_ = false;
       unified_controller_->resetCascadeAllocSent();
       unified_controller_->resetTargetAngleLpf();
       unified_controller_->resetQPState();
-      unified_controller_->resetFollowerReady();
+      unified_reference_warmup_count_ = 0;
       beetle_navigator_->setUnifiedControlMode(false);
 
       {
@@ -1475,9 +1454,9 @@ namespace aerial_robot_control
     // forwarded when switching back to unified mode.
     unified_cmd_received_ = false;
     follower_unified_active_ = false;
-    follower_ready_sent_ = false;
     unified_reference_sub_.shutdown();
     unified_reference_leader_id_ = -1;
+    unified_reference_warmup_count_ = 0;
   }
 
   void BeetleController::ensureUnifiedReferenceSubscription()
@@ -2010,6 +1989,9 @@ namespace aerial_robot_control
     getParam<bool>(control_nh, "unified_control_mode", unified_control_mode_, false);
 
     getParam<bool>(control_nh, "yaw_in_allocation", yaw_in_allocation_, false);
+
+    getParam<int>(control_nh, "unified_reference_warmup_frames", unified_reference_warmup_frames_, 20);
+    unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
 
     // Z I-term seed default for unified mode switch (Plan E')
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);

@@ -176,6 +176,8 @@ namespace aerial_robot_control
     Eigen::VectorXd unified_reference_desired_wrench_;
     double unified_reference_yaw_pid_raw_;
     int unified_reference_leader_id_;
+    int unified_reference_warmup_count_;
+    int unified_reference_warmup_frames_;
     int follower_cmd_timeout_count_ = 0;  // consecutive frames without valid unified cmd
     // T4.1: FOLLOWER holds last command for this many frames before full fallback.
     // At 40Hz, 20 frames = 0.5s — covers short ROS communication glitches.
@@ -193,11 +195,6 @@ namespace aerial_robot_control
     void publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                    const Eigen::VectorXd& desired_wrench,
                    double yaw_pid_raw);
-
-    // FOLLOWER Ready Sync (P2.1): publish "I'm ready" once cascade gains are set
-    // and the first valid unified command has been forwarded to spinal.
-    ros::Publisher follower_ready_pub_;
-    bool follower_ready_sent_;  // true once this FOLLOWER has published its ready signal
     
     map<string, ros::Subscriber> ff_inter_wrench_subs_;
     map<int, ros::Publisher> ff_inter_wrench_pubs_;

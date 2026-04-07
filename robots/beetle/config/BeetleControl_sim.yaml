@@ -13,6 +13,7 @@ controller:
   gimbal_dof: 1
   pd_wrench_comp_mode: true
   unified_control_mode: false
+  unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
   z_i_seed_default: 0.8    # Z I-term seed fallback (used when N not in z_i_seed_by_n)
   pitch_i_seed_default: -0.55  # Pitch I-term seed fallback (err_i domain)
 

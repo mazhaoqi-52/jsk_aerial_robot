@@ -1436,7 +1436,23 @@ namespace aerial_robot_control
          1. ControlBase::update() for activation/timing checks
          2. controlCore() for the unified allocation / forwarding
          3. PoseLinearController::sendCmd() for PID debug publishing */
-      if (!ControlBase::update()) return false;
+      bool base_ok = ControlBase::update();
+      if (!base_ok) {
+        if (module_state == LEADER) {
+          ROS_WARN_THROTTLE(0.5,
+                            "[UnifiedCtrl LEADER] unified loop gated before controlCore: navi_state=%d control_timestamp=%.4f unified=%s module_state=%d",
+                            navigator_->getNaviState(), control_timestamp_,
+                            unified_control_mode_ ? "ON" : "OFF", module_state);
+        }
+        return false;
+      }
+
+      if (module_state == LEADER) {
+        ROS_INFO_THROTTLE(1.0,
+                          "[UnifiedCtrl LEADER] entering unified controlCore: navi_state=%d control_timestamp=%.4f leader_id=%d",
+                          navigator_->getNaviState(), control_timestamp_, beetle_navigator_->getLeaderID());
+      }
+
       controlCore();
       PoseLinearController::sendCmd();
       return true;
@@ -1577,6 +1593,14 @@ namespace aerial_robot_control
     msg.desired_wrench.torque.z = desired_wrench(5);
     msg.yaw_pid_raw = yaw_pid_raw;
     unified_reference_pub_.publish(msg);
+
+    ROS_INFO_THROTTLE(1.0,
+                      "[UnifiedCtrl REF_PUB] leader_id=%d stamp=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+                      beetle_navigator_->getMyID(),
+                      msg.header.stamp.toSec(),
+                      target_wrench_acc(2),
+                      target_wrench_acc(4),
+                      yaw_pid_raw);
   }
 
   void BeetleController::unifiedReferenceCallback(const beetle::UnifiedControlReference& msg)
@@ -1598,6 +1622,15 @@ namespace aerial_robot_control
 
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
+
+    ROS_INFO_THROTTLE(1.0,
+              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+              beetle_navigator_->getMyID(),
+              beetle_navigator_->getLeaderID(),
+              (ros::Time::now() - unified_cmd_stamp_).toSec(),
+              unified_reference_wrench_acc_(2),
+              unified_reference_wrench_acc_(4),
+              unified_reference_yaw_pid_raw_);
 
     // Auto-latch: if this FOLLOWER receives a unified reference from the LEADER
     // but unified_control_mode_ is false (e.g. rosparam was overwritten by a

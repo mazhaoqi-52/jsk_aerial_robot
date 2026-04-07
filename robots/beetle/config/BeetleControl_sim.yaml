@@ -46,34 +46,6 @@ controller:
     bias_settle_time: 3.0          # seconds to wait for observer to converge before calibrating bias
     bias_calib_samples: 40         # number of samples to average for bias (at ~40Hz → ~1s window)
 
-  # ========== Cascade control for unified mode ==========
-  # Architecture: PC outer loop (40Hz) does formation-level 6-DOF allocation,
-  # sends target_angle + base_thrust to each module's spinal.
-  # Spinal inner loop (1000Hz) does P+D attitude tracking per-motor.
-  # PC retains I-term only for roll/pitch (formation-level slow bias).
-  #
-  # These are TORQUE-LEVEL gains sent to spinal via RollPitchYawTerms message.
-  # Spinal multiplies them by torque_allocation_matrix_inv to get per-motor gains:
-  #   thrust_p_gain[i][axis] = torque_alloc_inv[i][axis] * cascade_*_p
-  #   thrust_d_gain[i][axis] = torque_alloc_inv[i][axis] * cascade_*_d
-  #
-  # Formation inertia is ~600× larger than single beetle (Iyy≈5.98 vs ≈0.01),
-  # and the 6×24 pseudoinverse (alloc_inv) has element magnitudes ~10-100× smaller
-  # than the trimmed 4×8 single-robot matrix. Together, the effective per-motor
-  # attitude gain = alloc_inv × cascade_gain is far too small at cascade_*=8/5.
-  #
-  # Strategy: increase gradually. Round 1 = 10× (from 8→80, 5→50).
-  # Target: roll_pitch_term_[i] should reach ~1/10 of base_thrust_term_[i].
-  # If still too weak, increase to 20× or 30× in subsequent rounds.
-  # Watch for: high-frequency sawtooth in target_thrust → indicates overshoot.
-  # Round2: 3× (from baseline 8/5). Max row inv_rot_X≈0.129, so
-  #   thrust_p_max = 0.129 × 25 ≈ 3.2 → errA=0.05 → rp≈0.16N ≈ 1% bt (stable boundary)
-  # Round3: 3.5× — tracking err 2.1mrad still has margin, bt0 peak=0.195 < 0.3 safe
-  cascade_roll_p: 28.0     # [rad/s²/rad] torque-level P gain for roll  (Round3: 3.5×)
-  cascade_roll_d: 18.0     # [rad/s²/(rad/s)] torque-level D gain for roll  (Round3: 3.5×)
-  cascade_pitch_p: 28.0    # [rad/s²/rad] torque-level P gain for pitch  (Round3: 3.5×)
-  cascade_pitch_d: 18.0    # [rad/s²/(rad/s)] torque-level D gain for pitch  (Round3: 3.5×)
-  cascade_yaw_d: 2.5       # [rad/s²/(rad/s)] torque-level D gain for yaw (Round4: 4.0→2.5, reduce yaw damping)
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
   tgt_angle_lpf_alpha: 0.3  # LPF for target roll/pitch/yaw sent to spinal (0=no filter, 1=frozen; ~8Hz cutoff @40Hz)
 
@@ -156,17 +128,26 @@ controller:
     need_d_control: true
 
   # ========== Unified mode PID overrides ==========
-  # Applied ONLY when entering unified control mode; restored on exit.
-  # Roll/Pitch: only i_gain is used on PC (P+D handled by spinal cascade).
+  # Applied when entering unified control mode; restored on exit.
+  # P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
+  # I-term is retained on PC for slow formation-level bias correction.
   unified_roll:
+    p_gain: 28.0
     i_gain: 1.0
+    d_gain: 18.0
     limit_sum: 50.0
+    limit_p: 20.0
     limit_i: 10.0
+    limit_d: 20.0
 
   unified_pitch:
+    p_gain: 28.0
     i_gain: 5.0
+    d_gain: 18.0
     limit_sum: 50.0
+    limit_p: 20.0
     limit_i: 10.0
+    limit_d: 20.0
 
   unified_xy:
     p_gain: 2.0

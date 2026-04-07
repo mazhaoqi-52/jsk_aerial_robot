@@ -22,11 +22,6 @@ namespace aerial_robot_control
     rp_ki_boost_count_(0),
     rp_i_keep_ratio_(0.5),
     spinal_gains_zeroed_(false),
-    cascade_roll_p_(8.0),
-    cascade_roll_d_(5.0),
-    cascade_pitch_p_(8.0),
-    cascade_pitch_d_(5.0),
-    cascade_yaw_d_(2.5),
     yaw_in_allocation_(false),
     last_unified_z_i_ss_(0.8),
     has_unified_z_i_ss_(false),
@@ -457,8 +452,8 @@ namespace aerial_robot_control
                navigator_->getNaviState(), N_modules);
     }
 
-    sendCascadeSetup();
-    applyUnifiedGains();
+    sendCascadeSetup();       // reads from unified_*_gains_ directly, order-independent
+    applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
     spinal_gains_zeroed_ = true;
     unified_transition_count_ = 0;
     unified_controller_->resetFollowerReady();  // P2.1: start fresh ready tracking
@@ -1526,38 +1521,35 @@ namespace aerial_robot_control
 
   void BeetleController::sendCascadeSetup()
   {
-    // LEADER-only: send torque allocation matrix inverse and cascade P/D gains
+    // LEADER-only: send torque allocation matrix inverse and P/D gains
     // to ALL assembled modules' spinals. This configures each spinal for 1000Hz
     // P+D attitude tracking using thrustGainMapping().
     //
-    // NOTE: At mode-switch time, integrated_map_inv_rot_ may not be computed yet
-    // (computeUnifiedAllocation() hasn't run). In that case, sendTorqueAllocationMatrixInv()
-    // will silently return without sending. The one-shot logic inside
-    // computeUnifiedAllocation() will resend matrix + gains on the first successful
-    // computation. See cascade_alloc_sent_ flag.
+    // Gains are read directly from unified_*_gains_ (not pid_controllers_).
+    // This eliminates call-order dependency: sendCascadeSetup() always reads
+    // the correct unified gains regardless of whether applyUnifiedGains() has
+    // been called yet. I-term is set to 0 for Spinal (PC handles I-term).
     //
-    // Also publish gimbal_dof=1 to own spinal (LEADER's).
-    // FOLLOWERs' gimbal_dof is set by publishCommands() each frame,
-    // but publishCommands() skips LEADER, so we set it here at mode switch.
+    // NOTE: At mode-switch time, integrated_map_inv_rot_ may not be computed yet.
+    // The one-shot logic inside computeUnifiedAllocation() will resend on first
+    // successful computation. See cascade_alloc_sent_ flag.
+
+    double roll_p  = unified_roll_gains_.p;
+    double roll_d  = unified_roll_gains_.d;
+    double pitch_p = unified_pitch_gains_.p;
+    double pitch_d = unified_pitch_gains_.d;
+    double yaw_d   = unified_yaw_gains_.d;
 
     // Cache gains for deferred one-shot resend (must be done BEFORE the attempt)
-    unified_controller_->cacheCascadeGains(
-        cascade_roll_p_, cascade_roll_d_,
-        cascade_pitch_p_, cascade_pitch_d_,
-        cascade_yaw_d_);
+    unified_controller_->cacheCascadeGains(roll_p, roll_d, pitch_p, pitch_d, yaw_d);
 
     // Attempt to send now. If matrix is not yet computed, skip gains too —
     // sending cascade gains with the old independent-mode allocation matrix
     // causes thrustGainMapping() to produce wrong per-motor gains (P5 fix).
-    // The one-shot in computeUnifiedAllocation() will send matrix + gains
-    // together once the allocation is first successfully computed.
     unified_controller_->updateFormationGeometry();
     bool matrix_sent = unified_controller_->sendTorqueAllocationMatrixInv();
     if (matrix_sent) {
-      unified_controller_->sendCascadeGains(
-          cascade_roll_p_, cascade_roll_d_,
-          cascade_pitch_p_, cascade_pitch_d_,
-          cascade_yaw_d_);
+      unified_controller_->sendCascadeGains(roll_p, roll_d, pitch_p, pitch_d, yaw_d);
     } else {
       ROS_WARN("[UnifiedCtrl] Cascade setup: matrix not ready, deferring gains to one-shot");
     }
@@ -1572,36 +1564,36 @@ namespace aerial_robot_control
     ROS_INFO("[UnifiedCtrl] Cascade setup (LEADER): alloc_inv %s, gains %s, "
              "(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) %zu modules + gimbal_dof=1",
              matrix_sent ? "SENT" : "DEFERRED", matrix_sent ? "SENT" : "DEFERRED",
-             cascade_roll_p_, cascade_roll_d_, cascade_pitch_p_, cascade_pitch_d_, cascade_yaw_d_,
+             roll_p, roll_d, pitch_p, pitch_d, yaw_d,
              beetle_navigator_->getAssemblyIds().size());
   }
 
   void BeetleController::sendFollowerCascadeSetup()
   {
-    // FOLLOWER-only: send cascade P/D gains and gimbal_dof to THIS module's
+    // FOLLOWER-only: send P/D gains and gimbal_dof to THIS module's
     // own spinal only (via base-class publishers).
     //
-    // FOLLOWER does NOT:
-    //   - Send to other modules' spinals (LEADER is responsible for all-module setup)
-    //   - Send alloc_inv (LEADER's one-shot handles this after allocation computation)
-    //   - Cache gains for one-shot (FOLLOWER doesn't compute allocation)
-    //
-    // The gains sent here are temporary insurance — LEADER's sendCascadeSetup()
-    // will also send to this module. But if LEADER's message arrives late,
-    // the FOLLOWER's own spinal at least has cascade-mode gains to prevent
-    // it from running with stale independent-mode per-motor PID.
+    // Read directly from unified_*_gains_ (not pid_controllers_) because
+    // FOLLOWER does not call applyUnifiedGains() (it doesn't run PID).
+    // pid_controllers_ may still hold independent-mode values at this point.
 
-    // Send cascade gains to own spinal via base-class publisher (rpy_gain_pub_)
+    double roll_p  = unified_roll_gains_.p;
+    double roll_d  = unified_roll_gains_.d;
+    double pitch_p = unified_pitch_gains_.p;
+    double pitch_d = unified_pitch_gains_.d;
+    double yaw_d   = unified_yaw_gains_.d;
+
+    // Send gains to own spinal via base-class publisher (rpy_gain_pub_)
     {
       spinal::RollPitchYawTerms rpy_gain_msg;
       rpy_gain_msg.motors.resize(1);  // torque-level path
-      rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(cascade_roll_p_ * 1000);
+      rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p * 1000);
       rpy_gain_msg.motors[0].roll_i  = 0;  // I-term handled by PC
-      rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(cascade_roll_d_ * 1000);
-      rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(cascade_pitch_p_ * 1000);
+      rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d * 1000);
+      rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(pitch_p * 1000);
       rpy_gain_msg.motors[0].pitch_i = 0;  // I-term handled by PC
-      rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(cascade_pitch_d_ * 1000);
-      rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(cascade_yaw_d_ * 1000);
+      rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(pitch_d * 1000);
+      rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d * 1000);
       rpy_gain_pub_.publish(rpy_gain_msg);
     }
 
@@ -1612,10 +1604,10 @@ namespace aerial_robot_control
       gimbal_dof_pub_.publish(gimbal_dof_msg);
     }
 
-    ROS_INFO("[UnifiedCtrl] Cascade setup (FOLLOWER id=%d): sent cascade gains"
+    ROS_INFO("[UnifiedCtrl] Cascade setup (FOLLOWER id=%d): sent gains"
              "(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) + gimbal_dof=1 to own spinal only",
              beetle_navigator_->getMyID(),
-             cascade_roll_p_, cascade_roll_d_, cascade_pitch_p_, cascade_pitch_d_, cascade_yaw_d_);
+             roll_p, roll_d, pitch_p, pitch_d, yaw_d);
   }
 
   void BeetleController::applyUnifiedGains()
@@ -1646,21 +1638,21 @@ namespace aerial_robot_control
                         yaw_pid.getErrDLpfCutoffFreq()};
 
     // Apply unified (formation) gains.
-    // CASCADE MODE: wrench_acc only uses getITerm() for roll/pitch — P and D
-    // from the PC-side PID are computed but never included in the wrench.
-    // Set P=0, D=0 to avoid wasted computation and make the cascade semantics
-    // explicit. Only Ki and limit_i matter at the PC outer loop.
-    roll_pid.setGains(0.0, unified_roll_gains_.i, 0.0);
+    // Full P/I/D for roll/pitch: P+D are sent to each spinal for 1000Hz inner-loop
+    // tracking via sendCascadeSetup(). The PC wrench only uses getITerm() for
+    // roll/pitch, so having P/D here doesn't affect the PC wrench output — they
+    // exist solely so sendCascadeSetup() can read from pid_controllers_ directly.
+    roll_pid.setGains(unified_roll_gains_.p, unified_roll_gains_.i, unified_roll_gains_.d);
     roll_pid.setLimitSum(unified_roll_gains_.limit_sum);
-    roll_pid.setLimitP(0.0);
+    roll_pid.setLimitP(unified_roll_gains_.limit_p);
     roll_pid.setLimitI(unified_roll_gains_.limit_i);
-    roll_pid.setLimitD(0.0);
+    roll_pid.setLimitD(unified_roll_gains_.limit_d);
 
-    pitch_pid.setGains(0.0, unified_pitch_gains_.i, 0.0);
+    pitch_pid.setGains(unified_pitch_gains_.p, unified_pitch_gains_.i, unified_pitch_gains_.d);
     pitch_pid.setLimitSum(unified_pitch_gains_.limit_sum);
-    pitch_pid.setLimitP(0.0);
+    pitch_pid.setLimitP(unified_pitch_gains_.limit_p);
     pitch_pid.setLimitI(unified_pitch_gains_.limit_i);
-    pitch_pid.setLimitD(0.0);
+    pitch_pid.setLimitD(unified_pitch_gains_.limit_d);
 
     // Apply unified XY gains
     x_pid.setGains(unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d);
@@ -1695,9 +1687,10 @@ namespace aerial_robot_control
     yaw_pid.setLimitD(unified_yaw_gains_.limit_d);
 
     gains_switched_ = true;
-    ROS_WARN("[UnifiedCtrl] Applied unified gains: roll/pitch I=%.1f/%.1f, "
+    ROS_WARN("[UnifiedCtrl] Applied unified gains: roll P=%.1f I=%.1f D=%.1f, pitch P=%.1f I=%.1f D=%.1f, "
              "xy P=%.1f I=%.1f D=%.1f, z P=%.1f I=%.1f D=%.1f, yaw P=%.1f I=%.1f D=%.1f",
-             unified_roll_gains_.i, unified_pitch_gains_.i,
+             unified_roll_gains_.p, unified_roll_gains_.i, unified_roll_gains_.d,
+             unified_pitch_gains_.p, unified_pitch_gains_.i, unified_pitch_gains_.d,
              unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d,
              unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d,
              unified_yaw_gains_.p, unified_yaw_gains_.i, unified_yaw_gains_.d);
@@ -1825,6 +1818,16 @@ namespace aerial_robot_control
                      zeta, gain_set.p, gain_set.d);
           }
         }
+
+        // Resend P/D gains to all Spinals when unified roll/pitch/yaw gains change.
+        // Since sendCascadeSetup() reads from unified_*_gains_ directly, it will
+        // pick up the new value automatically.
+        if (level == Levels::RECONFIGURE_P_GAIN || level == Levels::RECONFIGURE_D_GAIN) {
+          if (unified_controller_) {
+            sendCascadeSetup();
+            ROS_INFO("[UnifiedCtrl] Resent cascade gains to Spinals after dynreconf P/D change");
+          }
+        }
       }
   }
 
@@ -1932,13 +1935,6 @@ namespace aerial_robot_control
 
     getParam<bool>(control_nh, "unified_control_mode", unified_control_mode_, false);
 
-    // Cascade control gains: torque-level P/D sent to each spinal for 1000Hz inner loop.
-    // Default values are conservative starting points.
-    getParam<double>(control_nh, "cascade_roll_p", cascade_roll_p_, 8.0);
-    getParam<double>(control_nh, "cascade_roll_d", cascade_roll_d_, 5.0);
-    getParam<double>(control_nh, "cascade_pitch_p", cascade_pitch_p_, 8.0);
-    getParam<double>(control_nh, "cascade_pitch_d", cascade_pitch_d_, 5.0);
-    getParam<double>(control_nh, "cascade_yaw_d", cascade_yaw_d_, 2.5);
     getParam<bool>(control_nh, "yaw_in_allocation", yaw_in_allocation_, false);
 
     // Z I-term seed default for unified mode switch (Plan E')
@@ -1994,18 +1990,26 @@ namespace aerial_robot_control
     // Fraction of independent-mode I-term to preserve at switch (0=clear, 1=full keep)
     getParam<double>(control_nh, "rp_i_keep_ratio", rp_i_keep_ratio_, 0.5);
 
-    // Load unified-mode PID gains for roll/pitch (formation pendulum compensation)
-    // Only i_gain, limit_sum, limit_i are used — PC outer loop runs I-only;
-    // P and D are handled by spinal cascade (cascade_roll_p/d, cascade_pitch_p/d).
+    // Load unified-mode PID gains for roll/pitch.
+    // Full P/I/D: P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
+    // I-term is retained on PC for slow formation-level bias correction.
     ros::NodeHandle u_roll_nh(control_nh, "unified_roll");
+    getParam<double>(u_roll_nh, "p_gain", unified_roll_gains_.p, 8.0);
     getParam<double>(u_roll_nh, "i_gain", unified_roll_gains_.i, 1.0);
+    getParam<double>(u_roll_nh, "d_gain", unified_roll_gains_.d, 5.0);
     getParam<double>(u_roll_nh, "limit_sum", unified_roll_gains_.limit_sum, 50.0);
+    getParam<double>(u_roll_nh, "limit_p", unified_roll_gains_.limit_p, 20.0);
     getParam<double>(u_roll_nh, "limit_i", unified_roll_gains_.limit_i, 10.0);
+    getParam<double>(u_roll_nh, "limit_d", unified_roll_gains_.limit_d, 20.0);
 
     ros::NodeHandle u_pitch_nh(control_nh, "unified_pitch");
+    getParam<double>(u_pitch_nh, "p_gain", unified_pitch_gains_.p, 8.0);
     getParam<double>(u_pitch_nh, "i_gain", unified_pitch_gains_.i, 1.0);
+    getParam<double>(u_pitch_nh, "d_gain", unified_pitch_gains_.d, 5.0);
     getParam<double>(u_pitch_nh, "limit_sum", unified_pitch_gains_.limit_sum, 50.0);
+    getParam<double>(u_pitch_nh, "limit_p", unified_pitch_gains_.limit_p, 20.0);
     getParam<double>(u_pitch_nh, "limit_i", unified_pitch_gains_.limit_i, 10.0);
+    getParam<double>(u_pitch_nh, "limit_d", unified_pitch_gains_.limit_d, 20.0);
 
     // Load unified-mode PID gains for XY and Z (used when formation is assembled)
     ros::NodeHandle u_xy_nh(control_nh, "unified_xy");

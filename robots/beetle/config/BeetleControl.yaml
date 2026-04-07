@@ -55,15 +55,7 @@ controller:
     xy_gain: 0.3      # X/Y feedforward gain [0,1]; start conservative (horizontal less reliable)
     torque_gain: 0.5  # Roll/Pitch/Yaw torque feedforward gain [0,1]; start conservative
 
-  # ========== Cascade control for unified mode ==========
-  # Torque-level gains sent to spinal via RollPitchYawTerms.
-  # Spinal does P+D at 1000Hz; PC retains I-term only.
-  cascade_roll_p: 8.0
-  cascade_roll_d: 5.0
-  cascade_pitch_p: 8.0
-  cascade_pitch_d: 5.0
-  cascade_yaw_d: 2.5
-  yaw_in_allocation: false  # false: single-channel yaw (spinal-only), true: include yaw in QP
+  yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
   tgt_angle_lpf_alpha: 0.3
 
   # Full-vector constrained QP allocation
@@ -147,17 +139,26 @@ controller:
     need_d_control: true
 
   # Unified-mode PID gains for roll/pitch.
-  # Applied ONLY when entering unified control mode; restored on exit.
-  # Roll/Pitch: only i_gain is used on PC (P+D handled by spinal cascade).
+  # Applied when entering unified control mode; restored on exit.
+  # P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
+  # I-term is retained on PC for slow formation-level bias correction.
   unified_roll:
+    p_gain: 8.0
     i_gain: 1.0
+    d_gain: 5.0
     limit_sum: 50.0
+    limit_p: 20.0
     limit_i: 10.0
+    limit_d: 20.0
 
   unified_pitch:
+    p_gain: 8.0
     i_gain: 3.0
+    d_gain: 5.0
     limit_sum: 50.0
+    limit_p: 20.0
     limit_i: 20.0
+    limit_d: 20.0
 
   unified_xy:
     p_gain: 10.0
@@ -179,9 +180,8 @@ controller:
     limit_d: 25.0
 
   # Unified-mode yaw PID gains.
-  # Full P+I+D used on PC side; spinal adds D-only damping via cascade_yaw_d.
-  # When yaw_in_allocation=true, yaw PID output participates in 6-DOF QP allocation
-  # (same as GimbalRotor standard mode). Otherwise single-channel spinal broadcast.
+  # Full P+I+D on PC side. D-gain also sent to spinal for high-freq damping.
+  # When yaw_in_allocation=true, yaw PID output participates in 6-DOF QP allocation.
   unified_yaw:
     p_gain: 15.0
     i_gain: 1.0

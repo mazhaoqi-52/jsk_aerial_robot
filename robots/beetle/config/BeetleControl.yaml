@@ -163,7 +163,7 @@ controller:
   unified_xy:
     p_gain: 10.0
     i_gain: 0.15
-    d_gain: 3        # ζ = 5.5/(2×√10) = 0.870 (was 4.0, ζ=0.632 underdamped)
+    d_gain: 6        # ζ = 5.5/(2×√10) = 0.870 (was 4.0, ζ=0.632 underdamped)
     err_d_lpf_cutoff_freq: 3.5  # 3.5→1.5 Hz: suppress D-term noise at low-freq oscillation (0.15-0.2Hz)
     limit_sum: 8.0
     limit_p: 12.0
@@ -185,7 +185,7 @@ controller:
   unified_yaw:
     p_gain: 15.0
     i_gain: 1.0
-    d_gain: 10.0
+    d_gain: 5.0
     limit_err_p: 0.4
     limit_sum: 20.0
     limit_p: 20.0

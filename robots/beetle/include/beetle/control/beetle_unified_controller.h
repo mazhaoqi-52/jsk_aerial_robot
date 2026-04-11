@@ -100,8 +100,24 @@ public:
    *  Call when entering unified mode so rate limits start clean. */
   void resetQPState() {
     prev_vectoring_f_.resize(0);
+    prev_gimbal_angles_.resize(0);
     qp_n_vars_ = -1;
     qp_n_constraints_ = -1;
+  }
+
+  void setFormationModelOverride(double formation_mass,
+                                 const Eigen::Vector3d& formation_cog_offset,
+                                 const Eigen::Matrix3d& formation_inertia)
+  {
+    use_external_formation_model_ = true;
+    external_formation_mass_ = formation_mass;
+    external_formation_cog_offset_ = formation_cog_offset;
+    external_formation_inertia_ = formation_inertia;
+  }
+
+  void clearFormationModelOverride()
+  {
+    use_external_formation_model_ = false;
   }
 
   /** @brief Update formation CoG offset and inertia from current TF. */
@@ -175,6 +191,10 @@ private:
   double formation_mass_;
   Eigen::Vector3d formation_cog_offset_;
   Eigen::Matrix3d formation_inertia_;
+  bool use_external_formation_model_;
+  double external_formation_mass_;
+  Eigen::Vector3d external_formation_cog_offset_;
+  Eigen::Matrix3d external_formation_inertia_;
 
   // Allocation matrices
   Eigen::MatrixXd integrated_map_;        // 6 x (rotor_coef * total_rotors)
@@ -240,10 +260,12 @@ private:
   double alloc_t_max_;                // per-rotor thrust upper bound [N]
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
   double alloc_rate_limit_;           // max force change per step [N/step], 0 = disabled
+  double alloc_angle_rate_limit_rad_; // max gimbal angle change per step [rad/step], 0 = disabled
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
   int qp_n_constraints_;              // number of linear constraints, -1 = uninit
   std::unique_ptr<OsqpEigen::Solver> qp_solver_;
   Eigen::VectorXd prev_vectoring_f_;  // previous step's solution for rate limiting & warm start
+  Eigen::VectorXd prev_gimbal_angles_; // previous gimbal angles for angle-rate limiting
 
   /**
    * @brief Full-vector constrained QP allocation.

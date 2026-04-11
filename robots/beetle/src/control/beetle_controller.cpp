@@ -17,6 +17,10 @@ namespace aerial_robot_control
     follower_unified_active_(false),
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
+    unified_reference_formation_mass_(0.0),
+    unified_reference_formation_cog_offset_(Eigen::Vector3d::Zero()),
+    unified_reference_formation_inertia_(Eigen::Matrix3d::Zero()),
+    unified_reference_has_formation_model_(false),
     unified_reference_yaw_pid_raw_(0.0),
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
@@ -819,6 +823,7 @@ namespace aerial_robot_control
       // --- Run unified 6-DOF allocation ---
       // formation_desired_wrench_ is set via the formation_desired_wrench topic (feedforward).
       // It carries the full 6D contact wrench for manipulation tasks (pulling, valve rotation).
+      unified_controller_->clearFormationModelOverride();
       bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
 
       if (ok) {
@@ -1011,6 +1016,17 @@ namespace aerial_robot_control
       bool have_valid_cmd = haveFreshUnifiedReference(0.5);
 
       if (have_valid_cmd) {
+        if (unified_reference_has_formation_model_) {
+          unified_controller_->setFormationModelOverride(
+              unified_reference_formation_mass_,
+              unified_reference_formation_cog_offset_,
+              unified_reference_formation_inertia_);
+        } else {
+          unified_controller_->clearFormationModelOverride();
+          ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d missing formation model in unified reference, falling back to local reconstruction",
+                            beetle_navigator_->getMyID());
+        }
+
         bool alloc_ok = unified_controller_->computeUnifiedAllocation(
             unified_reference_wrench_acc_, unified_reference_desired_wrench_,
             unified_reference_yaw_pid_raw_);
@@ -1517,6 +1533,8 @@ namespace aerial_robot_control
     unified_reference_sub_.shutdown();
     unified_reference_leader_id_ = -1;
     unified_reference_warmup_count_ = 0;
+    unified_reference_has_formation_model_ = false;
+    unified_controller_->clearFormationModelOverride();
   }
 
   void BeetleController::ensureUnifiedReferenceSubscription()
@@ -1591,13 +1609,25 @@ namespace aerial_robot_control
     msg.desired_wrench.torque.x = desired_wrench(3);
     msg.desired_wrench.torque.y = desired_wrench(4);
     msg.desired_wrench.torque.z = desired_wrench(5);
+    msg.formation_mass = unified_controller_->getFormationMass();
+    const Eigen::Vector3d& formation_cog_offset = unified_controller_->getFormationCogOffset();
+    msg.formation_cog_offset.x = formation_cog_offset.x();
+    msg.formation_cog_offset.y = formation_cog_offset.y();
+    msg.formation_cog_offset.z = formation_cog_offset.z();
+    const Eigen::Matrix3d& formation_inertia = unified_controller_->getFormationInertia();
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 3; c++) {
+        msg.formation_inertia[r * 3 + c] = formation_inertia(r, c);
+      }
+    }
     msg.yaw_pid_raw = yaw_pid_raw;
     unified_reference_pub_.publish(msg);
 
     ROS_INFO_THROTTLE(1.0,
-                      "[UnifiedCtrl REF_PUB] leader_id=%d stamp=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+                      "[UnifiedCtrl REF_PUB] leader_id=%d stamp=%.4f mass=%.3f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
                       beetle_navigator_->getMyID(),
                       msg.header.stamp.toSec(),
+                      msg.formation_mass,
                       target_wrench_acc(2),
                       target_wrench_acc(4),
                       yaw_pid_raw);
@@ -1618,16 +1648,27 @@ namespace aerial_robot_control
     unified_reference_desired_wrench_(3) = msg.desired_wrench.torque.x;
     unified_reference_desired_wrench_(4) = msg.desired_wrench.torque.y;
     unified_reference_desired_wrench_(5) = msg.desired_wrench.torque.z;
+    unified_reference_formation_mass_ = msg.formation_mass;
+    unified_reference_formation_cog_offset_ << msg.formation_cog_offset.x,
+        msg.formation_cog_offset.y,
+        msg.formation_cog_offset.z;
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 3; c++) {
+        unified_reference_formation_inertia_(r, c) = msg.formation_inertia[r * 3 + c];
+      }
+    }
+    unified_reference_has_formation_model_ = (unified_reference_formation_mass_ > 0.0);
     unified_reference_yaw_pid_raw_ = msg.yaw_pid_raw;
 
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
 
     ROS_INFO_THROTTLE(1.0,
-              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f mass=%.3f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
               beetle_navigator_->getMyID(),
               beetle_navigator_->getLeaderID(),
               (ros::Time::now() - unified_cmd_stamp_).toSec(),
+              unified_reference_formation_mass_,
               unified_reference_wrench_acc_(2),
               unified_reference_wrench_acc_(4),
               unified_reference_yaw_pid_raw_);

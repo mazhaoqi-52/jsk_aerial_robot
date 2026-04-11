@@ -174,6 +174,10 @@ namespace aerial_robot_control
     ros::Time unified_cmd_stamp_;
     Eigen::VectorXd unified_reference_wrench_acc_;
     Eigen::VectorXd unified_reference_desired_wrench_;
+    double unified_reference_formation_mass_;
+    Eigen::Vector3d unified_reference_formation_cog_offset_;
+    Eigen::Matrix3d unified_reference_formation_inertia_;
+    bool unified_reference_has_formation_model_;
     double unified_reference_yaw_pid_raw_;
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;

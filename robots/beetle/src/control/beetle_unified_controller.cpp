@@ -22,6 +22,10 @@ BeetleUnifiedController::BeetleUnifiedController()
     formation_mass_(0),
     formation_cog_offset_(Eigen::Vector3d::Zero()),
     formation_inertia_(Eigen::Matrix3d::Zero()),
+    use_external_formation_model_(false),
+    external_formation_mass_(0),
+    external_formation_cog_offset_(Eigen::Vector3d::Zero()),
+    external_formation_inertia_(Eigen::Matrix3d::Zero()),
     target_roll_(0),
     target_pitch_(0),
     candidate_yaw_term_(0),
@@ -42,6 +46,7 @@ BeetleUnifiedController::BeetleUnifiedController()
     alloc_t_max_(20.0),
     alloc_gimbal_limit_rad_(M_PI / 2.0),
     alloc_rate_limit_(0.0),
+    alloc_angle_rate_limit_rad_(0.0),
     qp_n_vars_(-1),
     qp_n_constraints_(-1),
     qp_solver_(std::make_unique<OsqpEigen::Solver>())
@@ -93,13 +98,27 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_lambda", alloc_lambda_, 1e-4);
   control_nh.param<double>("alloc_t_max", alloc_t_max_, 20.0);
   control_nh.param<double>("alloc_rate_limit", alloc_rate_limit_, 0.0);
+  double angle_rate_limit_deg;
+  control_nh.param<double>("alloc_angle_rate_limit_deg", angle_rate_limit_deg, 0.0);
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
   alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
+  alloc_angle_rate_limit_rad_ = angle_rate_limit_deg * M_PI / 180.0;
 }
 
 bool BeetleUnifiedController::updateFormationGeometry()
 {
+  if (use_external_formation_model_) {
+    if (external_formation_mass_ <= 0.0) {
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Invalid external formation mass %.4f", external_formation_mass_);
+      return false;
+    }
+    formation_mass_ = external_formation_mass_;
+    formation_cog_offset_ = external_formation_cog_offset_;
+    formation_inertia_ = external_formation_inertia_;
+    return true;
+  }
+
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) return false;
 
@@ -316,6 +335,20 @@ bool BeetleUnifiedController::solveFullVectorQP(
   const double tan_limit = std::tan(alloc_gimbal_limit_rad_);
   const bool use_rate_limit = (alloc_rate_limit_ > 0.0 &&
                                prev_vectoring_f_.size() == n_cols);
+  const bool use_angle_rate_limit = (rotor_coef_ == 2 &&
+                                     alloc_angle_rate_limit_rad_ > 0.0 &&
+                                     prev_vectoring_f_.size() == n_cols &&
+                                     prev_gimbal_angles_.size() == n_rotors);
+
+  int n_angle_rate_rows = 0;
+  if (use_angle_rate_limit) {
+    for (int i = 0; i < n_rotors; i++) {
+      double fx_prev = prev_vectoring_f_(2 * i);
+      double fz_prev = prev_vectoring_f_(2 * i + 1);
+      double denom = fx_prev * fx_prev + fz_prev * fz_prev;
+      if (denom > 1e-6) n_angle_rate_rows++;
+    }
+  }
 
   // --- Count constraints ---
   // For rotor_coef == 2:
@@ -324,7 +357,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   int n_gimbal_rows = (rotor_coef_ == 2) ? 2 * n_rotors : 0;
   int n_bound_rows = n_cols;  // one bound per variable
   int n_rate_rows = use_rate_limit ? n_cols : 0;
-  int n_constraints = n_gimbal_rows + n_bound_rows + n_rate_rows;
+  int n_constraints = n_gimbal_rows + n_bound_rows + n_rate_rows + n_angle_rate_rows;
 
   // --- Build Hessian P = A'A + λI ---
   Eigen::MatrixXd P_dense = alloc_matrix.transpose() * alloc_matrix
@@ -334,7 +367,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // --- Build constraint matrix C and bounds [lb, ub] ---
   // C * f ∈ [lb, ub]
   std::vector<Eigen::Triplet<double>> C_trips;
-  C_trips.reserve(n_gimbal_rows * 2 + n_bound_rows + n_rate_rows);
+  C_trips.reserve(n_gimbal_rows * 2 + n_bound_rows + n_rate_rows + n_angle_rate_rows * 2);
   Eigen::VectorXd lb(n_constraints), ub(n_constraints);
 
   int row = 0;
@@ -385,6 +418,29 @@ bool BeetleUnifiedController::solveFullVectorQP(
       C_trips.emplace_back(row, j, 1.0);
       lb(row) = prev_vectoring_f_(j) - alloc_rate_limit_;
       ub(row) = prev_vectoring_f_(j) + alloc_rate_limit_;
+      row++;
+    }
+  }
+
+  // (d) Gimbal angle rate limits (optional): linearize theta = atan2(-fx, fz)
+  // around the previous solution so the commanded angle cannot jump abruptly.
+  if (use_angle_rate_limit) {
+    for (int i = 0; i < n_rotors; i++) {
+      int fx_idx = 2 * i;
+      int fz_idx = 2 * i + 1;
+      double fx_prev = prev_vectoring_f_(fx_idx);
+      double fz_prev = prev_vectoring_f_(fz_idx);
+      double denom = fx_prev * fx_prev + fz_prev * fz_prev;
+      if (denom <= 1e-6) continue;
+
+      double dtheta_dfx = -fz_prev / denom;
+      double dtheta_dfz = fx_prev / denom;
+      double linearized_center = dtheta_dfx * fx_prev + dtheta_dfz * fz_prev;
+
+      C_trips.emplace_back(row, fx_idx, dtheta_dfx);
+      C_trips.emplace_back(row, fz_idx, dtheta_dfz);
+      lb(row) = linearized_center - alloc_angle_rate_limit_rad_;
+      ub(row) = linearized_center + alloc_angle_rate_limit_rad_;
       row++;
     }
   }
@@ -451,6 +507,12 @@ bool BeetleUnifiedController::solveFullVectorQP(
 
   // Store for next step's rate limiting and warm start
   prev_vectoring_f_ = f_sol;
+  if (rotor_coef_ == 2) {
+    prev_gimbal_angles_.resize(n_rotors);
+    for (int i = 0; i < n_rotors; i++) {
+      prev_gimbal_angles_(i) = std::atan2(-f_sol(2 * i), f_sol(2 * i + 1));
+    }
+  }
 
   // Debug: log residual and per-rotor thrust/angle
   {

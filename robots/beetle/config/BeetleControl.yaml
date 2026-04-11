@@ -67,6 +67,7 @@ controller:
   alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   alloc_rate_limit: 5.0         # max force change per step [N/step], 0 = disabled
+  alloc_angle_rate_limit_deg: 10.0  # max gimbal angle change per step [deg/step], 0 = disabled
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

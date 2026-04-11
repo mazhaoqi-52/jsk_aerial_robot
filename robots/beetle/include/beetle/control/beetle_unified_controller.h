@@ -99,8 +99,6 @@ public:
   /** @brief Reset QP solver state (previous solution, solver internals).
    *  Call when entering unified mode so rate limits start clean. */
   void resetQPState() {
-    prev_vectoring_f_.resize(0);
-    prev_gimbal_angles_.resize(0);
     qp_n_vars_ = -1;
     qp_n_constraints_ = -1;
   }
@@ -254,18 +252,13 @@ private:
   // Constraints:
   //   - Gimbal angle:  |f_x| ≤ tan(θ_max) * f_z  (linearized)
   //   - Thrust bound:  each component within [-T_max, T_max], f_z ≥ 0
-  //   - Rate limit:    |f_j^k - f_j^{k-1}| ≤ Δf_max  (optional)
   bool use_constrained_alloc_;        // if true, use OsqpEigen QP; fallback to pseudoinverse
   double alloc_lambda_;               // regularization weight
   double alloc_t_max_;                // per-rotor thrust upper bound [N]
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
-  double alloc_rate_limit_;           // max force change per step [N/step], 0 = disabled
-  double alloc_angle_rate_limit_rad_; // max gimbal angle change per step [rad/step], 0 = disabled
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
   int qp_n_constraints_;              // number of linear constraints, -1 = uninit
   std::unique_ptr<OsqpEigen::Solver> qp_solver_;
-  Eigen::VectorXd prev_vectoring_f_;  // previous step's solution for rate limiting & warm start
-  Eigen::VectorXd prev_gimbal_angles_; // previous gimbal angles for angle-rate limiting
 
   /**
    * @brief Full-vector constrained QP allocation.

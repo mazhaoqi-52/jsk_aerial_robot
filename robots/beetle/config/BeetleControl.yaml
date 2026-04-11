@@ -85,7 +85,7 @@ controller:
   xy:
     p_gain: 10.0
     i_gain: 0.2
-    d_gain: 4.0       # F-6: 5.0→4.0  XY D-term noise is the largest contributor to bt0
+    d_gain: 8.0       # F-6: 5.0→4.0  XY D-term noise is the largest contributor to bt0
     err_d_lpf_cutoff_freq: 3.5  # F-6: NEW  3.5Hz LPF on XY velocity error
     limit_sum: 8.0
     limit_p: 12.0
@@ -129,7 +129,7 @@ controller:
   yaw:
     p_gain: 15.0
     i_gain: 1.0
-    d_gain: 10.0
+    d_gain: 5.0
     limit_err_p: 0.4
     limit_sum: 20.0
     limit_p: 20.0

@@ -134,8 +134,13 @@ namespace aerial_robot_control
     /** @brief Common exit path: restore gains, reset targets, seed Z I-term, clear RP/XY. */
     void resetToIndependentHover();
 
-    /** @brief LEADER mode switch: reset targets, migrate I-terms, zero spinal gains, apply unified gains. */
-    void initUnifiedLeaderMode();
+    /** @brief Unified-mode switch (LEADER or FOLLOWER): reset targets, migrate I-terms,
+     *  configure spinal (all modules if leader, own only if follower), apply unified gains. */
+    void initUnifiedMode(bool is_leader);
+
+    /** @brief Symmetric unified-mode control body. Both leader and follower run the full
+     *  outer PID + formation allocation locally using their own estimator state. */
+    void runUnifiedControlCommon(bool is_leader);
 
     /** @brief Switch roll/pitch PID gains for unified (formation) mode. */
     void applyUnifiedGains();
@@ -172,28 +177,23 @@ namespace aerial_robot_control
     bool unified_cmd_received_;
     bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
+    // Reference msg fields — kept as debug/monitoring only (leader broadcasts,
+    // follower stores). NOT used for follower's control output: follower computes
+    // its own wrench_acc locally in runUnifiedControlCommon().
     Eigen::VectorXd unified_reference_wrench_acc_;
     Eigen::VectorXd unified_reference_desired_wrench_;
-    double unified_reference_formation_mass_;
-    Eigen::Vector3d unified_reference_formation_cog_offset_;
-    Eigen::Matrix3d unified_reference_formation_inertia_;
-    bool unified_reference_has_formation_model_;
     double unified_reference_yaw_pid_raw_;
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;
     int unified_reference_warmup_frames_;
-    int follower_cmd_timeout_count_ = 0;  // consecutive frames without valid unified cmd
-    // T4.1: FOLLOWER holds last command for this many frames before full fallback.
-    // At 40Hz, 20 frames = 0.5s — covers short ROS communication glitches.
-    static constexpr int FOLLOWER_HOLD_LAST_FRAMES = 20;
 
-    // Freeze: cache last independent hover commands to avoid competing publish during transition
-    spinal::FourAxisCommand last_independent_thrust_cmd_;
-    sensor_msgs::JointState last_independent_gimbal_cmd_;
-    bool has_cached_independent_cmd_;  // true once we've cached at least one frame
+    // Differential-mode damping gain: injects a passive dissipation term
+    // -K_damp * inter_wrench/mass into target_wrench_acc, based on
+    // inter_wrench_list_[my_id] (from calcInteractionWrench). Zero = disabled.
+    double unified_diff_damp_gain_;
+
     void unifiedReferenceCallback(const beetle::UnifiedControlReference& msg);
     void ensureUnifiedReferenceSubscription();
-    bool haveFreshUnifiedReference(double max_age) const;
     bool publishLocalUnifiedCommand();
     bool publishLocalUnifiedTorqueAllocationMatrixInv();
     void publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,

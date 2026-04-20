@@ -17,14 +17,11 @@ namespace aerial_robot_control
     follower_unified_active_(false),
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
-    unified_reference_formation_mass_(0.0),
-    unified_reference_formation_cog_offset_(Eigen::Vector3d::Zero()),
-    unified_reference_formation_inertia_(Eigen::Matrix3d::Zero()),
-    unified_reference_has_formation_model_(false),
     unified_reference_yaw_pid_raw_(0.0),
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
+    unified_diff_damp_gain_(0.0),
     unified_transition_count_(-1),
     z_integral_freeze_count_(0),
     z_ki_boost_count_(0),
@@ -43,7 +40,6 @@ namespace aerial_robot_control
     z_ki_boost_factor_(2.0),
     z_ki_boost_frames_default_(60),
     z_ki_boost_factor_default_(2.0),
-    has_cached_independent_cmd_(false),
     gains_switched_(false),
     formation_obs_comp_enable_(false),
     formation_obs_comp_z_gain_(1.0),
@@ -268,7 +264,7 @@ namespace aerial_robot_control
     formation_desired_wrench_.setZero();
   }
 
-  void BeetleController::initUnifiedLeaderMode()
+  void BeetleController::initUnifiedMode(bool is_leader)
   {
     tf::Vector3 cur_pos = estimator_->getPos(Frame::COG, estimate_mode_);
     unified_controller_->updateFormationGeometry();
@@ -453,21 +449,30 @@ namespace aerial_robot_control
                navigator_->getNaviState(), N_modules);
     }
 
-    sendCascadeSetup();       // reads from unified_*_gains_ directly, order-independent
+    if (is_leader) {
+      sendCascadeSetup();     // reads from unified_*_gains_ directly, order-independent
+    } else {
+      sendFollowerCascadeSetup();  // follower: own spinal only
+      ensureUnifiedReferenceSubscription();  // still subscribe for debug/monitoring
+    }
     applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
     spinal_gains_zeroed_ = true;
     unified_transition_count_ = 0;
     unified_reference_warmup_count_ = 0;
 
-    // Phase U2: activate formation observer on entering unified LEADER mode
-    if (formation_observer_) {
+    // Phase U2: activate formation observer on entering unified LEADER mode.
+    // Follower does NOT run observer (leader is the observation point).
+    if (is_leader && formation_observer_) {
       formation_observer_->reset();
       formation_observer_->setActive(true);
       ROS_INFO("[UnifiedCtrl] Formation observer activated (reset + active)");
     }
 
-    ROS_WARN("[UnifiedCtrl] LEADER mode switch: reset targets, sent cascade gains + alloc_inv to all spinals, "
+    ROS_WARN("[UnifiedCtrl] %s id=%d mode switch: reset targets, sent cascade gains%s, "
              "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
+             is_leader ? "LEADER" : "FOLLOWER",
+             beetle_navigator_->getMyID(),
+             is_leader ? " + alloc_inv to all spinals" : " to own spinal",
              unified_reference_warmup_frames_, ros::Time::now().toSec());
     formation_desired_wrench_.setZero();
   }
@@ -483,628 +488,28 @@ namespace aerial_robot_control
     // Note: unified_control_mode_ is now read in update() before routing,
     // so controlCore() always sees the up-to-date value.
 
-    // ======== Unified Control Mode ========
-    // LEADER does full 6-DOF PID (position + attitude) → formation allocation.
-    // Spinal acts as pure PWM executor (zero attitude gains).
-    if (unified_control_mode_ && module_state == LEADER && module_state != SEPARATED) {
-      // Detect mode switch: reset targets and zero spinal gains
-      if (pre_module_state_ != LEADER || !prev_unified_control_mode_) {
-        initUnifiedLeaderMode();
+    // ======== Unified Control Mode (symmetric local control) ========
+    // Both LEADER and FOLLOWER run the full 6-DOF outer PID + formation allocation
+    // locally using their own estimator data. This eliminates the network/CPU delay
+    // from leader→follower reference propagation and allows each module to react
+    // to its own state (IMU/odom) without contamination by a stale peer reference.
+    // LEADER additionally broadcasts a debug reference (for monitoring) and runs
+    // the formation-level momentum observer.
+    if (unified_control_mode_ &&
+        (module_state == LEADER || module_state == FOLLOWER) &&
+        module_state != SEPARATED) {
+      bool is_leader = (module_state == LEADER);
+      bool mode_switch = (pre_module_state_ != module_state) || !prev_unified_control_mode_;
+      if (mode_switch) {
+        initUnifiedMode(is_leader);
       }
       prev_unified_control_mode_ = true;
-
-      // --- Get LEADER state ---
-      pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
-      vel_ = estimator_->getVel(Frame::COG, estimate_mode_);
-      target_pos_ = navigator_->getTargetPos();
-      target_vel_ = navigator_->getTargetVel();
-      target_acc_ = navigator_->getTargetAcc();
-
-      tf::Quaternion cog2baselink_rot;
-      tf::quaternionKDLToTF(robot_model_->getCogDesireOrientation<KDL::Rotation>(), cog2baselink_rot);
-      tf::Matrix3x3 cog_rot = estimator_->getOrientation(Frame::BASELINK, estimate_mode_) * tf::Matrix3x3(cog2baselink_rot).inverse();
-      double r, p, y_angle; cog_rot.getRPY(r, p, y_angle);
-      rpy_.setValue(r, p, y_angle);
-
-      omega_ = estimator_->getAngularVel(Frame::COG, estimate_mode_);
-      target_rpy_ = navigator_->getTargetRPY();
-
-      // T3.2: In unified mode, the PC-side attitude PID controls roll/pitch directly
-      // (spinal attitude PID is zeroed). Use FinalTargetBaselinkRPY as the attitude
-      // setpoint — this is what the user commands via joystick or FlightNav messages.
-      // In independent mode, target_rpy_ roll/pitch comes from position PID (acc→angle),
-      // but in unified mode we do full 6-DOF PID, so we use the explicit command.
-      {
-        tf::Vector3 baselink_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
-        target_rpy_.setX(baselink_rpy.x());  // roll target
-        target_rpy_.setY(baselink_rpy.y());  // pitch target
-        // yaw is already set from navigator_->getTargetRPY().z()
-      }
-
-      tf::Matrix3x3 target_rot; target_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
-      tf::Vector3 target_omega = navigator_->getTargetOmega();
-      target_omega_ = cog_rot.inverse() * target_rot * target_omega;
-      target_ang_acc_ = navigator_->getTargetAngAcc();
-
-      // --- Compute formation CoG position in world frame ---
-      unified_controller_->updateFormationGeometry();
-      const Eigen::Vector3d& cog_offset = unified_controller_->getFormationCogOffset();
-      tf::Vector3 offset_body(cog_offset.x(), cog_offset.y(), cog_offset.z());
-      tf::Vector3 offset_world = cog_rot * offset_body;
-      tf::Vector3 formation_pos = pos_ + offset_world;
-      tf::Vector3 omega_world = cog_rot * omega_;
-      tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
-      tf::Vector3 target_formation_pos = target_pos_ + target_rot * offset_body;
-
-      // --- Position PID (X/Y/Z) with formation CoG ---
-      double du = ros::Time::now().toSec() - control_timestamp_;
-
-      // UO-4: inject formation observer X/Y horizontal force as feedforward.
-      // f_ext_body → world frame via cog_rot → divide by M → negate (oppose disturbance).
-      // Only active when: comp enabled, bias calibrated, not force-landing.
-      if (formation_obs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isBiasCalibrated() &&
-          !navigator_->getForceLandingFlag())
-      {
-        Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
-        tf::Vector3 f_world = cog_rot * tf::Vector3(f_body.x(), f_body.y(), f_body.z());
-        double mass = std::max(unified_controller_->getFormationMass(), 0.01);
-        pid_controllers_.at(X).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.x() / mass);
-        pid_controllers_.at(Y).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.y() / mass);
-      }
-      else
-      {
-        pid_controllers_.at(X).setPersistentFF(0.0);
-        pid_controllers_.at(Y).setPersistentFF(0.0);
-      }
-
-      switch(navigator_->getXyControlMode()) {
-        case aerial_robot_navigation::POS_CONTROL_MODE:
-          pid_controllers_.at(X).update(target_formation_pos.x() - formation_pos.x(), du,
-                                        target_vel_.x() - formation_vel.x(), target_acc_.x());
-          pid_controllers_.at(Y).update(target_formation_pos.y() - formation_pos.y(), du,
-                                        target_vel_.y() - formation_vel.y(), target_acc_.y());
-          break;
-        case aerial_robot_navigation::VEL_CONTROL_MODE:
-          pid_controllers_.at(X).update(0, du, target_vel_.x() - formation_vel.x(), target_acc_.x());
-          pid_controllers_.at(Y).update(0, du, target_vel_.y() - formation_vel.y(), target_acc_.y());
-          break;
-        case aerial_robot_navigation::ACC_CONTROL_MODE:
-          pid_controllers_.at(X).update(0, du, 0, target_acc_.x());
-          pid_controllers_.at(Y).update(0, du, 0, target_acc_.y());
-          break;
-        default: break;
-      }
-      if(navigator_->getForceLandingFlag()) {
-        pid_controllers_.at(X).reset();
-        pid_controllers_.at(Y).reset();
-      }
-
-      double err_z = target_formation_pos.z() - formation_pos.z();
-      double err_v_z = target_vel_.z() - formation_vel.z();
-      double z_p_limit = pid_controllers_.at(Z).getLimitP();
-      if(navigator_->getForceLandingFlag()) {
-        pid_controllers_.at(Z).setLimitP(0);
-        err_z = force_landing_descending_rate_;
-        err_v_z = 0;
-        target_acc_.setZ(0);
-      }
-
-      // UO-4: inject formation observer estimated external force as slow Z feedforward.
-      // Compensation: if observer detects downward load (f_body_z < 0), add upward FF.
-      // Only active when: comp enabled, bias calibrated, not force-landing.
-      // Sign: ff = -f_ext_body_z / M  (oppose the estimated load direction).
-      // NOTE: verify sign with E2 experiment before trusting for real compensation.
-      if (formation_obs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isBiasCalibrated() &&
-          !navigator_->getForceLandingFlag())
-      {
-        double fz_body = formation_observer_->getEstExternalForceBody().z();
-        double ff_z = -formation_obs_comp_z_gain_ * fz_body /
-                      std::max(unified_controller_->getFormationMass(), 0.01);
-        pid_controllers_.at(Z).setPersistentFF(ff_z);
-        ROS_INFO_THROTTLE(2.0, "[UO4_FF] f_body_z=%.3f N → ff_z=%.4f m/s²",
-                          fz_body, ff_z);
-      }
-      else
-      {
-        pid_controllers_.at(Z).setPersistentFF(0.0);
-      }
-
-      pid_controllers_.at(Z).update(err_z, du, err_v_z, target_acc_.z());
-      // In unified mode, Z I-term is allowed to be negative (explicit gravity FF handles g,
-      // so I-term only compensates model bias which can be positive or negative).
-      // The floor>=0 constraint is only applied in the independent mode path (base class).
-
-      // Integral freeze: during the first few frames after mode switch,
-      // revert Z I-term to its pre-update value to avoid eating transient errors
-      // (CoG jump, pitch moment onset, etc.)
-      if (z_integral_freeze_count_ > 0) {
-        pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
-        z_integral_freeze_count_--;
-      }
-      // Ki-boost (D' scheme): after freeze ends, accelerate Z I-term convergence
-      // by adding extra integral increment: err_i += err_p * dt * (boost_factor - 1).
-      // The normal PID::update() already did err_i += err_p * dt * 1, so total
-      // effective rate = boost_factor * Ki.
-      // AW1: if any motor thrust (from PREVIOUS frame's allocation) is near its
-      // min/max limit, suppress the boost to prevent windup when allocation is saturated.
-      else if (z_ki_boost_count_ > 0) {
-        if (!unified_controller_->isAllocationSaturated()) {
-          // Apply boost: add extra (boost_factor - 1) × err_p × dt to err_i
-          double clamped_err_p = pid_controllers_.at(Z).getErrP();  // already clamped by PID::update
-          double extra_increment = clamped_err_p * du * (z_ki_boost_factor_ - 1.0);
-          double new_err_i = pid_controllers_.at(Z).getErrI() + extra_increment;
-
-          // Respect err_i limits
-          double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
-          double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
-          new_err_i = boost::algorithm::clamp(new_err_i, -iz_limit, iz_limit);
-          pid_controllers_.at(Z).setErrI(new_err_i);
-        }
-
-        z_ki_boost_count_--;
-      }
-
-      if(navigator_->getForceLandingFlag()) {
-        pid_controllers_.at(Z).setLimitP(z_p_limit);
-        pid_controllers_.at(Z).setErrP(0);
-      }
-
-      // --- Attitude PID (Roll/Pitch/Yaw) ---
-      // Unified path bypasses PoseLinearController::controlCore(), so replicate
-      // the start_rp_integration_ height check here (same logic as base class).
-      if (!start_rp_integration_) {
-        if (pos_.z() - navigator_->getInitHeight() > start_rp_integration_height_) {
-          start_rp_integration_ = true;
-          spinal::FlightConfigCmd flight_config_cmd;
-          flight_config_cmd.cmd = spinal::FlightConfigCmd::INTEGRATION_CONTROL_ON_CMD;
-          navigator_->getFlightConfigPublisher().publish(flight_config_cmd);
-          ROS_WARN("[UnifiedCtrl] start roll/pitch I control (height threshold passed)");
-        }
-      }
-      double du_rp = du;
-      if(!start_rp_integration_) du_rp = 0;
-
-      // UO-4: inject formation observer torque estimate as Roll/Pitch/Yaw feedforward.
-      // tau_ext (N·m, body) → alpha_ext (rad/s²) via I^{-1}; negate to oppose the disturbance.
-      if (formation_obs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isBiasCalibrated() &&
-          !navigator_->getForceLandingFlag())
-      {
-        Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
-        Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
-        double tgain = formation_obs_comp_torque_gain_;
-        pid_controllers_.at(ROLL).setPersistentFF(-tgain * alpha_ext.x());
-        pid_controllers_.at(PITCH).setPersistentFF(-tgain * alpha_ext.y());
-        pid_controllers_.at(YAW).setPersistentFF(-tgain * alpha_ext.z());
-      }
-      else
-      {
-        pid_controllers_.at(ROLL).setPersistentFF(0.0);
-        pid_controllers_.at(PITCH).setPersistentFF(0.0);
-        pid_controllers_.at(YAW).setPersistentFF(0.0);
-      }
-
-      pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp,
-                                       target_omega_.x() - omega_.x(), target_ang_acc_.x());
-      pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
-                                        target_omega_.y() - omega_.y(), target_ang_acc_.y());
-
-      // --- Roll/Pitch I-term freeze + boost (mirrors Z axis logic) ---
-      // Freeze: revert I-term to pre-update value for the first few frames
-      if (rp_integral_freeze_count_ > 0) {
-        pid_controllers_.at(ROLL).setErrI(pid_controllers_.at(ROLL).getPrevErrI());
-        pid_controllers_.at(PITCH).setErrI(pid_controllers_.at(PITCH).getPrevErrI());
-        rp_integral_freeze_count_--;
-      }
-      // Boost: after freeze ends, accelerate I-term convergence
-      else if (rp_ki_boost_count_ > 0) {
-        if (!unified_controller_->isAllocationSaturated()) {
-          // Roll boost
-          {
-            double err_p_roll = pid_controllers_.at(ROLL).getErrP();
-            double extra = err_p_roll * du_rp * (RP_KI_BOOST_FACTOR - 1.0);
-            double new_i = pid_controllers_.at(ROLL).getErrI() + extra;
-            double Ki_r = std::max(pid_controllers_.at(ROLL).getIGain(), 1e-6);
-            double lim_r = pid_controllers_.at(ROLL).getLimitI() / Ki_r;
-            new_i = boost::algorithm::clamp(new_i, -lim_r, lim_r);
-            pid_controllers_.at(ROLL).setErrI(new_i);
-          }
-          // Pitch boost
-          {
-            double err_p_pitch = pid_controllers_.at(PITCH).getErrP();
-            double extra = err_p_pitch * du_rp * (RP_KI_BOOST_FACTOR - 1.0);
-            double new_i = pid_controllers_.at(PITCH).getErrI() + extra;
-            double Ki_p = std::max(pid_controllers_.at(PITCH).getIGain(), 1e-6);
-            double lim_p = pid_controllers_.at(PITCH).getLimitI() / Ki_p;
-            new_i = boost::algorithm::clamp(new_i, -lim_p, lim_p);
-            pid_controllers_.at(PITCH).setErrI(new_i);
-          }
-        }
-
-        rp_ki_boost_count_--;
-      }
-
-      double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
-      double err_omega_z = target_omega_.z() - omega_.z();
-      if(!need_yaw_d_control_) err_omega_z = target_omega_.z();
-      pid_controllers_.at(YAW).update(err_yaw, du, err_omega_z, target_ang_acc_.z());
-
-      control_timestamp_ = ros::Time::now().toSec();
-
-      // Debug: periodically log unified PID state for oscillation diagnosis
-      ROS_DEBUG_THROTTLE(0.5, "[UnifiedCtrl PID] "
-               "pos_err(%.3f,%.3f,%.3f) "
-               "X[P=%.3f I=%.3f D=%.3f sum=%.3f] "
-               "Z[P=%.3f I=%.3f D=%.3f sum=%.3f] "
-               "gains_xy(P=%.1f I=%.1f D=%.1f)",
-               target_formation_pos.x() - formation_pos.x(),
-               target_formation_pos.y() - formation_pos.y(),
-               err_z,
-               pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(), pid_controllers_.at(X).getDTerm(), pid_controllers_.at(X).result(),
-               pid_controllers_.at(Z).getPTerm(), pid_controllers_.at(Z).getITerm(), pid_controllers_.at(Z).getDTerm(), pid_controllers_.at(Z).result(),
-               unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d);
-
-      // Stage-2 startup warmup:
-      // After entering unified mode, keep the leader-side I terms frozen for a short,
-      // purely local window so followers have time to receive the first shared
-      // reference and complete their own local allocation/pickup path.
-      if (unified_reference_warmup_count_ < unified_reference_warmup_frames_) {
-        // Hover → Unified: freeze I-terms to prevent buildup while inner loops aren't synced.
-        // Ground start (TAKEOFF_STATE): skip freeze — I-terms start from zero, freezing
-        // only delays Z integral accumulation and slows the thrust ramp.
-        if (navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE) {
-          pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
-          pid_controllers_.at(ROLL).setErrI(pid_controllers_.at(ROLL).getPrevErrI());
-          pid_controllers_.at(PITCH).setErrI(pid_controllers_.at(PITCH).getPrevErrI());
-          pid_controllers_.at(X).setErrI(pid_controllers_.at(X).getPrevErrI());
-          pid_controllers_.at(Y).setErrI(pid_controllers_.at(Y).getPrevErrI());
-
-          if (z_integral_freeze_count_ == 0 && z_ki_boost_count_ == 0) {
-            z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
-          }
-          if (rp_integral_freeze_count_ == 0 && rp_ki_boost_count_ == 0) {
-            rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
-          }
-        }
-
-        unified_reference_warmup_count_++;
-        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl LEADER] Local warmup active "
-                          "(%d/%d frames, I-terms %s)",
-                          unified_reference_warmup_count_,
-                          unified_reference_warmup_frames_,
-                          (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) ? "accumulating" : "frozen");
-      }
-
-      // --- Build 6-DOF target wrench in acceleration space ---
-      // CASCADE: Roll/Pitch use I-TERM ONLY in wrench_acc.
-      // P+D are handled by spinal at 1000Hz using cascade gains.
-      // Yaw uses full PID (no cascade for yaw yet).
-      tf::Matrix3x3 uav_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
-      tf::Vector3 target_acc_w(pid_controllers_.at(X).result(),
-                               pid_controllers_.at(Y).result(),
-                               pid_controllers_.at(Z).result());
-      tf::Vector3 target_acc_cog = uav_rot.inverse() * target_acc_w;
-
-      Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
-      target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
-      // Roll/Pitch: I-term only (spinal does P+D at 1000Hz)
-      target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
-      target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
-      // Yaw handling in unified mode:
-      //  - yaw_in_allocation_=false: single-channel yaw (bypass allocation, spinal-only)
-      //  - yaw_in_allocation_=true : yaw participates in allocation
-      double yaw_pid_raw = pid_controllers_.at(YAW).result();
-      target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
-
-      // Gravity feedforward: spinal's inner loop sees angles[0/1] as target roll/pitch,
-      // but does NOT add gravity. PC must provide gravity compensation in body Z.
-      // During TAKEOFF_STATE, ramp gravity FF from 0→1 over ~0.5s (20 frames @40Hz)
-      // to avoid instantaneous full-thrust "pop-up". In HOVER/LAND the ramp is 1.0.
-      {
-        tf::Matrix3x3 uav_rot_ff = estimator_->getOrientation(Frame::COG, estimate_mode_);
-        tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
-        tf::Vector3 gravity_cog = uav_rot_ff.inverse() * gravity_w;
-        double gravity_ramp = 1.0;
-        if (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) {
-          constexpr int GRAVITY_RAMP_FRAMES = 20;  // ~0.5s @40Hz
-          gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
-        }
-        target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
-      }
-
-      // NOTE: Gyro compensation (ω × I·ω) is NOT added here.
-      // In cascade mode, spinal handles gyro internally at 1000Hz.
-
-      // Store for external wrench estimator
-      setTargetWrenchAccCog(target_wrench_acc);
-
-      // --- Run unified 6-DOF allocation ---
-      // formation_desired_wrench_ is set via the formation_desired_wrench topic (feedforward).
-      // It carries the full 6D contact wrench for manipulation tasks (pulling, valve rotation).
-      unified_controller_->clearFormationModelOverride();
-      bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
-
-      if (ok) {
-        // Stage-1 distributed unified mode:
-        // LEADER broadcasts a common reference, and every module computes the
-        // same unified allocation locally before picking its own block.
-        publishUnifiedReference(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
-        publishLocalUnifiedCommand();
-
-        // ---- Formation Momentum Observer (Phase U2) ----
-        // Feed the observer with formation-level data.
-        // Input: realized wrench from allocation (A * f), NOT PID command.
-        // This is cascade-agnostic and represents the actual control applied.
-        if (formation_observer_ && formation_observer_->isActive()) {
-          // Formation CoG velocity in world frame:
-          //   v_formation = v_leader + omega × r_offset
-          // where r_offset = formation_cog_offset in world frame.
-          tf::Matrix3x3 uav_rot_obs = estimator_->getOrientation(Frame::COG, estimate_mode_);
-          Eigen::Matrix3d cog_rot_eigen;
-          tf::matrixTFToEigen(uav_rot_obs, cog_rot_eigen);
-
-          const Eigen::Vector3d& cog_offset = unified_controller_->getFormationCogOffset();
-          Eigen::Vector3d offset_w = cog_rot_eigen * cog_offset;
-
-          // Use IMU-filtered signals (same as single-module observer) to avoid
-          // formation inertia amplifying raw IMU noise (~50x without filtering).
-          auto imu_handler_obs = boost::dynamic_pointer_cast<sensor_plugin::Imu>(
-              estimator_->getImuHandler(0));
-          Eigen::Vector3d vel_leader_w, omega_body;
-          tf::vectorTFToEigen(imu_handler_obs->getFilteredVelCog(), vel_leader_w);
-          tf::vectorTFToEigen(imu_handler_obs->getFilteredOmegaCog(), omega_body);
-
-          // Formation CoG velocity: v_f = v_leader + omega_w × r_offset_w
-          Eigen::Vector3d omega_w = cog_rot_eigen * omega_body;
-          Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
-
-          // Realized wrench from allocation (body frame)
-          Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
-
-            formation_observer_->setBiasCalibrationAllowed(
-              navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
-
-          // Observer dt: use the same du as PID (interval between controlCore calls).
-          // NOTE: do NOT use (ros::Time::now() - control_timestamp_) here because
-          // control_timestamp_ was already updated earlier in this same frame,
-          // giving dt ≈ 0 which triggers the sanity check and skips the update.
-          formation_observer_->update(
-              unified_controller_->getFormationMass(),
-              unified_controller_->getFormationInertia(),
-              cog_rot_eigen,
-              vel_formation_w,
-              omega_body,
-              realized_wrench,
-              du);
-        }
-      }
-
-      if (unified_transition_count_ >= 0)
-        unified_transition_count_++;
-
-      ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl LEADER] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d yaw_raw=%.4f yaw_alloc=%s",
-                        target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
-            target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5), ok,
-            yaw_pid_raw, yaw_in_allocation_ ? "ON" : "OFF");
-
-      {
-        const auto& module_commands = unified_controller_->getModuleCommands();
-        double max_abs_gimbal_deg = 0.0;
-        double max_abs_fx = 0.0;
-        double max_abs_fz = 0.0;
-        double max_thrust = 0.0;
-
-        for (const auto& module_command : module_commands) {
-          for (double angle_rad : module_command.second.gimbal_angles) {
-            max_abs_gimbal_deg = std::max(max_abs_gimbal_deg,
-                                          std::abs(angle_rad) * 180.0 / M_PI);
-          }
-          for (float thrust : module_command.second.full_thrusts) {
-            max_thrust = std::max(max_thrust, static_cast<double>(std::abs(thrust)));
-          }
-        }
-
-        const Eigen::VectorXd& vectoring_force = unified_controller_->getTargetVectoringForce();
-        for (int index = 0; index + 1 < vectoring_force.size(); index += 2) {
-          max_abs_fx = std::max(max_abs_fx, std::abs(vectoring_force(index)));
-          max_abs_fz = std::max(max_abs_fz, std::abs(vectoring_force(index + 1)));
-        }
-
-        ROS_WARN_THROTTLE(0.5,
-                          "[UnifiedCtrl SERVO_DIAG] roll_tgt=%.3f pitch_tgt=%.3f yaw_raw=%.3f yaw_cmd=%.3f yaw_alloc=%s max_gimbal=%.1fdeg max_thrust=%.2f max|fx|=%.2f max|fz|=%.2f",
-                          unified_controller_->getTargetRoll(),
-                          unified_controller_->getTargetPitch(),
-                          yaw_pid_raw,
-                          unified_controller_->getCandidateYawTerm(),
-                          yaw_in_allocation_ ? "ON" : "OFF",
-                          max_abs_gimbal_deg,
-                          max_thrust,
-                          max_abs_fx,
-                          max_abs_fz);
-
-        if (yaw_in_allocation_ && std::abs(unified_controller_->getCandidateYawTerm()) > 0.5) {
-          ROS_WARN_THROTTLE(0.5,
-                            "[UnifiedCtrl YAW_DIAG] yaw is active in both allocation and spinal reconstruction: yaw_raw=%.3f target_wrench_yaw=%.3f candidate_yaw_term=%.3f",
-                            yaw_pid_raw,
-                            target_wrench_acc(5),
-                            unified_controller_->getCandidateYawTerm());
-        }
-      }
-
-      // Formation observer diagnostic (Phase U2, debug-only)
-      if (formation_observer_ && formation_observer_->isActive() && formation_observer_->isInitialized()) {
-        const Eigen::Vector3d fext_w = formation_observer_->getEstExternalForceWorld();  // bias-subtracted
-        Eigen::Vector3d fext_b = formation_observer_->getEstExternalForceBody();         // bias-subtracted
-        ROS_INFO_THROTTLE(2.0, "[FormObs] corrected_w=(%.3f,%.3f,%.3f) corrected_b=(%.3f,%.3f,%.3f) |f|=%.3f bias_cal=%s",
-                          fext_w.x(), fext_w.y(), fext_w.z(),
-                          fext_b.x(), fext_b.y(), fext_b.z(),
-                          fext_w.norm(),
-                          formation_observer_->isBiasCalibrated() ? "YES" : "NO");
-      }
-
-      // Steady-state diagnostics: attitude error, position error, I-terms, saturation
-      ROS_INFO_THROTTLE(5.0, "[UnifiedCtrl DIAG] roll_err=%.4f pitch_err=%.4f yaw_err=%.4f "
-                        "z_err=%.4f | I: roll=%.4f pitch=%.4f z=%.4f | sat=%s",
-                        target_rpy_.x() - rpy_.x(),
-                        target_rpy_.y() - rpy_.y(),
-                        angles::shortest_angular_distance(rpy_.z(), target_rpy_.z()),
-                        target_pos_.z() - pos_.z(),
-                        pid_controllers_.at(ROLL).getITerm(),
-                        pid_controllers_.at(PITCH).getITerm(),
-                        pid_controllers_.at(Z).getITerm(),
-                        unified_controller_->isAllocationSaturated() ? "YES" : "no");
-
-      // Adaptive seed tracking: when in quasi-steady-state, low-pass update
-      // last_unified_*_i_ss_ so the NEXT mode switch gets a better seed.
-      // Conditions: boost/freeze finished, errors small, allocation unsaturated.
-      if (z_ki_boost_count_ == 0 && z_integral_freeze_count_ == 0 &&
-          rp_ki_boost_count_ == 0 && rp_integral_freeze_count_ == 0) {
-        double form_pos_z = pos_.z() + (estimator_->getOrientation(Frame::COG, estimate_mode_) *
-                            tf::Vector3(unified_controller_->getFormationCogOffset().x(),
-                                        unified_controller_->getFormationCogOffset().y(),
-                                        unified_controller_->getFormationCogOffset().z())).z();
-        double err_z_abs = std::abs(target_pos_.z() - form_pos_z);
-        double vel_z_abs = std::abs(vel_.z());
-        double pitch_err_abs = std::abs(target_rpy_.y() - rpy_.y());
-        double pitch_rate_abs = std::abs(omega_.y());
-
-        // Z seed: moderate conditions (position + velocity)
-        if (err_z_abs < 0.05 && vel_z_abs < 0.05) {
-          double current_z_i = pid_controllers_.at(Z).getITerm();
-          last_unified_z_i_ss_ = (1.0 - Z_SEED_LPF_ALPHA) * last_unified_z_i_ss_
-                                + Z_SEED_LPF_ALPHA * current_z_i;
-          has_unified_z_i_ss_ = true;
-        }
-
-        // Pitch seed: stricter conditions (attitude + rate + position stability)
-        // NOTE: use getErrI() (err_i domain), NOT getITerm() (= err_i × Ki).
-        // The seed is injected via setErrI(), so must be in err_i domain.
-        if (pitch_err_abs < 0.03 && pitch_rate_abs < 0.05 && vel_z_abs < 0.05) {
-          double current_pitch_err_i = pid_controllers_.at(PITCH).getErrI();
-          last_unified_pitch_i_ss_ = (1.0 - PITCH_SEED_LPF_ALPHA) * last_unified_pitch_i_ss_
-                                    + PITCH_SEED_LPF_ALPHA * current_pitch_err_i;
-          has_unified_pitch_i_ss_ = true;
-        }
-      }
-
-      // --- Publish assemble debug info ---
-      publishAssembleDebug(formation_pos, formation_vel, target_formation_pos, ok);
-
+      runUnifiedControlCommon(is_leader);
       pre_module_state_ = module_state;
-      return;  // Skip individual control path
+      return;
     }
 
-    // ======== Unified Control Mode: FOLLOWER ========
-    // FOLLOWER receives a formation-level unified reference from LEADER,
-    // computes the same unified allocation locally, then picks its own block.
-    if (unified_control_mode_ && module_state == FOLLOWER && module_state != SEPARATED) {
-      if (!prev_unified_control_mode_) {
-        // Set spinal to cascade mode on this FOLLOWER's own spinal only.
-        // Allocation/pickup runs locally after receiving the unified reference.
-        sendFollowerCascadeSetup();
-        spinal_gains_zeroed_ = true;
-        unified_transition_count_ = 0;
-        beetle_navigator_->setUnifiedControlMode(true);  // P3: skip CoG→CoM conversion
-        ensureUnifiedReferenceSubscription();
-        ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d entering unified mode, sent cascade gains to own spinal, t=%.4f",
-                 beetle_navigator_->getMyID(), ros::Time::now().toSec());
-      }
-
-      ensureUnifiedReferenceSubscription();
-      bool have_valid_cmd = haveFreshUnifiedReference(0.5);
-
-      if (have_valid_cmd) {
-        if (unified_reference_has_formation_model_) {
-          unified_controller_->setFormationModelOverride(
-              unified_reference_formation_mass_,
-              unified_reference_formation_cog_offset_,
-              unified_reference_formation_inertia_);
-        } else {
-          unified_controller_->clearFormationModelOverride();
-          ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d missing formation model in unified reference, falling back to local reconstruction",
-                            beetle_navigator_->getMyID());
-        }
-
-        bool alloc_ok = unified_controller_->computeUnifiedAllocation(
-            unified_reference_wrench_acc_, unified_reference_desired_wrench_,
-            unified_reference_yaw_pid_raw_);
-        bool local_matrix_ok = false;
-        if (alloc_ok) {
-          local_matrix_ok = publishLocalUnifiedTorqueAllocationMatrixInv();
-        }
-
-        if (alloc_ok && local_matrix_ok && publishLocalUnifiedCommand()) {
-          follower_unified_active_ = true;
-          follower_cmd_timeout_count_ = 0;  // reset timeout counter
-
-          ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER] id=%d local pickup: thrust_sz=%zu",
-                            beetle_navigator_->getMyID(),
-                            unified_thrust_cmd_.base_thrust.size());
-
-          pre_module_state_ = module_state;
-          prev_unified_control_mode_ = true;
-          return;
-        }
-
-        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d fresh reference but local allocation/matrix publish failed",
-                          beetle_navigator_->getMyID());
-      }
-
-      // ======== T4.1: FOLLOWER Heartbeat Timeout & Fallback ========
-      // Reference is stale (age > 0.5s) or never received.
-      // Strategy depends on whether we were ever actively forwarding:
-      if (follower_unified_active_) {
-        // We WERE actively forwarding local pickup output — leader reference has gone stale.
-        // Increment timeout counter for graceful degradation.
-        follower_cmd_timeout_count_++;
-
-        if (follower_cmd_timeout_count_ <= FOLLOWER_HOLD_LAST_FRAMES) {
-          // Phase 1: Hold last command (hold-last-sample).
-          // Better than nothing for short glitches (< 0.5s = 20 frames @40Hz).
-          follower_thrust_pub_.publish(unified_thrust_cmd_);
-          ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d HOLD-LAST: stale reference, "
-                            "holding for %d/%d frames",
-                            beetle_navigator_->getMyID(),
-                            follower_cmd_timeout_count_, FOLLOWER_HOLD_LAST_FRAMES);
-          pre_module_state_ = module_state;
-          prev_unified_control_mode_ = true;
-          return;
-        }
-
-        // Phase 2: Full fallback — restore independent hover.
-        // This is the "circuit breaker": leader reference is truly gone.
-        ROS_ERROR("[UnifiedCtrl FOLLOWER] id=%d FALLBACK: leader reference timeout (%d frames), "
-                  "restoring independent hover!",
-                  beetle_navigator_->getMyID(), follower_cmd_timeout_count_);
-
-        resetToIndependentHover();
-        spinal_gains_zeroed_ = false;
-
-        // Clear unified state
-        follower_unified_active_ = false;
-        unified_cmd_received_ = false;
-        follower_cmd_timeout_count_ = 0;
-        prev_unified_control_mode_ = false;
-        unified_controller_->resetCascadeAllocSent();
-        unified_controller_->resetTargetAngleLpf();
-        unified_controller_->resetQPState();
-        beetle_navigator_->setUnifiedControlMode(false);
-
-        // Fall through to independent control below
-      } else {
-        // Never received any unified reference — still waiting for LEADER's first publish.
-        // MUST return here to avoid falling through to T4.4 which would clear
-        // unified_control_mode rosparam and force this FOLLOWER back to independent.
-        ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl FOLLOWER] id=%d, no valid unified reference yet — waiting (age=%.3f)",
-                 beetle_navigator_->getMyID(),
-                 unified_cmd_received_ ? (ros::Time::now() - unified_cmd_stamp_).toSec() : -1.0);
-        pre_module_state_ = module_state;
-        prev_unified_control_mode_ = true;
-        return;
-      }
-    }
+    // (Legacy per-branch bodies removed — both leader and follower now share runUnifiedControlCommon.)
 
     // ======== Unified → Leader-Follower Transition (T4.4) ========
     // This exit path runs for BOTH LEADER and FOLLOWER when unified_control_mode_
@@ -1403,55 +808,18 @@ namespace aerial_robot_control
     if (unified_control_mode_) {
       int module_state = beetle_navigator_->getModuleState();
 
-      // --- FOLLOWER without valid unified command: FREEZE (defensive) ---
-      // Note: In practice this rarely triggers because LEADER publishes unified
-      // commands before FOLLOWERs detect the mode switch. Kept as a safety net.
-      if (module_state == FOLLOWER && module_state != SEPARATED) {
-        ensureUnifiedReferenceSubscription();
-        bool have_valid_cmd = haveFreshUnifiedReference(0.5);
-
-        if (!have_valid_cmd && !follower_unified_active_) {
-          // Transition: set spinal damping-only immediately, then freeze on last hover output.
-          // Do NOT call GimbalrotorController::update() — that would run its own
-          // attitude PID and publish competing commands on four_axes/command.
-          if (!prev_unified_control_mode_) {
-            sendFollowerCascadeSetup();
-            spinal_gains_zeroed_ = true;
-            unified_transition_count_ = 0;
-            beetle_navigator_->setUnifiedControlMode(true);  // P3: skip CoG→CoM conversion
-            ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d freeze: sent cascade gains to own spinal, awaiting unified reference, t=%.4f",
-                     beetle_navigator_->getMyID(), ros::Time::now().toSec());
-          }
-          prev_unified_control_mode_ = true;
-
-          // Re-send cached independent hover commands to keep motors running.
-          // Keep the cached angles (roll, pitch, yaw_term) — in cascade mode
-          // spinal uses them for P+D attitude stabilisation.
-          if (has_cached_independent_cmd_) {
-            follower_thrust_pub_.publish(last_independent_thrust_cmd_);
-            if (!gimbal_calc_in_fc_)
-              follower_gimbal_pub_.publish(last_independent_gimbal_cmd_);
-            ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] FOLLOWER id=%d freeze: re-sending cached hover cmd while waiting for unified reference (thrust_sz=%zu)",
-                              beetle_navigator_->getMyID(), last_independent_thrust_cmd_.base_thrust.size());
-          } else {
-            ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] FOLLOWER id=%d freeze: no cached cmd yet, waiting",
-                              beetle_navigator_->getMyID());
-          }
-
-          pre_module_state_ = module_state;
-          return true;  // Skip everything — no competing publish
-        }
-      }
-
-      /* In unified control mode (LEADER, or FOLLOWER with valid cmd),
-         thrust and gimbal commands are published in controlCore().
-         Bypass GimbalrotorController::update() which would call
-         sendCmd()->sendFourAxisCommand() and overwrite those commands.
+      /* In unified control mode, every assembled module (LEADER and FOLLOWER)
+         now runs the full controller locally in controlCore(). There is no
+         wait-for-reference freeze anymore — each module produces its own
+         thrust/gimbal commands from its own state.
 
          We still need:
-         1. ControlBase::update() for activation/timing checks
-         2. controlCore() for the unified allocation / forwarding
-         3. PoseLinearController::sendCmd() for PID debug publishing */
+           1. ControlBase::update() for activation/timing checks
+           2. controlCore() for the local PID + unified allocation + pickup
+           3. PoseLinearController::sendCmd() for PID debug publishing
+
+         Bypass GimbalrotorController::update() which would publish competing
+         four_axes/command from the single-module control path. */
       bool base_ok = ControlBase::update();
       if (!base_ok) {
         if (module_state == LEADER) {
@@ -1463,12 +831,6 @@ namespace aerial_robot_control
         return false;
       }
 
-      if (module_state == LEADER) {
-        ROS_INFO_THROTTLE(1.0,
-                          "[UnifiedCtrl LEADER] entering unified controlCore: navi_state=%d control_timestamp=%.4f leader_id=%d",
-                          navigator_->getNaviState(), control_timestamp_, beetle_navigator_->getLeaderID());
-      }
-
       controlCore();
       PoseLinearController::sendCmd();
       return true;
@@ -1476,35 +838,7 @@ namespace aerial_robot_control
 
     /* Non-unified mode: use the full GimbalrotorController update chain
        (sendGimbalCommand + PoseLinearController::update -> controlCore + sendCmd) */
-    bool result = GimbalrotorController::update();
-
-    // Cache the commands that GimbalrotorController just published,
-    // so we can freeze on them during unified mode transition.
-    // Must match the format of sendFourAxisCommand():
-    //   gimbal_calc_in_fc=true  → base_thrust = target_base_thrust_ (size=8, vectoring forces)
-    //                             angles = [target_roll_, target_pitch_, candidate_yaw_term_]
-    //   gimbal_calc_in_fc=false → base_thrust = target_full_thrust_ (size=4, scalar thrusts)
-    //                             angles = [target_roll_, target_pitch_, 0]
-    if (result) {
-      if (gimbal_calc_in_fc_) {
-        last_independent_thrust_cmd_.base_thrust = target_base_thrust_;
-        last_independent_thrust_cmd_.angles[2] = candidate_yaw_term_;
-      } else {
-        last_independent_thrust_cmd_.base_thrust = target_full_thrust_;
-        last_independent_thrust_cmd_.angles[2] = 0;
-      }
-      last_independent_thrust_cmd_.angles[0] = target_roll_;
-      last_independent_thrust_cmd_.angles[1] = target_pitch_;
-
-      last_independent_gimbal_cmd_.header.stamp = ros::Time::now();
-      last_independent_gimbal_cmd_.position.clear();
-      for (int i = 0; i < motor_num_; i++) {
-        last_independent_gimbal_cmd_.position.push_back(target_gimbal_angles_.at(i));
-      }
-      has_cached_independent_cmd_ = true;
-    }
-
-    return result;
+    return GimbalrotorController::update();
   }
 
   void BeetleController::reset()
@@ -1533,7 +867,6 @@ namespace aerial_robot_control
     unified_reference_sub_.shutdown();
     unified_reference_leader_id_ = -1;
     unified_reference_warmup_count_ = 0;
-    unified_reference_has_formation_model_ = false;
     unified_controller_->clearFormationModelOverride();
   }
 
@@ -1556,12 +889,6 @@ namespace aerial_robot_control
     ROS_INFO("[UnifiedCtrl] FOLLOWER id=%d subscribed to unified reference: %s",
              beetle_navigator_->getMyID(),
              (leader_ns + "/unified_control/reference").c_str());
-  }
-
-  bool BeetleController::haveFreshUnifiedReference(double max_age) const
-  {
-    if (!unified_cmd_received_) return false;
-    return (ros::Time::now() - unified_cmd_stamp_).toSec() < max_age;
   }
 
   bool BeetleController::publishLocalUnifiedCommand()
@@ -1648,27 +975,16 @@ namespace aerial_robot_control
     unified_reference_desired_wrench_(3) = msg.desired_wrench.torque.x;
     unified_reference_desired_wrench_(4) = msg.desired_wrench.torque.y;
     unified_reference_desired_wrench_(5) = msg.desired_wrench.torque.z;
-    unified_reference_formation_mass_ = msg.formation_mass;
-    unified_reference_formation_cog_offset_ << msg.formation_cog_offset.x,
-        msg.formation_cog_offset.y,
-        msg.formation_cog_offset.z;
-    for (int r = 0; r < 3; r++) {
-      for (int c = 0; c < 3; c++) {
-        unified_reference_formation_inertia_(r, c) = msg.formation_inertia[r * 3 + c];
-      }
-    }
-    unified_reference_has_formation_model_ = (unified_reference_formation_mass_ > 0.0);
     unified_reference_yaw_pid_raw_ = msg.yaw_pid_raw;
 
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
 
     ROS_INFO_THROTTLE(1.0,
-              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f mass=%.3f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f (debug only - follower uses local control)",
               beetle_navigator_->getMyID(),
               beetle_navigator_->getLeaderID(),
               (ros::Time::now() - unified_cmd_stamp_).toSec(),
-              unified_reference_formation_mass_,
               unified_reference_wrench_acc_(2),
               unified_reference_wrench_acc_(4),
               unified_reference_yaw_pid_raw_);
@@ -2111,6 +1427,11 @@ namespace aerial_robot_control
     getParam<int>(control_nh, "unified_reference_warmup_frames", unified_reference_warmup_frames_, 20);
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
 
+    // Differential-mode damping gain for symmetric-local unified control.
+    // Injects -K * inter_wrench/mass into target_wrench_acc as passive dissipation
+    // on the disagreement between per-module external-wrench estimators. Zero disables.
+    getParam<double>(control_nh, "unified_diff_damp_gain", unified_diff_damp_gain_, 0.0);
+
     // Z I-term seed default for unified mode switch (Plan E')
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);
     last_unified_z_i_ss_ = z_i_seed_default_;
@@ -2226,10 +1547,16 @@ namespace aerial_robot_control
 
   void BeetleController::externalWrenchEstimate()
   {
-    // In unified mode the formation-level observer (FormationMomentumObserver) handles
-    // estimation. Single-module observer has no formation-level semantics here.
-    if (unified_control_mode_) return;
-
+    // NOTE (unified mode): the single-module momentum observer also runs in
+    // unified mode so that inter_wrench_list_[my_id] (computed by
+    // calcInteractionWrench from est_wrench_list_) is populated and can be
+    // consumed by the differential-mode damping term in runUnifiedControlCommon.
+    // In unified mode each module's target_wrench_acc_cog is set locally by
+    // runUnifiedControlCommon (same formation-level target at both leader and
+    // follower in a rigid assembly), so the observer reports per-module
+    // momentum imbalance ≈ spinal P+D share + inter_wrench + external wrench.
+    // Only the differential component (est - mean, via calcInteractionWrench)
+    // is fed back through unified_diff_damp_gain_, which is small by design.
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&
@@ -2568,6 +1895,350 @@ namespace aerial_robot_control
       wrench_msg.wrench.torque.y = rw(4);
       wrench_msg.wrench.torque.z = rw(5);
       assemble_formation_wrench_pub_.publish(wrench_msg);
+    }
+  }
+
+  // =====================================================================
+  // runUnifiedControlCommon: symmetric unified-mode control body.
+  // Executed on BOTH leader and follower. Each module uses its own
+  // estimator / navigator / TF state. The leader additionally broadcasts
+  // a debug reference and feeds the formation-level momentum observer.
+  // =====================================================================
+  void BeetleController::runUnifiedControlCommon(bool is_leader)
+  {
+    int my_id = beetle_navigator_->getMyID();
+    int leader_id = beetle_navigator_->getLeaderID();
+
+    // --- Gather local state ---
+    pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
+    vel_ = estimator_->getVel(Frame::COG, estimate_mode_);
+    target_pos_ = navigator_->getTargetPos();
+    target_vel_ = navigator_->getTargetVel();
+    target_acc_ = navigator_->getTargetAcc();
+
+    tf::Quaternion cog2baselink_rot;
+    tf::quaternionKDLToTF(robot_model_->getCogDesireOrientation<KDL::Rotation>(), cog2baselink_rot);
+    tf::Matrix3x3 cog_rot = estimator_->getOrientation(Frame::BASELINK, estimate_mode_)
+                          * tf::Matrix3x3(cog2baselink_rot).inverse();
+    double r, p, y_angle; cog_rot.getRPY(r, p, y_angle);
+    rpy_.setValue(r, p, y_angle);
+    omega_ = estimator_->getAngularVel(Frame::COG, estimate_mode_);
+
+    target_rpy_ = navigator_->getTargetRPY();
+    {
+      tf::Vector3 baselink_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
+      target_rpy_.setX(baselink_rpy.x());
+      target_rpy_.setY(baselink_rpy.y());
+    }
+    tf::Matrix3x3 target_rot; target_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
+    tf::Vector3 target_omega = navigator_->getTargetOmega();
+    target_omega_ = cog_rot.inverse() * target_rot * target_omega;
+    target_ang_acc_ = navigator_->getTargetAngAcc();
+
+    // --- Formation geometry: each module computes locally ---
+    unified_controller_->updateFormationGeometry();
+    const Eigen::Vector3d& cog_offset_leader_frame = unified_controller_->getFormationCogOffset();
+    Eigen::Vector3d cog_offset_self = cog_offset_leader_frame;
+    if (!is_leader) {
+      // Convert leader-frame offset to this module's baselink frame.
+      // Rigid assembly ⇒ all modules share the same body orientation, so the
+      // formation CoG offset expressed in this module's frame is simply
+      // (leader→formation_CoG) − (leader→my_CoG), all in the common orientation.
+      // NOTE: tf2 frame_ids MUST NOT start with '/' (same convention as
+      // BeetleUnifiedController::updateFormationGeometry).
+      try {
+        std::string leader_cog_frame = beetle_navigator_->getMyName()
+                                      + std::to_string(leader_id) + "/cog";
+        std::string my_cog_frame = beetle_navigator_->getMyName()
+                                  + std::to_string(my_id) + "/cog";
+        geometry_msgs::TransformStamped tf_stamped =
+            beetle_navigator_->getTfBuffer().lookupTransform(leader_cog_frame, my_cog_frame, ros::Time(0));
+        cog_offset_self.x() -= tf_stamped.transform.translation.x;
+        cog_offset_self.y() -= tf_stamped.transform.translation.y;
+        cog_offset_self.z() -= tf_stamped.transform.translation.z;
+      } catch (tf2::TransformException& ex) {
+        // Soft fallback: keep leader-frame offset. One-frame positional bias is
+        // vastly safer than a full thrust drop-out from early-return. The next
+        // frame will retry.
+        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER id=%d] cog_offset_self TF failed (%s), falling back to leader-frame offset",
+                          my_id, ex.what());
+      }
+    }
+    tf::Vector3 offset_body(cog_offset_self.x(), cog_offset_self.y(), cog_offset_self.z());
+    tf::Vector3 offset_world = cog_rot * offset_body;
+    tf::Vector3 formation_pos = pos_ + offset_world;
+    tf::Vector3 omega_world = cog_rot * omega_;
+    tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
+    tf::Vector3 target_formation_pos = target_pos_ + target_rot * offset_body;
+
+    // --- Position PID (X/Y/Z) with formation CoG ---
+    double du = ros::Time::now().toSec() - control_timestamp_;
+
+    // UO-4 XY FF (leader only; observer does not run on follower)
+    if (is_leader && formation_obs_comp_enable_ &&
+        formation_observer_ && formation_observer_->isBiasCalibrated() &&
+        !navigator_->getForceLandingFlag()) {
+      Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
+      tf::Vector3 f_world = cog_rot * tf::Vector3(f_body.x(), f_body.y(), f_body.z());
+      double mass = std::max(unified_controller_->getFormationMass(), 0.01);
+      pid_controllers_.at(X).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.x() / mass);
+      pid_controllers_.at(Y).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.y() / mass);
+    } else {
+      pid_controllers_.at(X).setPersistentFF(0.0);
+      pid_controllers_.at(Y).setPersistentFF(0.0);
+    }
+
+    switch (navigator_->getXyControlMode()) {
+      case aerial_robot_navigation::POS_CONTROL_MODE:
+        pid_controllers_.at(X).update(target_formation_pos.x() - formation_pos.x(), du,
+                                      target_vel_.x() - formation_vel.x(), target_acc_.x());
+        pid_controllers_.at(Y).update(target_formation_pos.y() - formation_pos.y(), du,
+                                      target_vel_.y() - formation_vel.y(), target_acc_.y());
+        break;
+      case aerial_robot_navigation::VEL_CONTROL_MODE:
+        pid_controllers_.at(X).update(0, du, target_vel_.x() - formation_vel.x(), target_acc_.x());
+        pid_controllers_.at(Y).update(0, du, target_vel_.y() - formation_vel.y(), target_acc_.y());
+        break;
+      case aerial_robot_navigation::ACC_CONTROL_MODE:
+        pid_controllers_.at(X).update(0, du, 0, target_acc_.x());
+        pid_controllers_.at(Y).update(0, du, 0, target_acc_.y());
+        break;
+      default: break;
+    }
+    if (navigator_->getForceLandingFlag()) {
+      pid_controllers_.at(X).reset();
+      pid_controllers_.at(Y).reset();
+    }
+
+    double err_z = target_formation_pos.z() - formation_pos.z();
+    double err_v_z = target_vel_.z() - formation_vel.z();
+    double z_p_limit = pid_controllers_.at(Z).getLimitP();
+    if (navigator_->getForceLandingFlag()) {
+      pid_controllers_.at(Z).setLimitP(0);
+      err_z = force_landing_descending_rate_;
+      err_v_z = 0;
+      target_acc_.setZ(0);
+    }
+    if (is_leader && formation_obs_comp_enable_ &&
+        formation_observer_ && formation_observer_->isBiasCalibrated() &&
+        !navigator_->getForceLandingFlag()) {
+      double fz_body = formation_observer_->getEstExternalForceBody().z();
+      double ff_z = -formation_obs_comp_z_gain_ * fz_body /
+                    std::max(unified_controller_->getFormationMass(), 0.01);
+      pid_controllers_.at(Z).setPersistentFF(ff_z);
+    } else {
+      pid_controllers_.at(Z).setPersistentFF(0.0);
+    }
+    pid_controllers_.at(Z).update(err_z, du, err_v_z, target_acc_.z());
+
+    if (z_integral_freeze_count_ > 0) {
+      pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
+      z_integral_freeze_count_--;
+    } else if (z_ki_boost_count_ > 0) {
+      if (!unified_controller_->isAllocationSaturated()) {
+        double clamped_err_p = pid_controllers_.at(Z).getErrP();
+        double extra_increment = clamped_err_p * du * (z_ki_boost_factor_ - 1.0);
+        double new_err_i = pid_controllers_.at(Z).getErrI() + extra_increment;
+        double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
+        double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
+        new_err_i = boost::algorithm::clamp(new_err_i, -iz_limit, iz_limit);
+        pid_controllers_.at(Z).setErrI(new_err_i);
+      }
+      z_ki_boost_count_--;
+    }
+    if (navigator_->getForceLandingFlag()) {
+      pid_controllers_.at(Z).setLimitP(z_p_limit);
+      pid_controllers_.at(Z).setErrP(0);
+    }
+
+    // --- Attitude PID (Roll/Pitch/Yaw) ---
+    if (!start_rp_integration_) {
+      if (pos_.z() - navigator_->getInitHeight() > start_rp_integration_height_) {
+        start_rp_integration_ = true;
+        spinal::FlightConfigCmd flight_config_cmd;
+        flight_config_cmd.cmd = spinal::FlightConfigCmd::INTEGRATION_CONTROL_ON_CMD;
+        navigator_->getFlightConfigPublisher().publish(flight_config_cmd);
+        ROS_WARN("[UnifiedCtrl] id=%d start roll/pitch I control (height threshold passed)", my_id);
+      }
+    }
+    double du_rp = du;
+    if (!start_rp_integration_) du_rp = 0;
+
+    if (is_leader && formation_obs_comp_enable_ &&
+        formation_observer_ && formation_observer_->isBiasCalibrated() &&
+        !navigator_->getForceLandingFlag()) {
+      Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
+      Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
+      double tgain = formation_obs_comp_torque_gain_;
+      pid_controllers_.at(ROLL).setPersistentFF(-tgain * alpha_ext.x());
+      pid_controllers_.at(PITCH).setPersistentFF(-tgain * alpha_ext.y());
+      pid_controllers_.at(YAW).setPersistentFF(-tgain * alpha_ext.z());
+    } else {
+      pid_controllers_.at(ROLL).setPersistentFF(0.0);
+      pid_controllers_.at(PITCH).setPersistentFF(0.0);
+      pid_controllers_.at(YAW).setPersistentFF(0.0);
+    }
+
+    pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp,
+                                     target_omega_.x() - omega_.x(), target_ang_acc_.x());
+    pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
+                                      target_omega_.y() - omega_.y(), target_ang_acc_.y());
+
+    if (rp_integral_freeze_count_ > 0) {
+      pid_controllers_.at(ROLL).setErrI(pid_controllers_.at(ROLL).getPrevErrI());
+      pid_controllers_.at(PITCH).setErrI(pid_controllers_.at(PITCH).getPrevErrI());
+      rp_integral_freeze_count_--;
+    } else if (rp_ki_boost_count_ > 0) {
+      if (!unified_controller_->isAllocationSaturated()) {
+        {
+          double err_p_roll = pid_controllers_.at(ROLL).getErrP();
+          double extra = err_p_roll * du_rp * (RP_KI_BOOST_FACTOR - 1.0);
+          double new_i = pid_controllers_.at(ROLL).getErrI() + extra;
+          double Ki_r = std::max(pid_controllers_.at(ROLL).getIGain(), 1e-6);
+          double lim_r = pid_controllers_.at(ROLL).getLimitI() / Ki_r;
+          new_i = boost::algorithm::clamp(new_i, -lim_r, lim_r);
+          pid_controllers_.at(ROLL).setErrI(new_i);
+        }
+        {
+          double err_p_pitch = pid_controllers_.at(PITCH).getErrP();
+          double extra = err_p_pitch * du_rp * (RP_KI_BOOST_FACTOR - 1.0);
+          double new_i = pid_controllers_.at(PITCH).getErrI() + extra;
+          double Ki_p = std::max(pid_controllers_.at(PITCH).getIGain(), 1e-6);
+          double lim_p = pid_controllers_.at(PITCH).getLimitI() / Ki_p;
+          new_i = boost::algorithm::clamp(new_i, -lim_p, lim_p);
+          pid_controllers_.at(PITCH).setErrI(new_i);
+        }
+      }
+      rp_ki_boost_count_--;
+    }
+
+    double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
+    double err_omega_z = target_omega_.z() - omega_.z();
+    if (!need_yaw_d_control_) err_omega_z = target_omega_.z();
+    pid_controllers_.at(YAW).update(err_yaw, du, err_omega_z, target_ang_acc_.z());
+
+    control_timestamp_ = ros::Time::now().toSec();
+
+    // Local warmup (same on leader and follower)
+    if (unified_reference_warmup_count_ < unified_reference_warmup_frames_) {
+      if (navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE) {
+        pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
+        pid_controllers_.at(ROLL).setErrI(pid_controllers_.at(ROLL).getPrevErrI());
+        pid_controllers_.at(PITCH).setErrI(pid_controllers_.at(PITCH).getPrevErrI());
+        pid_controllers_.at(X).setErrI(pid_controllers_.at(X).getPrevErrI());
+        pid_controllers_.at(Y).setErrI(pid_controllers_.at(Y).getPrevErrI());
+        if (z_integral_freeze_count_ == 0 && z_ki_boost_count_ == 0)
+          z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
+        if (rp_integral_freeze_count_ == 0 && rp_ki_boost_count_ == 0)
+          rp_integral_freeze_count_ = RP_INTEGRAL_FREEZE_FRAMES;
+      }
+      unified_reference_warmup_count_++;
+    }
+
+    // --- Build 6-DOF target wrench in acceleration space ---
+    tf::Matrix3x3 uav_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
+    tf::Vector3 target_acc_w(pid_controllers_.at(X).result(),
+                             pid_controllers_.at(Y).result(),
+                             pid_controllers_.at(Z).result());
+    tf::Vector3 target_acc_cog = uav_rot.inverse() * target_acc_w;
+    Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
+    target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
+    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
+    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
+    double yaw_pid_raw = pid_controllers_.at(YAW).result();
+    target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
+
+    // Gravity FF with takeoff ramp
+    {
+      tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
+      tf::Vector3 gravity_cog = uav_rot.inverse() * gravity_w;
+      double gravity_ramp = 1.0;
+      if (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) {
+        constexpr int GRAVITY_RAMP_FRAMES = 20;
+        gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
+      }
+      target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
+    }
+
+    // --- Differential-mode damping (passive internal-force dissipation) ---
+    // Each module's share of the whole-formation external-wrench disagreement
+    // (inter_wrench_list_[my_id]) is injected as pure negative proportional
+    // feedback. This is a Lyapunov-dissipative term on the differential mode
+    // (the disagreement between modules' estimators), independent of the
+    // common-mode formation control. Zero when per-module wrench observers
+    // are not running; safe to leave enabled.
+    if (unified_diff_damp_gain_ > 0.0) {
+      const Eigen::VectorXd& inter = inter_wrench_list_[my_id];
+      double mass = std::max(unified_controller_->getFormationMass(), 0.01);
+      Eigen::Matrix3d inertia_inv = unified_controller_->getFormationInertia().inverse();
+      target_wrench_acc.head(3) -= unified_diff_damp_gain_ * inter.head(3) / mass;
+      target_wrench_acc.tail(3) -= unified_diff_damp_gain_ * (inertia_inv * inter.tail(3));
+    }
+
+    setTargetWrenchAccCog(target_wrench_acc);
+
+    // --- Run unified 6-DOF allocation ---
+    unified_controller_->clearFormationModelOverride();
+    bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
+
+    if (ok) {
+      publishLocalUnifiedCommand();
+      publishLocalUnifiedTorqueAllocationMatrixInv();
+      if (is_leader) {
+        publishUnifiedReference(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
+        if (formation_observer_ && formation_observer_->isActive()) {
+          Eigen::Matrix3d cog_rot_eigen;
+          tf::matrixTFToEigen(uav_rot, cog_rot_eigen);
+          Eigen::Vector3d offset_w(offset_world.x(), offset_world.y(), offset_world.z());
+          auto imu_handler_obs = boost::dynamic_pointer_cast<sensor_plugin::Imu>(
+              estimator_->getImuHandler(0));
+          Eigen::Vector3d vel_leader_w, omega_body;
+          tf::vectorTFToEigen(imu_handler_obs->getFilteredVelCog(), vel_leader_w);
+          tf::vectorTFToEigen(imu_handler_obs->getFilteredOmegaCog(), omega_body);
+          Eigen::Vector3d omega_w = cog_rot_eigen * omega_body;
+          Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
+          Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
+          formation_observer_->setBiasCalibrationAllowed(
+              navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
+          formation_observer_->update(
+              unified_controller_->getFormationMass(),
+              unified_controller_->getFormationInertia(),
+              cog_rot_eigen, vel_formation_w, omega_body,
+              realized_wrench, du);
+        }
+      }
+    }
+
+    if (unified_transition_count_ >= 0) unified_transition_count_++;
+
+    ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl %s id=%d] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d yaw_raw=%.4f",
+                      is_leader ? "LEADER" : "FOLLOWER", my_id,
+                      target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
+                      target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
+                      ok, yaw_pid_raw);
+
+    // Adaptive SS seed tracking (leader only - followers rely on YAML defaults)
+    if (is_leader && z_ki_boost_count_ == 0 && z_integral_freeze_count_ == 0 &&
+        rp_ki_boost_count_ == 0 && rp_integral_freeze_count_ == 0) {
+      double err_z_abs = std::abs(target_pos_.z() - formation_pos.z());
+      double vel_z_abs = std::abs(vel_.z());
+      double pitch_err_abs = std::abs(target_rpy_.y() - rpy_.y());
+      double pitch_rate_abs = std::abs(omega_.y());
+      if (err_z_abs < 0.05 && vel_z_abs < 0.05) {
+        last_unified_z_i_ss_ = (1.0 - Z_SEED_LPF_ALPHA) * last_unified_z_i_ss_
+                              + Z_SEED_LPF_ALPHA * pid_controllers_.at(Z).getITerm();
+        has_unified_z_i_ss_ = true;
+      }
+      if (pitch_err_abs < 0.03 && pitch_rate_abs < 0.05 && vel_z_abs < 0.05) {
+        last_unified_pitch_i_ss_ = (1.0 - PITCH_SEED_LPF_ALPHA) * last_unified_pitch_i_ss_
+                                  + PITCH_SEED_LPF_ALPHA * pid_controllers_.at(PITCH).getErrI();
+        has_unified_pitch_i_ss_ = true;
+      }
+    }
+
+    // Only leader publishes assembly-debug topics (shared global namespace)
+    if (is_leader) {
+      publishAssembleDebug(formation_pos, formation_vel, target_formation_pos, ok);
     }
   }
 

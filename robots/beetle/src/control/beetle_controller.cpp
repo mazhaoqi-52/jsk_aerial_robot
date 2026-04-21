@@ -22,6 +22,13 @@ namespace aerial_robot_control
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
     unified_diff_damp_gain_(0.0),
+    bias_pid_settled_rate_thresh_(0.05),
+    bias_pid_settled_frames_(40),
+    pid_settled_count_(0),
+    last_roll_i_for_settle_(0.0),
+    last_pitch_i_for_settle_(0.0),
+    last_yaw_i_for_settle_(0.0),
+    pid_settle_tracker_init_(false),
     unified_transition_count_(-1),
     z_integral_freeze_count_(0),
     z_ki_boost_count_(0),
@@ -467,6 +474,9 @@ namespace aerial_robot_control
       formation_observer_->setActive(true);
       ROS_INFO("[UnifiedCtrl] Formation observer activated (reset + active)");
     }
+    // Reset PID-settled tracker so new takeoff starts with a clean state.
+    pid_settle_tracker_init_ = false;
+    pid_settled_count_ = 0;
 
     ROS_WARN("[UnifiedCtrl] %s id=%d mode switch: reset targets, sent cascade gains%s, "
              "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
@@ -1432,6 +1442,14 @@ namespace aerial_robot_control
     // on the disagreement between per-module external-wrench estimators. Zero disables.
     getParam<double>(control_nh, "unified_diff_damp_gain", unified_diff_damp_gain_, 0.0);
 
+    // Bias-calibration PID-settled gate (real-hardware safety): the FormationObserver
+    // bias will only be calibrated once |d(R/P/Y I-term)/dt| summed drops below the
+    // threshold for N consecutive frames while HOVER state is active.
+    getParam<double>(control_nh, "bias_pid_settled_rate_thresh",
+                     bias_pid_settled_rate_thresh_, 0.05);
+    getParam<int>(control_nh, "bias_pid_settled_frames",
+                  bias_pid_settled_frames_, 40);
+
     // Z I-term seed default for unified mode switch (Plan E')
     getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);
     last_unified_z_i_ss_ = z_i_seed_default_;
@@ -2198,8 +2216,41 @@ namespace aerial_robot_control
           Eigen::Vector3d omega_w = cog_rot_eigen * omega_body;
           Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
           Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
-          formation_observer_->setBiasCalibrationAllowed(
-              navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
+
+          // PID-settled gate: block bias calibration while R/P/Y I-terms are
+          // still drifting (otherwise a real cog model error would be absorbed
+          // as observer bias and the FF path would stop compensating it).
+          const bool in_hover =
+              (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
+          bool pid_settled = false;
+          double last_drift = 0.0;
+          if (!in_hover) {
+            pid_settled_count_ = 0;
+            pid_settle_tracker_init_ = false;
+          } else {
+            double cur_roll_i  = pid_controllers_.at(ROLL).getITerm();
+            double cur_pitch_i = pid_controllers_.at(PITCH).getITerm();
+            double cur_yaw_i   = pid_controllers_.at(YAW).getITerm();
+            if (!pid_settle_tracker_init_) {
+              pid_settle_tracker_init_ = true;
+              pid_settled_count_       = 0;
+            } else {
+              last_drift = std::fabs(cur_roll_i  - last_roll_i_for_settle_)
+                         + std::fabs(cur_pitch_i - last_pitch_i_for_settle_)
+                         + std::fabs(cur_yaw_i   - last_yaw_i_for_settle_);
+              if (last_drift < bias_pid_settled_rate_thresh_) pid_settled_count_++;
+              else                                            pid_settled_count_ = 0;
+            }
+            last_roll_i_for_settle_  = cur_roll_i;
+            last_pitch_i_for_settle_ = cur_pitch_i;
+            last_yaw_i_for_settle_   = cur_yaw_i;
+            pid_settled = (pid_settled_count_ >= bias_pid_settled_frames_);
+            ROS_INFO_THROTTLE(2.0,
+                "[UnifiedCtrl] PID-settle gate: count=%d/%d, drift=%.4f (<%.4f?), settled=%d",
+                pid_settled_count_, bias_pid_settled_frames_,
+                last_drift, bias_pid_settled_rate_thresh_, pid_settled ? 1 : 0);
+          }
+          formation_observer_->setBiasCalibrationAllowed(in_hover && pid_settled);
           formation_observer_->update(
               unified_controller_->getFormationMass(),
               unified_controller_->getFormationInertia(),

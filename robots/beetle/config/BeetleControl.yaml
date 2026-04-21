@@ -23,6 +23,17 @@ controller:
   # /beetleX/internal_wrench spectrum and confirming no resonance near inner-loop BW).
   # Recommended tuning path on hardware: 0.0 -> 0.02 -> 0.05 (tether/ground first).
   unified_diff_damp_gain: 0.05
+
+  # FormationObserver bias-calibration PID-settled gate.
+  # Bias is only calibrated when the summed |d(R/P/Y I-term)/dt| over one frame
+  # stays below this threshold for N consecutive frames while HOVER is active.
+  # Goal: prevent the observer from "calibrating away" a real cog model error
+  # while the integrators are still compensating for it.
+  # Rule of thumb: if you see pitch_i drifting > 0.05 Nm/frame, raise threshold
+  # (or lower frames) to eventually admit; if you want stricter (avoid false
+  # positives on noisy hover), lower threshold to ~0.02.
+  bias_pid_settled_rate_thresh: 0.05   # [Nm/frame], summed over roll+pitch+yaw I-terms
+  bias_pid_settled_frames:      40     # ~1 s @ 40 Hz
   z_i_seed_default: 0.8    # Z I-term seed fallback (used when N not in z_i_seed_by_n)
   pitch_i_seed_default: -0.55  # Pitch I-term seed fallback (err_i domain)
 

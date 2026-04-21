@@ -192,6 +192,19 @@ namespace aerial_robot_control
     // inter_wrench_list_[my_id] (from calcInteractionWrench). Zero = disabled.
     double unified_diff_damp_gain_;
 
+    // PID-settled gating for FormationObserver bias calibration (leader only).
+    // Bias is only calibrated when |d/dt of roll/pitch/yaw I-terms| stays below
+    // bias_pid_settled_rate_thresh_ for bias_pid_settled_frames_ consecutive frames,
+    // AND the state is HOVER. This prevents bias absorbing still-growing I-terms
+    // (real-hardware cog model error would otherwise be "calibrated away").
+    double bias_pid_settled_rate_thresh_;  // [Nm / frame] summed over R/P/Y I-terms
+    int    bias_pid_settled_frames_;       // required consecutive quiet frames
+    int    pid_settled_count_;             // running counter
+    double last_roll_i_for_settle_;
+    double last_pitch_i_for_settle_;
+    double last_yaw_i_for_settle_;
+    bool   pid_settle_tracker_init_;
+
     void unifiedReferenceCallback(const beetle::UnifiedControlReference& msg);
     void ensureUnifiedReferenceSubscription();
     bool publishLocalUnifiedCommand();

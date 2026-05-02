@@ -206,7 +206,7 @@ controller:
   unified_yaw:
     p_gain: 15.0
     i_gain: 1.0
-    d_gain: 5.0
+    d_gain: 10.0
     limit_err_p: 0.4
     limit_sum: 20.0
     limit_p: 20.0

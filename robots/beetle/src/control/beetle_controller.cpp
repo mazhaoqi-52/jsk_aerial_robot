@@ -14,7 +14,7 @@ namespace aerial_robot_control
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
     unified_cmd_received_(false),
-    follower_unified_active_(false),
+    prev_navi_state_for_diag_(-1),
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
     unified_reference_yaw_pid_raw_(0.0),
@@ -35,7 +35,6 @@ namespace aerial_robot_control
     rp_integral_freeze_count_(0),
     rp_ki_boost_count_(0),
     rp_i_keep_ratio_(0.5),
-    spinal_gains_zeroed_(false),
     yaw_in_allocation_(false),
     last_unified_z_i_ss_(0.8),
     has_unified_z_i_ss_(false),
@@ -463,7 +462,6 @@ namespace aerial_robot_control
       ensureUnifiedReferenceSubscription();  // still subscribe for debug/monitoring
     }
     applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
-    spinal_gains_zeroed_ = true;
     unified_transition_count_ = 0;
     unified_reference_warmup_count_ = 0;
 
@@ -509,8 +507,12 @@ namespace aerial_robot_control
         (module_state == LEADER || module_state == FOLLOWER) &&
         module_state != SEPARATED) {
       bool is_leader = (module_state == LEADER);
-      bool mode_switch = (pre_module_state_ != module_state) || !prev_unified_control_mode_;
-      if (mode_switch) {
+      // Two independent edges trigger (re)initialization:
+      //   - role_changed: module just became LEADER/FOLLOWER (assembly/reconfig)
+      //   - mode_just_entered: unified mode just turned on this cycle
+      bool role_changed = (pre_module_state_ != module_state);
+      bool mode_just_entered = !prev_unified_control_mode_;
+      if (role_changed || mode_just_entered) {
         initUnifiedMode(is_leader);
       }
       prev_unified_control_mode_ = true;
@@ -522,43 +524,31 @@ namespace aerial_robot_control
     // (Legacy per-branch bodies removed — both leader and follower now share runUnifiedControlCommon.)
 
     // ======== Unified → Leader-Follower Transition (T4.4) ========
-    // This exit path runs for BOTH LEADER and FOLLOWER when unified_control_mode_
-    // becomes false. We must restore ALL state to avoid transient jumps that crash.
+    // Runs ONLY when we were previously in unified mode and now exited.
+    // If we never entered unified (prev_unified_control_mode_ == false), there
+    // is nothing to restore — and crucially, we must NOT touch the rosparam,
+    // otherwise a freshly-set service request can be silently overwritten.
     //
-    // Skip when SEPARATED: unified control was never active, so there is nothing
-    // to restore. This allows setting unified_control_mode rosparam on the ground
-    // (before takeoff) without T4.4 immediately clearing it.
-    //
-    // Critical items:
-    //   1. Restore spinal attitude PID gains (setAttitudeGains restores independent-mode gains)
-    //   2. Reset target position to CURRENT position (avoid P-term spike)
-    //   3. Seed Z I-term with gravity (avoid altitude drop)
-    //   4. Clear RP/XY I-terms (unified I-term values are meaningless for independent mode)
-    //   5. Sync target_pos_candidate_ (used by CoG→CoM conversion in leader-follower mode)
-    // Skip T4.4 cleanup when SEPARATED: unified control was never active,
-    // nothing to restore. Preserves rosparam for ground-set unified mode.
-    // Let control flow continue to GimbalrotorController::controlCore() below.
-    if (module_state != SEPARATED) {
-      if (prev_unified_control_mode_) {
-        ROS_WARN("[UnifiedCtrl] id=%d exiting unified mode → restoring independent hover state",
-                 beetle_navigator_->getMyID());
-        resetToIndependentHover();
-      }
+    // Restored items:
+    //   1. spinal attitude PID gains (via restoreIndependentGains in resetToIndependentHover)
+    //   2. target position → current position (avoid P-term spike)
+    //   3. Z I-term seeded with gravity (avoid altitude drop)
+    //   4. RP/XY I-terms cleared (unified I-term values meaningless for independent mode)
+    //   5. target_pos_candidate_ synced (used by CoG→CoM conversion)
+    if (prev_unified_control_mode_) {
+      ROS_WARN("[UnifiedCtrl] id=%d exiting unified mode → restoring independent hover state",
+               beetle_navigator_->getMyID());
+      resetToIndependentHover();  // calls restoreIndependentGains() → clears gains_switched_
 
       prev_unified_control_mode_ = false;
-      follower_unified_active_ = false;
-      spinal_gains_zeroed_ = false;
-      gains_switched_ = false;
       unified_controller_->resetCascadeAllocSent();
       unified_controller_->resetTargetAngleLpf();
       unified_controller_->resetQPState();
       unified_reference_warmup_count_ = 0;
       beetle_navigator_->setUnifiedControlMode(false);
 
-      {
-        ros::NodeHandle control_nh(nh_, "controller");
-        control_nh.setParam("unified_control_mode", false);
-      }
+      ros::NodeHandle control_nh(nh_, "controller");
+      control_nh.setParam("unified_control_mode", false);
     }
     
     if(beetle_navigator_->getControlFlag() &&
@@ -768,11 +758,30 @@ namespace aerial_robot_control
 
   bool BeetleController::update()
   {
-    // Read unified_control_mode from rosparam at the START of update(),
-    // so routing decisions below use the latest value (not stale from last cycle).
+    // unified_control_mode_ is the single source of truth. It is mutated only by:
+    //   1. setUnifiedModeCb (explicit user/script intent)
+    //   2. T4.3 below (force_landing/halt auto-exit)
+    //   3. FOLLOWER auto-latch (callback + safety net below)
+    // We deliberately do NOT re-read it from rosparam each cycle — doing so
+    // would let any external setParam (config reload / other tools / our own
+    // T4.4 cleanup writing back) silently flip the controller mode mid-flight.
+    // The setParam writes elsewhere are now broadcast-only (for rqt/Python).
+
+    // ======== One-shot takeoff diagnostic ========
+    // On the rising edge into TAKEOFF_STATE, snapshot the unified-mode wiring
+    // so silent mode mismatches (e.g. leader still in legacy while follower in
+    // unified) are immediately visible in the log.
     {
-      ros::NodeHandle control_nh(nh_, "controller");
-      control_nh.getParam("unified_control_mode", unified_control_mode_);
+      int navi_state = navigator_->getNaviState();
+      if (navi_state == aerial_robot_navigation::TAKEOFF_STATE &&
+          prev_navi_state_for_diag_ != aerial_robot_navigation::TAKEOFF_STATE) {
+        ROS_WARN("[UnifiedCtrl] takeoff snapshot: id=%d module_state=%d unified_mode=%s prev_unified=%s",
+                 beetle_navigator_->getMyID(),
+                 beetle_navigator_->getModuleState(),
+                 unified_control_mode_ ? "ON" : "OFF",
+                 prev_unified_control_mode_ ? "ON" : "OFF");
+      }
+      prev_navi_state_for_diag_ = navi_state;
     }
 
     // ======== Auto-latch: FOLLOWER safety net ========
@@ -873,7 +882,6 @@ namespace aerial_robot_control
     // Clear unified mode FOLLOWER state so that stale commands are not
     // forwarded when switching back to unified mode.
     unified_cmd_received_ = false;
-    follower_unified_active_ = false;
     unified_reference_sub_.shutdown();
     unified_reference_leader_id_ = -1;
     unified_reference_warmup_count_ = 0;

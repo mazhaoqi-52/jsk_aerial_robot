@@ -118,8 +118,6 @@ namespace aerial_robot_control
     std::map<int, int> z_ki_boost_frames_by_n_;
     std::map<int, double> z_ki_boost_factor_by_n_;
 
-    bool spinal_gains_zeroed_;        // track whether we sent zero rpy/gain to spinal
-
     bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
 
     /** @brief LEADER-only: send cascade gains + allocation matrix inverse to ALL assembled
@@ -175,8 +173,10 @@ namespace aerial_robot_control
     ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl (only when !gimbal_calc_in_fc)
     spinal::FourAxisCommand unified_thrust_cmd_;
     bool unified_cmd_received_;
-    bool follower_unified_active_;  // true once FOLLOWER has successfully forwarded at least one unified cmd
     ros::Time unified_cmd_stamp_;
+
+    // Edge-detector for one-shot takeoff diagnostic in update().
+    int prev_navi_state_for_diag_;
     // Reference msg fields — kept as debug/monitoring only (leader broadcasts,
     // follower stores). NOT used for follower's control output: follower computes
     // its own wrench_acc locally in runUnifiedControlCommon().

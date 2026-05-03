@@ -52,13 +52,19 @@ namespace aerial_robot_control
     // V1: 3D force estimation, debug-only (no control feedback).
     std::shared_ptr<FormationMomentumObserver> formation_observer_;
 
-    // UO-4: formation observer feedforward compensation (Phase UO-4)
-    // Injects LPF-filtered, bias-subtracted external force estimate as slow FF
-    // into the position PID. Enable only after bias is calibrated and E2 validation passes.
-    bool   formation_obs_comp_enable_;   // master switch (default false)
-    double formation_obs_comp_z_gain_;   // scaling factor for Z compensation [0,1]
-    double formation_obs_comp_xy_gain_;      // scaling factor for X/Y compensation [0,1]
-    double formation_obs_comp_torque_gain_;   // scaling factor for Roll/Pitch/Yaw torque compensation [0,1]
+    // Formation observer feedforward (redesigned, leader-follower-style two-stage attenuation)
+    //   Stage 1 = observer-internal LPF (very low cutoff, e.g. 0.05 Hz)
+    //   Stage 2 = soft ramp + per-axis hard clamp + injection through PID
+    //             integrator (limit_i / limit_sum naturally cap final command).
+    // Default disabled; enable only after E2 known-mass validation.
+    // Routing per axis:
+    //   X, Y, Z, YAW       → setPersistentFF (consumed via PID.result())
+    //   ROLL, PITCH        → setICompTerm    (consumed via PID.getITerm())
+    bool   fobs_comp_enable_;            // master switch (default false)
+    double fobs_comp_force_gain_;        // scalar gain on F_x/F_y/F_z FF acc [0,1]
+    double fobs_comp_torque_gain_;       // scalar gain on Tau_x/_y/_z FF ang-acc [0,1]
+    double fobs_comp_ff_force_limit_;    // hard clamp on |FF acc|     [m/s^2]
+    double fobs_comp_ff_torque_limit_;   // hard clamp on |FF ang-acc| [rad/s^2]
 
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;

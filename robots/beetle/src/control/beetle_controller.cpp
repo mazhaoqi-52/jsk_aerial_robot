@@ -47,10 +47,11 @@ namespace aerial_robot_control
     z_ki_boost_frames_default_(60),
     z_ki_boost_factor_default_(2.0),
     gains_switched_(false),
-    formation_obs_comp_enable_(false),
-    formation_obs_comp_z_gain_(1.0),
-    formation_obs_comp_xy_gain_(1.0),
-    formation_obs_comp_torque_gain_(1.0)
+    fobs_comp_enable_(false),
+    fobs_comp_force_gain_(0.0),
+    fobs_comp_torque_gain_(0.0),
+    fobs_comp_ff_force_limit_(0.5),
+    fobs_comp_ff_torque_limit_(0.3)
   {
   }
 
@@ -260,13 +261,13 @@ namespace aerial_robot_control
     init_sum_momentum_ = Eigen::VectorXd::Zero(6);
     ROS_INFO("[UnifiedCtrl] Single-module observer re-initialized (timestamp/integrate/est zeroed)");
 
-    // UO-4: clear observer feedforward on mode exit to avoid stale values
+    // Clear formation-observer FF on mode exit to avoid stale values
     pid_controllers_.at(X).setPersistentFF(0.0);
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
-    pid_controllers_.at(ROLL).setPersistentFF(0.0);
-    pid_controllers_.at(PITCH).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
+    pid_controllers_.at(ROLL).setICompTerm(0.0);
+    pid_controllers_.at(PITCH).setICompTerm(0.0);
     formation_desired_wrench_.setZero();
   }
 
@@ -1562,12 +1563,15 @@ namespace aerial_robot_control
     getParam<double>(u_yaw_nh, "limit_i", unified_yaw_gains_.limit_i, 5.0);
     getParam<double>(u_yaw_nh, "limit_d", unified_yaw_gains_.limit_d, 20.0);
 
-    // UO-4: formation observer feedforward compensation
+    // Formation observer feedforward (redesigned). Default disabled.
+    // Force/torque gains scale ramped, bias-subtracted, LPF-filtered observer output;
+    // ff_*_limit then hard-clamps the resulting FF acceleration.
     ros::NodeHandle obs_comp_nh(control_nh, "formation_observer_comp");
-    getParam<bool>(obs_comp_nh,   "enable",   formation_obs_comp_enable_,  false);
-    getParam<double>(obs_comp_nh, "z_gain",   formation_obs_comp_z_gain_,  1.0);
-    getParam<double>(obs_comp_nh, "xy_gain",     formation_obs_comp_xy_gain_,    1.0);
-    getParam<double>(obs_comp_nh, "torque_gain", formation_obs_comp_torque_gain_, 1.0);
+    getParam<bool>(obs_comp_nh,   "enable",          fobs_comp_enable_,           false);
+    getParam<double>(obs_comp_nh, "force_gain",      fobs_comp_force_gain_,       0.0);
+    getParam<double>(obs_comp_nh, "torque_gain",     fobs_comp_torque_gain_,      0.0);
+    getParam<double>(obs_comp_nh, "ff_force_limit",  fobs_comp_ff_force_limit_,   0.5);
+    getParam<double>(obs_comp_nh, "ff_torque_limit", fobs_comp_ff_torque_limit_,  0.3);
 
   }
 
@@ -2000,15 +2004,24 @@ namespace aerial_robot_control
     // --- Position PID (X/Y/Z) with formation CoG ---
     double du = ros::Time::now().toSec() - control_timestamp_;
 
-    // UO-4 XY FF (leader only; observer does not run on follower)
-    if (is_leader && formation_obs_comp_enable_ &&
+    // Formation observer feedforward (XY): leader-only, two-stage attenuated.
+    //   stage 1 (in observer): LPF @ 0.05 Hz on bias-subtracted estimate
+    //   stage 2 (here):        soft ramp * gain, then hard clamp to ff_force_limit
+    // Inject via setPersistentFF since X/Y consume PID.result() downstream.
+    if (is_leader && fobs_comp_enable_ &&
         formation_observer_ && formation_observer_->isBiasCalibrated() &&
         !navigator_->getForceLandingFlag()) {
+      double ramp = formation_observer_->getFfRampFactor();
       Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
       tf::Vector3 f_world = cog_rot * tf::Vector3(f_body.x(), f_body.y(), f_body.z());
-      double mass = std::max(unified_controller_->getFormationMass(), 0.01);
-      pid_controllers_.at(X).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.x() / mass);
-      pid_controllers_.at(Y).setPersistentFF(-formation_obs_comp_xy_gain_ * f_world.y() / mass);
+      double mass_inv_f = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
+      double k = ramp * fobs_comp_force_gain_;
+      double ff_x = boost::algorithm::clamp(-k * f_world.x() * mass_inv_f,
+                                            -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
+      double ff_y = boost::algorithm::clamp(-k * f_world.y() * mass_inv_f,
+                                            -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
+      pid_controllers_.at(X).setPersistentFF(ff_x);
+      pid_controllers_.at(Y).setPersistentFF(ff_y);
     } else {
       pid_controllers_.at(X).setPersistentFF(0.0);
       pid_controllers_.at(Y).setPersistentFF(0.0);
@@ -2045,12 +2058,14 @@ namespace aerial_robot_control
       err_v_z = 0;
       target_acc_.setZ(0);
     }
-    if (is_leader && formation_obs_comp_enable_ &&
+    if (is_leader && fobs_comp_enable_ &&
         formation_observer_ && formation_observer_->isBiasCalibrated() &&
         !navigator_->getForceLandingFlag()) {
+      double ramp = formation_observer_->getFfRampFactor();
       double fz_body = formation_observer_->getEstExternalForceBody().z();
-      double ff_z = -formation_obs_comp_z_gain_ * fz_body /
-                    std::max(unified_controller_->getFormationMass(), 0.01);
+      double mass_inv_z = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
+      double ff_z = boost::algorithm::clamp(-ramp * fobs_comp_force_gain_ * fz_body * mass_inv_z,
+                                            -fobs_comp_ff_force_limit_, fobs_comp_ff_force_limit_);
       pid_controllers_.at(Z).setPersistentFF(ff_z);
     } else {
       pid_controllers_.at(Z).setPersistentFF(0.0);
@@ -2090,18 +2105,31 @@ namespace aerial_robot_control
     double du_rp = du;
     if (!start_rp_integration_) du_rp = 0;
 
-    if (is_leader && formation_obs_comp_enable_ &&
+    // Formation observer torque feedforward (leader-only, two-stage attenuated).
+    // ROLL/PITCH consume PID.getITerm() downstream, so inject via setICompTerm
+    // (= ang_acc / i_gain) which then enters the i_term sum and is naturally
+    // capped by limit_i. YAW consumes PID.result() so injects via setPersistentFF.
+    if (is_leader && fobs_comp_enable_ &&
         formation_observer_ && formation_observer_->isBiasCalibrated() &&
         !navigator_->getForceLandingFlag()) {
+      double ramp = formation_observer_->getFfRampFactor();
       Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
       Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
-      double tgain = formation_obs_comp_torque_gain_;
-      pid_controllers_.at(ROLL).setPersistentFF(-tgain * alpha_ext.x());
-      pid_controllers_.at(PITCH).setPersistentFF(-tgain * alpha_ext.y());
-      pid_controllers_.at(YAW).setPersistentFF(-tgain * alpha_ext.z());
+      double k = ramp * fobs_comp_torque_gain_;
+      double ff_r = boost::algorithm::clamp(-k * alpha_ext.x(),
+                                            -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+      double ff_p = boost::algorithm::clamp(-k * alpha_ext.y(),
+                                            -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+      double ff_y = boost::algorithm::clamp(-k * alpha_ext.z(),
+                                            -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+      double ki_r = std::max(pid_controllers_.at(ROLL).getIGain(),  1e-6);
+      double ki_p = std::max(pid_controllers_.at(PITCH).getIGain(), 1e-6);
+      pid_controllers_.at(ROLL).setICompTerm(ff_r / ki_r);
+      pid_controllers_.at(PITCH).setICompTerm(ff_p / ki_p);
+      pid_controllers_.at(YAW).setPersistentFF(ff_y);
     } else {
-      pid_controllers_.at(ROLL).setPersistentFF(0.0);
-      pid_controllers_.at(PITCH).setPersistentFF(0.0);
+      pid_controllers_.at(ROLL).setICompTerm(0.0);
+      pid_controllers_.at(PITCH).setICompTerm(0.0);
       pid_controllers_.at(YAW).setPersistentFF(0.0);
     }
 

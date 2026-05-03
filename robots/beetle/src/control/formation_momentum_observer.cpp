@@ -39,13 +39,13 @@ FormationMomentumObserver::FormationMomentumObserver()
     integrate_term_force_(Eigen::Vector3d::Zero()),
     est_ext_force_w_(Eigen::Vector3d::Zero()),
     est_ext_force_w_filt_(Eigen::Vector3d::Zero()),
-    est_force_lpf_cutoff_freq_(2.0),
+    est_force_lpf_cutoff_freq_(0.05),
     est_force_lpf_initialized_(false),
     init_angular_momentum_(Eigen::Vector3d::Zero()),
     integrate_term_torque_(Eigen::Vector3d::Zero()),
     est_ext_torque_body_(Eigen::Vector3d::Zero()),
     est_ext_torque_body_filt_(Eigen::Vector3d::Zero()),
-    est_torque_lpf_cutoff_freq_(2.0),
+    est_torque_lpf_cutoff_freq_(0.05),
     est_torque_lpf_initialized_(false),
     last_cog_rot_(Eigen::Matrix3d::Identity()),
     force_observer_gain_(3.0),
@@ -66,7 +66,9 @@ FormationMomentumObserver::FormationMomentumObserver()
     bias_calib_samples_(40),
     update_count_(0),
     bias_calibration_allowed_(false),
-    bias_ready_count_(0)
+    bias_ready_count_(0),
+    bias_calibrated_time_(-1.0),
+    ff_ramp_seconds_(5.0)
 {
 }
 
@@ -100,8 +102,9 @@ void FormationMomentumObserver::loadParams()
   obs_nh.param<bool>("enable_torque_observer", enable_torque_observer_, false);
   obs_nh.param<double>("bias_settle_time", bias_settle_time_, 3.0);
   obs_nh.param<int>("bias_calib_samples", bias_calib_samples_, 40);
-  obs_nh.param<double>("est_force_lpf_cutoff_freq",  est_force_lpf_cutoff_freq_,  2.0);
-  obs_nh.param<double>("est_torque_lpf_cutoff_freq", est_torque_lpf_cutoff_freq_, 2.0);
+  obs_nh.param<double>("est_force_lpf_cutoff_freq",  est_force_lpf_cutoff_freq_,  0.05);
+  obs_nh.param<double>("est_torque_lpf_cutoff_freq", est_torque_lpf_cutoff_freq_, 0.05);
+  obs_nh.param<double>("ff_ramp_seconds",            ff_ramp_seconds_,            5.0);
 }
 
 void FormationMomentumObserver::reset()
@@ -137,6 +140,7 @@ void FormationMomentumObserver::reset()
   update_count_ = 0;
   bias_calibration_allowed_ = false;
   bias_ready_count_ = 0;
+  bias_calibrated_time_ = -1.0;
 
   ROS_INFO("[FormationObserver] State reset (including bias calibration)");
 }
@@ -271,8 +275,9 @@ void FormationMomentumObserver::update(
             bias_force_w_ = bias_accumulator_ / static_cast<double>(bias_calib_samples_);
             bias_calibrated_ = true;
             bias_calibrating_ = false;
-            ROS_INFO("[FormationObserver] Force bias calibrated: (%.3f, %.3f, %.3f) N",
-                     bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z());
+            bias_calibrated_time_ = ros::Time::now().toSec();
+            ROS_INFO("[FormationObserver] Force bias calibrated: (%.3f, %.3f, %.3f) N (FF ramp %.1fs starts now)",
+                     bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z(), ff_ramp_seconds_);
           }
         }
       }
@@ -485,6 +490,16 @@ Eigen::VectorXd FormationMomentumObserver::getEstExternalWrench6D() const
   wrench.head(3) = last_cog_rot_.transpose() * (est_ext_force_w_ - bias_force_w_);
   wrench.tail(3) = est_ext_torque_body_filt_ - bias_torque_body_;
   return wrench;
+}
+
+double FormationMomentumObserver::getFfRampFactor() const
+{
+  if (!bias_calibrated_ || bias_calibrated_time_ < 0.0) return 0.0;
+  if (ff_ramp_seconds_ <= 1e-3) return 1.0;
+  double dt_since = ros::Time::now().toSec() - bias_calibrated_time_;
+  if (dt_since <= 0.0) return 0.0;
+  if (dt_since >= ff_ramp_seconds_) return 1.0;
+  return dt_since / ff_ramp_seconds_;
 }
 
 } // namespace aerial_robot_control

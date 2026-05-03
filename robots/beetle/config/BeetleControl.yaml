@@ -62,20 +62,30 @@ controller:
     torque_observer_gain: 2.5
     enable_force_observer: true
     enable_torque_observer: true
-    est_force_lpf_cutoff_freq: 1.0   # Hz: output LPF on force estimate
-    est_torque_lpf_cutoff_freq: 2.0  # Hz: output LPF on torque estimate
+    # Stage-1 LPF cutoff. Pushed to 0.05 Hz so that any sub-Hz hover oscillation
+    # (e.g. ~0.2 Hz) is attenuated by ≥75 % before reaching the FF path.
+    est_force_lpf_cutoff_freq: 0.05
+    est_torque_lpf_cutoff_freq: 0.05
     bias_settle_time: 3.0
     bias_calib_samples: 200  # effective only in this namespace; sampling is gated until unified-hover
+    # Stage-2 ramp: after bias completes, FF rises 0→1 over this many seconds.
+    ff_ramp_seconds: 5.0
 
-  # ========== UO-4: Formation observer feedforward compensation ==========
-  # Enable ONLY after E2 validation (known-mass test confirms correct Z estimation).
-  # Sign: if observer detects downward load (f_body_z < 0), FF adds upward thrust.
-  # z_gain: scale factor [0,1]; start with 0.3–0.5 to be conservative.
+  # ========== Formation observer feedforward (redesigned, leader-follower style) ==========
+  # Enable ONLY after E2 known-mass validation. Default OFF.
+  # Two-stage attenuation pipeline:
+  #   stage 1 = observer LPF @ 0.05 Hz on bias-subtracted output
+  #   stage 2 = soft ramp * gain * hard clamp, then routed through PID's
+  #             persistent_ff or i_comp_term (i.e. final command is also
+  #             capped by limit_sum / limit_i of the host PID).
+  # Recommended bring-up: enable=true, force_gain=0.05, torque_gain=0.05, ramp=10s.
+  # If hover stays clean for 60 s, raise gain stepwise to 0.2.
   formation_observer_comp:
     enable: true
-    z_gain: 0.5      # Z feedforward gain [0,1]; validated with E2
-    xy_gain: 0.3      # X/Y feedforward gain [0,1]; start conservative (horizontal less reliable)
-    torque_gain: 0.5  # Roll/Pitch/Yaw torque feedforward gain [0,1]; start conservative
+    force_gain:      0.2   # scalar on F_x/F_y/F_z FF acc [0,1]
+    torque_gain:     0.2   # scalar on T_x/T_y/T_z FF ang-acc [0,1]
+    ff_force_limit:  5.0   # hard clamp on |FF acc|     [m/s^2]
+    ff_torque_limit: 2.0   # hard clamp on |FF ang-acc| [rad/s^2]
 
   yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
   tgt_angle_lpf_alpha: 0.3

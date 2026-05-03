@@ -117,6 +117,12 @@ public:
   /** @brief Is the bias calibrated? */
   bool isBiasCalibrated() const { return bias_calibrated_; }
 
+  /** @brief Soft-ramp factor used by downstream FF compensation. Returns 0 until
+   *  bias is calibrated, then linearly ramps 0→1 over ff_ramp_seconds_, then 1.0.
+   *  Combined with the very-low-cutoff LPF this provides the second stage of
+   *  attenuation for the formation-observer feedforward path. */
+  double getFfRampFactor() const;
+
   /** @brief Get the current bias value [N] (world frame). */
   const Eigen::Vector3d& getBias() const { return bias_force_w_; }
 
@@ -160,6 +166,11 @@ private:
   int    update_count_;                      // total update() calls since initialization
   bool   bias_calibration_allowed_;          // true only while unified hover is active
   int    bias_ready_count_;                  // hover-allowed frame counter for settle timing
+
+  // Ramp from 0→1 starting at the moment force bias finishes calibration.
+  // bias_calibrated_time_ < 0 means "not yet calibrated".
+  double bias_calibrated_time_;              // ros::Time::now().toSec() at completion
+  double ff_ramp_seconds_;                   // duration of the 0→1 soft ramp [s]
 
   // Last rotation matrix (cached for body↔world conversion)
   Eigen::Matrix3d last_cog_rot_;

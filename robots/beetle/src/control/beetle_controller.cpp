@@ -616,6 +616,8 @@ namespace aerial_robot_control
       }else{
         du = ros::Time::now().toSec() - prev_comp_update_time_;
         prev_comp_update_time_ = ros::Time::now().toSec();
+        if (du < 0.0) du = 0.0;
+        if (du > 0.1) du = 0.1;  // clamp callback-stall gaps
       }
 
       pid_controllers_.at(FX).updateWoVel(I_reconfig_acc_cog_term(0) / IGain_Fx, du);
@@ -2005,6 +2007,8 @@ namespace aerial_robot_control
 
     // --- Position PID (X/Y/Z) with formation CoG ---
     double du = ros::Time::now().toSec() - control_timestamp_;
+    if (du < 0.0) du = 0.0;
+    if (du > 0.1) du = 0.1;  // clamp callback-stall gaps so PID-D and FF integrators stay sane
 
     // Formation observer feedforward (XY): leader-only, two-stage attenuated.
     //   stage 1 (in observer): LPF @ 0.05 Hz on bias-subtracted estimate

@@ -62,12 +62,16 @@ controller:
     torque_observer_gain: 2.5
     enable_force_observer: true
     enable_torque_observer: true
-    # Stage-1 LPF cutoff. Pushed to 0.05 Hz so that any sub-Hz hover oscillation
-    # (e.g. ~0.2 Hz) is attenuated by ≥75 % before reaching the FF path.
-    est_force_lpf_cutoff_freq: 0.05
-    est_torque_lpf_cutoff_freq: 0.05
+    # Stage-1 LPF cutoff (output filt). 1.0 Hz lets real disturbances pass while
+    # rejecting attitude / IMU noise. Long-term drift is removed by the bias LPF below.
+    est_force_lpf_cutoff_freq: 1.0
+    est_torque_lpf_cutoff_freq: 1.0
     bias_settle_time: 3.0
-    bias_calib_samples: 200  # effective only in this namespace; sampling is gated until unified-hover
+    # Continuous bias LPF cutoff. After settle, bias_force_w_ tracks long-term
+    # drift via this LPF (bias = (1-r)*bias + r*filt with r = dt*2pi*fc).
+    # 0.02 Hz ⇒ ~8 s effective time constant; chosen ≪ est_force_lpf_cutoff so
+    # corrected = filt - bias still captures mid-band disturbances.
+    bias_lpf_cutoff_freq: 0.02
     # Stage-2 ramp: after bias completes, FF rises 0→1 over this many seconds.
     ff_ramp_seconds: 5.0
 

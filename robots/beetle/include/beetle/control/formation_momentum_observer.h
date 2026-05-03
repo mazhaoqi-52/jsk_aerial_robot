@@ -144,25 +144,20 @@ private:
   Eigen::Vector3d est_ext_torque_body_;      // estimated external torque in body frame
 
   // ---- Bias calibration ----
-  // After the observer converges during unloaded hover, record the steady-state
-  // estimate as a bias baseline. Output = raw_estimate - bias.
-  // This cancels the inherent offset from PID I-term model-error compensation,
-  // analogous to how the original per-module observer uses differential
-  // (individual - average) to cancel common-mode bias.
-  bool bias_calibrated_;                     // true once force bias calibration completes
-  bool bias_calibrating_;                    // true during force bias accumulation
-  int  bias_sample_count_;                   // samples accumulated for force bias
-  Eigen::Vector3d bias_accumulator_;         // sum of raw force estimates during calibration
-  Eigen::Vector3d bias_force_w_;             // calibrated force bias (subtracted from output)
+  // Two-stage Dragon-style bias tracking:
+  //   1) Wait bias_settle_time during stable hover, then snap bias_*_ from filt.
+  //   2) After snap, continuously update bias_*_ via a slow LPF
+  //      (bias_lpf_cutoff_freq, e.g. 0.02 Hz) so bias tracks system drift
+  //      (battery sag, thermal, aerodynamic ground effect changes).
+  // Output = filt - bias captures only mid-frequency real disturbances.
+  bool bias_calibrated_;                     // true once force bias is snapped
+  Eigen::Vector3d bias_force_w_;             // tracked force bias (subtracted from output)
 
-  bool bias_torque_calibrated_;              // true once torque bias calibration completes
-  bool bias_torque_calibrating_;             // true during torque bias accumulation
-  int  bias_torque_sample_count_;            // samples accumulated for torque bias
-  Eigen::Vector3d bias_torque_accumulator_;  // sum of raw torque estimates during calibration
-  Eigen::Vector3d bias_torque_body_;         // calibrated torque bias (subtracted from output)
+  bool bias_torque_calibrated_;              // true once torque bias is snapped
+  Eigen::Vector3d bias_torque_body_;         // tracked torque bias (subtracted from output)
 
-  double bias_settle_time_;                  // seconds to wait before starting calibration
-  int    bias_calib_samples_;                // number of samples to average for bias
+  double bias_settle_time_;                  // seconds to wait before snap
+  double bias_lpf_cutoff_freq_;              // Hz; LPF cutoff for continuous bias update
   int    update_count_;                      // total update() calls since initialization
   bool   bias_calibration_allowed_;          // true only while unified hover is active
   int    bias_ready_count_;                  // hover-allowed frame counter for settle timing

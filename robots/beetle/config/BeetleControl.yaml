@@ -194,8 +194,8 @@ controller:
   unified_xy:
     p_gain: 10.0
     i_gain: 0.15
-    d_gain: 6        # ζ = 5.5/(2×√10) = 0.870 (was 4.0, ζ=0.632 underdamped)
-    err_d_lpf_cutoff_freq: 3.5  # 3.5→1.5 Hz: suppress D-term noise at low-freq oscillation (0.15-0.2Hz)
+    d_gain: 4.0      # A: 6→4 revert to Flight 3 baseline (ζ=0.632, 验证候选 1: D 噪声放大)
+    err_d_lpf_cutoff_freq: 1.5  # A: 3.5→1.5 Hz, 抑制 1-3Hz 速度估计噪声放大成 target_pitch 抖动
     limit_sum: 8.0
     limit_p: 12.0
     limit_i: 5.0

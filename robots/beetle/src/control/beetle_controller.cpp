@@ -51,7 +51,9 @@ namespace aerial_robot_control
     fobs_comp_force_gain_(0.0),
     fobs_comp_torque_gain_(0.0),
     fobs_comp_ff_force_limit_(0.5),
-    fobs_comp_ff_torque_limit_(0.3)
+    fobs_comp_ff_torque_limit_(0.3),
+    fobs_comp_ff_torque_x_(0.0),
+    fobs_comp_ff_torque_y_(0.0)
   {
   }
 
@@ -266,8 +268,8 @@ namespace aerial_robot_control
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
-    pid_controllers_.at(ROLL).setICompTerm(0.0);
-    pid_controllers_.at(PITCH).setICompTerm(0.0);
+    fobs_comp_ff_torque_x_ = 0.0;
+    fobs_comp_ff_torque_y_ = 0.0;
     formation_desired_wrench_.setZero();
   }
 
@@ -2106,9 +2108,12 @@ namespace aerial_robot_control
     if (!start_rp_integration_) du_rp = 0;
 
     // Formation observer torque feedforward (leader-only, two-stage attenuated).
-    // ROLL/PITCH consume PID.getITerm() downstream, so inject via setICompTerm
-    // (= ang_acc / i_gain) which then enters the i_term sum and is naturally
-    // capped by limit_i. YAW consumes PID.result() so injects via setPersistentFF.
+    //   ROLL / PITCH → cached as fobs_comp_ff_torque_{x,y}_, ADDED below to
+    //                  target_wrench_acc(3,4) on top of PID.getITerm().
+    //                  This is mathematically equivalent to a one-shot
+    //                  setICompTerm(ff/ki) but stateless — PID's err_i_ is
+    //                  not contaminated, so it cannot accumulate frame-on-frame.
+    //   YAW          → setPersistentFF (PID.result() feeds wrench_acc(5)).
     if (is_leader && fobs_comp_enable_ &&
         formation_observer_ && formation_observer_->isBiasCalibrated() &&
         !navigator_->getForceLandingFlag()) {
@@ -2116,20 +2121,16 @@ namespace aerial_robot_control
       Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
       Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
       double k = ramp * fobs_comp_torque_gain_;
-      double ff_r = boost::algorithm::clamp(-k * alpha_ext.x(),
-                                            -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
-      double ff_p = boost::algorithm::clamp(-k * alpha_ext.y(),
-                                            -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+      fobs_comp_ff_torque_x_ = boost::algorithm::clamp(-k * alpha_ext.x(),
+                                                       -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+      fobs_comp_ff_torque_y_ = boost::algorithm::clamp(-k * alpha_ext.y(),
+                                                       -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
       double ff_y = boost::algorithm::clamp(-k * alpha_ext.z(),
                                             -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
-      double ki_r = std::max(pid_controllers_.at(ROLL).getIGain(),  1e-6);
-      double ki_p = std::max(pid_controllers_.at(PITCH).getIGain(), 1e-6);
-      pid_controllers_.at(ROLL).setICompTerm(ff_r / ki_r);
-      pid_controllers_.at(PITCH).setICompTerm(ff_p / ki_p);
       pid_controllers_.at(YAW).setPersistentFF(ff_y);
     } else {
-      pid_controllers_.at(ROLL).setICompTerm(0.0);
-      pid_controllers_.at(PITCH).setICompTerm(0.0);
+      fobs_comp_ff_torque_x_ = 0.0;
+      fobs_comp_ff_torque_y_ = 0.0;
       pid_controllers_.at(YAW).setPersistentFF(0.0);
     }
 
@@ -2195,10 +2196,42 @@ namespace aerial_robot_control
                              pid_controllers_.at(Y).result(),
                              pid_controllers_.at(Z).result());
     tf::Vector3 target_acc_cog = uav_rot.inverse() * target_acc_w;
+
+    // [DIAG-A+C] Rolling stddev of XY target_acc over last N=80 samples (~2s @40Hz).
+    // Quantifies how much D-term + observer noise gets injected into target attitude.
+    // High stddev (> ~0.5 m/s²) at hover indicates D-gain / LPF cutoff noise amplification.
+    {
+      static constexpr int DIAG_BUF_N = 80;
+      static double diag_ax_buf[DIAG_BUF_N] = {0};
+      static double diag_ay_buf[DIAG_BUF_N] = {0};
+      static int diag_idx = 0;
+      static int diag_count = 0;
+      diag_ax_buf[diag_idx] = target_acc_cog.x();
+      diag_ay_buf[diag_idx] = target_acc_cog.y();
+      diag_idx = (diag_idx + 1) % DIAG_BUF_N;
+      if (diag_count < DIAG_BUF_N) diag_count++;
+      double mx = 0, my = 0;
+      for (int k = 0; k < diag_count; k++) { mx += diag_ax_buf[k]; my += diag_ay_buf[k]; }
+      mx /= diag_count; my /= diag_count;
+      double vx = 0, vy = 0;
+      for (int k = 0; k < diag_count; k++) {
+        double dx = diag_ax_buf[k] - mx; double dy = diag_ay_buf[k] - my;
+        vx += dx*dx; vy += dy*dy;
+      }
+      double sx = std::sqrt(vx / std::max(diag_count, 1));
+      double sy = std::sqrt(vy / std::max(diag_count, 1));
+      ROS_INFO_THROTTLE(1.0,
+        "[DIAG-A+C id=%d] tgt_acc_cog mean=(%.3f,%.3f) std=(%.3f,%.3f) [m/s^2 over 2s] "
+        "X.PID p=%.3f i=%.3f d=%.3f Y.PID p=%.3f i=%.3f d=%.3f",
+        my_id, mx, my, sx, sy,
+        pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(), pid_controllers_.at(X).getDTerm(),
+        pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(), pid_controllers_.at(Y).getDTerm());
+    }
+
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
-    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
-    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
+    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm()  + fobs_comp_ff_torque_x_;
+    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm() + fobs_comp_ff_torque_y_;
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 

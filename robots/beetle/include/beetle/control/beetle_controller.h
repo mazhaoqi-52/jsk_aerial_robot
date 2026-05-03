@@ -59,12 +59,23 @@ namespace aerial_robot_control
     // Default disabled; enable only after E2 known-mass validation.
     // Routing per axis:
     //   X, Y, Z, YAW       → setPersistentFF (consumed via PID.result())
-    //   ROLL, PITCH        → setICompTerm    (consumed via PID.getITerm())
+    //   ROLL, PITCH        → additive direct FF on target_wrench_acc(3,4)
+    //                       (PID.getITerm() + fobs_comp_ff_torque_*_)
+    //                       Avoids the setICompTerm() accumulation pathology:
+    //                       PID::update() does err_i_ = clamp(err_i_+errp*du)+i_comp,
+    //                       so a constant i_comp written each frame grows err_i_
+    //                       linearly until limit_err_i clamps. A direct additive
+    //                       FF on wrench_acc has the SAME effect as one-shot i_comp
+    //                       (since wrench_acc(3,4)=ROLL/PITCH.getITerm()) but is
+    //                       stateless and cannot accumulate.
     bool   fobs_comp_enable_;            // master switch (default false)
     double fobs_comp_force_gain_;        // scalar gain on F_x/F_y/F_z FF acc [0,1]
     double fobs_comp_torque_gain_;       // scalar gain on Tau_x/_y/_z FF ang-acc [0,1]
     double fobs_comp_ff_force_limit_;    // hard clamp on |FF acc|     [m/s^2]
     double fobs_comp_ff_torque_limit_;   // hard clamp on |FF ang-acc| [rad/s^2]
+    // Cached FF roll/pitch ang-acc per frame, added directly to wrench_acc(3,4)
+    double fobs_comp_ff_torque_x_;       // [rad/s^2], leader-only, 0 when disabled
+    double fobs_comp_ff_torque_y_;       // [rad/s^2], leader-only, 0 when disabled
 
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;

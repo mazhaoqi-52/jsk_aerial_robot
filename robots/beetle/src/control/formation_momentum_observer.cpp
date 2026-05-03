@@ -284,12 +284,13 @@ void FormationMomentumObserver::update(
     }
 
     Eigen::Vector3d f_filt_corrected = est_ext_force_w_filt_ - bias_force_w_;
+    double f_raw_filt_dev = (est_ext_force_w_ - est_ext_force_w_filt_).norm();
     ROS_INFO_THROTTLE(2.0, "[FormObs_F] raw=(%.3f,%.3f,%.3f) filt=(%.3f,%.3f,%.3f) "
-                      "bias=(%.3f,%.3f,%.3f) |filt|=%.3f calib=%s",
+                      "bias=(%.3f,%.3f,%.3f) |filt|=%.3f |raw-filt|=%.3f calib=%s",
                       est_ext_force_w_.x(), est_ext_force_w_.y(), est_ext_force_w_.z(),
                       f_filt_corrected.x(), f_filt_corrected.y(), f_filt_corrected.z(),
                       bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z(),
-                      f_filt_corrected.norm(),
+                      f_filt_corrected.norm(), f_raw_filt_dev,
                       bias_calibrated_ ? "YES" : (bias_calibrating_ ? "SAMPLING" : "SETTLING"));
   }
 
@@ -389,12 +390,16 @@ void FormationMomentumObserver::update(
       }
     }
 
-    Eigen::Vector3d tau_ext_corrected = est_ext_torque_body_ - bias_torque_body_;
-    ROS_INFO_THROTTLE(2.0, "[FormObs_T] raw=(%.4f,%.4f,%.4f) bias=(%.4f,%.4f,%.4f) "
-                      "corrected=(%.4f,%.4f,%.4f) gyro=(%.4f,%.4f,%.4f)",
+    Eigen::Vector3d tau_ext_corrected = est_ext_torque_body_filt_ - bias_torque_body_;
+    double tau_raw_filt_dev = (est_ext_torque_body_ - est_ext_torque_body_filt_).norm();
+    ROS_INFO_THROTTLE(2.0, "[FormObs_T] raw=(%.4f,%.4f,%.4f) filt=(%.4f,%.4f,%.4f) "
+                      "bias=(%.4f,%.4f,%.4f) corrected=(%.4f,%.4f,%.4f) "
+                      "|raw-filt|=%.4f gyro=(%.4f,%.4f,%.4f)",
                       est_ext_torque_body_.x(), est_ext_torque_body_.y(), est_ext_torque_body_.z(),
+                      est_ext_torque_body_filt_.x(), est_ext_torque_body_filt_.y(), est_ext_torque_body_filt_.z(),
                       bias_torque_body_.x(), bias_torque_body_.y(), bias_torque_body_.z(),
                       tau_ext_corrected.x(), tau_ext_corrected.y(), tau_ext_corrected.z(),
+                      tau_raw_filt_dev,
                       gyroscopic.x(), gyroscopic.y(), gyroscopic.z());
   }
 

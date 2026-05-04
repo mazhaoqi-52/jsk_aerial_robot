@@ -252,6 +252,18 @@ void FormationMomentumObserver::update(
     }
 
     Eigen::Vector3d f_filt_corrected = est_ext_force_w_filt_ - bias_force_w_;
+    // DEBUG: detect large corrected-force jump that would cause a sudden FF step.
+    {
+      static Eigen::Vector3d s_dbg_prev_corrected = Eigen::Vector3d::Zero();
+      double corrected_delta = (f_filt_corrected - s_dbg_prev_corrected).norm();
+      if (corrected_delta > 0.5 && bias_calibrated_)
+        ROS_WARN("[FormObs_Jump] delta=%.3f c=(%.2f,%.2f,%.2f) b=(%.2f,%.2f,%.2f) filt=(%.2f,%.2f,%.2f)",
+                 corrected_delta,
+                 f_filt_corrected.x(), f_filt_corrected.y(), f_filt_corrected.z(),
+                 bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z(),
+                 est_ext_force_w_filt_.x(), est_ext_force_w_filt_.y(), est_ext_force_w_filt_.z());
+      s_dbg_prev_corrected = f_filt_corrected;
+    }
     double f_raw_filt_dev = (est_ext_force_w_ - est_ext_force_w_filt_).norm();
     ROS_INFO_THROTTLE(2.0, "[FormObs_F] raw=(%.3f,%.3f,%.3f) filt=(%.3f,%.3f,%.3f) "
                       "bias=(%.3f,%.3f,%.3f) |filt|=%.3f |raw-filt|=%.3f calib=%s",

@@ -2010,6 +2010,20 @@ namespace aerial_robot_control
     if (du < 0.0) du = 0.0;
     if (du > 0.1) du = 0.1;  // clamp callback-stall gaps so PID-D and FF integrators stay sane
 
+    // DEBUG: detect large position jump that may indicate a mocap/estimator discontinuity.
+    // A jump > 1.5 cm in one 40 Hz frame (25 ms) is physically implausible at hover.
+    {
+      static tf::Vector3 s_dbg_prev_pos(0, 0, 0);
+      double djump = (formation_pos - s_dbg_prev_pos).length();
+      if (djump > 0.015 && s_dbg_prev_pos.length() > 0.01)
+        ROS_WARN("[PosJump id=%d] dt=%.4f |dp|=%.4f dx=%.4f dy=%.4f dz=%.4f",
+                 my_id, du, djump,
+                 formation_pos.x() - s_dbg_prev_pos.x(),
+                 formation_pos.y() - s_dbg_prev_pos.y(),
+                 formation_pos.z() - s_dbg_prev_pos.z());
+      s_dbg_prev_pos = formation_pos;
+    }
+
     // Formation observer feedforward (XY): leader-only, two-stage attenuated.
     //   stage 1 (in observer): LPF @ 0.05 Hz on bias-subtracted estimate
     //   stage 2 (here):        soft ramp * gain, then hard clamp to ff_force_limit

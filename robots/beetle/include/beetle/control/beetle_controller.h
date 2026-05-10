@@ -256,12 +256,15 @@ namespace aerial_robot_control
 
     bool des_wrench_pub_flag_;
 
-    // Desired external wrench for the whole assembly (body frame)
+    // Desired external wrench for the whole assembly (body frame, FULL value).
+    // Set on every module from desiredExternalWrenchCallback (leader receives from
+    // user, followers receive rebroadcast from leader). Used:
+    //  - Unified mode: directly as formation-level task FF in runUnifiedControlCommon.
+    //  - Legacy mode: leader splits into 1/N share for ff_inter distribution.
     Eigen::VectorXd desired_external_wrench_;
 
-    // Formation-level desired wrench for unified mode (full 6D, formation body frame).
-    // Unlike desired_external_wrench_ which holds a 1/N per-module share (independent mode),
-    // this holds the FULL wrench and is passed directly to computeUnifiedAllocation().
+    // Formation-level desired wrench for unified mode (full 6D, formation body frame),
+    // alternative input path bypassing the per-module share machinery.
     Eigen::VectorXd formation_desired_wrench_;
     ros::Subscriber formation_desired_wrench_sub_;
 

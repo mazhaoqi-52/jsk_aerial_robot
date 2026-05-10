@@ -725,28 +725,11 @@ namespace aerial_robot_control
       pid_controllers_.at(TY).reset();
       pid_controllers_.at(TZ).reset();
 
-      // LEADER feedforward: inject desired_external_wrench_ as persistent FF on position PID
-      // Uses setPersistentFF to avoid race condition with nav callback clearing target_acc_
-      if(module_state == LEADER && desired_external_wrench_.norm() > 1e-6) {
-        Eigen::Matrix3d cog_rot;
-        tf::matrixTFToEigen(estimator_->getOrientation(Frame::COG, estimate_mode_), cog_rot);
-        // desired_external_wrench_ is in body frame, rotate to world frame
-        Eigen::Vector3d ff_world = cog_rot * desired_external_wrench_.head(3);
-        // convert force to acceleration
-        Eigen::Vector3d ff_acc = mass_inv * ff_world;
-        // X/Y: persistent feedforward (avoids race condition with nav callback)
-        pid_controllers_.at(X).setPersistentFF(ff_acc(0));
-        pid_controllers_.at(Y).setPersistentFF(ff_acc(1));
-        // Z: inject body_z directly as persistent FF, skip cog_rot to avoid
-        // pitch-coupling instability. Uses setPersistentFF (not setICompTerm)
-        // because ICompTerm accumulates in the I-term integrator every tick.
-        double ff_z_direct = mass_inv * desired_external_wrench_(2);
-        pid_controllers_.at(Z).setPersistentFF(ff_z_direct);
-      } else {
-        pid_controllers_.at(X).setPersistentFF(0.0);
-        pid_controllers_.at(Y).setPersistentFF(0.0);
-        pid_controllers_.at(Z).setPersistentFF(0.0);
-      }
+      // Clear persistent FF (legacy LEADER task-FF injection removed; unified
+      // mode handles task FF inside runUnifiedControlCommon).
+      pid_controllers_.at(X).setPersistentFF(0.0);
+      pid_controllers_.at(Y).setPersistentFF(0.0);
+      pid_controllers_.at(Z).setPersistentFF(0.0);
       pid_controllers_.at(X).setICompTerm(0.0);
       pid_controllers_.at(Y).setICompTerm(0.0);
       pid_controllers_.at(Z).setICompTerm(0.0);
@@ -1696,20 +1679,20 @@ namespace aerial_robot_control
 
   void BeetleController::desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg)
   {
-    // Receive desired total external wrench for the whole assembly (body frame),
-    // then distribute to per-module ff_inter_wrench via ROS topics so that
-    // every module's ffInterWrenchCallback updates its local ff_inter_wrench_list_.
+    // Receive desired total external wrench for the whole assembly (body frame).
     //
-    // Force distribution strategy:
-    //   F_total is split equally among ALL assembled modules (N_total).
-    //   - LEADER: gets share via desired_external_wrench_ -> setPersistentFF in else branch
-    //   - FOLLOWERs: get share via ff_inter_wrench_list_ -> wrench_comp -> setPersistentFF
+    // Storage semantic (after Fix C unification):
+    //   desired_external_wrench_ = FULL formation-level wrench on EVERY module.
+    //   - Unified mode: runUnifiedControlCommon uses it directly as formation target.
+    //   - Legacy leader-follower mode: leader splits into share for ff_inter
+    //     distribution to followers (followers' wrench_comp consumes ff_inter,
+    //     not desired_external_wrench_).
     //
     // ff_inter mapping (after calcInteractionWrench sign fix):
     //   3.1 (i < leader): wrench_comp[i] = -ff_inter[i] + inter[i]
-    //        To drive FOLLOWER i with +F_share: need -ff_inter[i] = F_share => ff_inter[i] = -F_share
+    //        For FOLLOWER i to apply +F_share: ff_inter[i] = -F_share
     //   3.2 (i > leader): wrench_comp[i] = ff_inter[left] - inter[left]
-    //        To drive FOLLOWER i with +F_share: need ff_inter[left] = F_share
+    //        For FOLLOWER i to apply +F_share: ff_inter[left] = +F_share
 
     Eigen::VectorXd desired = Eigen::VectorXd::Zero(6);
     desired(0) = msg.wrench.force.x;
@@ -1719,10 +1702,11 @@ namespace aerial_robot_control
     desired(4) = msg.wrench.torque.y;
     desired(5) = msg.wrench.torque.z;
 
-    // Only LEADER distributes; FOLLOWERs just store their share and return
+    // Every module stores the FULL desired wrench (semantic unified across modules)
+    desired_external_wrench_ = desired;
+
+    // Only LEADER distributes ff_inter and rebroadcasts to followers
     if(beetle_navigator_->getModuleState() != LEADER) {
-      // FOLLOWERs receive their share via desired_ext_wrench_pubs_ (set below)
-      desired_external_wrench_ = desired;
       return;
     }
 
@@ -1737,9 +1721,6 @@ namespace aerial_robot_control
     if(total_count == 0) return;
 
     Eigen::VectorXd share = desired / total_count;
-
-    // LEADER stores its own share (not full desired!)
-    desired_external_wrench_ = share;
 
     // Build per-module ff_inter values based on the derivation:
     //   For module i < leader: ff_inter[i] = -share  (so wrench_comp[i] = share when inter=0)
@@ -1795,20 +1776,20 @@ namespace aerial_robot_control
         ff_inter_wrench_pubs_[item.first].publish(tw);
     }
 
-    // Distribute per-follower share via desired_external_wrench topics
-    // so each FOLLOWER's desired_external_wrench_ gets its share value
+    // Rebroadcast FULL desired wrench to all followers so every module stores
+    // the same desired_external_wrench_ (FULL semantic).
     for(const auto & item : assembly_flag) {
       if(!item.second) continue;
       if(item.first == leader_id) continue;  // skip LEADER to avoid cascade
       if(desired_ext_wrench_pubs_.count(item.first) == 0) continue;
       geometry_msgs::WrenchStamped fw;
       fw.header.stamp = stamp;
-      fw.wrench.force.x = share(0);
-      fw.wrench.force.y = share(1);
-      fw.wrench.force.z = share(2);
-      fw.wrench.torque.x = share(3);
-      fw.wrench.torque.y = share(4);
-      fw.wrench.torque.z = share(5);
+      fw.wrench.force.x = desired(0);
+      fw.wrench.force.y = desired(1);
+      fw.wrench.force.z = desired(2);
+      fw.wrench.torque.x = desired(3);
+      fw.wrench.torque.y = desired(4);
+      fw.wrench.torque.z = desired(5);
       desired_ext_wrench_pubs_[item.first].publish(fw);
     }
   }
@@ -2010,6 +1991,20 @@ namespace aerial_robot_control
     if (du < 0.0) du = 0.0;
     if (du > 0.1) du = 0.1;  // clamp callback-stall gaps so PID-D and FF integrators stay sane
 
+    // --- Task-level external wrench feedforward (towing / valve_rotation) ---
+    // desired_external_wrench_ holds the FULL formation-level wrench (body frame).
+    // Every module independently uses it to compute the same formation acc:
+    //   acc_world = cog_rot * F_full / formation_mass
+    //   ang_acc   = inertia_inv * tau_full
+    // Sign: positive (drone provides +F to apply +F via interface, opposite of
+    // observer FF which compensates a detected residual push).
+    Eigen::VectorXd desired_total_ff = Eigen::VectorXd::Zero(6);
+    if (desired_external_wrench_.norm() > 1e-6 &&
+        !navigator_->getForceLandingFlag()) {
+      desired_total_ff = desired_external_wrench_;
+    }
+    bool task_ff_active = (desired_total_ff.norm() > 1e-6);
+
     // DEBUG: detect large position jump that may indicate a mocap/estimator discontinuity.
     // A jump > 1.5 cm in one 40 Hz frame (25 ms) is physically implausible at hover.
     {
@@ -2028,23 +2023,33 @@ namespace aerial_robot_control
     //   stage 1 (in observer): LPF @ 0.05 Hz on bias-subtracted estimate
     //   stage 2 (here):        soft ramp * gain, then hard clamp to ff_force_limit
     // Inject via setPersistentFF since X/Y consume PID.result() downstream.
-    if (is_leader && fobs_comp_enable_ &&
-        formation_observer_ && formation_observer_->isBiasCalibrated() &&
-        !navigator_->getForceLandingFlag()) {
-      double ramp = formation_observer_->getFfRampFactor();
-      Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
-      tf::Vector3 f_world = cog_rot * tf::Vector3(f_body.x(), f_body.y(), f_body.z());
+    {
       double mass_inv_f = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
-      double k = ramp * fobs_comp_force_gain_;
-      double ff_x = boost::algorithm::clamp(-k * f_world.x() * mass_inv_f,
-                                            -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
-      double ff_y = boost::algorithm::clamp(-k * f_world.y() * mass_inv_f,
-                                            -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
+      double ff_x = 0.0, ff_y = 0.0;
+      // Observer FF (leader-only, residual compensation): negative sign because
+      // it counteracts a detected unmodeled external push.
+      if (is_leader && fobs_comp_enable_ &&
+          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          !navigator_->getForceLandingFlag()) {
+        double ramp = formation_observer_->getFfRampFactor();
+        Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
+        tf::Vector3 f_world = cog_rot * tf::Vector3(f_body.x(), f_body.y(), f_body.z());
+        double k = ramp * fobs_comp_force_gain_;
+        ff_x += boost::algorithm::clamp(-k * f_world.x() * mass_inv_f,
+                                        -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
+        ff_y += boost::algorithm::clamp(-k * f_world.y() * mass_inv_f,
+                                        -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
+      }
+      // Task FF (all modules, towing / valve_rotation): positive sign, body→world rotation.
+      if (task_ff_active) {
+        tf::Vector3 task_world = cog_rot * tf::Vector3(desired_total_ff(0),
+                                                       desired_total_ff(1),
+                                                       desired_total_ff(2));
+        ff_x += task_world.x() * mass_inv_f;
+        ff_y += task_world.y() * mass_inv_f;
+      }
       pid_controllers_.at(X).setPersistentFF(ff_x);
       pid_controllers_.at(Y).setPersistentFF(ff_y);
-    } else {
-      pid_controllers_.at(X).setPersistentFF(0.0);
-      pid_controllers_.at(Y).setPersistentFF(0.0);
     }
 
     switch (navigator_->getXyControlMode()) {
@@ -2078,17 +2083,22 @@ namespace aerial_robot_control
       err_v_z = 0;
       target_acc_.setZ(0);
     }
-    if (is_leader && fobs_comp_enable_ &&
-        formation_observer_ && formation_observer_->isBiasCalibrated() &&
-        !navigator_->getForceLandingFlag()) {
-      double ramp = formation_observer_->getFfRampFactor();
-      double fz_body = formation_observer_->getEstExternalForceBody().z();
+    {
       double mass_inv_z = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
-      double ff_z = boost::algorithm::clamp(-ramp * fobs_comp_force_gain_ * fz_body * mass_inv_z,
-                                            -fobs_comp_ff_force_limit_, fobs_comp_ff_force_limit_);
+      double ff_z = 0.0;
+      if (is_leader && fobs_comp_enable_ &&
+          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          !navigator_->getForceLandingFlag()) {
+        double ramp = formation_observer_->getFfRampFactor();
+        double fz_body = formation_observer_->getEstExternalForceBody().z();
+        ff_z += boost::algorithm::clamp(-ramp * fobs_comp_force_gain_ * fz_body * mass_inv_z,
+                                        -fobs_comp_ff_force_limit_, fobs_comp_ff_force_limit_);
+      }
+      // Task FF Z: body z direct (skip cog_rot) to avoid pitch-coupling instability.
+      if (task_ff_active) {
+        ff_z += desired_total_ff(2) * mass_inv_z;
+      }
       pid_controllers_.at(Z).setPersistentFF(ff_z);
-    } else {
-      pid_controllers_.at(Z).setPersistentFF(0.0);
     }
     pid_controllers_.at(Z).update(err_z, du, err_v_z, target_acc_.z());
 
@@ -2132,24 +2142,34 @@ namespace aerial_robot_control
     //                  setICompTerm(ff/ki) but stateless — PID's err_i_ is
     //                  not contaminated, so it cannot accumulate frame-on-frame.
     //   YAW          → setPersistentFF (PID.result() feeds wrench_acc(5)).
-    if (is_leader && fobs_comp_enable_ &&
-        formation_observer_ && formation_observer_->isBiasCalibrated() &&
-        !navigator_->getForceLandingFlag()) {
-      double ramp = formation_observer_->getFfRampFactor();
-      Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
-      Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
-      double k = ramp * fobs_comp_torque_gain_;
-      fobs_comp_ff_torque_x_ = boost::algorithm::clamp(-k * alpha_ext.x(),
-                                                       -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
-      fobs_comp_ff_torque_y_ = boost::algorithm::clamp(-k * alpha_ext.y(),
-                                                       -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
-      double ff_y = boost::algorithm::clamp(-k * alpha_ext.z(),
-                                            -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
-      pid_controllers_.at(YAW).setPersistentFF(ff_y);
-    } else {
+    {
       fobs_comp_ff_torque_x_ = 0.0;
       fobs_comp_ff_torque_y_ = 0.0;
-      pid_controllers_.at(YAW).setPersistentFF(0.0);
+      double ff_yaw = 0.0;
+      // Observer torque FF (leader-only, residual compensation): negative sign.
+      if (is_leader && fobs_comp_enable_ &&
+          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          !navigator_->getForceLandingFlag()) {
+        double ramp = formation_observer_->getFfRampFactor();
+        Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
+        Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
+        double k = ramp * fobs_comp_torque_gain_;
+        fobs_comp_ff_torque_x_ += boost::algorithm::clamp(-k * alpha_ext.x(),
+                                                          -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+        fobs_comp_ff_torque_y_ += boost::algorithm::clamp(-k * alpha_ext.y(),
+                                                          -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+        ff_yaw += boost::algorithm::clamp(-k * alpha_ext.z(),
+                                          -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
+      }
+      // Task torque FF (all modules, valve_rotation etc.): positive sign, body frame.
+      if (task_ff_active) {
+        Eigen::Vector3d task_alpha =
+            unified_controller_->getFormationInertia().inverse() * desired_total_ff.tail(3);
+        fobs_comp_ff_torque_x_ += task_alpha.x();
+        fobs_comp_ff_torque_y_ += task_alpha.y();
+        ff_yaw += task_alpha.z();
+      }
+      pid_controllers_.at(YAW).setPersistentFF(ff_yaw);
     }
 
     pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp,

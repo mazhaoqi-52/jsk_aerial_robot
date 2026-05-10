@@ -435,11 +435,14 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
 
   // ======== Unified Control Mode Navigation ========
   // In unified mode, target positions are in assembly CoG world frame.
-  // We convert them to leader's individual CoG frame by subtracting Cog2CoM offset,
-  // so that the PID drives the leader such that the assembly CoG reaches the target.
-  if (unified_control_mode_ && getModuleState() == LEADER) {
+  // EVERY assembled module (LEADER and FOLLOWER) converts the assembly target to
+  // its own individual CoG frame by subtracting its own Cog2CoM offset. This way
+  // each module's outer PID independently drives its own pose so that the
+  // assembly CoG reaches the shared target — symmetric formation control.
+  if (unified_control_mode_ &&
+      (getModuleState() == LEADER || getModuleState() == FOLLOWER)) {
 
-    // Compute assembly CoG → leader CoG offset (same as convertTargetPosFromCoG2CoM)
+    // Compute assembly CoG → this module's CoG offset (same as convertTargetPosFromCoG2CoM)
     tf::Transform cog2com_tf;
     tf::transformKDLToTF(getCog2CoM<KDL::Frame>(), cog2com_tf);
     tf::Vector3 com_offset = tf::Matrix3x3(tf::createQuaternionFromYaw(
@@ -547,8 +550,8 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
     }
 
     {
-      tf::Vector3 final_rp = getFinalTargetBaselinkRPY();
-      ROS_INFO_THROTTLE(1.0, "[UnifiedNav] assembly_target=(%.3f,%.3f,%.3f) leader_target=(%.3f,%.3f,%.3f) com_offset=(%.3f,%.3f,%.3f) yaw=%.3f",
+      ROS_INFO_THROTTLE(1.0, "[UnifiedNav id=%d state=%d] assembly_target=(%.3f,%.3f,%.3f) my_target=(%.3f,%.3f,%.3f) com_offset=(%.3f,%.3f,%.3f) yaw=%.3f",
+                        my_id_, static_cast<int>(getModuleState()),
                         msg->target_pos_x, msg->target_pos_y, msg->target_pos_z,
                         getTargetPos().x(), getTargetPos().y(), getTargetPos().z(),
                         com_offset.x(), com_offset.y(), com_offset.z(),

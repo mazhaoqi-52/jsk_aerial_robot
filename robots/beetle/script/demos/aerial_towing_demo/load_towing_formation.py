@@ -55,6 +55,11 @@ TOWING_MAX_FORCE = 5.0   # max adaptive force (N), overridden by ~towing_force p
 # - offset 0.15 -> approach 0.80m
 # - offset 0.18 -> approach 0.83m
 APPROACH_HEIGHT_OFFSET = 0.18
+# XY-transit clearance above box top — used as a SAFETY FLOOR for the
+# horizontal-transit phase and the disengage-ascent phase. Acts as a hard lower
+# bound on the transit Z target so even if takeoff_height is set low or the EE
+# drifts down during XY motion, the formation still clears the box.
+TRANSIT_CLEARANCE_OFFSET = 0.30
 
 
 class LinearTowingTrajectoryGenerator:
@@ -497,9 +502,11 @@ class ApproachLoadState(TowingStateBase):
         rospy.loginfo(f"Target height: {approach_height:.3f}m")
         rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f}°")
 
-        # Phase 1: XY movement (keep current Z)
-        rospy.loginfo("[Phase 1] Moving to XY position above box (Z unchanged)")
-        phase1_target = np.array([approach_xy[0], approach_xy[1], current_pos[2]])
+        # Phase 1: XY movement (Z = box-anchored safety floor or current Z, whichever higher)
+        transit_z = max(current_pos[2], load_top_z + TRANSIT_CLEARANCE_OFFSET)
+        rospy.loginfo(f"[Phase 1] Moving to XY position above box "
+                      f"(transit_z={transit_z:.3f}m, floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m)")
+        phase1_target = np.array([approach_xy[0], approach_xy[1], transit_z])
 
         trajectory_points = self.generate_polynomial_trajectory(
             start_pos=current_pos,
@@ -839,7 +846,8 @@ class DisengageAndReturnState(TowingStateBase):
     def __init__(self):
         TowingStateBase.__init__(self,
             outcomes=['succeeded', 'failed'],
-            input_keys=['start_position', 'start_yaw', 'towing_end_position', 'towing_direction'])
+            input_keys=['start_position', 'start_yaw', 'towing_end_position',
+                        'towing_direction', 'load_position'])
     
     def execute(self, userdata):
         rospy.loginfo("=== Disengage and Return State ===")
@@ -892,11 +900,16 @@ class DisengageAndReturnState(TowingStateBase):
         )
         rospy.sleep(0.5)
 
-        # Phase 1: Return to start height (hook is already disengaged in Phase 0.5)
+        # Phase 1: Return to start height (hook is already disengaged in Phase 0.5).
+        # Apply box-anchored safety floor — same convention as ApproachLoadState
+        # Phase 1 — so transit Z above the box is consistent across the whole task.
         current_pos = self.get_end_effector_position()
-        target_height = start_pos[2]
+        load_top_z = float(userdata.load_position[2]) + LOAD_BOX_HEIGHT / 2
+        target_height = max(start_pos[2], load_top_z + TRANSIT_CLEARANCE_OFFSET)
         rospy.loginfo(f"[Phase 1] Returning to start height {target_height:.3f}m "
-                      f"(current {current_pos[2]:.3f}m, delta {(target_height - current_pos[2])*1000:.0f}mm)")
+                      f"(start_pos[2]={start_pos[2]:.3f}m, "
+                      f"floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m={load_top_z+TRANSIT_CLEARANCE_OFFSET:.3f}m, "
+                      f"current {current_pos[2]:.3f}m, delta {(target_height - current_pos[2])*1000:.0f}mm)")
         ascent_target = (current_pos[0], current_pos[1], target_height)
         
         success = self.active_position_convergence(

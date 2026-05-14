@@ -78,7 +78,30 @@ class BeetleInterface(object):
         # External wrench state
         self.external_wrench_active = False
         self.current_external_wrench = TaggedWrench()
-        
+
+        # Task observer-prediction state (Level 2: spatial-inertia consistent).
+        # `attach_module_id` is retained only as an opt-in marker; the
+        # decomposition formula is uniform across modules.
+        self._inter_attach_module_id = None
+        self._inter_module_masses = {}
+        self._inter_module_ids = []
+        # Positions r_i in formation frame (will be auto-recentered to
+        # formation CoG); diagonal inertias I_i (Ixx,Iyy,Izz) in module body
+        # frame. Both optional — if absent, helper falls back to mass-ratio
+        # (Level 1) which is OK for pure-translational tasks like towing but
+        # NOT for tasks with significant torque (e.g. valve rotation).
+        self._inter_module_positions = {}
+        self._inter_module_inertias_diag = {}
+        # Cached after setAttachModule(): centred positions, M_form^{-1}.
+        self._inter_r_centered = {}
+        self._inter_M_form_inv = None
+        self._inter_m_total = 0.0
+        self._inter_auto_publish = False
+        self._est_wrench_task_pubs = {}
+        # Track last published ŷ^task per module so clearExternalWrench can
+        # zero them out cleanly.
+        self._last_est_wrench_task = {}
+
         # Joy control state
         self.prev_joy_state = Joy()
         self.halt_task = False
@@ -103,6 +126,31 @@ class BeetleInterface(object):
         if assembly_mode and wrench_target_id != module_id:
             rospy.logwarn(f"[BeetleInterface] Wrench routed to C++ LEADER beetle{wrench_target_id} "
                           f"(Python EE module={module_id})")
+
+        # ----- Per-module task observer prediction (ŷ^task) publishers -----
+        # Theory: the per-module momentum observer outputs
+        #     ŷ_i = c_i + d_i + b_i   (joint force + direct external + parasitic)
+        # We publish a task-space prediction ŷ_i^task and the C++ controller
+        # subtracts it BEFORE the joint-cut recursion in calcInteractionWrench,
+        # so downstream inter_wrench_list_ is the task-subtracted residual
+        # (~parasitic if the model is accurate). Two decomposition models are
+        # supported:
+        #   Level 1 (mass ratio): ŷ_i^task = (m_i/m_tot) * W_ext
+        #     Only valid for pure-translational tasks (towing). Used when
+        #     positions/inertias are not provided.
+        #   Level 2 (spatial inertia): physically consistent decomposition
+        #     F_i = m_i (a + α × r_i), τ_{i,Ci} = I_i α, where
+        #     [a; α] = M_form^{-1} W_ext at formation CoG. Required when the
+        #     task wrench has torque (e.g. valve rotation).
+        # Invariant: Σ ŷ_i^task = W_ext (Newton 2nd + parallel-axis identity).
+        default_ids = [1, 2]
+        self._inter_module_ids = rospy.get_param(
+            f'/beetle{wrench_target_id}/assembly_ids', default_ids)
+        for mid in self._inter_module_ids:
+            self._est_wrench_task_pubs[mid] = rospy.Publisher(
+                f'/beetle{mid}/est_wrench_task', TaggedWrench, queue_size=1)
+            self._last_est_wrench_task[mid] = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+
         
         # Setup subscribers
         if assembly_mode:
@@ -379,6 +427,12 @@ class BeetleInterface(object):
             self.formation_wrench_pub.publish(ff_msg)
         else:
             self.desired_ext_wrench_pub.publish(ff_msg)
+
+        # ----- Also drive per-module ŷ^task in lockstep, if enabled -----
+        # The body-frame force/torque is reused (same frame as the C++
+        # est_wrench_task_list_).
+        if self._inter_auto_publish:
+            self._publishInternalWrenchFromExternal(force_list, torque_list, frame_id)
     
     def clearExternalWrench(self):
         """Clear external wrench application."""
@@ -391,6 +445,211 @@ class BeetleInterface(object):
             else:
                 self.desired_ext_wrench_pub.publish(zero_msg)
             self.external_wrench_active = False
+        # Also zero per-module ŷ^task so the controller's residual
+        # subtraction no longer subtracts a stale task expectation.
+        if self._inter_auto_publish:
+            self._publishInternalWrenchRaw(
+                {mid: ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+                 for mid in self._inter_module_ids})
+
+    # ------------------------------------------------------------------
+    # Task internal wrench API
+    # ------------------------------------------------------------------
+    def setAttachModule(self, module_id, module_masses=None,
+                        module_positions=None, module_inertias_diag=None):
+        """Declare an external load is bolted to one module and enable
+        per-module ŷ^task auto-publishing.
+
+        Decomposition model is selected by the data provided:
+          * mass-ratio (Level 1) if positions+inertias are both missing;
+          * spatial-inertia (Level 2) otherwise (use this whenever the task
+            wrench has non-trivial torque, e.g. valve rotation).
+
+        All vectors/tensors are in the formation body frame `fc` at
+        formation CoG. Module body frames are assumed axis-aligned with the
+        formation frame (R_i = I); update _decomposeTaskWrench to apply R_i
+        if a non-aligned assembly is introduced.
+
+        Parameters
+        ----------
+        module_id : int or None
+            Opt-in marker only (uniform formula across modules). Pass None
+            to disable auto-publishing and broadcast a final zero.
+        module_masses : dict[int, float] or None
+            Per-module mass in kg. Defaults to uniform `self.mass`.
+        module_positions : dict[int, list[float]] or None
+            Per-module CoG position [x,y,z] (m) in the formation frame.
+            Will be auto-recentered to the mass-weighted centroid so the
+            caller may use any consistent origin.
+        module_inertias_diag : dict[int, list[float]] or None
+            Per-module diagonal inertia [Ixx,Iyy,Izz] (kg·m^2) about its own
+            CoG, expressed in the module body frame.
+        """
+        if module_id is None:
+            self._inter_attach_module_id = None
+            self._inter_auto_publish = False
+            # Best-effort clear so a previously running auto-publish
+            # doesn't leave stale ŷ^task on the bus.
+            self._publishInternalWrenchRaw(
+                {mid: ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+                 for mid in self._inter_module_ids})
+            rospy.loginfo("[BeetleInterface] est_wrench_task auto-publish DISABLED")
+            return
+        if module_id not in self._inter_module_ids:
+            rospy.logwarn(
+                "[BeetleInterface] setAttachModule(%d) but module not in "
+                "assembly_ids=%s — est_wrench_task publish skipped",
+                module_id, self._inter_module_ids)
+            return
+        self._inter_attach_module_id = int(module_id)
+        if module_masses:
+            self._inter_module_masses = {int(k): float(v) for k, v in module_masses.items()}
+        else:
+            # Default: uniform self.mass for every known module.
+            self._inter_module_masses = {mid: float(self.mass)
+                                         for mid in self._inter_module_ids}
+        # Optional geometry for Level 2 spatial-inertia decomposition.
+        self._inter_module_positions = (
+            {int(k): [float(c) for c in v] for k, v in module_positions.items()}
+            if module_positions else {})
+        self._inter_module_inertias_diag = (
+            {int(k): [float(c) for c in v] for k, v in module_inertias_diag.items()}
+            if module_inertias_diag else {})
+        self._precomputeTaskDecomposition()
+        self._inter_auto_publish = True
+        level = 2 if (self._inter_module_positions and
+                      self._inter_module_inertias_diag) else 1
+        rospy.loginfo(
+            "[BeetleInterface] est_wrench_task auto-publish ENABLED "
+            "(level=%d, attach_module=%d, masses=%s)",
+            level, self._inter_attach_module_id, self._inter_module_masses)
+
+    def setInternalWrenchPerModule(self, per_module, frame_id="fc"):
+        """Explicit advanced API: directly publish ŷ^task for each module.
+
+        Parameters
+        ----------
+        per_module : dict[int, (force3, torque3)]
+            Body-frame 6D wrench to assign to each module.
+        frame_id : str
+            Header frame id (defaults to formation body 'fc').
+        """
+        norm = {}
+        for mid, ft in per_module.items():
+            f = self._to_list3(ft[0]) or [0.0, 0.0, 0.0]
+            t = self._to_list3(ft[1]) or [0.0, 0.0, 0.0]
+            norm[int(mid)] = (f, t)
+        self._publishInternalWrenchRaw(norm, frame_id=frame_id)
+
+    # --- internal helpers -------------------------------------------------
+    def _precomputeTaskDecomposition(self):
+        """Cache m_total, mass-centred positions and M_form^{-1} (block-diag
+        translation/rotation inertia at formation CoG) so per-call work in
+        addExternalWrench is just two 3x3 matrix-vector multiplies."""
+        self._inter_m_total = float(sum(self._inter_module_masses.values()))
+        self._inter_r_centered = {}
+        self._inter_M_form_inv = None
+        if self._inter_m_total <= 1e-6:
+            return
+        if not (self._inter_module_positions and self._inter_module_inertias_diag):
+            return  # Level-1 path; no further caching needed.
+        # Mass-weighted centroid; recenter so Σ m_i r_i = 0.
+        ids = self._inter_module_ids
+        r_cog = np.zeros(3)
+        for mid in ids:
+            m_i = self._inter_module_masses.get(mid, 0.0)
+            r_i = np.array(self._inter_module_positions.get(mid, [0.0, 0.0, 0.0]))
+            r_cog += m_i * r_i
+        r_cog /= self._inter_m_total
+        # Build I_form at formation CoG (parallel-axis on diagonals; assumes
+        # module body frames axis-aligned with formation frame).
+        I_form = np.zeros((3, 3))
+        for mid in ids:
+            m_i = self._inter_module_masses.get(mid, 0.0)
+            r_i = np.array(self._inter_module_positions.get(mid, [0.0, 0.0, 0.0])) - r_cog
+            self._inter_r_centered[mid] = r_i
+            I_i = np.diag(self._inter_module_inertias_diag.get(mid, [0.0, 0.0, 0.0]))
+            I_form += I_i + m_i * (np.dot(r_i, r_i) * np.eye(3) - np.outer(r_i, r_i))
+        try:
+            self._inter_M_form_inv = np.linalg.inv(I_form)
+        except np.linalg.LinAlgError:
+            rospy.logwarn("[BeetleInterface] I_form singular; falling back to mass-ratio")
+            self._inter_M_form_inv = None
+
+    def _decomposeTaskWrench(self, force, torque):
+        """Return {mid: (F_i_body, τ_i_body)} for the body-frame external
+        wrench (F, τ) applied at formation CoG.
+
+        Level 2 (spatial inertia) used when geometry is cached; else falls
+        back to Level 1 (mass ratio). Module body frames are assumed
+        axis-aligned with the formation frame.
+        """
+        if self._inter_m_total <= 1e-6:
+            return {}
+        F = np.asarray(force, dtype=float)
+        tau = np.asarray(torque, dtype=float)
+        per_module = {}
+        if self._inter_M_form_inv is None:
+            # Level 1: mass-ratio split (force AND torque). OK only for tasks
+            # without torque — retained for backward compatibility / towing.
+            for mid in self._inter_module_ids:
+                share = self._inter_module_masses.get(mid, 0.0) / self._inter_m_total
+                per_module[mid] = ((share * F).tolist(), (share * tau).tolist())
+            return per_module
+        # Level 2: physically consistent spatial-inertia decomposition.
+        a = F / self._inter_m_total
+        alpha = self._inter_M_form_inv @ tau
+        for mid in self._inter_module_ids:
+            m_i = self._inter_module_masses.get(mid, 0.0)
+            r_i = self._inter_r_centered.get(mid, np.zeros(3))
+            I_i = np.array(self._inter_module_inertias_diag.get(mid, [0.0, 0.0, 0.0]))
+            F_i = m_i * (a + np.cross(alpha, r_i))
+            tau_i_Ci = I_i * alpha  # diagonal I_i times alpha (componentwise)
+            per_module[mid] = (F_i.tolist(), tau_i_Ci.tolist())
+        return per_module
+
+    def _publishInternalWrenchFromExternal(self, force_body, torque_body, frame_id):
+        """Decompose the body-frame external wrench at formation CoG into
+        per-module observer task prediction ŷ^task and publish."""
+        per_module = self._decomposeTaskWrench(force_body, torque_body)
+        if not per_module:
+            return
+        # Optional self-check: Σ W_i^{task,F} == W_ext^F at formation CoG.
+        # Only runs at DEBUG verbosity; cheap (constant work per call).
+        if rospy.get_param('~debug_task_wrench_check', False):
+            F_sum = np.zeros(3)
+            tau_sum = np.zeros(3)
+            for mid, (f, t) in per_module.items():
+                r_i = self._inter_r_centered.get(mid, np.zeros(3))
+                F_sum += np.asarray(f)
+                tau_sum += np.cross(r_i, np.asarray(f)) + np.asarray(t)
+            err = np.concatenate([F_sum - np.asarray(force_body),
+                                  tau_sum - np.asarray(torque_body)])
+            if np.linalg.norm(err) > 1e-6:
+                rospy.logwarn_throttle(2.0,
+                    "[BeetleInterface] ΣW_i^task != W_ext, residual=%s", err)
+        self._publishInternalWrenchRaw(per_module, frame_id=frame_id)
+
+    def _publishInternalWrenchRaw(self, per_module, frame_id="fc"):
+        """Publish raw per-module ŷ^task and cache last values."""
+        stamp = rospy.Time.now()
+        for mid, (f, t) in per_module.items():
+            pub = self._est_wrench_task_pubs.get(mid)
+            if pub is None:
+                continue
+            msg = TaggedWrench()
+            msg.index = int(mid)
+            msg.wrench.header.stamp = stamp
+            msg.wrench.header.frame_id = frame_id
+            msg.wrench.wrench.force.x = f[0]
+            msg.wrench.wrench.force.y = f[1]
+            msg.wrench.wrench.force.z = f[2]
+            msg.wrench.wrench.torque.x = t[0]
+            msg.wrench.wrench.torque.y = t[1]
+            msg.wrench.wrench.torque.z = t[2]
+            pub.publish(msg)
+            self._last_est_wrench_task[mid] = (list(f), list(t))
+
     
     def executeTrajectoryWithWrench(self, pos, rot, linear_vel, angular_vel, force, torque):
         """Combined SE(3) control with external wrench feedforward."""

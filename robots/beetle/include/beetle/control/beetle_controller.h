@@ -4,7 +4,6 @@
 #include <beetle/model/beetle_robot_model.h>
 #include <beetle/beetle_navigation.h>
 #include <beetle/TaggedWrench.h>
-#include <beetle/TaggedWrenches.h>
 #include <beetle/UnifiedControlReference.h>
 #include <gimbalrotor/control/gimbalrotor_controller.h>
 #include <beetle/sensor/imu.h>
@@ -36,7 +35,11 @@ namespace aerial_robot_control
                     boost::shared_ptr<aerial_robot_navigation::BaseNavigator> navigator,
                     double ctrl_loop_rate
                     ) override;
-    void setFfInterWrench(int id, Eigen::VectorXd des_int_wrench){ff_inter_wrench_list_[id] = des_int_wrench;}
+    // Inject per-module observer task prediction (ŷ_i^task). New semantic:
+    //   ŷ_i^task = predicted observer output for module i under the active
+    //   task model (sums to W_ext across modules). Retained as the public
+    //   setter for external controllers (e.g. NinjaController joint PID).
+    void setTaskWrench(int id, Eigen::VectorXd y_task){est_wrench_task_list_[id] = y_task;}
     
   private:
     boost::shared_ptr<BeetleRobotModel> beetle_robot_model_;
@@ -206,7 +209,9 @@ namespace aerial_robot_control
 
     // Differential-mode damping gain: injects a passive dissipation term
     // -K_damp * inter_wrench/mass into target_wrench_acc, based on
-    // inter_wrench_list_[my_id] (from calcInteractionWrench). Zero = disabled.
+    // inter_wrench_list_[my_id] (from calcInteractionWrench, already the
+    // parasitic residual after subtracting est_wrench_task_list_).
+    // Zero = disabled.
     double unified_diff_damp_gain_;
 
     // PID-settled gating for FormationObserver bias calibration (leader only).
@@ -230,8 +235,8 @@ namespace aerial_robot_control
                    const Eigen::VectorXd& desired_wrench,
                    double yaw_pid_raw);
     
-    map<string, ros::Subscriber> ff_inter_wrench_subs_;
-    map<int, ros::Publisher> ff_inter_wrench_pubs_;
+    map<string, ros::Subscriber> est_wrench_task_subs_;
+    map<int, ros::Publisher> est_wrench_task_pubs_;
     map<int, ros::Publisher> desired_ext_wrench_pubs_;
     ros::Subscriber desired_ext_wrench_sub_;
 
@@ -243,9 +248,19 @@ namespace aerial_robot_control
 
   protected:
     std::map<int, Eigen::VectorXd> est_wrench_list_;
+    // Per-module observer task prediction (ŷ_i^task). Set by demo layer via
+    // /<robot>{i}/est_wrench_task topic. SEMANTIC: predicted observer output
+    // under the active task model (NOT joint-on-module force). Sum invariant:
+    //   Σ est_wrench_task_list_[i] = W_ext  (Newton 2nd on whole formation)
+    // For uniform allocation + similar modules:
+    //   est_wrench_task_list_[i] ≈ (m_i / m_total) * W_ext   for ALL i
+    std::map<int, Eigen::VectorXd> est_wrench_task_list_;
+    // Per-module observer residual (parasitic) = est_wrench - est_wrench_task.
+    // Computed in calcInteractionWrench and consumed by the recursion so that
+    // inter_wrench_list_ and wrench_comp_list_ are naturally parasitic-only.
+    std::map<int, Eigen::VectorXd> est_residual_list_;
     std::map<int, Eigen::VectorXd> inter_wrench_list_;
     std::map<int, Eigen::VectorXd> wrench_comp_list_;
-    std::map<int, Eigen::VectorXd> ff_inter_wrench_list_;
 
     /* external wrench compensation */
     bool pd_wrench_comp_mode_;
@@ -254,13 +269,12 @@ namespace aerial_robot_control
 
     int pre_module_state_;
 
-    bool des_wrench_pub_flag_;
-
     // Desired external wrench for the whole assembly (body frame, FULL value).
     // Set on every module from desiredExternalWrenchCallback (leader receives from
-    // user, followers receive rebroadcast from leader). Used:
-    //  - Unified mode: directly as formation-level task FF in runUnifiedControlCommon.
-    //  - Legacy mode: leader splits into 1/N share for ff_inter distribution.
+    // user, followers receive rebroadcast from leader). Used directly by
+    // runUnifiedControlCommon as the formation-level task FF. The leader
+    // does NOT distribute it as per-module ff_inter anymore — demo layer
+    // publishes est_wrench_task per module directly.
     Eigen::VectorXd desired_external_wrench_;
 
     // Formation-level desired wrench for unified mode (full 6D, formation body frame),
@@ -287,7 +301,12 @@ namespace aerial_robot_control
     ros::Publisher whole_external_wrench_pub_;
     ros::Publisher internal_wrench_pub_;
     ros::Publisher wrench_comp_pid_pub_;
-    ros::Publisher des_inter_wrench_pub_;
+    // [Step D'] Leader-only diagnostic: pairwise disagreement of the
+    // per-module observer-derived inter-wrenches. Float32MultiArray:
+    // [max_force_norm, max_torque_norm, rms_force_norm, rms_torque_norm].
+    // Published only when the running controller instance is the leader.
+    // PURE DIAGNOSTIC — no control feedback.
+    ros::Publisher inter_disagreement_pub_;
 
     // Assemble debug publishers (global /assemble/debug/ namespace)
     ros::Publisher assemble_pid_pub_;
@@ -299,7 +318,7 @@ namespace aerial_robot_control
     void controlCore() override;
     bool update() override;
     
-    virtual void ffInterWrenchCallback(const beetle::TaggedWrench & msg);
+    virtual void estWrenchTaskCallback(const beetle::TaggedWrench & msg);
     void desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg);
     void formationDesiredWrenchCallback(const geometry_msgs::WrenchStamped& msg);
     void rosParamInit() override;

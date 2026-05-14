@@ -1618,6 +1618,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
         rospy.logerr(f"Contact failed: max valve movement {math.degrees(max_detected):.2f}°")
         self.beetle.clearExternalWrench()
+        self.beetle.setAttachModule(None)
         return False
 
     # ------------------------------------------------------------------
@@ -1651,6 +1652,21 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         rospy.loginfo(f"Feedforward: enabled={ff_enabled}, force_z={ff_force_z}, "
                       f"torque_z_max={TORQUE_MAX:.1f} N·m (adaptive from {current_torque:.1f})")
 
+        # Enable per-module ŷ^task auto-publish for the duration of the
+        # rotation. The valve reaction wrench is applied at the EE module;
+        # BeetleInterface publishes ŷ_i^task = (m_i/m_total) * W_ext on
+        # /beetle{i}/est_wrench_task so the C++ controller can subtract the
+        # task component before forming inter_wrench_list_ (Step C).
+        if ff_enabled:
+            module_masses = rospy.get_param("~module_masses", None)
+            module_positions = rospy.get_param("~module_positions", None)
+            module_inertias_diag = rospy.get_param("~module_inertias_diag", None)
+            self.beetle.setAttachModule(self.beetle.module_id,
+                                        module_masses=module_masses,
+                                        module_positions=module_positions,
+                                        module_inertias_diag=module_inertias_diag)
+
+
         start_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
         last_valve_yaw = start_valve_yaw
         last_valve_check_time = rospy.get_time()
@@ -1681,6 +1697,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                               f"(target: {math.degrees(self.target_rotation):.1f}°) in {t:.1f}s")
                 rospy.loginfo(f"Final adaptive torque: {current_torque:.2f} N·m")
                 self.beetle.clearExternalWrench()
+                self.beetle.setAttachModule(None)
                 userdata.trajectory_state = {
                     'current_radius': radius,
                     'current_angle': angle,
@@ -1732,6 +1749,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
         # Failed
         self.beetle.clearExternalWrench()
+        self.beetle.setAttachModule(None)
         rospy.logerr(f"Valve rotation failed: achieved {math.degrees(max_rotation_detected):.1f}° "
                      f"of {math.degrees(self.target_rotation):.1f}° target")
         return 'failed'

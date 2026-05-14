@@ -614,6 +614,82 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   return realized;
 }
 
+Eigen::VectorXd BeetleUnifiedController::getLocalRealizedWrenchBody(int module_id) const
+{
+  // Returns the wrench (Force, Torque) produced by a single module's rotors,
+  // expressed in that module's body frame and referenced to that module's CoG.
+  //
+  // Under the rigid-assembly assumption (all modules share the same orientation),
+  // each module's body frame is aligned with the leader's body frame, so we only
+  // need to evaluate the rotor positions in the module-local CoG and apply the
+  // same thrust-coord gimbal mask as the formation allocation.
+  //
+  // This wrench is the correct "what I am producing" input for the per-module
+  // momentum observer in unified mode; it replaces the buggy
+  // (single_mass * formation_target_acc) feedforward.
+
+  Eigen::VectorXd local_wrench = Eigen::VectorXd::Zero(6);
+
+  if (!robot_model_) return local_wrench;
+  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  int N = static_cast<int>(assembled_ids.size());
+  if (N == 0) return local_wrench;
+
+  int cols_per_module = rotor_coef_ * motor_num_per_module_;
+  if (target_vectoring_f_.size() != cols_per_module * N) return local_wrench;
+
+  int module_idx = -1;
+  for (int m = 0; m < N; m++) {
+    if (assembled_ids[m] == module_id) { module_idx = m; break; }
+  }
+  if (module_idx < 0) return local_wrench;
+
+  Eigen::VectorXd module_f =
+      target_vectoring_f_.segment(module_idx * cols_per_module, cols_per_module);
+
+  // Build module-local wrench map (about module's own CoG, no mass/inertia scaling)
+  std::vector<Eigen::Vector3d> rotor_pos =
+      robot_model_->getRotorsOriginFromCog<Eigen::Vector3d>();
+  const auto& rotor_direction = robot_model_->getRotorDirection();
+  const double m_f_rate = robot_model_->getMFRate();
+
+  Eigen::MatrixXd local_q = Eigen::MatrixXd::Zero(6, 3 * motor_num_per_module_);
+  Eigen::MatrixXd wrench_map = Eigen::MatrixXd::Zero(6, 3);
+  wrench_map.block(0, 0, 3, 3) = Eigen::Matrix3d::Identity();
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    int dir = rotor_direction.at(r + 1);
+    wrench_map.block(3, 0, 3, 3) =
+        aerial_robot_model::skew(rotor_pos.at(r)) +
+        dir * m_f_rate * Eigen::Matrix3d::Identity();
+    local_q.middleCols(3 * r, 3) = wrench_map;
+  }
+
+  // Gimbal mask (same construction as buildFormationAllocationMatrix)
+  std::vector<KDL::Rotation> thrust_coords_rot =
+      robot_model_->getThrustCoordRot<KDL::Rotation>();
+  Eigen::MatrixXd integrated_rot =
+      Eigen::MatrixXd::Zero(3 * motor_num_per_module_, cols_per_module);
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    tf::Quaternion quat;
+    tf::quaternionKDLToTF(thrust_coords_rot.at(r), quat);
+    Eigen::Matrix3d conv_cog_from_thrust;
+    tf::matrixTFToEigen(tf::Matrix3x3(quat), conv_cog_from_thrust);
+
+    if (gimbal_dof_ == 1) {
+      Eigen::MatrixXd mask(3, 2);
+      mask << 0, 0,
+              1, 0,
+              0, 1;
+      integrated_rot.block(3 * r, rotor_coef_ * r, 3, 2) = conv_cog_from_thrust * mask;
+    } else if (gimbal_dof_ == 2) {
+      integrated_rot.block(3 * r, rotor_coef_ * r, 3, 3) = conv_cog_from_thrust;
+    }
+  }
+
+  local_wrench = local_q * integrated_rot * module_f;
+  return local_wrench;
+}
+
 bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 {
   // Send the rotational part of the formation-level allocation pseudoinverse

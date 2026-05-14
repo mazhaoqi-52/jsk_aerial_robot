@@ -8,7 +8,6 @@ namespace aerial_robot_control
     GimbalrotorController(),
     pd_wrench_comp_mode_(false),
     pre_module_state_(SEPARATED),
-    des_wrench_pub_flag_(false),
     desired_external_wrench_(Eigen::VectorXd::Zero(6)),
     formation_desired_wrench_(Eigen::VectorXd::Zero(6)),
     unified_control_mode_(false),
@@ -101,7 +100,8 @@ namespace aerial_robot_control
     whole_external_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("whole_wrench", 1);
     internal_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("internal_wrench", 1);
     wrench_comp_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("debug/wrench_comp/pid", 1);
-    des_inter_wrench_pub_ = nh_.advertise<beetle::TaggedWrenches>("des_inter_wnrech", 1);
+    // [Step D'] Pairwise observer disagreement diagnostic (leader-only publish).
+    inter_disagreement_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("inter_disagreement", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
     formation_desired_wrench_sub_ = nh_.subscribe("formation_desired_wrench", 1, &BeetleController::formationDesiredWrenchCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
@@ -112,9 +112,10 @@ namespace aerial_robot_control
       est_wrench_list_.insert(make_pair(i+1, wrench));
       inter_wrench_list_.insert(make_pair(i+1, wrench));
       wrench_comp_list_.insert(make_pair(i+1, wrench));
-      ff_inter_wrench_list_.insert(make_pair(i+1, wrench));
-      ff_inter_wrench_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/ff_inter_wrench"), 1, &BeetleController::ffInterWrenchCallback, this)));
-      ff_inter_wrench_pubs_[i+1] = nh_.advertise<beetle::TaggedWrench>(module_name + string("/ff_inter_wrench"), 1);
+      est_wrench_task_list_.insert(make_pair(i+1, wrench));
+      est_residual_list_.insert(make_pair(i+1, wrench));
+      est_wrench_task_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/est_wrench_task"), 1, &BeetleController::estWrenchTaskCallback, this)));
+      est_wrench_task_pubs_[i+1] = nh_.advertise<beetle::TaggedWrench>(module_name + string("/est_wrench_task"), 1);
       desired_ext_wrench_pubs_[i+1] = nh_.advertise<geometry_msgs::WrenchStamped>(module_name + string("/desired_external_wrench"), 1);
     }
     pid_controllers_.push_back(PID("f_x", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
@@ -596,8 +597,10 @@ namespace aerial_robot_control
       wrench_comp_term.head(3) = cog_rot * wrench_comp_term.head(3); // regarding world
 
       /* current version: I term reconfig mehod */
-      /* wrench_comp already includes ff_inter (feedforward) + inter (observer estimate),
-         so no separate desired_external_wrench_ injection needed here — that would double-count. */
+      /* wrench_comp accumulates the parasitic residual (task prediction
+         already subtracted upstream in calcInteractionWrench), so no
+         separate desired_external_wrench_ injection here — that would
+         double-count the task component. */
       Eigen::VectorXd I_reconfig_acc_cog_term = Eigen::VectorXd::Zero(6);
       I_reconfig_acc_cog_term.head(3) = mass_inv * wrench_comp_term.head(3);
       I_reconfig_acc_cog_term.tail(3) = inertia_inv * wrench_comp_term.tail(3); //inavailable
@@ -689,34 +692,6 @@ namespace aerial_robot_control
       wrench_pid_msg_.yaw.d_term.at(0) = pid_controllers_.at(TZ).getDTerm();
 
       wrench_comp_pid_pub_.publish(wrench_pid_msg_);
-
-      /*publish desire internal wrench*/
-      if(des_wrench_pub_flag_)
-        {
-          beetle::TaggedWrenches all_tagged_des_wrenche_msg;
-          std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
-          all_tagged_des_wrenche_msg.tagged_wrenches.resize(assembled_ids.size());
-          int cnt =0;
-          for(const auto id: assembled_ids)
-            {
-              beetle::TaggedWrench tagged_des_wrench_msg;
-              geometry_msgs::WrenchStamped des_wrench_msg;
-              Eigen::VectorXd des_wrench = ff_inter_wrench_list_[id];
-              des_wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
-              des_wrench_msg.wrench.force.x = des_wrench(0);
-              des_wrench_msg.wrench.force.y = des_wrench(1);
-              des_wrench_msg.wrench.force.z = des_wrench(2);
-              des_wrench_msg.wrench.torque.x = des_wrench(3);
-              des_wrench_msg.wrench.torque.y = des_wrench(4);
-              des_wrench_msg.wrench.torque.z = des_wrench(5);
-
-              tagged_des_wrench_msg.index = id;
-              tagged_des_wrench_msg.wrench = des_wrench_msg;
-              all_tagged_des_wrenche_msg.tagged_wrenches[cnt] = tagged_des_wrench_msg;
-              cnt ++;
-            }
-          des_inter_wrench_pub_.publish(all_tagged_des_wrenche_msg);
-        }
     }else{
       pid_controllers_.at(FX).reset();
       pid_controllers_.at(FY).reset();
@@ -1326,21 +1301,46 @@ namespace aerial_robot_control
 
   void BeetleController::calcInteractionWrench()
   {
-    /* 1. calculate external wrench W_w for whole system*/
-    Eigen::VectorXd W_w = Eigen::VectorXd::Zero(6);
-    Eigen::VectorXd W_sum = Eigen::VectorXd::Zero(6);
-    int module_num = 0;
+    /* 1. Subtract per-module observer task prediction up-front.
+     *
+     *    est_residual_list_[i] = est_wrench_list_[i] - est_wrench_task_list_[i]
+     *
+     *    Theory: observer output ŷ_i = c_i + d_i + b_i (joint force + direct
+     *    external + parasitic). Task prediction ŷ_i^task models the c_i+d_i
+     *    induced by the active task. Their difference is the parasitic-only
+     *    component b_i (plus modelling error). All downstream products
+     *    (W_w, inter_wrench_list_, wrench_comp_list_) are computed from
+     *    est_residual_list_ so they are naturally parasitic by construction.
+     *
+     *    Sum invariant: Σ est_wrench_task_list_[i] = W_ext (Newton 2nd on
+     *    whole formation). With matching Σ est_wrench_list_[i] this gives
+     *    Σ est_residual_list_[i] ≈ 0, so the resulting damping correction
+     *    is naturally zero-sum and does not contaminate formation-level
+     *    wrench tracking.
+     *
+     *    When no task is active (demo publishes zeros), est_residual = est_wrench
+     *    and the rest of the function reduces to the pre-existing behaviour.
+     */
     std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
-
+    int module_num = 0;
+    Eigen::VectorXd W_sum = Eigen::VectorXd::Zero(6);
     for(const auto & item : est_wrench_list_){
       if(assembly_flag[item.first]){
-      W_sum += item.second;
-      module_num ++;
+        Eigen::VectorXd y_task = est_wrench_task_list_.count(item.first)
+                                  ? est_wrench_task_list_[item.first]
+                                  : Eigen::VectorXd::Zero(6);
+        if(y_task.size() != 6) y_task = Eigen::VectorXd::Zero(6);
+        Eigen::VectorXd residual = item.second - y_task;
+        est_residual_list_[item.first] = residual;
+        W_sum += residual;
+        module_num ++;
+      }else{
+        est_residual_list_[item.first] = Eigen::VectorXd::Zero(6);
       }
     }
 
     if(!module_num) return;
-    W_w = W_sum / module_num;
+    Eigen::VectorXd W_w = W_sum / module_num;
     geometry_msgs::WrenchStamped wrench_msg;
     wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
     wrench_msg.wrench.force.x = W_w(0);
@@ -1351,9 +1351,11 @@ namespace aerial_robot_control
     wrench_msg.wrench.torque.z = W_w(5);
     whole_external_wrench_pub_.publish(wrench_msg);
 
-    /* 2. calculate interactional wrench for each module*/
-    Eigen::VectorXd left_inter_wrench = Eigen::VectorXd::Zero(6); //'left_inter_wrench' represents the wrench applied from right-side module to left-side module
-    for(const auto & item : est_wrench_list_){
+    /* 2. Recursion on the residual: inter_wrench_list_[i] is now the
+     *    PARASITIC joint-cut wrench across the boundary between module i
+     *    and module i+1 (along the leader→i traversal). */
+    Eigen::VectorXd left_inter_wrench = Eigen::VectorXd::Zero(6);
+    for(const auto & item : est_residual_list_){
       if(assembly_flag[item.first]){
         Eigen::VectorXd right_inter_wrench = item.second - W_w + left_inter_wrench;
         inter_wrench_list_[item.first] = right_inter_wrench;
@@ -1370,17 +1372,56 @@ namespace aerial_robot_control
     wrench_msg.wrench.torque.y = inter_wrench_list_[my_id](4);
     wrench_msg.wrench.torque.z = inter_wrench_list_[my_id](5);
     internal_wrench_pub_.publish(wrench_msg);
-    /* 3. calculate wrench compensation term for each module*/
+
+    /* 2b. [Step D'] Leader-only diagnostic: pairwise disagreement of
+     *     per-module inter wrenches. PURE OBSERVATION — does not affect
+     *     control. Useful to detect divergent observer states between
+     *     modules (model error, drift, comm dropout). */
+    int leader_id_diag = beetle_navigator_->getLeaderID();
+    if (my_id == leader_id_diag) {
+      std::vector<int> active_ids;
+      for (const auto& kv : inter_wrench_list_) {
+        if (assembly_flag[kv.first] && kv.second.size() == 6) {
+          active_ids.push_back(kv.first);
+        }
+      }
+      double max_f = 0.0, max_t = 0.0;
+      double sum_f2 = 0.0, sum_t2 = 0.0;
+      int n_pairs = 0;
+      for (size_t a = 0; a < active_ids.size(); ++a) {
+        for (size_t b = a + 1; b < active_ids.size(); ++b) {
+          Eigen::VectorXd diff =
+              inter_wrench_list_[active_ids[a]] - inter_wrench_list_[active_ids[b]];
+          double nf = diff.head(3).norm();
+          double nt = diff.tail(3).norm();
+          if (nf > max_f) max_f = nf;
+          if (nt > max_t) max_t = nt;
+          sum_f2 += nf * nf;
+          sum_t2 += nt * nt;
+          n_pairs++;
+        }
+      }
+      double rms_f = (n_pairs > 0) ? std::sqrt(sum_f2 / n_pairs) : 0.0;
+      double rms_t = (n_pairs > 0) ? std::sqrt(sum_t2 / n_pairs) : 0.0;
+      std_msgs::Float32MultiArray diag_msg;
+      diag_msg.data.resize(4);
+      diag_msg.data[0] = static_cast<float>(max_f);
+      diag_msg.data[1] = static_cast<float>(max_t);
+      diag_msg.data[2] = static_cast<float>(rms_f);
+      diag_msg.data[3] = static_cast<float>(rms_t);
+      inter_disagreement_pub_.publish(diag_msg);
+    }
+    /* 3. Compute wrench_comp_list_[i] for the LF cascade. Since inter is now
+     *    the PARASITIC joint-cut wrench (task already subtracted at step 1),
+     *    wrench_comp_list_[i] is a simple cumulative sum of parasitic joint
+     *    wrenches between the leader and module i. */
     int leader_id = beetle_navigator_->getLeaderID();
     /* 3.1. process from leader to left*/
-    int right_module_id = leader_id;
     Eigen::VectorXd wrench_comp_sum_left = Eigen::VectorXd::Zero(6);
     for(int i = leader_id-1; i > 0; i--){
       if(assembly_flag[i]){
-        wrench_comp_sum_left += -ff_inter_wrench_list_[i] + inter_wrench_list_[i];
-        // wrench_comp_list_[i] += wrench_comp_gain_ *  wrench_comp_sum_left;
+        wrench_comp_sum_left += inter_wrench_list_[i];
         wrench_comp_list_[i] = wrench_comp_sum_left;
-        right_module_id = i;
       }else{
         wrench_comp_list_[i] = Eigen::VectorXd::Zero(6);
       }
@@ -1391,8 +1432,7 @@ namespace aerial_robot_control
     Eigen::VectorXd wrench_comp_sum_right = Eigen::VectorXd::Zero(6);
     for(int i = leader_id+1; i <= max_modules_num; i++){
       if(assembly_flag[i]){
-        wrench_comp_sum_right += ff_inter_wrench_list_[left_module_id] - inter_wrench_list_[left_module_id];
-        // wrench_comp_list_[i] += wrench_comp_gain_ * wrench_comp_sum_right;
+        wrench_comp_sum_right += -inter_wrench_list_[left_module_id];
         wrench_comp_list_[i] = wrench_comp_sum_right;
         left_module_id = i;
       }else{
@@ -1568,10 +1608,16 @@ namespace aerial_robot_control
     // unified mode so that inter_wrench_list_[my_id] (computed by
     // calcInteractionWrench from est_wrench_list_) is populated and can be
     // consumed by the differential-mode damping term in runUnifiedControlCommon.
-    // In unified mode each module's target_wrench_acc_cog is set locally by
-    // runUnifiedControlCommon (same formation-level target at both leader and
-    // follower in a rigid assembly), so the observer reports per-module
-    // momentum imbalance ≈ spinal P+D share + inter_wrench + external wrench.
+    //
+    // Feedforward correction (Stage 1 fix): in unified mode the observer's
+    // commanded-wrench input is taken from the formation QP allocation result
+    // (getLocalRealizedWrenchBody(my_id)), which is the wrench this module's
+    // own rotors are actually producing — NOT (single_module_mass *
+    // formation_target_acc), which would create an acceleration-proportional
+    // residual that contaminates inter_wrench during tilted or accelerated
+    // flight. In LF / independent mode the legacy single-module expression is
+    // retained.
+    //
     // Only the differential component (est - mean, via calcInteractionWrench)
     // is fed back through unified_diff_damp_gain_, which is small by design.
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
@@ -1605,8 +1651,27 @@ namespace aerial_robot_control
     sum_momentum.tail(3) = inertia * omega_cog;
 
     Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
-    target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
-    target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
+    if (unified_control_mode_ && unified_controller_) {
+      // Unified mode: observer feedforward must use the wrench actually produced
+      // by THIS module's rotors (from the formation QP allocation), not
+      // (single_mass * formation_target_acc) — which would mismatch the
+      // physical force/torque this module is generating and inject a spurious
+      // signal into est_external_wrench_ that scales with formation acceleration
+      // (the "differential-mode contamination" problem during tilted / accelerated
+      // flight).
+      int my_id = beetle_navigator_->getMyID();
+      target_wrench_cog = unified_controller_->getLocalRealizedWrenchBody(my_id);
+      // Fall back to the legacy expression only if local realized wrench is not
+      // yet available (e.g. first frame before allocation has converged).
+      if (target_wrench_cog.size() != 6 || target_wrench_cog.isZero(0.0)) {
+        target_wrench_cog = Eigen::VectorXd::Zero(6);
+        target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
+        target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
+      }
+    } else {
+      target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
+      target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
+    }
 
     Eigen::MatrixXd J_t = Eigen::MatrixXd::Identity(6,6);
     J_t.topLeftCorner(3,3) = cog_rot;
@@ -1662,7 +1727,7 @@ namespace aerial_robot_control
     est_wrench_list_[id] = wrench;
   }
 
-  void BeetleController::ffInterWrenchCallback(const beetle::TaggedWrench & msg)
+  void BeetleController::estWrenchTaskCallback(const beetle::TaggedWrench & msg)
   {
     int id = msg.index;
     geometry_msgs::Wrench wrench_msg = msg.wrench.wrench;
@@ -1674,25 +1739,21 @@ namespace aerial_robot_control
     wrench(3) =  wrench_msg.torque.x;
     wrench(4) =  wrench_msg.torque.y;
     wrench(5) =  wrench_msg.torque.z;
-    ff_inter_wrench_list_[id] = wrench;
+    est_wrench_task_list_[id] = wrench;
   }
 
   void BeetleController::desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg)
   {
     // Receive desired total external wrench for the whole assembly (body frame).
     //
-    // Storage semantic (after Fix C unification):
+    // Storage semantic:
     //   desired_external_wrench_ = FULL formation-level wrench on EVERY module.
-    //   - Unified mode: runUnifiedControlCommon uses it directly as formation target.
-    //   - Legacy leader-follower mode: leader splits into share for ff_inter
-    //     distribution to followers (followers' wrench_comp consumes ff_inter,
-    //     not desired_external_wrench_).
+    //   Used directly by runUnifiedControlCommon as the formation-level task FF.
     //
-    // ff_inter mapping (after calcInteractionWrench sign fix):
-    //   3.1 (i < leader): wrench_comp[i] = -ff_inter[i] + inter[i]
-    //        For FOLLOWER i to apply +F_share: ff_inter[i] = -F_share
-    //   3.2 (i > leader): wrench_comp[i] = ff_inter[left] - inter[left]
-    //        For FOLLOWER i to apply +F_share: ff_inter[left] = +F_share
+    // Per-module observer task prediction (est_wrench_task_list_) is published
+    // by the demo layer (BeetleInterface) on /<robot>{i}/est_wrench_task and
+    // arrives via estWrenchTaskCallback. The leader no longer derives or
+    // re-publishes those values here.
 
     Eigen::VectorXd desired = Eigen::VectorXd::Zero(6);
     desired(0) = msg.wrench.force.x;
@@ -1705,76 +1766,14 @@ namespace aerial_robot_control
     // Every module stores the FULL desired wrench (semantic unified across modules)
     desired_external_wrench_ = desired;
 
-    // Only LEADER distributes ff_inter and rebroadcasts to followers
+    // Only LEADER rebroadcasts to followers so every module sees the same value.
     if(beetle_navigator_->getModuleState() != LEADER) {
       return;
     }
 
     std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
     int leader_id = beetle_navigator_->getLeaderID();
-
-    // Count ALL assembled modules (including leader)
-    int total_count = 0;
-    for(const auto & item : assembly_flag) {
-      if(item.second) total_count++;
-    }
-    if(total_count == 0) return;
-
-    Eigen::VectorXd share = desired / total_count;
-
-    // Build per-module ff_inter values based on the derivation:
-    //   For module i < leader: ff_inter[i] = -share  (so wrench_comp[i] = share when inter=0)
-    //   For module i > leader: ff_inter[left_of_i] = share  (so wrench_comp[i] = share when inter=0)
-    std::map<int, Eigen::VectorXd> ff_values;
-    for(const auto & item : assembly_flag) {
-      if(!item.second) continue;
-      int id = item.first;
-      if(id < leader_id) {
-        // Section 3.1: wrench_comp[i] = -ff_inter[i] + inter[i]
-        // Want wrench_comp[i] = share => ff_inter[i] = -share
-        ff_values[id] = -share;
-      } else if(id > leader_id) {
-        // Section 3.2: wrench_comp[i] = ff_inter[left] - inter[left]
-        // Want wrench_comp[i] = share => ff_inter[left] = share
-        int left_id = leader_id;
-        for(int j = id - 1; j >= 1; j--) {
-          if(assembly_flag.count(j) && assembly_flag.at(j)) {
-            left_id = j;
-            break;
-          }
-        }
-        ff_values[left_id] = share;
-      }
-    }
-
-    // Publish ff_inter via ROS topics so all modules receive the update
     ros::Time stamp = msg.header.stamp;
-    for(const auto & kv : ff_values) {
-      beetle::TaggedWrench tw;
-      tw.index = kv.first;
-      tw.wrench.header.stamp = stamp;
-      tw.wrench.wrench.force.x = kv.second(0);
-      tw.wrench.wrench.force.y = kv.second(1);
-      tw.wrench.wrench.force.z = kv.second(2);
-      tw.wrench.wrench.torque.x = kv.second(3);
-      tw.wrench.wrench.torque.y = kv.second(4);
-      tw.wrench.wrench.torque.z = kv.second(5);
-      if(ff_inter_wrench_pubs_.count(kv.first))
-        ff_inter_wrench_pubs_[kv.first].publish(tw);
-    }
-
-    // Publish zeros for assembled modules not in ff_values (e.g., leader itself, or modules
-    // whose ff_inter was not explicitly set)
-    for(const auto & item : assembly_flag) {
-      if(!item.second) continue;
-      if(ff_values.count(item.first)) continue;
-      beetle::TaggedWrench tw;
-      tw.index = item.first;
-      tw.wrench.header.stamp = stamp;
-      // wrench fields default to 0
-      if(ff_inter_wrench_pubs_.count(item.first))
-        ff_inter_wrench_pubs_[item.first].publish(tw);
-    }
 
     // Rebroadcast FULL desired wrench to all followers so every module stores
     // the same desired_external_wrench_ (FULL semantic).
@@ -2285,19 +2284,25 @@ namespace aerial_robot_control
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
     }
 
-    // --- Differential-mode damping (passive internal-force dissipation) ---
-    // Each module's share of the whole-formation external-wrench disagreement
-    // (inter_wrench_list_[my_id]) is injected as pure negative proportional
-    // feedback. This is a Lyapunov-dissipative term on the differential mode
-    // (the disagreement between modules' estimators), independent of the
-    // common-mode formation control. Zero when per-module wrench observers
-    // are not running; safe to leave enabled.
+    // --- Differential-mode damping (passive PARASITIC residual dissipation) ---
+    // inter_wrench_list_[my_id] is already the parasitic joint-cut wrench:
+    // calcInteractionWrench subtracted the per-module task prediction
+    // (est_wrench_task_list_[i]) from ŷ_i BEFORE running the recursion, so
+    // the task-induced load distribution is no longer present here.
+    //
+    // Sum invariant (Σ ŷ^task = W_ext) makes Σ residual ≈ 0, so this damping
+    // correction is naturally zero-sum across modules and does not
+    // contaminate formation-level wrench tracking (null-space property).
+    //
+    // When no task is active (demo publishes zeros), inter_wrench_list_ falls
+    // back to the pure observer-disagreement signal Pŷ (BEATLE-style residual).
     if (unified_diff_damp_gain_ > 0.0) {
-      const Eigen::VectorXd& inter = inter_wrench_list_[my_id];
+      Eigen::VectorXd inter_parasitic = inter_wrench_list_[my_id];
+      if (inter_parasitic.size() != 6) inter_parasitic = Eigen::VectorXd::Zero(6);
       double mass = std::max(unified_controller_->getFormationMass(), 0.01);
       Eigen::Matrix3d inertia_inv = unified_controller_->getFormationInertia().inverse();
-      target_wrench_acc.head(3) -= unified_diff_damp_gain_ * inter.head(3) / mass;
-      target_wrench_acc.tail(3) -= unified_diff_damp_gain_ * (inertia_inv * inter.tail(3));
+      target_wrench_acc.head(3) -= unified_diff_damp_gain_ * inter_parasitic.head(3) / mass;
+      target_wrench_acc.tail(3) -= unified_diff_damp_gain_ * (inertia_inv * inter_parasitic.tail(3));
     }
 
     setTargetWrenchAccCog(target_wrench_acc);

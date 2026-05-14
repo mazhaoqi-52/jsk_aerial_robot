@@ -686,6 +686,8 @@ class TowingWithFeedforwardState(TowingStateBase):
             self.beetle.addExternalWrench(zero, zero)
             rospy.sleep(0.04)
         self.beetle.clearExternalWrench()
+        # Disable internal-wrench auto-publish (also broadcasts a final zero).
+        self.beetle.setAttachModule(None)
     
     def execute(self, userdata):
         rospy.loginfo("=== Towing With Feedforward State ===")
@@ -707,6 +709,24 @@ class TowingWithFeedforwardState(TowingStateBase):
         # It also handles world→body frame rotation internally.
         control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
         rospy.loginfo(f"Wrench feedforward via BeetleInterface (mode: {control_mode})")
+
+        # ---- Per-module observer task prediction auto-publish ----
+        # Declare which module physically carries the towing hook (= the EE
+        # module on which BeetleInterface is instantiated). BeetleInterface
+        # will then publish per-module ŷ^task = (m_i/m_total) * W_ext on
+        # /beetle{i}/est_wrench_task. The C++ controller subtracts this from
+        # the raw observer output BEFORE the inter-wrench recursion, so both
+        # unified-mode diff damping and LF wrench_comp cascade consume the
+        # parasitic residual only — the task-induced load distribution is
+        # not cancelled or fed back into formation acceleration.
+        module_masses = rospy.get_param("~module_masses", None)
+        module_positions = rospy.get_param("~module_positions", None)
+        module_inertias_diag = rospy.get_param("~module_inertias_diag", None)
+        self.beetle.setAttachModule(self.beetle.module_id,
+                                    module_masses=module_masses,
+                                    module_positions=module_positions,
+                                    module_inertias_diag=module_inertias_diag)
+
         
         trajectory_gen = LinearTowingTrajectoryGenerator(
             start_pos=start_pos,
@@ -734,7 +754,6 @@ class TowingWithFeedforwardState(TowingStateBase):
         # When EE is below target (z_err>0), integral saturates negative, pushes Z target UP,
         # UAV spends control effort climbing instead of pushing horizontally → can't tow.
         # Z-axis stabilization is handled by C++ Z-PID (p=8, d=5) alone.
-        # Future: use ff_inter_wrench topic to provide proper feedforward.
         
         while not rospy.is_shutdown():
             elapsed = rospy.Time.now().to_sec() - towing_start_time

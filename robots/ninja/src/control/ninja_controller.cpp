@@ -77,12 +77,12 @@ namespace aerial_robot_control
         joint_ff_wrench(5) = pid_controllers_.at(JOINT_TZ).result();
         if(my_id < leader_id)
           {
-            setFfInterWrench(my_id,-joint_ff_wrench);
+            setTaskWrench(my_id,-joint_ff_wrench);
           }
         else if(my_id > leader_id)
           {
             int left_module_id = assembled_modules_ids[ninja_navigator_->getMyIndex() -1];
-            setFfInterWrench(left_module_id, joint_ff_wrench);
+            setTaskWrench(left_module_id, joint_ff_wrench);
           }
       }
     joint_control_timestamp_ = ros::Time::now().toSec();
@@ -319,7 +319,7 @@ namespace aerial_robot_control
     Eigen::VectorXd wrench_comp_sum_left = Eigen::VectorXd::Zero(6);
     for(int i = leader_id-1; i > 0; i--){
       if(assembly_flag[i]){
-        wrench_comp_sum_left += ff_inter_wrench_list_[i] + inter_wrench_list_[i];
+        wrench_comp_sum_left += est_wrench_task_list_[i] + inter_wrench_list_[i];
         // wrench_comp_list_[i] += wrench_comp_gain_ *  wrench_comp_sum_left;
         wrench_comp_list_[i] = wrench_comp_sum_left;
         right_module_id = i;
@@ -333,7 +333,7 @@ namespace aerial_robot_control
     Eigen::VectorXd wrench_comp_sum_right = Eigen::VectorXd::Zero(6);
     for(int i = leader_id+1; i <= max_modules_num; i++){
       if(assembly_flag[i]){
-        wrench_comp_sum_right +=- ff_inter_wrench_list_[left_module_id] - inter_wrench_list_[left_module_id];
+        wrench_comp_sum_right +=- est_wrench_task_list_[left_module_id] - inter_wrench_list_[left_module_id];
         // wrench_comp_list_[i] += wrench_comp_gain_ * wrench_comp_sum_right;
         wrench_comp_list_[i] = wrench_comp_sum_right;
         left_module_id = i;
@@ -383,7 +383,7 @@ namespace aerial_robot_control
     for(const auto & id : ninja_navigator_->getAssemblyIds())
       {
         Eigen::VectorXd reset_ff_wrench = Eigen::VectorXd::Zero(6);
-        setFfInterWrench(id,reset_ff_wrench); 
+        setTaskWrench(id,reset_ff_wrench); 
       }
     joint_control_timestamp_ = -1;
   }

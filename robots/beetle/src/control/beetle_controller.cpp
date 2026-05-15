@@ -1938,12 +1938,15 @@ namespace aerial_robot_control
     rpy_.setValue(r, p, y_angle);
     omega_ = estimator_->getAngularVel(Frame::COG, estimate_mode_);
 
+    // [Fix A] Restore the canonical cog-frame tracker pattern: rely solely on
+    // navigator_->getTargetRPY(), which is the spinal-side rate-limited target.
+    // Previously this routine overwrote x/y with beetle_navigator_->getFinalTargetBaselinkRPY(),
+    // i.e. the *unramped* final baselink target. That mismatch injected a step (up to
+    // ~0.2 rad on pitch=0.2 hover transitions) directly into the outer PID error,
+    // causing pitch_i wind-up and a cascading Z drop. Removing the override restores
+    // the same single-source-of-truth used by PoseLinearController (see
+    // pose_linear_controller.cpp:244).
     target_rpy_ = navigator_->getTargetRPY();
-    {
-      tf::Vector3 baselink_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
-      target_rpy_.setX(baselink_rpy.x());
-      target_rpy_.setY(baselink_rpy.y());
-    }
     tf::Matrix3x3 target_rot; target_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
     tf::Vector3 target_omega = navigator_->getTargetOmega();
     target_omega_ = cog_rot.inverse() * target_rot * target_omega;
@@ -1984,6 +1987,22 @@ namespace aerial_robot_control
     tf::Vector3 omega_world = cog_rot * omega_;
     tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
     tf::Vector3 target_formation_pos = target_pos_ + target_rot * offset_body;
+
+    // [DBG-ATT2POS] Attitude-to-position projection bias: how much pitch/roll
+    // error leaks into the Z position target via offset_body rotation. At hover
+    // with pitch_err 0.05 rad and offset_body.x=0.265, this is ~1.3 cm — large
+    // enough to drive Z PID windup. Throttled 1 Hz.
+    {
+      tf::Vector3 att_proj_bias = (target_rot * offset_body) - (cog_rot * offset_body);
+      ROS_INFO_THROTTLE(1.0,
+        "[DBG-ATT2POS id=%d] (tgt_rot-cog_rot)*off_body=(%.4f,%.4f,%.4f) m | "
+        "off_body=(%.3f,%.3f,%.3f) tgt_rpy=(%.3f,%.3f,%.3f) cur_rpy=(%.3f,%.3f,%.3f)",
+        my_id,
+        att_proj_bias.x(), att_proj_bias.y(), att_proj_bias.z(),
+        offset_body.x(), offset_body.y(), offset_body.z(),
+        target_rpy_.x(), target_rpy_.y(), target_rpy_.z(),
+        rpy_.x(), rpy_.y(), rpy_.z());
+    }
 
     // --- Position PID (X/Y/Z) with formation CoG ---
     double du = ros::Time::now().toSec() - control_timestamp_;
@@ -2098,6 +2117,14 @@ namespace aerial_robot_control
         ff_z += desired_total_ff(2) * mass_inv_z;
       }
       pid_controllers_.at(Z).setPersistentFF(ff_z);
+    }
+    // [Fix C] sec(tilt) compensation: with non-zero baselink tilt the world-frame
+    // vertical lift component drops by cos(roll)*cos(pitch). Scale the Z position
+    // error so the outer PID commands enough total thrust to recover the world-Z
+    // setpoint. A floor of 0.5 prevents divergence near 60 deg tilt.
+    {
+      const double tilt_cos = std::max(std::cos(rpy_.x()) * std::cos(rpy_.y()), 0.5);
+      err_z /= tilt_cos;
     }
     pid_controllers_.at(Z).update(err_z, du, err_v_z, target_acc_.z());
 
@@ -2303,6 +2330,57 @@ namespace aerial_robot_control
       Eigen::Matrix3d inertia_inv = unified_controller_->getFormationInertia().inverse();
       target_wrench_acc.head(3) -= unified_diff_damp_gain_ * inter_parasitic.head(3) / mass;
       target_wrench_acc.tail(3) -= unified_diff_damp_gain_ * (inertia_inv * inter_parasitic.tail(3));
+
+      // [DBG-DIFFDAMP] Inter-parasitic magnitude vs target wrench; throttled 1 Hz.
+      // Large |inter_parasitic| at hover (no task) indicates common-mode
+      // contamination of the diff-damping channel — observer disagreement, not
+      // true parasitic load. Compare to target_wrench_acc magnitude to gauge
+      // how much the damping pushes the formation around.
+      ROS_INFO_THROTTLE(1.0,
+        "[DBG-DIFFDAMP id=%d] inter_F=(%.3f,%.3f,%.3f) inter_T=(%.3f,%.3f,%.3f) "
+        "|inter_F|=%.3f |inter_T|=%.3f gain=%.3f mass=%.2f",
+        my_id,
+        inter_parasitic(0), inter_parasitic(1), inter_parasitic(2),
+        inter_parasitic(3), inter_parasitic(4), inter_parasitic(5),
+        inter_parasitic.head(3).norm(), inter_parasitic.tail(3).norm(),
+        unified_diff_damp_gain_, mass);
+    }
+
+    // [DBG-NANGUARD] Catch non-finite or absurd target_wrench_acc BEFORE feeding
+    // it to allocation pseudoinverse. SIGSEGV in spinal pipeline is typically
+    // caused by NaN/Inf propagating through Eigen path. Print FULL context so
+    // the offending source is identifiable from a single log line.
+    {
+      bool any_bad = false;
+      double max_abs = 0.0;
+      for (int k = 0; k < 6; ++k) {
+        double v = target_wrench_acc(k);
+        if (!std::isfinite(v)) { any_bad = true; break; }
+        max_abs = std::max(max_abs, std::fabs(v));
+      }
+      // Absurd threshold: 6 g translational or 50 rad/s^2 angular implies
+      // upstream divergence. Treat as soft alarm (still proceed, no behavioural
+      // change) so we capture the LAST sane frame before SIGSEGV.
+      if (any_bad || max_abs > 60.0) {
+        ROS_ERROR(
+          "[DBG-NANGUARD id=%d] wrench_acc=(%.3f,%.3f,%.3f, %.4f,%.4f,%.4f) "
+          "pitch_I=%.4f roll_I=%.4f yaw_I=%.4f "
+          "fobs_ff_tx=%.4f fobs_ff_ty=%.4f "
+          "pos=(%.3f,%.3f,%.3f) tgt_pos=(%.3f,%.3f,%.3f) rpy=(%.3f,%.3f,%.3f) tgt_rpy=(%.3f,%.3f,%.3f) "
+          "off_body=(%.3f,%.3f,%.3f) any_bad=%d max_abs=%.3f",
+          my_id,
+          target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
+          target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
+          pid_controllers_.at(PITCH).getITerm(), pid_controllers_.at(ROLL).getITerm(),
+          pid_controllers_.at(YAW).getITerm(),
+          fobs_comp_ff_torque_x_, fobs_comp_ff_torque_y_,
+          pos_.x(), pos_.y(), pos_.z(),
+          target_pos_.x(), target_pos_.y(), target_pos_.z(),
+          rpy_.x(), rpy_.y(), rpy_.z(),
+          target_rpy_.x(), target_rpy_.y(), target_rpy_.z(),
+          offset_body.x(), offset_body.y(), offset_body.z(),
+          any_bad ? 1 : 0, max_abs);
+      }
     }
 
     setTargetWrenchAccCog(target_wrench_acc);
@@ -2310,6 +2388,20 @@ namespace aerial_robot_control
     // --- Run unified 6-DOF allocation ---
     unified_controller_->clearFormationModelOverride();
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
+
+    // [DBG-NANGUARD2] Detect non-finite allocation output: if the pseudoinverse
+    // produced NaN, downstream spinal packing will likely SIGSEGV.
+    if (ok) {
+      const Eigen::VectorXd& fw = formation_desired_wrench_;
+      bool fw_bad = false;
+      for (int k = 0; k < fw.size(); ++k) {
+        if (!std::isfinite(fw(k))) { fw_bad = true; break; }
+      }
+      if (fw_bad) {
+        ROS_ERROR("[DBG-NANGUARD2 id=%d] formation_desired_wrench has NaN/Inf, size=%ld",
+                  my_id, (long)fw.size());
+      }
+    }
 
     if (ok) {
       publishLocalUnifiedCommand();

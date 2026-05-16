@@ -110,11 +110,20 @@ bool BeetleUnifiedController::updateFormationGeometry()
     formation_mass_ = external_formation_mass_;
     formation_cog_offset_ = external_formation_cog_offset_;
     formation_inertia_ = external_formation_inertia_;
+    cached_assembled_ids_.clear();  // invalidate cache so next non-external call refreshes
     return true;
   }
 
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) return false;
+
+  // ε-fix: reuse the latched geometry while the assembled-IDs set is unchanged.
+  // Re-running lookupTransform per cycle introduced ~10 cm Z drift in cog_offset
+  // under sustained tilt (real-hw pitch=0.4). Geometry is structurally constant
+  // for a given assembled set, so memoize on the IDs key.
+  if (assembled_ids == cached_assembled_ids_ && formation_mass_ > 0.0) {
+    return true;
+  }
 
   int N = assembled_ids.size();
   double single_mass = robot_model_->getMass();
@@ -141,6 +150,12 @@ bool BeetleUnifiedController::updateFormationGeometry()
   }
   formation_cog_offset_ = cog_offset_sum / N;
   formation_inertia_ = computeFormationInertia(assembled_ids, formation_cog_offset_);
+  cached_assembled_ids_ = assembled_ids;  // ε-fix: latch
+  ROS_INFO("[UnifiedCtrl] Formation geometry latched for assembled_ids=[%s] "
+           "N=%d cog_offset=(%.4f,%.4f,%.4f) mass=%.3f",
+           [&]{ std::string s; for(int id : assembled_ids){ s += std::to_string(id) + ","; } return s; }().c_str(),
+           N, formation_cog_offset_.x(), formation_cog_offset_.y(), formation_cog_offset_.z(),
+           formation_mass_);
   return true;
 }
 

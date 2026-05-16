@@ -538,15 +538,21 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
     }
 
     /* pitch/roll target for formation (if needed) */
+    // ζ-fix: unified mode must ALSO write target_rpy_ so the outer PID tracks
+    // the commanded tilt; previously only baselink_rot was set, so the outer
+    // PID saw target=0 while spinal held the desired tilt → integrator wind-up
+    // at large angles (pitch=0.4 crashed; pitch=0.2 stayed below threshold).
     if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
       tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
       target_rp.setY(msg->target_pitch);
       setFinalTargetBaselinkRPY(target_rp);
+      setTargetPitch(msg->target_pitch);
     }
     if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
       tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
       target_rp.setX(msg->target_roll);
       setFinalTargetBaselinkRPY(target_rp);
+      setTargetRoll(msg->target_roll);
     }
 
     {

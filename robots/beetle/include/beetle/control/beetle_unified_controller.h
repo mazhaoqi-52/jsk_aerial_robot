@@ -214,6 +214,12 @@ private:
   Eigen::Vector3d external_formation_cog_offset_;
   Eigen::Matrix3d external_formation_inertia_;
 
+  // ε-fix: cache formation geometry keyed on the assembled-IDs set.
+  // Per-cycle tf::lookupTransform under large tilt produced 10 cm Z drift in
+  // cog_offset (real-hw pitch=0.4 log). We now only recompute when the set
+  // of assembled modules changes, freezing geometry during steady flight.
+  std::vector<int> cached_assembled_ids_;
+
   // Allocation matrices
   Eigen::MatrixXd integrated_map_;        // 6 x (rotor_coef * total_rotors)
   Eigen::MatrixXd integrated_map_inv_;    // pseudoinverse

@@ -59,6 +59,8 @@ FormationMomentumObserver::FormationMomentumObserver()
     bias_torque_body_(Eigen::Vector3d::Zero()),
     bias_settle_time_(3.0),
     bias_lpf_cutoff_freq_(0.02),
+    bias_snap_force_thresh_(2.0),
+    bias_snap_torque_thresh_(0.5),
     update_count_(0),
     bias_calibration_allowed_(false),
     bias_ready_count_(0),
@@ -97,6 +99,8 @@ void FormationMomentumObserver::loadParams()
   obs_nh.param<bool>("enable_torque_observer", enable_torque_observer_, false);
   obs_nh.param<double>("bias_settle_time", bias_settle_time_, 3.0);
   obs_nh.param<double>("bias_lpf_cutoff_freq", bias_lpf_cutoff_freq_, 0.02);
+  obs_nh.param<double>("bias_snap_force_thresh",  bias_snap_force_thresh_,  2.0);
+  obs_nh.param<double>("bias_snap_torque_thresh", bias_snap_torque_thresh_, 0.5);
   obs_nh.param<double>("est_force_lpf_cutoff_freq",  est_force_lpf_cutoff_freq_,  0.05);
   obs_nh.param<double>("est_torque_lpf_cutoff_freq", est_torque_lpf_cutoff_freq_, 0.05);
   obs_nh.param<double>("ff_ramp_seconds",            ff_ramp_seconds_,            5.0);
@@ -231,7 +235,12 @@ void FormationMomentumObserver::update(
       bias_ready_count_++;
       int settle_frames = std::max(10, static_cast<int>(bias_settle_time_ / dt));
 
-      if (!bias_calibrated_ && bias_ready_count_ >= settle_frames)
+      // β1-fix: also require |filt| to be below threshold. Otherwise we snap
+      // during a transient and lock a bogus bias (root cause of pitch=0.4
+      // divergence: snap fired at |filt|≈10 N, see [FormObs_F] logs).
+      bool magnitude_ok = est_ext_force_w_filt_.norm() < bias_snap_force_thresh_;
+
+      if (!bias_calibrated_ && bias_ready_count_ >= settle_frames && magnitude_ok)
       {
         bias_force_w_ = est_ext_force_w_filt_;  // snap baseline
         bias_calibrated_ = true;
@@ -341,7 +350,10 @@ void FormationMomentumObserver::update(
     {
       int settle_frames = std::max(10, static_cast<int>(bias_settle_time_ / dt));
 
-      if (!bias_torque_calibrated_ && bias_ready_count_ >= settle_frames)
+      // β1-fix: gate torque snap on |tau_filt| magnitude (same rationale as force).
+      bool tau_magnitude_ok = est_ext_torque_body_filt_.norm() < bias_snap_torque_thresh_;
+
+      if (!bias_torque_calibrated_ && bias_ready_count_ >= settle_frames && tau_magnitude_ok)
       {
         bias_torque_body_ = est_ext_torque_body_filt_;
         bias_torque_calibrated_ = true;

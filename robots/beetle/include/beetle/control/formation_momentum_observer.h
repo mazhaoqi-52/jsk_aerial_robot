@@ -158,6 +158,11 @@ private:
 
   double bias_settle_time_;                  // seconds to wait before snap
   double bias_lpf_cutoff_freq_;              // Hz; LPF cutoff for continuous bias update
+  // β1-fix: snap gate requires |filt| AND |tau_filt| below these thresholds.
+  // Prevents premature snap during large transients (e.g. pitch=0.4 tilt
+  // ramp) that would otherwise lock a wildly wrong bias and diverge.
+  double bias_snap_force_thresh_;            // N; snap blocked while |filt|>this
+  double bias_snap_torque_thresh_;           // Nm; snap blocked while |tau_filt|>this
   int    update_count_;                      // total update() calls since initialization
   bool   bias_calibration_allowed_;          // true only while unified hover is active
   int    bias_ready_count_;                  // hover-allowed frame counter for settle timing

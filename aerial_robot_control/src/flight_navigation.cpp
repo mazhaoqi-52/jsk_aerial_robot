@@ -1143,6 +1143,7 @@ void BaseNavigator::rosParamInit()
   getParam<double>(nh, "max_teleop_z_vel", max_teleop_z_vel_, 0.5);
   getParam<double>(nh, "max_teleop_yaw_vel", max_teleop_yaw_vel_, 0.5);
   getParam<double>(nh, "max_teleop_rp_angle", max_teleop_rp_angle_, 0.2);
+  getParam<double>(nh, "max_target_tilt_angle", max_target_tilt_angle_, 0.2);
   getParam<double>(nh, "joy_stick_deadzone", joy_stick_deadzone_, 0.2);
   getParam<double>(nh, "joy_stick_heart_beat_du", joy_stick_heart_beat_du_, 2.0);
   getParam<double>(nh, "force_landing_to_halt_du", force_landing_to_halt_du_, 1.0);

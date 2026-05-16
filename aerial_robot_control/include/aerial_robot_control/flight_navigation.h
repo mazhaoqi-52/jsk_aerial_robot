@@ -92,12 +92,12 @@ namespace aerial_robot_navigation
     inline void setTargetAcc(double x, double y, double z) { setTargetAcc(tf::Vector3(x, y, z)); }
     inline void setTargetZeroAcc() { setTargetAcc(tf::Vector3(0,0,0)); }
 
-    inline void setTargetRoll(float value) { target_rpy_.setX(value); }
+    inline void setTargetRoll(float value) { target_rpy_.setX(clampTiltAngle(value)); }
     inline void setTargetOmega(tf::Vector3 omega) { target_omega_ = omega; }
     inline void setTargetOmega(double x, double y, double z) { setTargetOmega(tf::Vector3(x, y, z)); }
     inline void setTargetZeroOmega() { setTargetOmega(0,0,0); }
     inline void setTargetOmegaX(float value) { target_omega_.setX(value); }
-    inline void setTargetPitch(float value) { target_rpy_.setY(value); }
+    inline void setTargetPitch(float value) { target_rpy_.setY(clampTiltAngle(value)); }
     inline void setTargetOmegaY(float value) { target_omega_.setY(value); }
     inline void setTargetYaw(float value) { target_rpy_.setZ(value); }
     inline void addTargetYaw(float value) { setTargetYaw(angles::normalize_angle(target_rpy_.z() + value)); }
@@ -330,6 +330,21 @@ namespace aerial_robot_navigation
     double max_teleop_z_vel_;
     double max_teleop_yaw_vel_;
     double max_teleop_rp_angle_;
+    double max_target_tilt_angle_; // outer-PID target roll/pitch clamp (rad); 0 disables
+
+    inline float clampTiltAngle(float v) const {
+      const float lim = static_cast<float>(max_target_tilt_angle_);
+      if (lim <= 0.0f) return v;
+      if (v >  lim) {
+        ROS_WARN_THROTTLE(2.0, "[Nav] target tilt %.3f clamped to +%.3f rad (max_target_tilt_angle)", v, lim);
+        return  lim;
+      }
+      if (v < -lim) {
+        ROS_WARN_THROTTLE(2.0, "[Nav] target tilt %.3f clamped to -%.3f rad (max_target_tilt_angle)", v, lim);
+        return -lim;
+      }
+      return v;
+    }
 
     double joy_stick_deadzone_;
     double joy_stick_prev_time_;

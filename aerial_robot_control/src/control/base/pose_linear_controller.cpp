@@ -316,6 +316,16 @@ namespace aerial_robot_control
     pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp, target_omega_.x() - omega_.x(), target_ang_acc_.x());
     pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp, target_omega_.y() - omega_.y(), target_ang_acc_.y());
 
+    // Outer R/P diagnostic: track whether ref/cur stay aligned so I-term does
+    // not wind up (regression probe for the unified-mode pseudo-error bug).
+    ROS_INFO_THROTTLE(2.0,
+                      "[OuterRP] tgt=(%.3f,%.3f) cur=(%.3f,%.3f) err=(%.3f,%.3f) "
+                      "i=(%.3f,%.3f)",
+                      target_rpy_.x(), target_rpy_.y(), rpy_.x(), rpy_.y(),
+                      target_rpy_.x() - rpy_.x(), target_rpy_.y() - rpy_.y(),
+                      pid_controllers_.at(ROLL).getITerm(),
+                      pid_controllers_.at(PITCH).getITerm());
+
     // yaw
     double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
     double err_omega_z = target_omega_.z() - omega_.z();

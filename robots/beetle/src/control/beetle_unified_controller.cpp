@@ -247,6 +247,18 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     candidate_yaw_term_ = candidate_yaw_term_lpf_;
   }
 
+  // A-fix: feed the *actually commanded* tilt back to the outer R/P PID
+  // reference. In unified mode, the spinal inner loop tracks target_pitch_
+  // (derived from XY acc), so the body's true pitch settles near target_pitch_
+  // (typically ±0.05~0.15 rad due to cog/FF). The outer PoseLinearController
+  // however uses navigator->getTargetRPY() = (0,0,*) as reference, producing
+  // a permanent pseudo-error ≈ target_pitch_ that winds up pitch_i without
+  // bound (root cause of the 17030-17066s divergence). Writing the realized
+  // tilt back closes the loop: outer err → 0 in steady state. setTargetRoll/
+  // setTargetPitch already enforce ±max_target_tilt_angle clamping (α-fix).
+  navigator_->setTargetRoll(static_cast<float>(target_roll_));
+  navigator_->setTargetPitch(static_cast<float>(target_pitch_));
+
   // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
 
@@ -280,36 +292,6 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
              cached_cascade_roll_p_, cached_cascade_roll_d_,
              cached_cascade_pitch_p_, cached_cascade_pitch_d_,
              cached_cascade_yaw_d_);
-
-    // D-3 diagnostic: dump inv_rot matrix and resulting thrust gains for analysis
-    {
-      int rows_per_mod = motor_num_per_module_ * rotor_coef_;
-      std::vector<int> ids = navigator_->getAssemblyIds();
-      for (size_t m = 0; m < ids.size(); m++) {
-        for (int i = 0; i < rows_per_mod; i++) {
-          int row = m * rows_per_mod + i;
-          ROS_WARN("[D3_ALLOC] mod=%d row=%d inv_rot=(%.6f, %.6f, %.6f) "
-                   "thrust_p_X=%.6f thrust_p_Y=%.6f thrust_d_X=%.6f thrust_d_Y=%.6f thrust_d_Z=%.6f",
-                   ids[m], i,
-                   integrated_map_inv_rot_(row, 0),
-                   integrated_map_inv_rot_(row, 1),
-                   integrated_map_inv_rot_(row, 2),
-                   integrated_map_inv_rot_(row, 0) * cached_cascade_roll_p_,
-                   integrated_map_inv_rot_(row, 1) * cached_cascade_pitch_p_,
-                   integrated_map_inv_rot_(row, 0) * cached_cascade_roll_d_,
-                   integrated_map_inv_rot_(row, 1) * cached_cascade_pitch_d_,
-                   integrated_map_inv_rot_(row, 2) * cached_cascade_yaw_d_);
-        }
-      }
-      // Also dump the full integrated_map_ for reference
-      ROS_WARN("[D3_MAP] integrated_map (%ldx%ld):", integrated_map_.rows(), integrated_map_.cols());
-      for (int r = 0; r < integrated_map_.rows(); r++) {
-        std::string row_str;
-        for (int c = 0; c < integrated_map_.cols(); c++)
-          row_str += std::to_string(integrated_map_(r, c)) + " ";
-        ROS_WARN("[D3_MAP] row%d: %s", r, row_str.c_str());
-      }
-    }
   }
 
   return true;

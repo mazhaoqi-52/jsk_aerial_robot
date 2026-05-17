@@ -247,17 +247,16 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     candidate_yaw_term_ = candidate_yaw_term_lpf_;
   }
 
-  // A-fix: feed the *actually commanded* tilt back to the outer R/P PID
-  // reference. In unified mode, the spinal inner loop tracks target_pitch_
-  // (derived from XY acc), so the body's true pitch settles near target_pitch_
-  // (typically ±0.05~0.15 rad due to cog/FF). The outer PoseLinearController
-  // however uses navigator->getTargetRPY() = (0,0,*) as reference, producing
-  // a permanent pseudo-error ≈ target_pitch_ that winds up pitch_i without
-  // bound (root cause of the 17030-17066s divergence). Writing the realized
-  // tilt back closes the loop: outer err → 0 in steady state. setTargetRoll/
-  // setTargetPitch already enforce ±max_target_tilt_angle clamping (α-fix).
-  navigator_->setTargetRoll(static_cast<float>(target_roll_));
-  navigator_->setTargetPitch(static_cast<float>(target_pitch_));
+  // NOTE: previously we wrote target_roll_/target_pitch_ back into the
+  // navigator via setTargetRoll/Pitch (the "A-fix"). It eliminated the static
+  // outer-PID pseudo-error but introduced a positive-feedback loop with the
+  // XY-PID + FormObs FF channel: target_pitch_ tracks instantaneous XY-acc,
+  // body pitch lags 60~90deg behind the spinal cascade, so the outer R/P
+  // error settles around an oscillating ±0.1 rad reference vs lagging body
+  // angle -> pitch_i winds up monotonically (real-hw run 17030..17060s,
+  // pitch_i reached +10 Nm). Outer R/P I-term is now disabled in unified
+  // mode (see runUnifiedControlCommon: target_wrench_acc(3,4) carry only
+  // FormObs/task torque FF), so the writeback is no longer needed.
 
   // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);

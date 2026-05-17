@@ -30,16 +30,12 @@ controller:
   bias_pid_settled_rate_thresh: 0.03   # [Nm/frame], summed over roll+pitch+yaw I-terms
   bias_pid_settled_frames:      40     # ~1 s @ 40 Hz
   z_i_seed_default: 0.8    # Z I-term seed fallback (used when N not in z_i_seed_by_n)
-  pitch_i_seed_default: -0.55  # Pitch I-term seed fallback (err_i domain)
 
   # P2: Per-module-count seed bucketing.
   # 2-module has worse allocation efficiency → needs larger Z seed and stronger boost.
   z_i_seed_by_n:
     n2: 1.2   # 2-module: higher seed (allocation efficiency ~60-70%)
     n3: 0.8   # 3-module: standard seed (allocation efficiency ~90%+)
-  pitch_i_seed_by_n:
-    n2: -0.70  # 2-module: larger pitch bias due to geometry
-    n3: -0.55  # 3-module: standard pitch bias
   z_ki_boost_frames_default: 60   # boost duration fallback [frames @40Hz]
   z_ki_boost_factor_default: 2.0  # boost factor fallback
   z_ki_boost_by_n:

@@ -93,15 +93,13 @@ namespace aerial_robot_control
     // P2: boost duration and factor are now per-N (see z_ki_boost_frames_by_n_).
     int z_ki_boost_count_;            // frames remaining in boost phase (0 = normal)
 
-    // Roll/Pitch I-term transition support for unified mode switch:
-    // Same philosophy as Z axis — freeze then boost — but with different parameters
-    // because roll/pitch bias is typically smaller but more attitude-sensitive.
-    int rp_integral_freeze_count_;    // frames remaining to freeze Roll/Pitch I-term
-    int rp_ki_boost_count_;           // frames remaining in Roll/Pitch boost phase
-    static constexpr int RP_INTEGRAL_FREEZE_FRAMES = 3;   // shorter freeze (3 frames)
-    static constexpr int RP_KI_BOOST_FRAMES = 80;         // boost duration: 80 frames = 2.0s @40Hz
-    static constexpr double RP_KI_BOOST_FACTOR = 6.0;     // effective Ki = nominal_Ki * 6.0 during boost phase
-    double rp_i_keep_ratio_;          // fraction of old I-term to keep at switch (0~1, from YAML)
+    // Roll/Pitch I-term transition support: removed.
+    // Outer R/P I-term is structurally unused in unified mode (the spinal
+    // cascade tracks target_roll_/target_pitch_ directly, and the formation
+    // allocation absorbs the constant trim torque via cog_offset). All of
+    // rp_integral_freeze / rp_ki_boost / rp_i_keep_ratio / pitch_i_seed have
+    // been removed; the ROLL/PITCH PID I-accumulator is zeroed every frame
+    // in runUnifiedControlCommon.
 
     // I-term seed for unified mode switch (Plan E'):
     // Unified mode needs steady-state I-term biases that don't exist in independent mode.
@@ -120,15 +118,6 @@ namespace aerial_robot_control
     std::map<int, double> z_i_seed_by_n_;     // per-N seed defaults from YAML
     static constexpr double Z_SEED_GAIN = 0.8;       // inject 80% of seed to be conservative
     static constexpr double Z_SEED_LPF_ALPHA = 0.05; // low-pass filter for SS tracking
-    //
-    // Pitch axis: SS err_i ≈ -0.54 (i_term ≈ -2.7 / Ki=5), from formation geometry offset.
-    // All pitch seed values are in err_i domain (consistent with setErrI at injection).
-    double last_unified_pitch_i_ss_;  // most recent unified steady-state pitch err_i
-    bool has_unified_pitch_i_ss_;     // true after at least one SS sample recorded
-    double pitch_i_seed_default_;     // global fallback when N not in map
-    std::map<int, double> pitch_i_seed_by_n_; // per-N seed defaults from YAML
-    static constexpr double PITCH_SEED_GAIN = 0.8;       // inject 80% of seed
-    static constexpr double PITCH_SEED_LPF_ALPHA = 0.02; // slower LPF than Z (pitch more sensitive)
     //
     // Per-N Z boost parameters: 2-module needs stronger/longer boost than 3-module.
     int z_ki_boost_frames_;           // current N-specific boost duration

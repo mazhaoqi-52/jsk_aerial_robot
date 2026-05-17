@@ -83,22 +83,26 @@ public:
 
   // ---- Accessors (debug / future compensation) ----
 
-  /** @brief Get estimated external force in world frame [N] (LPF-filtered, bias-subtracted). */
-  Eigen::Vector3d getEstExternalForceWorld() const { return est_ext_force_w_filt_ - bias_force_w_; }
+  /** @brief Get estimated external force in world frame [N] (LPF-filtered).
+   *  Plan-A: NO bias subtraction. ninja-style: trust the observer output as the
+   *  true external force estimate. Initial-momentum baseline is locked once at
+   *  observer init, so steady-state DC is captured by it instead of by a
+   *  post-hoc bias snap. */
+  Eigen::Vector3d getEstExternalForceWorld() const { return est_ext_force_w_filt_; }
 
-  /** @brief Get raw (pre-LPF, pre-bias) estimated external force in world frame [N]. */
+  /** @brief Get raw (pre-LPF) estimated external force in world frame [N]. */
   const Eigen::Vector3d& getRawEstExternalForceWorld() const { return est_ext_force_w_; }
 
-  /** @brief Get estimated external force in body frame [N] (LPF-filtered, bias-subtracted). */
-  Eigen::Vector3d getEstExternalForceBody() const { return last_cog_rot_.transpose() * (est_ext_force_w_filt_ - bias_force_w_); }
+  /** @brief Get estimated external force in body frame [N] (LPF-filtered). */
+  Eigen::Vector3d getEstExternalForceBody() const { return last_cog_rot_.transpose() * est_ext_force_w_filt_; }
 
-  /** @brief Get estimated external torque in body frame [N·m] (LPF-filtered, bias-subtracted, V2). */
-  Eigen::Vector3d getEstExternalTorqueBody() const { return est_ext_torque_body_filt_ - bias_torque_body_; }
+  /** @brief Get estimated external torque in body frame [N·m] (LPF-filtered, V2). */
+  Eigen::Vector3d getEstExternalTorqueBody() const { return est_ext_torque_body_filt_; }
 
-  /** @brief Get raw (pre-LPF, pre-bias) estimated external torque in body frame [N·m]. */
+  /** @brief Get raw (pre-LPF) estimated external torque in body frame [N·m]. */
   const Eigen::Vector3d& getRawEstExternalTorqueBody() const { return est_ext_torque_body_; }
 
-  /** @brief Get full 6D estimated external wrench (bias-subtracted) in formation_body frame.
+  /** @brief Get full 6D estimated external wrench in formation_body frame.
    *  [force_body(3); torque_body(3)]. torque is zero when torque observer is disabled. */
   Eigen::VectorXd getEstExternalWrench6D() const;
 
@@ -111,20 +115,18 @@ public:
   /** @brief Set the observer to active/inactive. When inactive, update() is a no-op. */
   void setActive(bool active) { active_ = active; }
 
-  /** @brief Allow bias calibration only when the controller judges the formation to be hovering stably. */
-  void setBiasCalibrationAllowed(bool allowed);
+  /** @brief Gate downstream FF compensation. Called by the controller when the
+   *  formation is judged to be in stable hover. When the gate flips OFF→ON, the
+   *  ff_armed_time_ is recorded and getFfRampFactor() ramps 0→1 over
+   *  ff_ramp_seconds_. */
+  void setFfArmed(bool armed);
 
-  /** @brief Is the bias calibrated? */
-  bool isBiasCalibrated() const { return bias_calibrated_; }
+  /** @brief Is the FF gate currently armed? (replaces isBiasCalibrated) */
+  bool isFfReady() const { return ff_armed_ && initialized_; }
 
-  /** @brief Soft-ramp factor used by downstream FF compensation. Returns 0 until
-   *  bias is calibrated, then linearly ramps 0→1 over ff_ramp_seconds_, then 1.0.
-   *  Combined with the very-low-cutoff LPF this provides the second stage of
-   *  attenuation for the formation-observer feedforward path. */
+  /** @brief Soft-ramp factor [0,1] used by downstream FF compensation.
+   *  0 until ff is armed, then linearly ramps 0→1 over ff_ramp_seconds_, then 1.0. */
   double getFfRampFactor() const;
-
-  /** @brief Get the current bias value [N] (world frame). */
-  const Eigen::Vector3d& getBias() const { return bias_force_w_; }
 
 private:
   ros::NodeHandle nh_;
@@ -143,33 +145,20 @@ private:
   Eigen::Vector3d integrate_term_torque_;    // accumulated integral for torque channel
   Eigen::Vector3d est_ext_torque_body_;      // estimated external torque in body frame
 
-  // ---- Bias calibration ----
-  // Two-stage Dragon-style bias tracking:
-  //   1) Wait bias_settle_time during stable hover, then snap bias_*_ from filt.
-  //   2) After snap, continuously update bias_*_ via a slow LPF
-  //      (bias_lpf_cutoff_freq, e.g. 0.02 Hz) so bias tracks system drift
-  //      (battery sag, thermal, aerodynamic ground effect changes).
-  // Output = filt - bias captures only mid-frequency real disturbances.
-  bool bias_calibrated_;                     // true once force bias is snapped
-  Eigen::Vector3d bias_force_w_;             // tracked force bias (subtracted from output)
-
-  bool bias_torque_calibrated_;              // true once torque bias is snapped
-  Eigen::Vector3d bias_torque_body_;         // tracked torque bias (subtracted from output)
-
-  double bias_settle_time_;                  // seconds to wait before snap
-  double bias_lpf_cutoff_freq_;              // Hz; LPF cutoff for continuous bias update
-  // β1-fix: snap gate requires |filt| AND |tau_filt| below these thresholds.
-  // Prevents premature snap during large transients (e.g. pitch=0.4 tilt
-  // ramp) that would otherwise lock a wildly wrong bias and diverge.
-  double bias_snap_force_thresh_;            // N; snap blocked while |filt|>this
-  double bias_snap_torque_thresh_;           // Nm; snap blocked while |tau_filt|>this
-  int    update_count_;                      // total update() calls since initialization
-  bool   bias_calibration_allowed_;          // true only while unified hover is active
-  int    bias_ready_count_;                  // hover-allowed frame counter for settle timing
-
-  // Ramp from 0→1 starting at the moment force bias finishes calibration.
-  // bias_calibrated_time_ < 0 means "not yet calibrated".
-  double bias_calibrated_time_;              // ros::Time::now().toSec() at completion
+  // ---- FF arming (Plan A: no bias subtraction) ----
+  // Plan A discards the snap-and-LPF bias mechanism entirely. The observer's
+  // own init_linear_momentum_ / init_angular_momentum_ baseline already
+  // captures the steady-state DC component, so any post-hoc bias subtraction
+  // is double-counting and was the root cause of the positive-feedback
+  // divergence at t=17304 (snap froze a transient relative residual at 8.3 N
+  // and then FF gain=0.2 fed corrected=filt-bias back into target_wrench_acc).
+  //
+  // The only piece we keep is a simple time gate: once the controller arms
+  // the FF (typically at hover-stable transition), ramp 0→1 over
+  // ff_ramp_seconds_ to avoid stepping the wrench command. ff_armed_ replaces
+  // bias_calibrated_ in the downstream API.
+  bool   ff_armed_;                          // FF gate state (controlled by setFfArmed)
+  double ff_armed_time_;                     // ros::Time::now().toSec() when armed (<0 = unarmed)
   double ff_ramp_seconds_;                   // duration of the 0→1 soft ramp [s]
 
   // Last rotation matrix (cached for body↔world conversion)

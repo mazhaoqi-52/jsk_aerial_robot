@@ -197,11 +197,24 @@ namespace aerial_robot_control
     int unified_reference_warmup_frames_;
 
     // Differential-mode damping gain: injects a passive dissipation term
-    // -K_damp * inter_wrench/mass into target_wrench_acc, based on
-    // inter_wrench_list_[my_id] (from calcInteractionWrench, already the
-    // parasitic residual after subtracting est_wrench_task_list_).
+    // -K_damp * inter_wrench/mass into target_wrench_acc. D3 architecture:
+    //   diff_i = est_residual_list_[my_id] - formation_observer_wrench_/N
+    // where the common-mode is taken from FormationMomentumObserver (an
+    // INDEPENDENT formation-level external-wrench estimator), not from the
+    // simple per-module average. The previous "residual_i - mean(residual)"
+    // formula had no immunity against common-mode model error (same CoG /
+    // inertia mismatch in every module's observer) and was the source of the
+    // persistent diff-damping signal at hover.
     // Zero = disabled.
     double unified_diff_damp_gain_;
+
+    // D3 common-mode source: cached output of the global formation observer
+    // (published by the leader to /assemble/formation_observer/est_ext_wrench).
+    // 6D in formation_body frame ([force(3); torque(3)]).
+    Eigen::VectorXd formation_observer_wrench_;
+    ros::Time formation_observer_wrench_stamp_;
+    ros::Subscriber formation_observer_wrench_sub_;
+    void formationObserverWrenchCallback(const geometry_msgs::WrenchStamped & msg);
 
     // PID-settled gating for FormationObserver bias calibration (leader only).
     // Bias is only calibrated when |d/dt of roll/pitch/yaw I-terms| stays below

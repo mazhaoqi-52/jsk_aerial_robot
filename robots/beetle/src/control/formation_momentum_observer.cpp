@@ -53,18 +53,8 @@ FormationMomentumObserver::FormationMomentumObserver()
     torque_observer_gain_(2.5),
     enable_force_observer_(true),
     enable_torque_observer_(false),
-    bias_calibrated_(false),
-    bias_force_w_(Eigen::Vector3d::Zero()),
-    bias_torque_calibrated_(false),
-    bias_torque_body_(Eigen::Vector3d::Zero()),
-    bias_settle_time_(3.0),
-    bias_lpf_cutoff_freq_(0.02),
-    bias_snap_force_thresh_(10.0),
-    bias_snap_torque_thresh_(0.5),
-    update_count_(0),
-    bias_calibration_allowed_(false),
-    bias_ready_count_(0),
-    bias_calibrated_time_(-1.0),
+    ff_armed_(false),
+    ff_armed_time_(-1.0),
     ff_ramp_seconds_(5.0)
 {
 }
@@ -97,10 +87,6 @@ void FormationMomentumObserver::loadParams()
   obs_nh.param<double>("torque_observer_gain", torque_observer_gain_, 2.5);
   obs_nh.param<bool>("enable_force_observer", enable_force_observer_, true);
   obs_nh.param<bool>("enable_torque_observer", enable_torque_observer_, false);
-  obs_nh.param<double>("bias_settle_time", bias_settle_time_, 3.0);
-  obs_nh.param<double>("bias_lpf_cutoff_freq", bias_lpf_cutoff_freq_, 0.02);
-  obs_nh.param<double>("bias_snap_force_thresh",  bias_snap_force_thresh_,  10.0);
-  obs_nh.param<double>("bias_snap_torque_thresh", bias_snap_torque_thresh_, 0.5);
   obs_nh.param<double>("est_force_lpf_cutoff_freq",  est_force_lpf_cutoff_freq_,  0.05);
   obs_nh.param<double>("est_torque_lpf_cutoff_freq", est_torque_lpf_cutoff_freq_, 0.05);
   obs_nh.param<double>("ff_ramp_seconds",            ff_ramp_seconds_,            5.0);
@@ -123,34 +109,28 @@ void FormationMomentumObserver::reset()
 
   last_cog_rot_ = Eigen::Matrix3d::Identity();
 
-  // Reset bias calibration state
-  bias_calibrated_ = false;
-  bias_force_w_ = Eigen::Vector3d::Zero();
-  bias_torque_calibrated_ = false;
-  bias_torque_body_ = Eigen::Vector3d::Zero();
+  // Plan A: no bias state to reset. Just clear FF arming.
+  ff_armed_ = false;
+  ff_armed_time_ = -1.0;
 
-  update_count_ = 0;
-  bias_calibration_allowed_ = false;
-  bias_ready_count_ = 0;
-  bias_calibrated_time_ = -1.0;
-
-  ROS_INFO("[FormationObserver] State reset (including bias calibration)");
+  ROS_INFO("[FormationObserver] State reset (Plan A: no bias subtraction)");
 }
 
-void FormationMomentumObserver::setBiasCalibrationAllowed(bool allowed)
+void FormationMomentumObserver::setFfArmed(bool armed)
 {
-  if (bias_calibration_allowed_ == allowed) return;
+  if (ff_armed_ == armed) return;
 
-  bias_calibration_allowed_ = allowed;
-  bias_ready_count_ = 0;
-
-  if (!allowed)
+  ff_armed_ = armed;
+  if (armed)
   {
-    ROS_INFO("[FormationObserver] Bias calibration gated OFF (bias frozen)");
-    return;
+    ff_armed_time_ = ros::Time::now().toSec();
+    ROS_INFO("[FormationObserver] FF gate ARMED (ramp %.1fs starts now)", ff_ramp_seconds_);
   }
-
-  ROS_INFO("[FormationObserver] Bias calibration gated ON (hover detected, settle timer starts now)");
+  else
+  {
+    ff_armed_time_ = -1.0;
+    ROS_INFO("[FormationObserver] FF gate DISARMED");
+  }
 }
 
 void FormationMomentumObserver::update(
@@ -168,7 +148,6 @@ void FormationMomentumObserver::update(
   if (formation_mass < 0.01) return;  // sanity: skip zero mass
 
   last_cog_rot_ = cog_rot;
-  update_count_++;
 
   // ========== 3D Force Observer (V1) ==========
   Eigen::Vector3d residual = Eigen::Vector3d::Zero();
@@ -184,10 +163,9 @@ void FormationMomentumObserver::update(
       init_linear_momentum_ = p_lin;
       initialized_ = true;
       ROS_INFO("[FormationObserver] First update: p_lin_0 = (%.4f, %.4f, %.4f), "
-               "mass = %.3f, bias_settle=%.1fs, bias_lpf=%.3fHz",
+               "mass = %.3f (Plan A: no bias subtraction)",
                init_linear_momentum_.x(), init_linear_momentum_.y(),
-               init_linear_momentum_.z(), formation_mass,
-               bias_settle_time_, bias_lpf_cutoff_freq_);
+               init_linear_momentum_.z(), formation_mass);
     }
 
     // 3. Realized force: rotate body-frame force to world frame
@@ -226,64 +204,24 @@ void FormationMomentumObserver::update(
       est_ext_force_w_filt_ = alpha * est_ext_force_w_filt_ + (1.0 - alpha) * est_ext_force_w_;
     }
 
-    // 7. Bias tracking (Dragon-style continuous LPF):
-    //    - Wait bias_settle_time of allowed hover, then snap bias from filt once.
-    //    - After snap, slowly LPF-update bias to track system drift.
-    //    - Bias updates only while bias_calibration_allowed_ (frozen otherwise).
-    if (bias_calibration_allowed_)
-    {
-      int settle_frames = std::max(10, static_cast<int>(bias_settle_time_ / dt));
-
-      // β1+C-fix: only count frames where |filt| stays below threshold. A
-      // single transient excursion resets the counter, so settle_time must
-      // elapse entirely inside the stable regime. This prevents snapping a
-      // wildly wrong bias mid-oscillation (root cause of the 17058s snap
-      // that injected a 1.83 N bias step and triggered divergence).
-      bool magnitude_ok = est_ext_force_w_filt_.norm() < bias_snap_force_thresh_;
-      if (magnitude_ok) bias_ready_count_++;
-      else              bias_ready_count_ = 0;
-
-      if (!bias_calibrated_ && bias_ready_count_ >= settle_frames)
-      {
-        bias_force_w_ = est_ext_force_w_filt_;  // snap baseline
-        bias_calibrated_ = true;
-        bias_calibrated_time_ = ros::Time::now().toSec();
-        ROS_INFO("[FormationObserver] Force bias snapped after hover settle (%d frames, %.1fs): (%.3f, %.3f, %.3f) N (FF ramp %.1fs starts now, bias LPF=%.3f Hz)",
-                 bias_ready_count_, bias_settle_time_,
-                 bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z(),
-                 ff_ramp_seconds_, bias_lpf_cutoff_freq_);
-      }
-
-      if (bias_calibrated_)
-      {
-        // Continuous slow LPF: bias tracks long-term drift, filt-bias keeps mid-band disturbance.
-        double tau_b = 1.0 / (2.0 * M_PI * std::max(bias_lpf_cutoff_freq_, 1e-4));
-        double a_b = tau_b / (tau_b + dt);
-        bias_force_w_ = a_b * bias_force_w_ + (1.0 - a_b) * est_ext_force_w_filt_;
-      }
-    }
-
-    Eigen::Vector3d f_filt_corrected = est_ext_force_w_filt_ - bias_force_w_;
-    // DEBUG: detect large corrected-force jump that would cause a sudden FF step.
-    {
-      static Eigen::Vector3d s_dbg_prev_corrected = Eigen::Vector3d::Zero();
-      double corrected_delta = (f_filt_corrected - s_dbg_prev_corrected).norm();
-      if (corrected_delta > 0.5 && bias_calibrated_)
-        ROS_WARN("[FormObs_Jump] delta=%.3f c=(%.2f,%.2f,%.2f) b=(%.2f,%.2f,%.2f) filt=(%.2f,%.2f,%.2f)",
-                 corrected_delta,
-                 f_filt_corrected.x(), f_filt_corrected.y(), f_filt_corrected.z(),
-                 bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z(),
-                 est_ext_force_w_filt_.x(), est_ext_force_w_filt_.y(), est_ext_force_w_filt_.z());
-      s_dbg_prev_corrected = f_filt_corrected;
-    }
+    // 7. Plan A: no bias snap, no slow-LPF bias tracker. The init_linear_momentum_
+    //    baseline captured at step 2 IS the steady-state reference; subtracting
+    //    a post-hoc bias is double-counting and was the root cause of the
+    //    positive-feedback divergence at t=17304 (snap froze a transient
+    //    residual at 8.3 N and then FF gain=0.2 fed corrected=filt-bias back
+    //    into target_wrench_acc).
+    //
+    //    Output for downstream consumers = est_ext_force_w_filt_ (raw observer
+    //    + 1 Hz LPF). DC component is handled by ninja-style trust:
+    //    if the observer estimates a steady residual, treat it as a real
+    //    external force and let FF compensate.
     double f_raw_filt_dev = (est_ext_force_w_ - est_ext_force_w_filt_).norm();
     ROS_INFO_THROTTLE(2.0, "[FormObs_F] raw=(%.3f,%.3f,%.3f) filt=(%.3f,%.3f,%.3f) "
-                      "bias=(%.3f,%.3f,%.3f) |filt|=%.3f |raw-filt|=%.3f calib=%s",
+                      "|filt|=%.3f |raw-filt|=%.3f ff=%s",
                       est_ext_force_w_.x(), est_ext_force_w_.y(), est_ext_force_w_.z(),
-                      f_filt_corrected.x(), f_filt_corrected.y(), f_filt_corrected.z(),
-                      bias_force_w_.x(), bias_force_w_.y(), bias_force_w_.z(),
-                      f_filt_corrected.norm(), f_raw_filt_dev,
-                      bias_calibrated_ ? "TRACKING" : (bias_calibration_allowed_ ? "SETTLING" : "FROZEN"));
+                      est_ext_force_w_filt_.x(), est_ext_force_w_filt_.y(), est_ext_force_w_filt_.z(),
+                      est_ext_force_w_filt_.norm(), f_raw_filt_dev,
+                      ff_armed_ ? "ARMED" : "DISARMED");
   }
 
   // ========== 3D Torque Observer (V2) ==========
@@ -348,39 +286,12 @@ void FormationMomentumObserver::update(
       est_ext_torque_body_filt_ = alpha_t * est_ext_torque_body_filt_ + (1.0 - alpha_t) * est_ext_torque_body_;
     }
 
-    // 7. Torque bias tracking — mirrors force channel: snap then continuous LPF.
-    if (bias_calibration_allowed_)
-    {
-      int settle_frames = std::max(10, static_cast<int>(bias_settle_time_ / dt));
-
-      // β1-fix: gate torque snap on |tau_filt| magnitude (same rationale as force).
-      bool tau_magnitude_ok = est_ext_torque_body_filt_.norm() < bias_snap_torque_thresh_;
-
-      if (!bias_torque_calibrated_ && bias_ready_count_ >= settle_frames && tau_magnitude_ok)
-      {
-        bias_torque_body_ = est_ext_torque_body_filt_;
-        bias_torque_calibrated_ = true;
-        ROS_INFO("[FormationObserver] Torque bias snapped: (%.4f, %.4f, %.4f) Nm",
-                 bias_torque_body_.x(), bias_torque_body_.y(), bias_torque_body_.z());
-      }
-
-      if (bias_torque_calibrated_)
-      {
-        double tau_b = 1.0 / (2.0 * M_PI * std::max(bias_lpf_cutoff_freq_, 1e-4));
-        double a_b = tau_b / (tau_b + dt);
-        bias_torque_body_ = a_b * bias_torque_body_ + (1.0 - a_b) * est_ext_torque_body_filt_;
-      }
-    }
-
-    Eigen::Vector3d tau_ext_corrected = est_ext_torque_body_filt_ - bias_torque_body_;
+    // 7. Plan A: no torque bias snap. Output = est_ext_torque_body_filt_.
     double tau_raw_filt_dev = (est_ext_torque_body_ - est_ext_torque_body_filt_).norm();
     ROS_INFO_THROTTLE(2.0, "[FormObs_T] raw=(%.4f,%.4f,%.4f) filt=(%.4f,%.4f,%.4f) "
-                      "bias=(%.4f,%.4f,%.4f) corrected=(%.4f,%.4f,%.4f) "
                       "|raw-filt|=%.4f gyro=(%.4f,%.4f,%.4f)",
                       est_ext_torque_body_.x(), est_ext_torque_body_.y(), est_ext_torque_body_.z(),
                       est_ext_torque_body_filt_.x(), est_ext_torque_body_filt_.y(), est_ext_torque_body_filt_.z(),
-                      bias_torque_body_.x(), bias_torque_body_.y(), bias_torque_body_.z(),
-                      tau_ext_corrected.x(), tau_ext_corrected.y(), tau_ext_corrected.z(),
                       tau_raw_filt_dev,
                       gyroscopic.x(), gyroscopic.y(), gyroscopic.z());
   }
@@ -412,11 +323,13 @@ void FormationMomentumObserver::publishDebug(
     const Eigen::Vector3d& residual_force,
     const Eigen::Vector3d& residual_torque)
 {
-  // Bias-subtracted, LPF-filtered estimates for all published topics
-  Eigen::Vector3d f_ext_corrected = est_ext_force_w_filt_ - bias_force_w_;
+  // Snap+bias mechanism removed: observer output is the LPF-filtered estimate
+  // directly (ninja-style direct output). FF ramp gating is applied at the
+  // accessor (getEstExternalForceWorld), not here.
+  Eigen::Vector3d f_ext_corrected = est_ext_force_w_filt_;
 
-  // Estimated external torque — body frame (LPF-filtered, bias-subtracted)
-  Eigen::Vector3d t_ext_corrected = est_ext_torque_body_filt_ - bias_torque_body_;
+  // Estimated external torque — body frame (LPF-filtered, no bias subtraction).
+  Eigen::Vector3d t_ext_corrected = est_ext_torque_body_filt_;
   if (enable_torque_observer_)
   {
     geometry_msgs::Vector3Stamped msg;
@@ -473,17 +386,18 @@ void FormationMomentumObserver::publishDebug(
 Eigen::VectorXd FormationMomentumObserver::getEstExternalWrench6D() const
 {
   Eigen::VectorXd wrench = Eigen::VectorXd::Zero(6);
-  // Force: rotate world-frame estimate to body frame
-  wrench.head(3) = last_cog_rot_.transpose() * (est_ext_force_w_ - bias_force_w_);
-  wrench.tail(3) = est_ext_torque_body_filt_ - bias_torque_body_;
+  // Plan A: no bias subtraction. Trust LPF-filtered observer output as the
+  // true external wrench estimate.
+  wrench.head(3) = last_cog_rot_.transpose() * est_ext_force_w_filt_;
+  wrench.tail(3) = est_ext_torque_body_filt_;
   return wrench;
 }
 
 double FormationMomentumObserver::getFfRampFactor() const
 {
-  if (!bias_calibrated_ || bias_calibrated_time_ < 0.0) return 0.0;
+  if (!ff_armed_ || ff_armed_time_ < 0.0) return 0.0;
   if (ff_ramp_seconds_ <= 1e-3) return 1.0;
-  double dt_since = ros::Time::now().toSec() - bias_calibrated_time_;
+  double dt_since = ros::Time::now().toSec() - ff_armed_time_;
   if (dt_since <= 0.0) return 0.0;
   if (dt_since >= ff_ramp_seconds_) return 1.0;
   return dt_since / ff_ramp_seconds_;

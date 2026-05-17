@@ -98,6 +98,15 @@ namespace aerial_robot_control
     inter_disagreement_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("inter_disagreement", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
     formation_desired_wrench_sub_ = nh_.subscribe("formation_desired_wrench", 1, &BeetleController::formationDesiredWrenchCallback, this);
+    // D3: subscribe to the global formation observer output (leader publishes;
+    // every module — leader and followers — receives it). Used as common-mode
+    // reference in unified diff-damping so the differential signal is immune
+    // to common-mode model error in the per-module observers.
+    formation_observer_wrench_ = Eigen::VectorXd::Zero(6);
+    formation_observer_wrench_stamp_ = ros::Time(0);
+    formation_observer_wrench_sub_ = nh_.subscribe(
+        "/assemble/formation_observer/est_ext_wrench", 1,
+        &BeetleController::formationObserverWrenchCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
@@ -1735,6 +1744,21 @@ namespace aerial_robot_control
     formation_desired_wrench_(5) = msg.wrench.torque.z;
   }
 
+  void BeetleController::formationObserverWrenchCallback(const geometry_msgs::WrenchStamped& msg)
+  {
+    // D3: cache the formation-level external wrench estimate published by the
+    // leader's FormationMomentumObserver. Used as common-mode reference when
+    // computing the per-module differential signal in unified diff-damping.
+    // Frame convention: world-frame force, body-frame torque (matches observer output).
+    formation_observer_wrench_(0) = msg.wrench.force.x;
+    formation_observer_wrench_(1) = msg.wrench.force.y;
+    formation_observer_wrench_(2) = msg.wrench.force.z;
+    formation_observer_wrench_(3) = msg.wrench.torque.x;
+    formation_observer_wrench_(4) = msg.wrench.torque.y;
+    formation_observer_wrench_(5) = msg.wrench.torque.z;
+    formation_observer_wrench_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
+  }
+
   void BeetleController::publishAssembleDebug(
       const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
       const tf::Vector3& target_formation_pos, bool alloc_ok)
@@ -1963,7 +1987,7 @@ namespace aerial_robot_control
       // Observer FF (leader-only, residual compensation): negative sign because
       // it counteracts a detected unmodeled external push.
       if (is_leader && fobs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          formation_observer_ && formation_observer_->isFfReady() &&
           !navigator_->getForceLandingFlag()) {
         double ramp = formation_observer_->getFfRampFactor();
         Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
@@ -2021,7 +2045,7 @@ namespace aerial_robot_control
       double mass_inv_z = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
       double ff_z = 0.0;
       if (is_leader && fobs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          formation_observer_ && formation_observer_->isFfReady() &&
           !navigator_->getForceLandingFlag()) {
         double ramp = formation_observer_->getFfRampFactor();
         double fz_body = formation_observer_->getEstExternalForceBody().z();
@@ -2090,7 +2114,7 @@ namespace aerial_robot_control
       double ff_yaw = 0.0;
       // Observer torque FF (leader-only, residual compensation): negative sign.
       if (is_leader && fobs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isBiasCalibrated() &&
+          formation_observer_ && formation_observer_->isFfReady() &&
           !navigator_->getForceLandingFlag()) {
         double ramp = formation_observer_->getFfRampFactor();
         Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
@@ -2118,14 +2142,16 @@ namespace aerial_robot_control
                                      target_omega_.x() - omega_.x(), target_ang_acc_.x());
     pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
                                       target_omega_.y() - omega_.y(), target_ang_acc_.y());
-    // Outer R/P I-term is structurally unused in unified mode (the spinal
-    // cascade tracks target_roll_/target_pitch_, and target_wrench_acc(3,4)
-    // carries only FormObs/task torque FF). Zero the accumulator every frame
-    // so it cannot wind up under the dynamic phase-lag between fast XY-PID
-    // reference and slower body angle response, and so that a later mode
-    // switch back to hover/split starts cleanly.
-    pid_controllers_.at(ROLL).setErrI(0);
-    pid_controllers_.at(PITCH).setErrI(0);
+    // gimbalrotor-standard architecture (i_term_rp_calc_in_pc=true):
+    //   - PID's P+D terms feed target_roll_/target_pitch_ via atan2 -> spinal
+    //     cascade tracks the body attitude.
+    //   - PID's I-term is routed to target_wrench_acc(3,4) below, where the
+    //     formation allocation matrix turns it into per-rotor thrust trim.
+    //   - This is the ONLY path that can compensate a constant external
+    //     torque (e.g. CoG modelling error, payload imbalance). Without it,
+    //     hover pitch sits at a P+D steady-state error (observed +0.10 rad).
+    // The earlier setErrI(0) was a wind-up workaround that simultaneously
+    // killed the legitimate steady-state compensation. Removed.
 
     double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
     double err_omega_z = target_omega_.z() - omega_.z();
@@ -2186,15 +2212,13 @@ namespace aerial_robot_control
 
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
-    // Outer R/P I-term is structurally redundant in unified mode: spinal does
-    // cascade P+D tracking on target_roll_/target_pitch_ (derived from XY-acc
-    // via atan2), and cog_offset is already baked into integrated_map_ so the
-    // formation allocation absorbs the constant trim torque. The outer-loop
-    // I-channel only accumulates the dynamic lag between fast XY-PID reference
-    // and the slower body angle response, causing pitch_i wind-up in the
-    // 17030..17060s real-hw run. We carry only FormObs/task torque FF here.
-    target_wrench_acc(3) = fobs_comp_ff_torque_x_;
-    target_wrench_acc(4) = fobs_comp_ff_torque_y_;
+    // gimbalrotor-standard architecture (i_term_rp_calc_in_pc=true):
+    //   target_wrench_acc(3,4) = ROLL/PITCH PID I-term + observer/task FF.
+    // The I-term provides DC compensation for constant external torques
+    // (CoG offset, payload imbalance) via the formation allocation matrix.
+    // P+D feed the cascade through target_roll_/target_pitch_ atan2 path.
+    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm()  + fobs_comp_ff_torque_x_;
+    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm() + fobs_comp_ff_torque_y_;
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 
@@ -2210,38 +2234,71 @@ namespace aerial_robot_control
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
     }
 
-    // --- Differential-mode damping (passive PARASITIC residual dissipation) ---
-    // inter_wrench_list_[my_id] is already the parasitic joint-cut wrench:
-    // calcInteractionWrench subtracted the per-module task prediction
-    // (est_wrench_task_list_[i]) from ŷ_i BEFORE running the recursion, so
-    // the task-induced load distribution is no longer present here.
+    // --- Differential-mode damping (D3: formation-observer common-mode reference) ---
     //
-    // Sum invariant (Σ ŷ^task = W_ext) makes Σ residual ≈ 0, so this damping
-    // correction is naturally zero-sum across modules and does not
-    // contaminate formation-level wrench tracking (null-space property).
+    // D3 design rationale:
+    //   The legacy formulation used inter_wrench_list_[my_id], built by
+    //   calcInteractionWrench as a cumulative-sum minus average over the
+    //   per-module observer residuals. That removes ONLY the empirical mean
+    //   of the per-module observer outputs, which is not the true formation
+    //   external wrench when every module shares the same model error
+    //   (same CoG/inertia mismatch → same bias). The leftover common-mode
+    //   then leaks into every module's "differential" channel and shows up
+    //   as a persistent diff-damping signal at hover.
     //
-    // When no task is active (demo publishes zeros), inter_wrench_list_ falls
-    // back to the pure observer-disagreement signal Pŷ (BEATLE-style residual).
+    //   D3 substitutes the GLOBAL formation observer output as the
+    //   common-mode truth (W_truth) and computes
+    //       diff_i = est_residual_list_[my_id] - W_truth / N
+    //   where N is the number of assembled modules. The formation observer
+    //   is an independent momentum-based estimator on the whole rigid body,
+    //   so its model error structure is uncorrelated with the per-module
+    //   observers and the differential is genuinely module-specific.
+    //
+    //   Frames: both est_residual_list_ entries (per-module observer output
+    //   minus task prediction) and formation_observer_wrench_ are published
+    //   in formation_body frame, so the subtraction is well-defined.
+    //
+    //   Gating: skipped until the formation observer FF is armed
+    //   (isFfReady()) and a fresh message arrived within 0.5 s. Otherwise
+    //   fall back to ZERO (no damping) — never reuse the stale legacy
+    //   path which is known to be biased.
     if (unified_diff_damp_gain_ > 0.0) {
-      Eigen::VectorXd inter_parasitic = inter_wrench_list_[my_id];
-      if (inter_parasitic.size() != 6) inter_parasitic = Eigen::VectorXd::Zero(6);
+      Eigen::VectorXd diff = Eigen::VectorXd::Zero(6);
+      bool obs_fresh = formation_observer_ && formation_observer_->isFfReady()
+                       && !formation_observer_wrench_stamp_.isZero()
+                       && (ros::Time::now() - formation_observer_wrench_stamp_).toSec() < 0.5;
+      int n_assembled = 0;
+      if (obs_fresh) {
+        std::map<int, bool> aflag = beetle_navigator_->getAssemblyFlags();
+        for (const auto& kv : aflag) if (kv.second) n_assembled++;
+      }
+      if (obs_fresh && n_assembled > 0
+          && est_residual_list_.count(my_id)
+          && est_residual_list_[my_id].size() == 6
+          && formation_observer_wrench_.size() == 6) {
+        diff = est_residual_list_[my_id] - formation_observer_wrench_ / static_cast<double>(n_assembled);
+      }
       double mass = std::max(unified_controller_->getFormationMass(), 0.01);
       Eigen::Matrix3d inertia_inv = unified_controller_->getFormationInertia().inverse();
-      target_wrench_acc.head(3) -= unified_diff_damp_gain_ * inter_parasitic.head(3) / mass;
-      target_wrench_acc.tail(3) -= unified_diff_damp_gain_ * (inertia_inv * inter_parasitic.tail(3));
+      target_wrench_acc.head(3) -= unified_diff_damp_gain_ * diff.head(3) / mass;
+      target_wrench_acc.tail(3) -= unified_diff_damp_gain_ * (inertia_inv * diff.tail(3));
 
-      // [DBG-DIFFDAMP] Inter-parasitic magnitude vs target wrench; throttled 1 Hz.
-      // Large |inter_parasitic| at hover (no task) indicates common-mode
-      // contamination of the diff-damping channel — observer disagreement, not
-      // true parasitic load. Compare to target_wrench_acc magnitude to gauge
-      // how much the damping pushes the formation around.
+      // [DBG-DIFFDAMP-D3] Throttled 1 Hz: differential magnitude vs the
+      // per-module residual and the formation-observer common-mode share.
+      // A near-zero |diff| at hover with non-zero |residual| confirms that
+      // the common-mode is being captured by the formation observer and
+      // that the differential channel is correctly model-error-free.
+      Eigen::VectorXd res = est_residual_list_.count(my_id) ? est_residual_list_[my_id]
+                                                            : Eigen::VectorXd::Zero(6);
+      if (res.size() != 6) res = Eigen::VectorXd::Zero(6);
       ROS_INFO_THROTTLE(1.0,
-        "[DBG-DIFFDAMP id=%d] inter_F=(%.3f,%.3f,%.3f) inter_T=(%.3f,%.3f,%.3f) "
-        "|inter_F|=%.3f |inter_T|=%.3f gain=%.3f mass=%.2f",
-        my_id,
-        inter_parasitic(0), inter_parasitic(1), inter_parasitic(2),
-        inter_parasitic(3), inter_parasitic(4), inter_parasitic(5),
-        inter_parasitic.head(3).norm(), inter_parasitic.tail(3).norm(),
+        "[DBG-DIFFDAMP-D3 id=%d] fresh=%d N=%d |res|F=%.3f T=%.3f "
+        "|Wobs|F=%.3f T=%.3f |diff|F=%.3f T=%.3f gain=%.3f mass=%.2f",
+        my_id, obs_fresh ? 1 : 0, n_assembled,
+        res.head(3).norm(), res.tail(3).norm(),
+        formation_observer_wrench_.head(3).norm(),
+        formation_observer_wrench_.tail(3).norm(),
+        diff.head(3).norm(), diff.tail(3).norm(),
         unified_diff_damp_gain_, mass);
     }
 
@@ -2353,7 +2410,7 @@ namespace aerial_robot_control
                 pid_settled_count_, bias_pid_settled_frames_,
                 last_drift, bias_pid_settled_rate_thresh_, pid_settled ? 1 : 0);
           }
-          formation_observer_->setBiasCalibrationAllowed(in_hover && pid_settled);
+          formation_observer_->setFfArmed(in_hover && pid_settled);
           formation_observer_->update(
               unified_controller_->getFormationMass(),
               unified_controller_->getFormationInertia(),

@@ -29,24 +29,13 @@ namespace aerial_robot_control
     last_yaw_i_for_settle_(0.0),
     pid_settle_tracker_init_(false),
     unified_transition_count_(-1),
-    z_integral_freeze_count_(0),
-    z_ki_boost_count_(0),
     yaw_in_allocation_(false),
-    last_unified_z_i_ss_(0.8),
-    has_unified_z_i_ss_(false),
-    z_i_seed_default_(0.8),
-    z_ki_boost_frames_(60),
-    z_ki_boost_factor_(2.0),
-    z_ki_boost_frames_default_(60),
-    z_ki_boost_factor_default_(2.0),
     gains_switched_(false),
     fobs_comp_enable_(false),
     fobs_comp_force_gain_(0.0),
     fobs_comp_torque_gain_(0.0),
     fobs_comp_ff_force_limit_(0.5),
-    fobs_comp_ff_torque_limit_(0.3),
-    fobs_comp_ff_torque_x_(0.0),
-    fobs_comp_ff_torque_y_(0.0)
+    fobs_comp_ff_torque_limit_(0.3)
   {
   }
 
@@ -272,8 +261,6 @@ namespace aerial_robot_control
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
-    fobs_comp_ff_torque_x_ = 0.0;
-    fobs_comp_ff_torque_y_ = 0.0;
     formation_desired_wrench_.setZero();
   }
 
@@ -313,91 +300,42 @@ namespace aerial_robot_control
     navigator_->setTargetOmegaZ(0);
     beetle_navigator_->setUnifiedControlMode(true);
 
-    // P2: Determine module count for per-N seed/boost bucketing
-    int N_modules = static_cast<int>(beetle_navigator_->getAssemblyIds().size());
+    // v4 architecture — outer ROLL/PITCH PID is inert in unified mode
+    // (target_wrench_acc(3,4) ≡ 0; spinal owns full P+I+D), so just zero them.
+    // XY I-terms are reset (target_pos = cur_pos above → fresh PID starts at 0 err).
+    pid_controllers_.at(ROLL).setErrI(0);
+    pid_controllers_.at(PITCH).setErrI(0);
+    pid_controllers_.at(X).setErrI(0);
+    pid_controllers_.at(Y).setErrI(0);
 
     if (from_hover) {
-      // ===== Hover → Unified: migrate existing I-terms carefully =====
+      // ===== Hover → Unified: Z I-term bumpless transfer (de-gravity) =====
+      // Independent mode I-term implicitly carries gravity (≈ G). Unified mode has
+      // explicit gravity FF in target_wrench_acc(2), so subtract gravity from the
+      // I-term to keep the total Z command continuous across the switch.
+      // This is the entire LF↔unified bumpless-transfer mechanism — no seed
+      // bucket, no integral freeze, no Ki boost.
+      double i_output_old = pid_controllers_.at(Z).getITerm();
+      tf::Matrix3x3 uav_rot_mig = estimator_->getOrientation(Frame::COG, estimate_mode_);
+      tf::Vector3 gravity_w_mig(0, 0, aerial_robot_estimation::G);
+      tf::Vector3 gravity_cog_mig = uav_rot_mig.inverse() * gravity_w_mig;
+      double gravity_ff_z = gravity_cog_mig.z();
+      double i_output_degrav = i_output_old - gravity_ff_z;
 
-      // Outer R/P I-term is unused in unified mode (target_wrench_acc(3,4)
-      // carries only FF torque, see runUnifiedControlCommon). Zero on entry
-      // so that a later switch back to hover/split mode starts clean.
-      pid_controllers_.at(ROLL).setErrI(0);
-      pid_controllers_.at(PITCH).setErrI(0);
-      pid_controllers_.at(X).setErrI(0);
-      pid_controllers_.at(Y).setErrI(0);
+      double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
+      double iz_new = i_output_degrav / Ki;
+      double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
+      if (!std::isfinite(iz_new)) iz_new = 0.0;
+      iz_new = boost::algorithm::clamp(iz_new, -iz_limit, iz_limit);
+      pid_controllers_.at(Z).setErrI(iz_new);
 
-      // --- Z I-term: de-gravity + seed injection (Plan E') ---
-      // Independent mode I-term ≈ G (implicit gravity). Unified mode has explicit
-      // gravity FF, so de-gravity subtracts it, then seed injects unified-mode bias.
-      {
-        double i_output_old = pid_controllers_.at(Z).getITerm();
-
-        tf::Matrix3x3 uav_rot_mig = estimator_->getOrientation(Frame::COG, estimate_mode_);
-        tf::Vector3 gravity_w_mig(0, 0, aerial_robot_estimation::G);
-        tf::Vector3 gravity_cog_mig = uav_rot_mig.inverse() * gravity_w_mig;
-        double gravity_ff_z = gravity_cog_mig.z();
-
-        double i_output_degrav = i_output_old - gravity_ff_z;
-
-        // P2: Select Z seed by N, fall back to global default
-        double z_seed_default_n = z_i_seed_default_;
-        if (z_i_seed_by_n_.count(N_modules))
-          z_seed_default_n = z_i_seed_by_n_.at(N_modules);
-        double seed_value = has_unified_z_i_ss_ ? last_unified_z_i_ss_ : z_seed_default_n;
-        double i_output_seeded = i_output_degrav + Z_SEED_GAIN * seed_value;
-
-        double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
-        double iz_new = i_output_seeded / Ki;
-        double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
-        if (!std::isfinite(iz_new)) iz_new = 0.0;
-        iz_new = boost::algorithm::clamp(iz_new, -iz_limit, iz_limit);
-
-        pid_controllers_.at(Z).setErrI(iz_new);
-        z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
-
-        // P2: Select Z boost params by N
-        z_ki_boost_frames_ = z_ki_boost_frames_default_;
-        z_ki_boost_factor_ = z_ki_boost_factor_default_;
-        if (z_ki_boost_frames_by_n_.count(N_modules))
-          z_ki_boost_frames_ = z_ki_boost_frames_by_n_.at(N_modules);
-        if (z_ki_boost_factor_by_n_.count(N_modules))
-          z_ki_boost_factor_ = z_ki_boost_factor_by_n_.at(N_modules);
-        z_ki_boost_count_ = z_ki_boost_frames_;
-
-        ROS_WARN("[UnifiedCtrl] Z de-gravity + seed (hover→unified): i_old=%.4f, gravity_ff=%.4f, "
-                 "i_degrav=%.4f, seed=%.4f(×%.1f=%s, N=%d), i_seeded=%.4f, err_i=%.4f "
-                 "(limit=±%.1f), freeze=%d, boost=%d(×%.1f)",
-                 i_output_old, gravity_ff_z, i_output_degrav,
-                 seed_value, Z_SEED_GAIN,
-                 has_unified_z_i_ss_ ? "adaptive" : "default",
-                 N_modules,
-                 i_output_seeded, iz_new, iz_limit,
-                 z_integral_freeze_count_, z_ki_boost_count_, z_ki_boost_factor_);
-      }
+      ROS_WARN("[UnifiedCtrl] Z bumpless transfer (hover→unified): "
+               "i_old=%.4f, gravity_ff=%.4f, i_degrav=%.4f, err_i=%.4f (limit=±%.1f)",
+               i_output_old, gravity_ff_z, i_output_degrav, iz_new, iz_limit);
     } else {
-      // ===== Ground start → Unified =====
-      // Outer R/P I-term is unused in unified mode; XY/Z are not yet accumulated
-      // on the ground. Just zero everything.
-      pid_controllers_.at(X).setErrI(0);
-      pid_controllers_.at(Y).setErrI(0);
       pid_controllers_.at(Z).setErrI(0);
-      pid_controllers_.at(ROLL).setErrI(0);
-      pid_controllers_.at(PITCH).setErrI(0);
-
-      z_integral_freeze_count_ = 0;
-      z_ki_boost_count_ = 0;
-
-      // P2: Still initialize per-N boost params for later use
-      z_ki_boost_frames_ = z_ki_boost_frames_default_;
-      z_ki_boost_factor_ = z_ki_boost_factor_default_;
-      if (z_ki_boost_frames_by_n_.count(N_modules))
-        z_ki_boost_frames_ = z_ki_boost_frames_by_n_.at(N_modules);
-      if (z_ki_boost_factor_by_n_.count(N_modules))
-        z_ki_boost_factor_ = z_ki_boost_factor_by_n_.at(N_modules);
-
-      ROS_WARN("[UnifiedCtrl] Ground start: Z/RP/XY I-terms zeroed (naviState=%d, N=%d)",
-               navigator_->getNaviState(), N_modules);
+      ROS_WARN("[UnifiedCtrl] Ground start: Z/RP/XY I-terms zeroed (naviState=%d)",
+               navigator_->getNaviState());
     }
 
     if (is_leader) {
@@ -929,27 +867,34 @@ namespace aerial_robot_control
 
   void BeetleController::sendCascadeSetup()
   {
-    // LEADER-only: send torque allocation matrix inverse and P/D gains
+    // LEADER-only: send torque allocation matrix inverse and P/I/D gains
     // to ALL assembled modules' spinals. This configures each spinal for 1000Hz
-    // P+D attitude tracking using thrustGainMapping().
+    // P+I+D attitude tracking using thrustGainMapping().
+    //
+    // v4 architecture: spinal owns the entire roll/pitch attitude loop, so
+    // roll_i / pitch_i are now ALSO sent (non-zero). PC's outer roll/pitch
+    // PIDs are inert in unified mode (target_wrench_acc(3,4)=0).
     //
     // Gains are read directly from unified_*_gains_ (not pid_controllers_).
     // This eliminates call-order dependency: sendCascadeSetup() always reads
     // the correct unified gains regardless of whether applyUnifiedGains() has
-    // been called yet. I-term is set to 0 for Spinal (PC handles I-term).
+    // been called yet.
     //
     // NOTE: At mode-switch time, integrated_map_inv_rot_ may not be computed yet.
     // The one-shot logic inside computeUnifiedAllocation() will resend on first
     // successful computation. See cascade_alloc_sent_ flag.
 
     double roll_p  = unified_roll_gains_.p;
+    double roll_i  = unified_roll_gains_.i;
     double roll_d  = unified_roll_gains_.d;
     double pitch_p = unified_pitch_gains_.p;
+    double pitch_i = unified_pitch_gains_.i;
     double pitch_d = unified_pitch_gains_.d;
     double yaw_d   = unified_yaw_gains_.d;
 
     // Cache gains for deferred one-shot resend (must be done BEFORE the attempt)
-    unified_controller_->cacheCascadeGains(roll_p, roll_d, pitch_p, pitch_d, yaw_d);
+    unified_controller_->cacheCascadeGains(roll_p, roll_i, roll_d,
+                                           pitch_p, pitch_i, pitch_d, yaw_d);
 
     // Attempt to send now. If matrix is not yet computed, skip gains too —
     // sending cascade gains with the old independent-mode allocation matrix
@@ -957,7 +902,8 @@ namespace aerial_robot_control
     unified_controller_->updateFormationGeometry();
     bool matrix_sent = unified_controller_->sendTorqueAllocationMatrixInv();
     if (matrix_sent) {
-      unified_controller_->sendCascadeGains(roll_p, roll_d, pitch_p, pitch_d, yaw_d);
+      unified_controller_->sendCascadeGains(roll_p, roll_i, roll_d,
+                                            pitch_p, pitch_i, pitch_d, yaw_d);
     } else {
       ROS_WARN("[UnifiedCtrl] Cascade setup: matrix not ready, deferring gains to one-shot");
     }
@@ -970,9 +916,9 @@ namespace aerial_robot_control
     }
 
     ROS_INFO("[UnifiedCtrl] Cascade setup (LEADER): alloc_inv %s, gains %s, "
-             "(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) %zu modules + gimbal_dof=1",
+             "(P_r=%.1f I_r=%.2f D_r=%.1f P_p=%.1f I_p=%.2f D_p=%.1f D_y=%.1f) %zu modules + gimbal_dof=1",
              matrix_sent ? "SENT" : "DEFERRED", matrix_sent ? "SENT" : "DEFERRED",
-             roll_p, roll_d, pitch_p, pitch_d, yaw_d,
+             roll_p, roll_i, roll_d, pitch_p, pitch_i, pitch_d, yaw_d,
              beetle_navigator_->getAssemblyIds().size());
   }
 
@@ -986,8 +932,10 @@ namespace aerial_robot_control
     // pid_controllers_ may still hold independent-mode values at this point.
 
     double roll_p  = unified_roll_gains_.p;
+    double roll_i  = unified_roll_gains_.i;
     double roll_d  = unified_roll_gains_.d;
     double pitch_p = unified_pitch_gains_.p;
+    double pitch_i = unified_pitch_gains_.i;
     double pitch_d = unified_pitch_gains_.d;
     double yaw_d   = unified_yaw_gains_.d;
 
@@ -995,13 +943,13 @@ namespace aerial_robot_control
     {
       spinal::RollPitchYawTerms rpy_gain_msg;
       rpy_gain_msg.motors.resize(1);  // torque-level path
-      rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p * 1000);
-      rpy_gain_msg.motors[0].roll_i  = 0;  // I-term handled by PC
-      rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d * 1000);
+      rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p  * 1000);
+      rpy_gain_msg.motors[0].roll_i  = static_cast<int16_t>(roll_i  * 1000);  // v4: spinal owns I
+      rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d  * 1000);
       rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(pitch_p * 1000);
-      rpy_gain_msg.motors[0].pitch_i = 0;  // I-term handled by PC
+      rpy_gain_msg.motors[0].pitch_i = static_cast<int16_t>(pitch_i * 1000);  // v4: spinal owns I
       rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(pitch_d * 1000);
-      rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d * 1000);
+      rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d   * 1000);
       rpy_gain_pub_.publish(rpy_gain_msg);
     }
 
@@ -1425,41 +1373,6 @@ namespace aerial_robot_control
                      bias_pid_settled_rate_thresh_, 0.05);
     getParam<int>(control_nh, "bias_pid_settled_frames",
                   bias_pid_settled_frames_, 40);
-
-    // Z I-term seed default for unified mode switch (Plan E')
-    getParam<double>(control_nh, "z_i_seed_default", z_i_seed_default_, 0.8);
-    last_unified_z_i_ss_ = z_i_seed_default_;
-
-    // P2: Per-N seed bucketing — load z_i_seed_by_n/n2, z_i_seed_by_n/n3, etc.
-    {
-      ros::NodeHandle seed_nh(control_nh, "z_i_seed_by_n");
-      for (int n = 2; n <= 6; n++) {
-        double val;
-        if (seed_nh.getParam("n" + std::to_string(n), val)) {
-          z_i_seed_by_n_[n] = val;
-          ROS_INFO("[SeedBucket] z_i_seed_by_n[%d] = %.4f", n, val);
-        }
-      }
-    }
-
-    // Pitch I-term seed removed: outer R/P I-channel disabled in unified mode.
-
-    // P2: Per-N Z boost parameters
-    getParam<int>(control_nh, "z_ki_boost_frames_default", z_ki_boost_frames_default_, 60);
-    getParam<double>(control_nh, "z_ki_boost_factor_default", z_ki_boost_factor_default_, 2.0);
-    z_ki_boost_frames_ = z_ki_boost_frames_default_;
-    z_ki_boost_factor_ = z_ki_boost_factor_default_;
-    {
-      ros::NodeHandle boost_nh(control_nh, "z_ki_boost_by_n");
-      for (int n = 2; n <= 6; n++) {
-        int frames;
-        double factor;
-        if (boost_nh.getParam("n" + std::to_string(n) + "/frames", frames))
-          z_ki_boost_frames_by_n_[n] = frames;
-        if (boost_nh.getParam("n" + std::to_string(n) + "/factor", factor))
-          z_ki_boost_factor_by_n_[n] = factor;
-      }
-    }
 
     // Roll/Pitch I-term keep ratio removed: outer R/P I-channel disabled in unified mode.
 
@@ -2074,21 +1987,6 @@ namespace aerial_robot_control
     }
     pid_controllers_.at(Z).update(err_z, du, err_v_z, target_acc_.z());
 
-    if (z_integral_freeze_count_ > 0) {
-      pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
-      z_integral_freeze_count_--;
-    } else if (z_ki_boost_count_ > 0) {
-      if (!unified_controller_->isAllocationSaturated()) {
-        double clamped_err_p = pid_controllers_.at(Z).getErrP();
-        double extra_increment = clamped_err_p * du * (z_ki_boost_factor_ - 1.0);
-        double new_err_i = pid_controllers_.at(Z).getErrI() + extra_increment;
-        double Ki = std::max(pid_controllers_.at(Z).getIGain(), 1e-6);
-        double iz_limit = pid_controllers_.at(Z).getLimitI() / Ki;
-        new_err_i = boost::algorithm::clamp(new_err_i, -iz_limit, iz_limit);
-        pid_controllers_.at(Z).setErrI(new_err_i);
-      }
-      z_ki_boost_count_--;
-    }
     if (navigator_->getForceLandingFlag()) {
       pid_controllers_.at(Z).setLimitP(z_p_limit);
       pid_controllers_.at(Z).setErrP(0);
@@ -2107,18 +2005,16 @@ namespace aerial_robot_control
     double du_rp = du;
     if (!start_rp_integration_) du_rp = 0;
 
-    // Formation observer torque feedforward (leader-only, two-stage attenuated).
-    //   ROLL / PITCH → cached as fobs_comp_ff_torque_{x,y}_, ADDED below to
-    //                  target_wrench_acc(3,4) on top of PID.getITerm().
-    //                  This is mathematically equivalent to a one-shot
-    //                  setICompTerm(ff/ki) but stateless — PID's err_i_ is
-    //                  not contaminated, so it cannot accumulate frame-on-frame.
-    //   YAW          → setPersistentFF (PID.result() feeds wrench_acc(5)).
+    // Formation observer torque feedforward — YAW only.
+    //   ROLL/PITCH FF is intentionally removed in v4: the PC wrench's
+    //   (Mx,My) channels are fixed at 0 (see target_wrench_acc(3,4) below),
+    //   so any roll/pitch torque FF here would be silently discarded. Roll/
+    //   pitch external-torque rejection is delegated to each spinal's 1 kHz
+    //   cascade I-term (configured via sendCascadeSetup with non-zero roll_i/
+    //   pitch_i from unified_{roll,pitch}_gains_.i). The corresponding fobs
+    //   compensation on Mx/My would only be a slower duplicate path.
     {
-      fobs_comp_ff_torque_x_ = 0.0;
-      fobs_comp_ff_torque_y_ = 0.0;
       double ff_yaw = 0.0;
-      // Observer torque FF (leader-only, residual compensation): negative sign.
       if (is_leader && fobs_comp_enable_ &&
           formation_observer_ && formation_observer_->isFfReady() &&
           !navigator_->getForceLandingFlag()) {
@@ -2126,38 +2022,27 @@ namespace aerial_robot_control
         Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
         Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
         double k = ramp * fobs_comp_torque_gain_;
-        fobs_comp_ff_torque_x_ += boost::algorithm::clamp(-k * alpha_ext.x(),
-                                                          -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
-        fobs_comp_ff_torque_y_ += boost::algorithm::clamp(-k * alpha_ext.y(),
-                                                          -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
         ff_yaw += boost::algorithm::clamp(-k * alpha_ext.z(),
                                           -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
       }
-      // Task torque FF (all modules, valve_rotation etc.): positive sign, body frame.
+      // Task torque FF (all modules, valve_rotation etc.): yaw component only.
       if (task_ff_active) {
         Eigen::Vector3d task_alpha =
             unified_controller_->getFormationInertia().inverse() * desired_total_ff.tail(3);
-        fobs_comp_ff_torque_x_ += task_alpha.x();
-        fobs_comp_ff_torque_y_ += task_alpha.y();
         ff_yaw += task_alpha.z();
       }
       pid_controllers_.at(YAW).setPersistentFF(ff_yaw);
     }
 
-    pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp,
-                                     target_omega_.x() - omega_.x(), target_ang_acc_.x());
-    pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
-                                      target_omega_.y() - omega_.y(), target_ang_acc_.y());
-    // gimbalrotor-standard architecture (i_term_rp_calc_in_pc=true):
-    //   - PID's P+D terms feed target_roll_/target_pitch_ via atan2 -> spinal
-    //     cascade tracks the body attitude.
-    //   - PID's I-term is routed to target_wrench_acc(3,4) below, where the
-    //     formation allocation matrix turns it into per-rotor thrust trim.
-    //   - This is the ONLY path that can compensate a constant external
-    //     torque (e.g. CoG modelling error, payload imbalance). Without it,
-    //     hover pitch sits at a P+D steady-state error (observed +0.10 rad).
-    // The earlier setErrI(0) was a wind-up workaround that simultaneously
-    // killed the legitimate steady-state compensation. Removed.
+    // v4: PC roll/pitch PID is intentionally NOT updated in unified mode.
+    //   - Roll/Pitch attitude tracking is delegated entirely to each spinal's
+    //     1 kHz cascade (P+I+D), configured by sendCascadeSetup.
+    //   - target_wrench_acc(3,4) is fixed at 0, so PID.getITerm() would never
+    //     reach the actuators; running update() here would only accumulate a
+    //     stale ITerm that becomes a discontinuity on exit (back to independent
+    //     hover). Zeroing the err_i_ each frame keeps the PID inert.
+    pid_controllers_.at(ROLL).setErrI(0);
+    pid_controllers_.at(PITCH).setErrI(0);
 
     double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
     double err_omega_z = target_omega_.z() - omega_.z();
@@ -2172,8 +2057,6 @@ namespace aerial_robot_control
         pid_controllers_.at(Z).setErrI(pid_controllers_.at(Z).getPrevErrI());
         pid_controllers_.at(X).setErrI(pid_controllers_.at(X).getPrevErrI());
         pid_controllers_.at(Y).setErrI(pid_controllers_.at(Y).getPrevErrI());
-        if (z_integral_freeze_count_ == 0 && z_ki_boost_count_ == 0)
-          z_integral_freeze_count_ = Z_INTEGRAL_FREEZE_FRAMES;
       }
       unified_reference_warmup_count_++;
     }
@@ -2218,13 +2101,15 @@ namespace aerial_robot_control
 
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
-    // gimbalrotor-standard architecture (i_term_rp_calc_in_pc=true):
-    //   target_wrench_acc(3,4) = ROLL/PITCH PID I-term + observer/task FF.
-    // The I-term provides DC compensation for constant external torques
-    // (CoG offset, payload imbalance) via the formation allocation matrix.
-    // P+D feed the cascade through target_roll_/target_pitch_ atan2 path.
-    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm()  + fobs_comp_ff_torque_x_;
-    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm() + fobs_comp_ff_torque_y_;
+    // v4 architecture: PC manages translation (X/Y/Z) and yaw only.
+    // Roll/Pitch attitude authority lives entirely on each module's spinal
+    // (1 kHz cascade with P+I+D). target_wrench_acc(3,4)=0 ensures the PC
+    // allocation does NOT inject any rotational torque on Mx/My — the formation
+    // pseudoinverse will leave (Mx,My) at zero and translate (Fx,Fy,Fz,Mz)
+    // through the global gimbal+thrust solution. Eliminates the dual outer-I /
+    // inner-PD wind-up oscillation on roll/pitch observed prior to v4.
+    target_wrench_acc(3) = 0.0;
+    target_wrench_acc(4) = 0.0;
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 
@@ -2325,7 +2210,6 @@ namespace aerial_robot_control
         ROS_ERROR(
           "[DBG-NANGUARD id=%d] wrench_acc=(%.3f,%.3f,%.3f, %.4f,%.4f,%.4f) "
           "pitch_I=%.4f roll_I=%.4f yaw_I=%.4f "
-          "fobs_ff_tx=%.4f fobs_ff_ty=%.4f "
           "pos=(%.3f,%.3f,%.3f) tgt_pos=(%.3f,%.3f,%.3f) rpy=(%.3f,%.3f,%.3f) tgt_rpy=(%.3f,%.3f,%.3f) "
           "off_body=(%.3f,%.3f,%.3f) any_bad=%d max_abs=%.3f",
           my_id,
@@ -2333,7 +2217,6 @@ namespace aerial_robot_control
           target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
           pid_controllers_.at(PITCH).getITerm(), pid_controllers_.at(ROLL).getITerm(),
           pid_controllers_.at(YAW).getITerm(),
-          fobs_comp_ff_torque_x_, fobs_comp_ff_torque_y_,
           pos_.x(), pos_.y(), pos_.z(),
           target_pos_.x(), target_pos_.y(), target_pos_.z(),
           rpy_.x(), rpy_.y(), rpy_.z(),
@@ -2431,18 +2314,6 @@ namespace aerial_robot_control
                       target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
                       target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
                       ok, yaw_pid_raw);
-
-    // Adaptive SS seed tracking for Z (leader only - followers use YAML default).
-    // Pitch SS seeding removed: outer R/P I-term is no longer used in unified mode.
-    if (is_leader && z_ki_boost_count_ == 0 && z_integral_freeze_count_ == 0) {
-      double err_z_abs = std::abs(target_pos_.z() - formation_pos.z());
-      double vel_z_abs = std::abs(vel_.z());
-      if (err_z_abs < 0.05 && vel_z_abs < 0.05) {
-        last_unified_z_i_ss_ = (1.0 - Z_SEED_LPF_ALPHA) * last_unified_z_i_ss_
-                              + Z_SEED_LPF_ALPHA * pid_controllers_.at(Z).getITerm();
-        has_unified_z_i_ss_ = true;
-      }
-    }
 
     // Only leader publishes assembly-debug topics (shared global namespace)
     if (is_leader) {

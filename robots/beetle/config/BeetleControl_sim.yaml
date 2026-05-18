@@ -29,22 +29,8 @@ controller:
   # for semantics. Sim tolerances can be tighter since noise is lower.
   bias_pid_settled_rate_thresh: 0.03   # [Nm/frame], summed over roll+pitch+yaw I-terms
   bias_pid_settled_frames:      40     # ~1 s @ 40 Hz
-  z_i_seed_default: 0.8    # Z I-term seed fallback (used when N not in z_i_seed_by_n)
-
-  # P2: Per-module-count seed bucketing.
-  # 2-module has worse allocation efficiency → needs larger Z seed and stronger boost.
-  z_i_seed_by_n:
-    n2: 1.2   # 2-module: higher seed (allocation efficiency ~60-70%)
-    n3: 0.8   # 3-module: standard seed (allocation efficiency ~90%+)
-  z_ki_boost_frames_default: 60   # boost duration fallback [frames @40Hz]
-  z_ki_boost_factor_default: 2.0  # boost factor fallback
-  z_ki_boost_by_n:
-    n2:
-      frames: 90    # 2-module: longer boost (2.25s) to compensate slower convergence
-      factor: 3.0   # 2-module: stronger boost for larger efficiency gap
-    n3:
-      frames: 60    # 3-module: standard boost (1.5s)
-      factor: 2.0   # 3-module: standard factor
+  # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
+  # handles LF↔unified switching directly in initUnifiedMode().
 
   # ========== Formation Momentum Observer (Phase U2) ==========
   # Formation-level external wrench estimation using realized wrench from allocation.

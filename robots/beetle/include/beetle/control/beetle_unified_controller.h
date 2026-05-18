@@ -72,20 +72,21 @@ public:
    *  @return true if matrix was sent, false if not yet computed. */
   bool sendTorqueAllocationMatrixInv();
 
-  /** @brief Send cascade P/D attitude gains to each module's spinal.
+  /** @brief Send cascade P/I/D attitude gains to each module's spinal.
    *  Uses motors.resize(1) path → spinal stores as torque-level gains and
    *  multiplies by torque_allocation_matrix_inv to get per-motor gains.
-   *  I=0 because PC handles I-term. */
-  void sendCascadeGains(double roll_p, double roll_d,
-                        double pitch_p, double pitch_d,
+   *  v4: I-term is now owned by each spinal (PC does NOT inject Mx/My into
+   *  target_wrench_acc anymore), so roll_i/pitch_i are passed through. */
+  void sendCascadeGains(double roll_p, double roll_i, double roll_d,
+                        double pitch_p, double pitch_i, double pitch_d,
                         double yaw_d);
 
   /** @brief Cache cascade gains for deferred one-shot resend.
    *  Called by BeetleController::sendCascadeSetup() so that the one-shot
    *  logic inside computeUnifiedAllocation() can resend gains without
    *  needing to know the gain values. */
-  void cacheCascadeGains(double roll_p, double roll_d,
-                         double pitch_p, double pitch_d,
+  void cacheCascadeGains(double roll_p, double roll_i, double roll_d,
+                         double pitch_p, double pitch_i, double pitch_d,
                          double yaw_d);
 
   /** @brief Reset the one-shot flag so the next computeUnifiedAllocation()
@@ -235,8 +236,10 @@ private:
   bool cascade_alloc_sent_;           // true once one-shot has fired
   bool has_cascade_gain_cache_;       // true once cacheCascadeGains() has been called
   double cached_cascade_roll_p_;
+  double cached_cascade_roll_i_;
   double cached_cascade_roll_d_;
   double cached_cascade_pitch_p_;
+  double cached_cascade_pitch_i_;
   double cached_cascade_pitch_d_;
   double cached_cascade_yaw_d_;
 

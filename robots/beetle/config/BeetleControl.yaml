@@ -34,21 +34,8 @@ controller:
   # positives on noisy hover), lower threshold to ~0.02.
   bias_pid_settled_rate_thresh: 0.05   # [Nm/frame], summed over roll+pitch+yaw I-terms
   bias_pid_settled_frames:      40     # ~1 s @ 40 Hz
-  z_i_seed_default: 0.8    # Z I-term seed fallback (used when N not in z_i_seed_by_n)
-
-  # P2: Per-module-count seed bucketing.
-  z_i_seed_by_n:
-    n2: 0.9
-    n3: 0.8
-  z_ki_boost_frames_default: 60
-  z_ki_boost_factor_default: 2.0
-  z_ki_boost_by_n:
-    n2:
-      frames: 60
-      factor: 2.0
-    n3:
-      frames: 60
-      factor: 2.0
+  # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
+  # handles LF↔unified switching directly in initUnifiedMode().
 
   # ========== Formation Momentum Observer (Phase U2) ==========
   # Formation-level external wrench estimation using realized wrench from allocation.

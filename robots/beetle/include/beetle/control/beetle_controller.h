@@ -76,56 +76,19 @@ namespace aerial_robot_control
     double fobs_comp_torque_gain_;       // scalar gain on Tau_x/_y/_z FF ang-acc [0,1]
     double fobs_comp_ff_force_limit_;    // hard clamp on |FF acc|     [m/s^2]
     double fobs_comp_ff_torque_limit_;   // hard clamp on |FF ang-acc| [rad/s^2]
-    // Cached FF roll/pitch ang-acc per frame, added directly to wrench_acc(3,4)
-    double fobs_comp_ff_torque_x_;       // [rad/s^2], leader-only, 0 when disabled
-    double fobs_comp_ff_torque_y_;       // [rad/s^2], leader-only, 0 when disabled
+    // v4: roll/pitch FF on wrench_acc removed — spinal owns full P+I+D roll/pitch,
+    // so PC's target_wrench_acc(3,4) ≡ 0. Yaw FF still applied via setPersistentFF.
 
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;
     bool setUnifiedModeCb(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res);
     int unified_transition_count_;    // frame counter since last mode switch (for high-freq diag)
-    int z_integral_freeze_count_;     // frames remaining to freeze Z I-term after mode switch
-    static constexpr int Z_INTEGRAL_FREEZE_FRAMES = 5;  // freeze Z integration for first N frames
 
-    // Ki-boost for Z axis after mode switch (D' scheme):
-    // Temporarily multiply Z integral update rate to accelerate bias convergence.
-    // With seed preload, boost only needs to cover residual error → gentler settings.
-    // P2: boost duration and factor are now per-N (see z_ki_boost_frames_by_n_).
-    int z_ki_boost_count_;            // frames remaining in boost phase (0 = normal)
-
-    // Roll/Pitch I-term transition support: removed.
-    // Outer R/P I-term is structurally unused in unified mode (the spinal
-    // cascade tracks target_roll_/target_pitch_ directly, and the formation
-    // allocation absorbs the constant trim torque via cog_offset). All of
-    // rp_integral_freeze / rp_ki_boost / rp_i_keep_ratio / pitch_i_seed have
-    // been removed; the ROLL/PITCH PID I-accumulator is zeroed every frame
-    // in runUnifiedControlCommon.
-
-    // I-term seed for unified mode switch (Plan E'):
-    // Unified mode needs steady-state I-term biases that don't exist in independent mode.
-    // Instead of waiting for I-term to accumulate (→overshoot), preload estimated biases
-    // at mode switch. Seeds are adaptively updated from the most recent unified-mode
-    // steady state, or use configurable defaults.
-    //
-    // P2: Seed defaults are bucketed by module count N (2-module vs 3-module have
-    // very different allocation geometry and efficiency). The maps are keyed by N;
-    // if the current N is not found, falls back to the global default.
-    //
-    // Z axis: bias ≈ 0.86–0.94 (formation efficiency offset under explicit gravity FF)
-    double last_unified_z_i_ss_;      // most recent unified steady-state Z I-term
-    bool has_unified_z_i_ss_;         // true after at least one SS sample recorded
-    double z_i_seed_default_;         // global fallback when N not in map
-    std::map<int, double> z_i_seed_by_n_;     // per-N seed defaults from YAML
-    static constexpr double Z_SEED_GAIN = 0.8;       // inject 80% of seed to be conservative
-    static constexpr double Z_SEED_LPF_ALPHA = 0.05; // low-pass filter for SS tracking
-    //
-    // Per-N Z boost parameters: 2-module needs stronger/longer boost than 3-module.
-    int z_ki_boost_frames_;           // current N-specific boost duration
-    double z_ki_boost_factor_;        // current N-specific boost factor
-    int z_ki_boost_frames_default_;   // global fallback
-    double z_ki_boost_factor_default_;
-    std::map<int, int> z_ki_boost_frames_by_n_;
-    std::map<int, double> z_ki_boost_factor_by_n_;
+    // v4 architecture — seed_bucket / z_integral_freeze / z_ki_boost machinery removed.
+    // LF↔unified switching uses a pure de-gravity bumpless transfer in initUnifiedMode():
+    // i_new = i_old - gravity_ff_cog. No per-N seed lookup, no integral freeze, no Ki boost.
+    // Roll/Pitch outer I-term is structurally unused (target_wrench_acc(3,4)=0); the spinal
+    // 1 kHz cascade owns the entire roll/pitch attitude loop (P+I+D).
 
     bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
 

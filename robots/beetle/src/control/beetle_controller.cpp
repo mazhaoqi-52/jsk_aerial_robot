@@ -1634,6 +1634,13 @@ namespace aerial_robot_control
     tagged_wrench.wrench = wrench_msg;
     tagged_external_wrench_pub_.publish(tagged_wrench);
 
+    // Synchronous self-update: write our own observer result directly into
+    // est_wrench_list_ so calcInteractionWrench() never reads a stale (or
+    // zero) entry for this module within the same control tick. The cross-
+    // module entries still arrive via estExternalWrenchCallback. Frame is
+    // CoG (matches what the publish carries and what callbacks store).
+    est_wrench_list_[beetle_navigator_->getMyID()] = est_external_wrench_cog;
+
     prev_est_wrench_timestamp_ = ros::Time::now().toSec();
   }
 
@@ -2258,26 +2265,26 @@ namespace aerial_robot_control
     //   minus task prediction) and formation_observer_wrench_ are published
     //   in formation_body frame, so the subtraction is well-defined.
     //
-    //   Gating: skipped until the formation observer FF is armed
-    //   (isFfReady()) and a fresh message arrived within 0.5 s. Otherwise
-    //   fall back to ZERO (no damping) — never reuse the stale legacy
-    //   path which is known to be biased.
+    //   Gating: a single continuous freshness weight w_fresh in [0,1] derived
+    //   from the age of formation_observer_wrench_stamp_ — no boolean if/else.
+    //   When the formation observer has never published (stamp == 0) or its
+    //   last sample is older than T_decay, w_fresh = 0 and no damping is
+    //   injected.
     if (unified_diff_damp_gain_ > 0.0) {
-      Eigen::VectorXd diff = Eigen::VectorXd::Zero(6);
-      bool obs_fresh = formation_observer_ && formation_observer_->isFfReady()
-                       && !formation_observer_wrench_stamp_.isZero()
-                       && (ros::Time::now() - formation_observer_wrench_stamp_).toSec() < 0.5;
+      // Continuous-weight D3 injection.
+      //   diff_i = w_fresh * ( residual_i  -  W_obs / max(1, N_assembled) )
+      //   w_fresh = clip(1 - dt_obs / T_decay, 0, 1)
+      constexpr double kFreshDecay = 0.5;   // [s]
+      double dt_obs = formation_observer_wrench_stamp_.isZero()
+                      ? std::numeric_limits<double>::infinity()
+                      : (ros::Time::now() - formation_observer_wrench_stamp_).toSec();
+      double w_fresh = std::max(0.0, std::min(1.0, 1.0 - dt_obs / kFreshDecay));
+      std::map<int, bool> aflag = beetle_navigator_->getAssemblyFlags();
       int n_assembled = 0;
-      if (obs_fresh) {
-        std::map<int, bool> aflag = beetle_navigator_->getAssemblyFlags();
-        for (const auto& kv : aflag) if (kv.second) n_assembled++;
-      }
-      if (obs_fresh && n_assembled > 0
-          && est_residual_list_.count(my_id)
-          && est_residual_list_[my_id].size() == 6
-          && formation_observer_wrench_.size() == 6) {
-        diff = est_residual_list_[my_id] - formation_observer_wrench_ / static_cast<double>(n_assembled);
-      }
+      for (const auto& kv : aflag) if (kv.second) n_assembled++;
+      double inv_N = 1.0 / static_cast<double>(std::max(1, n_assembled));
+      Eigen::VectorXd diff = w_fresh *
+        (est_residual_list_[my_id] - formation_observer_wrench_ * inv_N);
       double mass = std::max(unified_controller_->getFormationMass(), 0.01);
       Eigen::Matrix3d inertia_inv = unified_controller_->getFormationInertia().inverse();
       target_wrench_acc.head(3) -= unified_diff_damp_gain_ * diff.head(3) / mass;
@@ -2288,14 +2295,12 @@ namespace aerial_robot_control
       // A near-zero |diff| at hover with non-zero |residual| confirms that
       // the common-mode is being captured by the formation observer and
       // that the differential channel is correctly model-error-free.
-      Eigen::VectorXd res = est_residual_list_.count(my_id) ? est_residual_list_[my_id]
-                                                            : Eigen::VectorXd::Zero(6);
-      if (res.size() != 6) res = Eigen::VectorXd::Zero(6);
       ROS_INFO_THROTTLE(1.0,
-        "[DBG-DIFFDAMP-D3 id=%d] fresh=%d N=%d |res|F=%.3f T=%.3f "
+        "[DBG-DIFFDAMP-D3 id=%d] w_fresh=%.2f N=%d |res|F=%.3f T=%.3f "
         "|Wobs|F=%.3f T=%.3f |diff|F=%.3f T=%.3f gain=%.3f mass=%.2f",
-        my_id, obs_fresh ? 1 : 0, n_assembled,
-        res.head(3).norm(), res.tail(3).norm(),
+        my_id, w_fresh, n_assembled,
+        est_residual_list_[my_id].head(3).norm(),
+        est_residual_list_[my_id].tail(3).norm(),
         formation_observer_wrench_.head(3).norm(),
         formation_observer_wrench_.tail(3).norm(),
         diff.head(3).norm(), diff.tail(3).norm(),

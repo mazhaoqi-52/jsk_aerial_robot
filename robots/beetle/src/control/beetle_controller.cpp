@@ -487,7 +487,6 @@ namespace aerial_robot_control
 
       prev_unified_control_mode_ = false;
       unified_controller_->resetCascadeAllocSent();
-      unified_controller_->resetTargetAngleLpf();
       unified_controller_->resetQPState();
       unified_reference_warmup_count_ = 0;
       beetle_navigator_->setUnifiedControlMode(false);

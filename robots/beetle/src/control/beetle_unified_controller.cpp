@@ -29,11 +29,6 @@ BeetleUnifiedController::BeetleUnifiedController()
     target_roll_(0),
     target_pitch_(0),
     candidate_yaw_term_(0),
-    target_roll_lpf_(0),
-    target_pitch_lpf_(0),
-    candidate_yaw_term_lpf_(0),
-    tgt_angle_lpf_alpha_(0.3),
-    tgt_angle_lpf_initialized_(false),
     cascade_alloc_sent_(false),
     has_cascade_gain_cache_(false),
     cached_cascade_roll_p_(0),
@@ -91,7 +86,6 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<int>("gimbal_dof", gimbal_dof_, 1);
   control_nh.param<bool>("gimbal_calc_in_fc", gimbal_calc_in_fc_, false);
   control_nh.param<bool>("yaw_in_allocation", yaw_in_allocation_, false);
-  control_nh.param<double>("tgt_angle_lpf_alpha", tgt_angle_lpf_alpha_, 0.3);
   control_nh.param<bool>("use_constrained_alloc", use_constrained_alloc_, false);
   control_nh.param<double>("alloc_lambda", alloc_lambda_, 1e-4);
   control_nh.param<double>("alloc_t_max", alloc_t_max_, 20.0);
@@ -200,16 +194,18 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
   }
 
-  // Compute target angles for spinal inner loop
-  // (underactuated: derive from position PID target acceleration)
-  {
-    // target_acc in body frame (first 3 elements of total_wrench_acc)
-    Eigen::Vector3d target_acc_body = total_wrench_acc.head(3);
-    target_roll_ = atan2(-target_acc_body.y(),
-                         sqrt(target_acc_body.x() * target_acc_body.x() +
-                              target_acc_body.z() * target_acc_body.z()));
-    target_pitch_ = atan2(target_acc_body.x(), target_acc_body.z());
-  }
+  // Target attitude for spinal inner loop is the operator's commanded attitude
+  // (navigator->target_rpy_), NOT atan2(target_acc) derived from XY-PID.
+  //
+  // Rationale: unified mode is fully-actuated — gimbal vectoring already produces
+  // body-x/y acceleration via the 6-DOF allocation, so the cascade must NOT also
+  // tilt the body to generate that same acceleration (double-actuation positive
+  // feedback). Real-hw log (pitch≈0.4 hover) showed the atan2 path coupled with
+  // XY-PID drove monotonic pitch divergence; outer PITCH-I wound up to +5 N·m
+  // without ever correcting the body angle. See gimbalrotor_controller.cpp
+  // fully-actuated branch for the equivalent pattern.
+  target_roll_  = navigator_->getTargetRPY().x();
+  target_pitch_ = navigator_->getTargetRPY().y();
 
   // Compute candidate yaw term for spinal yaw reconstruction.
   // When yaw already participates in unified allocation, do NOT reconstruct the
@@ -226,37 +222,6 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     }
     candidate_yaw_term_ = yaw_pid_raw * max_yaw_scale;
   }
-
-  // Low-pass filter target angles to suppress 40Hz jitter before sending to spinal.
-  // Spinal's 1000Hz P+D would amplify frame-to-frame noise in tgtA → rotor oscillation.
-  // alpha=0 → no filtering (pass-through), alpha=1 → fully frozen.
-  {
-    if (!tgt_angle_lpf_initialized_) {
-      target_roll_lpf_ = target_roll_;
-      target_pitch_lpf_ = target_pitch_;
-      candidate_yaw_term_lpf_ = candidate_yaw_term_;
-      tgt_angle_lpf_initialized_ = true;
-    } else {
-      double a = tgt_angle_lpf_alpha_;
-      target_roll_lpf_  = a * target_roll_lpf_  + (1.0 - a) * target_roll_;
-      target_pitch_lpf_ = a * target_pitch_lpf_ + (1.0 - a) * target_pitch_;
-      candidate_yaw_term_lpf_ = a * candidate_yaw_term_lpf_ + (1.0 - a) * candidate_yaw_term_;
-    }
-    target_roll_  = target_roll_lpf_;
-    target_pitch_ = target_pitch_lpf_;
-    candidate_yaw_term_ = candidate_yaw_term_lpf_;
-  }
-
-  // NOTE: previously we wrote target_roll_/target_pitch_ back into the
-  // navigator via setTargetRoll/Pitch (the "A-fix"). It eliminated the static
-  // outer-PID pseudo-error but introduced a positive-feedback loop with the
-  // XY-PID + FormObs FF channel: target_pitch_ tracks instantaneous XY-acc,
-  // body pitch lags 60~90deg behind the spinal cascade, so the outer R/P
-  // error settles around an oscillating ±0.1 rad reference vs lagging body
-  // angle -> pitch_i winds up monotonically (real-hw run 17030..17060s,
-  // pitch_i reached +10 Nm). Outer R/P I-term is now disabled in unified
-  // mode (see runUnifiedControlCommon: target_wrench_acc(3,4) carry only
-  // FormObs/task torque FF), so the writeback is no longer needed.
 
   // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);

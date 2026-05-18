@@ -88,7 +88,6 @@ controller:
     ff_torque_limit: 2.0   # hard clamp on |FF ang-acc| [rad/s^2]
 
   yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
-  tgt_angle_lpf_alpha: 0.3
 
   # Full-vector constrained QP allocation
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).

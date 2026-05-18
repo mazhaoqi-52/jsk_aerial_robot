@@ -220,6 +220,22 @@ void BaseNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & ms
       trajectory_reset_time_ = trajectory_reset_duration_ + ros::Time::now().toSec();
     }
 
+  /* roll / pitch (fully-actuated only; gated by max_target_tilt_angle clamp).
+   * Accepted in HOVER_STATE so operators can command non-zero tilt set-points
+   * (e.g. unified-mode tilted hover). Underactuated controllers will overwrite
+   * target_rpy_.x/y from atan2(target_acc) inside controlCore and thus ignore
+   * this input — that path is unaffected. */
+  if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      setTargetRoll(msg->target_roll);
+      setTargetOmegaX(0);
+    }
+  if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      setTargetPitch(msg->target_pitch);
+      setTargetOmegaY(0);
+    }
+
   /* z */
   if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::VEL_MODE)
     {

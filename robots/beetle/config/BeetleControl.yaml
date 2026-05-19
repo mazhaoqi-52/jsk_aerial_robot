@@ -68,7 +68,7 @@ controller:
   # Recommended bring-up: enable=true, force_gain=0.05, torque_gain=0.05, ramp=10s.
   # If hover stays clean for 60 s, raise gain stepwise to 0.2.
   formation_observer_comp:
-    enable: true
+    enable: false
     force_gain:      0.2   # scalar on F_x/F_y/F_z FF acc [0,1]
     torque_gain:     0.2   # scalar on T_x/T_y/T_z FF ang-acc [0,1]
     ff_force_limit:  5.0   # hard clamp on |FF acc|     [m/s^2]

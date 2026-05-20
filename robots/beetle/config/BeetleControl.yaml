@@ -22,7 +22,7 @@ controller:
   # 0.0 = DISABLED (real-hardware default — enable only after bag-analyzing
   # /beetleX/internal_wrench spectrum and confirming no resonance near inner-loop BW).
   # Recommended tuning path on hardware: 0.0 -> 0.02 -> 0.05 (tether/ground first).
-  unified_diff_damp_gain: 0.05
+  unified_diff_damp_gain: 0
 
   # FormationObserver bias-calibration PID-settled gate.
   # Bias is only calibrated when the summed |d(R/P/Y I-term)/dt| over one frame

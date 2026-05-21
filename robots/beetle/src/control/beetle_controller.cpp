@@ -871,9 +871,13 @@ namespace aerial_robot_control
     // to ALL assembled modules' spinals. This configures each spinal for 1000Hz
     // P+I+D attitude tracking using thrustGainMapping().
     //
-    // v4 architecture: spinal owns the entire roll/pitch attitude loop, so
-    // roll_i / pitch_i are now ALSO sent (non-zero). PC's outer roll/pitch
-    // PIDs are inert in unified mode (target_wrench_acc(3,4)=0).
+    // v5 architecture: spinal owns the high-bandwidth P+D inner loop only.
+    // I-term is integrated by PC's outer R/P PID and fed via target_wrench_acc(3,4).
+    // Therefore roll_i / pitch_i sent to spinal are forced to 0 here, regardless
+    // of the unified-mode YAML I gain (which IS used for the PC outer integrator).
+    //
+    // PC's outer roll/pitch PIDs are now ACTIVE in unified mode (mirrors beetle
+    // independent mode with i_term_rp_calc_in_pc=true).
     //
     // Gains are read directly from unified_*_gains_ (not pid_controllers_).
     // This eliminates call-order dependency: sendCascadeSetup() always reads
@@ -885,10 +889,10 @@ namespace aerial_robot_control
     // successful computation. See cascade_alloc_sent_ flag.
 
     double roll_p  = unified_roll_gains_.p;
-    double roll_i  = unified_roll_gains_.i;
+    double roll_i  = 0.0;  // v5: PC owns I; spinal P+D only
     double roll_d  = unified_roll_gains_.d;
     double pitch_p = unified_pitch_gains_.p;
-    double pitch_i = unified_pitch_gains_.i;
+    double pitch_i = 0.0;  // v5: PC owns I; spinal P+D only
     double pitch_d = unified_pitch_gains_.d;
     double yaw_d   = unified_yaw_gains_.d;
 
@@ -932,10 +936,10 @@ namespace aerial_robot_control
     // pid_controllers_ may still hold independent-mode values at this point.
 
     double roll_p  = unified_roll_gains_.p;
-    double roll_i  = unified_roll_gains_.i;
+    double roll_i  = 0.0;  // v5: PC owns I; spinal P+D only
     double roll_d  = unified_roll_gains_.d;
     double pitch_p = unified_pitch_gains_.p;
-    double pitch_i = unified_pitch_gains_.i;
+    double pitch_i = 0.0;  // v5: PC owns I; spinal P+D only
     double pitch_d = unified_pitch_gains_.d;
     double yaw_d   = unified_yaw_gains_.d;
 
@@ -1050,21 +1054,11 @@ namespace aerial_robot_control
              unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d,
              unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d,
              unified_yaw_gains_.p, unified_yaw_gains_.i, unified_yaw_gains_.d);
-
-    // Debug: check damping ratio for oscillation diagnosis
-    // For a PD system: zeta = D / (2*sqrt(P)). zeta < 0.7 => likely oscillatory.
-    if (unified_xy_gains_.p > 0.0) {
-      double zeta_xy = unified_xy_gains_.d / (2.0 * std::sqrt(unified_xy_gains_.p));
-      ROS_INFO("[UnifiedCtrl] XY damping ratio zeta=%.3f (P=%.2f D=%.2f) %s",
-               zeta_xy, unified_xy_gains_.p, unified_xy_gains_.d,
-               zeta_xy < 0.7 ? "** UNDERDAMPED - may oscillate **" : "OK");
-    }
-    if (unified_z_gains_.p > 0.0) {
-      double zeta_z = unified_z_gains_.d / (2.0 * std::sqrt(unified_z_gains_.p));
-      ROS_INFO("[UnifiedCtrl] Z damping ratio zeta=%.3f (P=%.2f D=%.2f) %s",
-               zeta_z, unified_z_gains_.p, unified_z_gains_.d,
-               zeta_z < 0.7 ? "** UNDERDAMPED - may oscillate **" : "OK");
-    }
+    // NOTE: ζ = D / (2·√P) damping-ratio heuristic was removed — it assumes a
+    // unit-mass 2nd-order plant ẍ=u, but our XY PID outputs target_acc_cog,
+    // which feeds atan2 → target attitude → 1 kHz spinal inner loop → motor
+    // → gravity projection (≥4-order dynamics). Stability cannot be inferred
+    // from PID gains in isolation; use frequency-domain identification.
   }
 
   void BeetleController::restoreIndependentGains()
@@ -1165,15 +1159,6 @@ namespace aerial_robot_control
               }
             ROS_INFO_STREAM("[UnifiedCtrl] change unified gain for controller '" << pid_controllers_.at(index).getName() << "'");
           }
-
-        // Damping ratio check after gain change
-        if (gain_set.p > 0.0) {
-          double zeta = gain_set.d / (2.0 * std::sqrt(gain_set.p));
-          if (zeta < 0.7) {
-            ROS_WARN("[UnifiedCtrl] Damping ratio zeta=%.3f after gain change (P=%.2f D=%.2f) - UNDERDAMPED, oscillation likely!",
-                     zeta, gain_set.p, gain_set.d);
-          }
-        }
 
         // Resend P/D gains to all Spinals when unified roll/pitch/yaw gains change.
         // Since sendCascadeSetup() reads from unified_*_gains_ directly, it will
@@ -1896,28 +1881,13 @@ namespace aerial_robot_control
       s_dbg_prev_pos = formation_pos;
     }
 
-    // Formation observer feedforward (XY): leader-only, two-stage attenuated.
-    //   stage 1 (in observer): LPF @ 0.05 Hz on bias-subtracted estimate
-    //   stage 2 (here):        soft ramp * gain, then hard clamp to ff_force_limit
-    // Inject via setPersistentFF since X/Y consume PID.result() downstream.
+    // XY task feedforward only. Formation-observer FF (fobs_comp) was deleted
+    // in v5: empirically it formed a positive-feedback loop with the bias
+    // calibration in the momentum observer, and provided no benefit over the
+    // PID I-term integration in steady-state.
     {
       double mass_inv_f = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
       double ff_x = 0.0, ff_y = 0.0;
-      // Observer FF (leader-only, residual compensation): negative sign because
-      // it counteracts a detected unmodeled external push.
-      if (is_leader && fobs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isFfReady() &&
-          !navigator_->getForceLandingFlag()) {
-        double ramp = formation_observer_->getFfRampFactor();
-        Eigen::Vector3d f_body = formation_observer_->getEstExternalForceBody();
-        tf::Vector3 f_world = cog_rot * tf::Vector3(f_body.x(), f_body.y(), f_body.z());
-        double k = ramp * fobs_comp_force_gain_;
-        ff_x += boost::algorithm::clamp(-k * f_world.x() * mass_inv_f,
-                                        -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
-        ff_y += boost::algorithm::clamp(-k * f_world.y() * mass_inv_f,
-                                        -fobs_comp_ff_force_limit_,  fobs_comp_ff_force_limit_);
-      }
-      // Task FF (all modules, towing / valve_rotation): positive sign, body→world rotation.
       if (task_ff_active) {
         tf::Vector3 task_world = cog_rot * tf::Vector3(desired_total_ff(0),
                                                        desired_total_ff(1),
@@ -1963,15 +1933,7 @@ namespace aerial_robot_control
     {
       double mass_inv_z = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
       double ff_z = 0.0;
-      if (is_leader && fobs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isFfReady() &&
-          !navigator_->getForceLandingFlag()) {
-        double ramp = formation_observer_->getFfRampFactor();
-        double fz_body = formation_observer_->getEstExternalForceBody().z();
-        ff_z += boost::algorithm::clamp(-ramp * fobs_comp_force_gain_ * fz_body * mass_inv_z,
-                                        -fobs_comp_ff_force_limit_, fobs_comp_ff_force_limit_);
-      }
-      // Task FF Z: body z direct (skip cog_rot) to avoid pitch-coupling instability.
+      // fobs_comp Z FF removed (v5). Task FF only.
       if (task_ff_active) {
         ff_z += desired_total_ff(2) * mass_inv_z;
       }
@@ -2005,27 +1967,10 @@ namespace aerial_robot_control
     double du_rp = du;
     if (!start_rp_integration_) du_rp = 0;
 
-    // Formation observer torque feedforward — YAW only.
-    //   ROLL/PITCH FF is intentionally removed in v4: the PC wrench's
-    //   (Mx,My) channels are fixed at 0 (see target_wrench_acc(3,4) below),
-    //   so any roll/pitch torque FF here would be silently discarded. Roll/
-    //   pitch external-torque rejection is delegated to each spinal's 1 kHz
-    //   cascade I-term (configured via sendCascadeSetup with non-zero roll_i/
-    //   pitch_i from unified_{roll,pitch}_gains_.i). The corresponding fobs
-    //   compensation on Mx/My would only be a slower duplicate path.
+    // Yaw task-torque feedforward (only). fobs_comp torque FF removed in v5
+    // along with the rest of the observer-FF chain.
     {
       double ff_yaw = 0.0;
-      if (is_leader && fobs_comp_enable_ &&
-          formation_observer_ && formation_observer_->isFfReady() &&
-          !navigator_->getForceLandingFlag()) {
-        double ramp = formation_observer_->getFfRampFactor();
-        Eigen::Vector3d tau_ext = formation_observer_->getEstExternalTorqueBody();
-        Eigen::Vector3d alpha_ext = unified_controller_->getFormationInertia().inverse() * tau_ext;
-        double k = ramp * fobs_comp_torque_gain_;
-        ff_yaw += boost::algorithm::clamp(-k * alpha_ext.z(),
-                                          -fobs_comp_ff_torque_limit_, fobs_comp_ff_torque_limit_);
-      }
-      // Task torque FF (all modules, valve_rotation etc.): yaw component only.
       if (task_ff_active) {
         Eigen::Vector3d task_alpha =
             unified_controller_->getFormationInertia().inverse() * desired_total_ff.tail(3);
@@ -2034,15 +1979,20 @@ namespace aerial_robot_control
       pid_controllers_.at(YAW).setPersistentFF(ff_yaw);
     }
 
-    // v4: PC roll/pitch PID is intentionally NOT updated in unified mode.
-    //   - Roll/Pitch attitude tracking is delegated entirely to each spinal's
-    //     1 kHz cascade (P+I+D), configured by sendCascadeSetup.
-    //   - target_wrench_acc(3,4) is fixed at 0, so PID.getITerm() would never
-    //     reach the actuators; running update() here would only accumulate a
-    //     stale ITerm that becomes a discontinuity on exit (back to independent
-    //     hover). Zeroing the err_i_ each frame keeps the PID inert.
-    pid_controllers_.at(ROLL).setErrI(0);
-    pid_controllers_.at(PITCH).setErrI(0);
+    // v5: Restored outer R/P PID. Mirrors beetle independent-mode
+    // (gimbal_calc_in_fc=true && i_term_rp_calc_in_pc=true): PC runs full
+    // P+I+D update each frame, but only the I-term is fed into
+    // target_wrench_acc(3,4); spinal owns the high-bandwidth P+D inner loop.
+    // The PC P-/D-term states are still maintained for clean exit to
+    // independent hover (no discontinuity).
+    pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp,
+                                     target_omega_.x() - omega_.x(), target_ang_acc_.x());
+    pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
+                                      target_omega_.y() - omega_.y(), target_ang_acc_.y());
+    if (navigator_->getForceLandingFlag()) {
+      pid_controllers_.at(ROLL).reset();
+      pid_controllers_.at(PITCH).reset();
+    }
 
     double err_yaw = angles::shortest_angular_distance(rpy_.z(), target_rpy_.z());
     double err_omega_z = target_omega_.z() - omega_.z();
@@ -2101,15 +2051,15 @@ namespace aerial_robot_control
 
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
-    // v4 architecture: PC manages translation (X/Y/Z) and yaw only.
-    // Roll/Pitch attitude authority lives entirely on each module's spinal
-    // (1 kHz cascade with P+I+D). target_wrench_acc(3,4)=0 ensures the PC
-    // allocation does NOT inject any rotational torque on Mx/My — the formation
-    // pseudoinverse will leave (Mx,My) at zero and translate (Fx,Fy,Fz,Mz)
-    // through the global gimbal+thrust solution. Eliminates the dual outer-I /
-    // inner-PD wind-up oscillation on roll/pitch observed prior to v4.
-    target_wrench_acc(3) = 0.0;
-    target_wrench_acc(4) = 0.0;
+    // v5 architecture (mirrors beetle independent mode with i_term_rp_calc_in_pc=true):
+    //   target_wrench_acc(3,4) = (ROLL.getITerm(), PITCH.getITerm())
+    //   spinal owns P+D high-bandwidth (roll_i/pitch_i sent as 0 in sendCascadeSetup)
+    // The outer I-term integrates slow CoG-offset / model-error torques; spinal's P+D
+    // delivers the fast attitude-tracking response. This is the same dual-loop split
+    // db6cec4d adopted and that the original beetle / ninja architectures have used
+    // for years.
+    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
+    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 
@@ -2125,71 +2075,22 @@ namespace aerial_robot_control
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
     }
 
-    // --- Differential-mode damping (D3: formation-observer common-mode reference) ---
-    //
-    // D3 design rationale:
-    //   The legacy formulation used inter_wrench_list_[my_id], built by
-    //   calcInteractionWrench as a cumulative-sum minus average over the
-    //   per-module observer residuals. That removes ONLY the empirical mean
-    //   of the per-module observer outputs, which is not the true formation
-    //   external wrench when every module shares the same model error
-    //   (same CoG/inertia mismatch → same bias). The leftover common-mode
-    //   then leaks into every module's "differential" channel and shows up
-    //   as a persistent diff-damping signal at hover.
-    //
-    //   D3 substitutes the GLOBAL formation observer output as the
-    //   common-mode truth (W_truth) and computes
-    //       diff_i = est_residual_list_[my_id] - W_truth / N
-    //   where N is the number of assembled modules. The formation observer
-    //   is an independent momentum-based estimator on the whole rigid body,
-    //   so its model error structure is uncorrelated with the per-module
-    //   observers and the differential is genuinely module-specific.
-    //
-    //   Frames: both est_residual_list_ entries (per-module observer output
-    //   minus task prediction) and formation_observer_wrench_ are published
-    //   in formation_body frame, so the subtraction is well-defined.
-    //
-    //   Gating: a single continuous freshness weight w_fresh in [0,1] derived
-    //   from the age of formation_observer_wrench_stamp_ — no boolean if/else.
-    //   When the formation observer has never published (stamp == 0) or its
-    //   last sample is older than T_decay, w_fresh = 0 and no damping is
-    //   injected.
-    if (unified_diff_damp_gain_ > 0.0) {
-      // Continuous-weight D3 injection.
-      //   diff_i = w_fresh * ( residual_i  -  W_obs / max(1, N_assembled) )
-      //   w_fresh = clip(1 - dt_obs / T_decay, 0, 1)
-      constexpr double kFreshDecay = 0.5;   // [s]
-      double dt_obs = formation_observer_wrench_stamp_.isZero()
-                      ? std::numeric_limits<double>::infinity()
-                      : (ros::Time::now() - formation_observer_wrench_stamp_).toSec();
-      double w_fresh = std::max(0.0, std::min(1.0, 1.0 - dt_obs / kFreshDecay));
-      std::map<int, bool> aflag = beetle_navigator_->getAssemblyFlags();
-      int n_assembled = 0;
-      for (const auto& kv : aflag) if (kv.second) n_assembled++;
-      double inv_N = 1.0 / static_cast<double>(std::max(1, n_assembled));
-      Eigen::VectorXd diff = w_fresh *
-        (est_residual_list_[my_id] - formation_observer_wrench_ * inv_N);
-      double mass = std::max(unified_controller_->getFormationMass(), 0.01);
-      Eigen::Matrix3d inertia_inv = unified_controller_->getFormationInertia().inverse();
-      target_wrench_acc.head(3) -= unified_diff_damp_gain_ * diff.head(3) / mass;
-      target_wrench_acc.tail(3) -= unified_diff_damp_gain_ * (inertia_inv * diff.tail(3));
-
-      // [DBG-DIFFDAMP-D3] Throttled 1 Hz: differential magnitude vs the
-      // per-module residual and the formation-observer common-mode share.
-      // A near-zero |diff| at hover with non-zero |residual| confirms that
-      // the common-mode is being captured by the formation observer and
-      // that the differential channel is correctly model-error-free.
-      ROS_INFO_THROTTLE(1.0,
-        "[DBG-DIFFDAMP-D3 id=%d] w_fresh=%.2f N=%d |res|F=%.3f T=%.3f "
-        "|Wobs|F=%.3f T=%.3f |diff|F=%.3f T=%.3f gain=%.3f mass=%.2f",
-        my_id, w_fresh, n_assembled,
-        est_residual_list_[my_id].head(3).norm(),
-        est_residual_list_[my_id].tail(3).norm(),
-        formation_observer_wrench_.head(3).norm(),
-        formation_observer_wrench_.tail(3).norm(),
-        diff.head(3).norm(), diff.tail(3).norm(),
-        unified_diff_damp_gain_, mass);
-    }
+    // v5: D3 differential-mode damping deleted.
+    //   - Mathematically the diff signal was injected at the allocation
+    //     layer instead of at a PID I-output (no integration smoothing,
+    //     no dead-zone, no LPF) which mixes high-frequency observer noise
+    //     with the wrench command.
+    //   - Functionally it duplicated the role originally served by the
+    //     pre-2025 leader-follower setICompTerm path, but at the wrong
+    //     point in the cascade.
+    //   - Phase 3 will revisit "module-internal-force compensation"
+    //     by reviving the original-beetle calcInteractionWrench /
+    //     setICompTerm route, which acts on each module's PID I-term
+    //     channel.
+    // The formation observer subscription itself is preserved so that
+    // diagnostics ( /formation_observer/wrench ) are still published.
+    (void)formation_observer_wrench_stamp_;
+    (void)unified_diff_damp_gain_;
 
     // [DBG-NANGUARD] Catch non-finite or absurd target_wrench_acc BEFORE feeding
     // it to allocation pseudoinverse. SIGSEGV in spinal pipeline is typically
@@ -2231,6 +2132,18 @@ namespace aerial_robot_control
     // --- Run unified 6-DOF allocation ---
     unified_controller_->clearFormationModelOverride();
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
+
+    // v5 (db6cec4d-style): close the outer R/P pseudo-error loop.
+    //   The allocator computes target_roll_/target_pitch_ internally from the
+    //   commanded thrust direction. Writing them back into navigator's
+    //   target_rpy ensures the next frame's outer R/P PID computes
+    //   err = navigator_target_rpy - rpy_, i.e. the *real* attitude tracking
+    //   error rather than (0 - rpy_) which would saturate the I-term toward
+    //   the cog_offset bias and oscillate at hover.
+    if (ok) {
+      navigator_->setTargetRoll(unified_controller_->getTargetRoll());
+      navigator_->setTargetPitch(unified_controller_->getTargetPitch());
+    }
 
     // [DBG-NANGUARD2] Detect non-finite allocation output: if the pseudoinverse
     // produced NaN, downstream spinal packing will likely SIGSEGV.

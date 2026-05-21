@@ -1418,19 +1418,27 @@ namespace aerial_robot_control
 
   void BeetleController::externalWrenchEstimate()
   {
-    // NOTE (unified mode): the single-module momentum observer also runs in
-    // unified mode so that inter_wrench_list_[my_id] (computed by
-    // calcInteractionWrench from est_wrench_list_) is populated and can be
-    // consumed by the differential-mode damping term in runUnifiedControlCommon.
+    // NOTE: in unified mode the assembled formation is controlled by the
+    // formation-level QP allocation in BeetleUnifiedController. The per-module
+    // single-mass momentum observer here has no consumer in that path
+    // (calcInteractionWrench / wrench_comp / diff-mode damping are NOT injected
+    // into runUnifiedControlCommon). Worse, this method runs on a dedicated
+    // 100Hz thread (wrench_estimate_thread_) and previously read
+    // unified_controller_->getLocalRealizedWrenchBody() which dereferences
+    // target_vectoring_f_ / integrated_map_ — the very Eigen members the main
+    // control thread resizes inside computeUnifiedAllocation(). At the takeoff
+    // edge those buffers are first allocated (N: 0 → assembled count), giving
+    // the wrench thread a window of free()'d memory and a hard SIGSEGV.
     //
-    // Feedforward correction (Stage 1 fix): in unified mode the observer's
-    // commanded-wrench input is taken from the formation QP allocation result
-    // (getLocalRealizedWrenchBody(my_id)), which is the wrench this module's
-    // own rotors are actually producing — NOT (single_module_mass *
-    // formation_target_acc), which would create an acceleration-proportional
-    // residual that contaminates inter_wrench during tilted or accelerated
-    // flight. In LF / independent mode the legacy single-module expression is
-    // retained.
+    // Fix: in unified + assembled state, early-return. The observer remains
+    // fully active in LF / independent / SEPARATED states which depend on it.
+    if (unified_control_mode_ &&
+        beetle_navigator_->getModuleState() != SEPARATED) {
+      prev_est_wrench_timestamp_ = 0;
+      integrate_term_ = Eigen::VectorXd::Zero(6);
+      return;
+    }
+
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&
@@ -1462,27 +1470,8 @@ namespace aerial_robot_control
     sum_momentum.tail(3) = inertia * omega_cog;
 
     Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
-    if (unified_control_mode_ && unified_controller_) {
-      // Unified mode: observer feedforward must use the wrench actually produced
-      // by THIS module's rotors (from the formation QP allocation), not
-      // (single_mass * formation_target_acc) — which would mismatch the
-      // physical force/torque this module is generating and inject a spurious
-      // signal into est_external_wrench_ that scales with formation acceleration
-      // (the "differential-mode contamination" problem during tilted / accelerated
-      // flight).
-      int my_id = beetle_navigator_->getMyID();
-      target_wrench_cog = unified_controller_->getLocalRealizedWrenchBody(my_id);
-      // Fall back to the legacy expression only if local realized wrench is not
-      // yet available (e.g. first frame before allocation has converged).
-      if (target_wrench_cog.size() != 6 || target_wrench_cog.isZero(0.0)) {
-        target_wrench_cog = Eigen::VectorXd::Zero(6);
-        target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
-        target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
-      }
-    } else {
-      target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
-      target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
-    }
+    target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
+    target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
 
     Eigen::MatrixXd J_t = Eigen::MatrixXd::Identity(6,6);
     J_t.topLeftCorner(3,3) = cog_rot;

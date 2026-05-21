@@ -165,26 +165,6 @@ public:
    */
   Eigen::VectorXd getRealizedWrenchBody() const;
 
-  /**
-   * @brief Compute the realized 6D wrench produced by a SINGLE module's rotors,
-   *        expressed in that module's body frame and referenced to that module's
-   *        own CoG (i.e. force + torque about the module-local origin).
-   *
-   *  Used to correct the per-module momentum observer in unified mode:
-   *  the observer needs to know "what force/torque this module's actuators are
-   *  actually producing", which is NOT equal to (single_module_mass *
-   *  formation_target_acc) — that is the bug we are fixing.
-   *
-   *  Implementation: extract the module's slice of target_vectoring_f_,
-   *  multiply by a module-local allocation matrix built about the module's CoG
-   *  (no 1/M or I^-1 scaling, no gimbal-frame change beyond the rotor's own
-   *  thrust-coord rotation).
-   *
-   *  Returns force [N] and torque [N·m]. Zero vector if module not assembled or
-   *  allocation not yet computed.
-   */
-  Eigen::VectorXd getLocalRealizedWrenchBody(int module_id) const;
-
   /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
   bool isAllocationSaturated() const;
 

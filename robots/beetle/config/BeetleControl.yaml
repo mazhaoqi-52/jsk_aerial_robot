@@ -124,18 +124,18 @@ controller:
   # P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
   # I-term is retained on PC for slow formation-level bias correction.
   unified_roll:
-    p_gain: 8.0
+    p_gain: 17.0
     i_gain: 1.0
-    d_gain: 5.0
+    d_gain: 15.0
     limit_sum: 50.0
     limit_p: 20.0
     limit_i: 10.0
     limit_d: 20.0
 
   unified_pitch:
-    p_gain: 8.0
+    p_gain: 17.0
     i_gain: 3.0
-    d_gain: 5.0
+    d_gain: 12.0
     limit_sum: 50.0
     limit_p: 20.0
     limit_i: 20.0

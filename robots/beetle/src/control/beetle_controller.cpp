@@ -20,6 +20,12 @@ namespace aerial_robot_control
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
+    leader_target_pos_(0, 0, 0),
+    leader_target_vel_(0, 0, 0),
+    leader_target_acc_(0, 0, 0),
+    leader_target_rpy_(0, 0, 0),
+    leader_target_omega_(0, 0, 0),
+    leader_target_ang_acc_(0, 0, 0),
     unified_transition_count_(-1),
     yaw_in_allocation_(false),
     gains_switched_(false)
@@ -782,6 +788,25 @@ namespace aerial_robot_control
       }
     }
     msg.yaw_pid_raw = yaw_pid_raw;
+
+    // Phase B: broadcast leader's navigator setpoints. Followers reconstruct
+    // their per-module reference from these via rigid-formation kinematics
+    // (see runUnifiedControlCommon "Phase B follower override" block).
+    {
+      tf::Vector3 lt_pos     = navigator_->getTargetPos();
+      tf::Vector3 lt_vel     = navigator_->getTargetVel();
+      tf::Vector3 lt_acc     = navigator_->getTargetAcc();
+      tf::Vector3 lt_rpy     = navigator_->getTargetRPY();
+      tf::Vector3 lt_omega   = navigator_->getTargetOmega();
+      tf::Vector3 lt_ang_acc = navigator_->getTargetAngAcc();
+      msg.leader_target_pos.x     = lt_pos.x();     msg.leader_target_pos.y     = lt_pos.y();     msg.leader_target_pos.z     = lt_pos.z();
+      msg.leader_target_vel.x     = lt_vel.x();     msg.leader_target_vel.y     = lt_vel.y();     msg.leader_target_vel.z     = lt_vel.z();
+      msg.leader_target_acc.x     = lt_acc.x();     msg.leader_target_acc.y     = lt_acc.y();     msg.leader_target_acc.z     = lt_acc.z();
+      msg.leader_target_rpy.x     = lt_rpy.x();     msg.leader_target_rpy.y     = lt_rpy.y();     msg.leader_target_rpy.z     = lt_rpy.z();
+      msg.leader_target_omega.x   = lt_omega.x();   msg.leader_target_omega.y   = lt_omega.y();   msg.leader_target_omega.z   = lt_omega.z();
+      msg.leader_target_ang_acc.x = lt_ang_acc.x(); msg.leader_target_ang_acc.y = lt_ang_acc.y(); msg.leader_target_ang_acc.z = lt_ang_acc.z();
+    }
+
     unified_reference_pub_.publish(msg);
 
     ROS_INFO_THROTTLE(1.0,
@@ -810,6 +835,26 @@ namespace aerial_robot_control
     unified_reference_desired_wrench_(4) = msg.desired_wrench.torque.y;
     unified_reference_desired_wrench_(5) = msg.desired_wrench.torque.z;
     unified_reference_yaw_pid_raw_ = msg.yaw_pid_raw;
+
+    // Phase B: cache leader's navigator setpoints for follower target derivation.
+    leader_target_pos_.setValue(msg.leader_target_pos.x,
+                                msg.leader_target_pos.y,
+                                msg.leader_target_pos.z);
+    leader_target_vel_.setValue(msg.leader_target_vel.x,
+                                msg.leader_target_vel.y,
+                                msg.leader_target_vel.z);
+    leader_target_acc_.setValue(msg.leader_target_acc.x,
+                                msg.leader_target_acc.y,
+                                msg.leader_target_acc.z);
+    leader_target_rpy_.setValue(msg.leader_target_rpy.x,
+                                msg.leader_target_rpy.y,
+                                msg.leader_target_rpy.z);
+    leader_target_omega_.setValue(msg.leader_target_omega.x,
+                                  msg.leader_target_omega.y,
+                                  msg.leader_target_omega.z);
+    leader_target_ang_acc_.setValue(msg.leader_target_ang_acc.x,
+                                    msg.leader_target_ang_acc.y,
+                                    msg.leader_target_ang_acc.z);
 
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
@@ -1753,6 +1798,51 @@ namespace aerial_robot_control
         ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER id=%d] cog_offset_self TF failed (%s), falling back to leader-frame offset",
                           my_id, ex.what());
       }
+    }
+
+    // ---- Phase B follower override --------------------------------------
+    // In unified mode the follower's own navigator never receives the
+    // user/trajectory setpoint (only the leader's does). Reading
+    // navigator_->getTargetPos() above on a follower therefore yields a stale
+    // value and the QP allocation diverges from the leader's. Here we replace
+    // the follower's target_pos/_vel/_acc/_rpy/_omega/_ang_acc with values
+    // derived from the leader's broadcast plus rigid-formation kinematics.
+    //
+    //   delta_body = (leader_baselink → formation_CoG) − (follower_baselink → formation_CoG)
+    //              = follower_baselink → leader_baselink   [shared body frame]
+    //   p_follower = p_leader + R_target * delta_body
+    //   v_follower = v_leader + ω × (R_target * delta_body)
+    //   a_follower = a_leader + α × Δworld + ω × (ω × Δworld)
+    // For the leader itself this branch is skipped (its own navigator already
+    // holds the correct setpoint). If no leader message has arrived yet, we
+    // fall back to the navigator value (bounded transient at first frame).
+    if (!is_leader && unified_cmd_received_) {
+      const tf::Vector3& lt_pos     = leader_target_pos_;
+      const tf::Vector3& lt_vel     = leader_target_vel_;
+      const tf::Vector3& lt_acc     = leader_target_acc_;
+      const tf::Vector3& lt_rpy     = leader_target_rpy_;
+      const tf::Vector3& lt_omega   = leader_target_omega_;
+      const tf::Vector3& lt_ang_acc = leader_target_ang_acc_;
+
+      // Recompute target_rot with leader's RPY (rigid assembly ⇒ shared orientation).
+      target_rpy_ = lt_rpy;
+      target_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
+
+      tf::Vector3 delta_body(cog_offset_leader_frame.x() - cog_offset_self.x(),
+                             cog_offset_leader_frame.y() - cog_offset_self.y(),
+                             cog_offset_leader_frame.z() - cog_offset_self.z());
+      tf::Vector3 delta_world      = target_rot * delta_body;
+      tf::Vector3 lt_omega_world   = target_rot * lt_omega;
+      tf::Vector3 lt_ang_acc_world = target_rot * lt_ang_acc;
+
+      target_pos_ = lt_pos + delta_world;
+      target_vel_ = lt_vel + lt_omega_world.cross(delta_world);
+      target_acc_ = lt_acc + lt_ang_acc_world.cross(delta_world)
+                  + lt_omega_world.cross(lt_omega_world.cross(delta_world));
+
+      target_omega    = lt_omega;
+      target_omega_   = cog_rot.inverse() * target_rot * target_omega;
+      target_ang_acc_ = lt_ang_acc;
     }
     tf::Vector3 offset_body(cog_offset_self.x(), cog_offset_self.y(), cog_offset_self.z());
     tf::Vector3 offset_world = cog_rot * offset_body;

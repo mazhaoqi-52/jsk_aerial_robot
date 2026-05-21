@@ -125,15 +125,24 @@ namespace aerial_robot_control
 
     // Edge-detector for one-shot takeoff diagnostic in update().
     int prev_navi_state_for_diag_;
-    // Reference msg fields — kept as debug/monitoring only (leader broadcasts,
-    // follower stores). NOT used for follower's control output: follower computes
-    // its own wrench_acc locally in runUnifiedControlCommon().
+    // Reference msg fields cached on the follower side.
+    // wrench_acc / desired_wrench / yaw_pid_raw : debug/monitoring (the
+    //   follower still runs its own QP allocation; these are not consumed).
+    // leader_target_*                           : Phase B — drives the
+    //   follower's target_pos/_vel/_acc/_rpy/_omega/_ang_acc via rigid-formation
+    //   kinematics inside runUnifiedControlCommon().
     Eigen::VectorXd unified_reference_wrench_acc_;
     Eigen::VectorXd unified_reference_desired_wrench_;
     double unified_reference_yaw_pid_raw_;
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;
     int unified_reference_warmup_frames_;
+    tf::Vector3 leader_target_pos_;
+    tf::Vector3 leader_target_vel_;
+    tf::Vector3 leader_target_acc_;
+    tf::Vector3 leader_target_rpy_;
+    tf::Vector3 leader_target_omega_;
+    tf::Vector3 leader_target_ang_acc_;
 
     void unifiedReferenceCallback(const beetle::UnifiedControlReference& msg);
     void ensureUnifiedReferenceSubscription();

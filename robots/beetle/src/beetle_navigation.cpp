@@ -547,11 +547,29 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
       tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
       target_rp.setY(msg->target_pitch);
       setFinalTargetBaselinkRPY(target_rp);
+      const tf::Vector3 final_rpy = getFinalTargetBaselinkRPY();
+      const tf::Vector3 curr_rpy = getCurrTargetBaselinkRPY();
+      const tf::Vector3 target_rpy = getTargetRPY();
+      ROS_INFO("[UnifiedNav id=%d] pitch_cmd=%.3f final_baselink_rpy=(%.3f,%.3f) "
+               "curr_baselink_rpy=(%.3f,%.3f) target_rpy=(%.3f,%.3f)",
+               my_id_, msg->target_pitch,
+               final_rpy.x(), final_rpy.y(),
+               curr_rpy.x(), curr_rpy.y(),
+               target_rpy.x(), target_rpy.y());
     }
     if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
       tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
       target_rp.setX(msg->target_roll);
       setFinalTargetBaselinkRPY(target_rp);
+      const tf::Vector3 final_rpy = getFinalTargetBaselinkRPY();
+      const tf::Vector3 curr_rpy = getCurrTargetBaselinkRPY();
+      const tf::Vector3 target_rpy = getTargetRPY();
+      ROS_INFO("[UnifiedNav id=%d] roll_cmd=%.3f final_baselink_rpy=(%.3f,%.3f) "
+               "curr_baselink_rpy=(%.3f,%.3f) target_rpy=(%.3f,%.3f)",
+               my_id_, msg->target_roll,
+               final_rpy.x(), final_rpy.y(),
+               curr_rpy.x(), curr_rpy.y(),
+               target_rpy.x(), target_rpy.y());
     }
 
     {

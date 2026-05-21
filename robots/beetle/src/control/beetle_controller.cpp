@@ -809,14 +809,14 @@ namespace aerial_robot_control
 
     unified_reference_pub_.publish(msg);
 
-    ROS_INFO_THROTTLE(1.0,
-                      "[UnifiedCtrl REF_PUB] leader_id=%d stamp=%.4f mass=%.3f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
-                      beetle_navigator_->getMyID(),
-                      msg.header.stamp.toSec(),
-                      msg.formation_mass,
-                      target_wrench_acc(2),
-                      target_wrench_acc(4),
-                      yaw_pid_raw);
+    ROS_DEBUG_THROTTLE(1.0,
+                       "[UnifiedCtrl REF_PUB] leader_id=%d stamp=%.4f mass=%.3f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+                       beetle_navigator_->getMyID(),
+                       msg.header.stamp.toSec(),
+                       msg.formation_mass,
+                       target_wrench_acc(2),
+                       target_wrench_acc(4),
+                       yaw_pid_raw);
   }
 
   void BeetleController::unifiedReferenceCallback(const beetle::UnifiedControlReference& msg)
@@ -859,8 +859,8 @@ namespace aerial_robot_control
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
 
-    ROS_INFO_THROTTLE(1.0,
-              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f (debug only - follower uses local control)",
+    ROS_DEBUG_THROTTLE(1.0,
+              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
               beetle_navigator_->getMyID(),
               beetle_navigator_->getLeaderID(),
               (ros::Time::now() - unified_cmd_stamp_).toSec(),
@@ -1840,22 +1840,6 @@ namespace aerial_robot_control
     tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
     tf::Vector3 target_formation_pos = target_pos_ + target_rot * offset_body;
 
-    // [DBG-ATT2POS] Attitude-to-position projection bias: how much pitch/roll
-    // error leaks into the Z position target via offset_body rotation. At hover
-    // with pitch_err 0.05 rad and offset_body.x=0.265, this is ~1.3 cm — large
-    // enough to drive Z PID windup. Throttled 1 Hz.
-    {
-      tf::Vector3 att_proj_bias = (target_rot * offset_body) - (cog_rot * offset_body);
-      ROS_INFO_THROTTLE(1.0,
-        "[DBG-ATT2POS id=%d] (tgt_rot-cog_rot)*off_body=(%.4f,%.4f,%.4f) m | "
-        "off_body=(%.3f,%.3f,%.3f) tgt_rpy=(%.3f,%.3f,%.3f) cur_rpy=(%.3f,%.3f,%.3f)",
-        my_id,
-        att_proj_bias.x(), att_proj_bias.y(), att_proj_bias.z(),
-        offset_body.x(), offset_body.y(), offset_body.z(),
-        target_rpy_.x(), target_rpy_.y(), target_rpy_.z(),
-        rpy_.x(), rpy_.y(), rpy_.z());
-    }
-
     // --- Position PID (X/Y/Z) with formation CoG ---
     double du = ros::Time::now().toSec() - control_timestamp_;
     if (du < 0.0) du = 0.0;
@@ -1874,20 +1858,6 @@ namespace aerial_robot_control
       desired_total_ff = desired_external_wrench_;
     }
     bool task_ff_active = (desired_total_ff.norm() > 1e-6);
-
-    // DEBUG: detect large position jump that may indicate a mocap/estimator discontinuity.
-    // A jump > 1.5 cm in one 40 Hz frame (25 ms) is physically implausible at hover.
-    {
-      static tf::Vector3 s_dbg_prev_pos(0, 0, 0);
-      double djump = (formation_pos - s_dbg_prev_pos).length();
-      if (djump > 0.015 && s_dbg_prev_pos.length() > 0.01)
-        ROS_WARN("[PosJump id=%d] dt=%.4f |dp|=%.4f dx=%.4f dy=%.4f dz=%.4f",
-                 my_id, du, djump,
-                 formation_pos.x() - s_dbg_prev_pos.x(),
-                 formation_pos.y() - s_dbg_prev_pos.y(),
-                 formation_pos.z() - s_dbg_prev_pos.z());
-      s_dbg_prev_pos = formation_pos;
-    }
 
     // XY task feedforward only (formation-observer FF was removed in v5).
     {
@@ -2020,37 +1990,6 @@ namespace aerial_robot_control
                              pid_controllers_.at(Y).result(),
                              pid_controllers_.at(Z).result());
     tf::Vector3 target_acc_cog = uav_rot.inverse() * target_acc_w;
-
-    // [DIAG-A+C] Rolling stddev of XY target_acc over last N=80 samples (~2s @40Hz).
-    // Quantifies how much D-term + observer noise gets injected into target attitude.
-    // High stddev (> ~0.5 m/s²) at hover indicates D-gain / LPF cutoff noise amplification.
-    {
-      static constexpr int DIAG_BUF_N = 80;
-      static double diag_ax_buf[DIAG_BUF_N] = {0};
-      static double diag_ay_buf[DIAG_BUF_N] = {0};
-      static int diag_idx = 0;
-      static int diag_count = 0;
-      diag_ax_buf[diag_idx] = target_acc_cog.x();
-      diag_ay_buf[diag_idx] = target_acc_cog.y();
-      diag_idx = (diag_idx + 1) % DIAG_BUF_N;
-      if (diag_count < DIAG_BUF_N) diag_count++;
-      double mx = 0, my = 0;
-      for (int k = 0; k < diag_count; k++) { mx += diag_ax_buf[k]; my += diag_ay_buf[k]; }
-      mx /= diag_count; my /= diag_count;
-      double vx = 0, vy = 0;
-      for (int k = 0; k < diag_count; k++) {
-        double dx = diag_ax_buf[k] - mx; double dy = diag_ay_buf[k] - my;
-        vx += dx*dx; vy += dy*dy;
-      }
-      double sx = std::sqrt(vx / std::max(diag_count, 1));
-      double sy = std::sqrt(vy / std::max(diag_count, 1));
-      ROS_INFO_THROTTLE(1.0,
-        "[DIAG-A+C id=%d] tgt_acc_cog mean=(%.3f,%.3f) std=(%.3f,%.3f) [m/s^2 over 2s] "
-        "X.PID p=%.3f i=%.3f d=%.3f Y.PID p=%.3f i=%.3f d=%.3f",
-        my_id, mx, my, sx, sy,
-        pid_controllers_.at(X).getPTerm(), pid_controllers_.at(X).getITerm(), pid_controllers_.at(X).getDTerm(),
-        pid_controllers_.at(Y).getPTerm(), pid_controllers_.at(Y).getITerm(), pid_controllers_.at(Y).getDTerm());
-    }
 
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());

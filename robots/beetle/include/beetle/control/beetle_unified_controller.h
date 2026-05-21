@@ -139,8 +139,6 @@ public:
   const Eigen::MatrixXd& getFormationWrenchMatrix() const { return integrated_map_; }
   const Eigen::MatrixXd& getFormationWrenchMatrixInv() const { return integrated_map_inv_; }
   const Eigen::MatrixXd& getFormationWrenchMatrixInvRot() const { return integrated_map_inv_rot_; }
-  double getTargetRoll() const { return target_roll_; }
-  double getTargetPitch() const { return target_pitch_; }
   double getCandidateYawTerm() const { return candidate_yaw_term_; }
   const Eigen::VectorXd& getTargetVectoringForce() const { return target_vectoring_f_; }
   const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
@@ -224,9 +222,7 @@ private:
   Eigen::MatrixXd integrated_map_inv_rot_; // last 3 cols of pseudoinverse (torque part)
   Eigen::VectorXd target_vectoring_f_;    // allocation result
 
-  // Target angles for spinal cascade inner loop
-  double target_roll_;
-  double target_pitch_;
+  // Target yaw term for spinal cascade inner loop
   double candidate_yaw_term_;
 
   // Per-module commands

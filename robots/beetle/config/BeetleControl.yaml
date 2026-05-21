@@ -14,26 +14,6 @@ controller:
   unified_control_mode: false
   unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
 
-  # Differential-mode damping gain (passive internal-force dissipation).
-  # Each module injects -K * inter_wrench/mass (force) and -K * I_inv * inter_wrench (torque)
-  # into its local target_wrench_acc, where inter_wrench = est_wrench_module - mean_over_modules.
-  # Dissipates disagreement between per-module momentum observers (non-rigid interface,
-  # mounting error, IMU/estimator drift, vibration).
-  # 0.0 = DISABLED (real-hardware default — enable only after bag-analyzing
-  # /beetleX/internal_wrench spectrum and confirming no resonance near inner-loop BW).
-  # Recommended tuning path on hardware: 0.0 -> 0.02 -> 0.05 (tether/ground first).
-  unified_diff_damp_gain: 0
-
-  # FormationObserver bias-calibration PID-settled gate.
-  # Bias is only calibrated when the summed |d(R/P/Y I-term)/dt| over one frame
-  # stays below this threshold for N consecutive frames while HOVER is active.
-  # Goal: prevent the observer from "calibrating away" a real cog model error
-  # while the integrators are still compensating for it.
-  # Rule of thumb: if you see pitch_i drifting > 0.05 Nm/frame, raise threshold
-  # (or lower frames) to eventually admit; if you want stricter (avoid false
-  # positives on noisy hover), lower threshold to ~0.02.
-  bias_pid_settled_rate_thresh: 0.05   # [Nm/frame], summed over roll+pitch+yaw I-terms
-  bias_pid_settled_frames:      40     # ~1 s @ 40 Hz
   # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
   # handles LF↔unified switching directly in initUnifiedMode().
 
@@ -57,22 +37,6 @@ controller:
     bias_lpf_cutoff_freq: 0.02
     # Stage-2 ramp: after bias completes, FF rises 0→1 over this many seconds.
     ff_ramp_seconds: 5.0
-
-  # ========== Formation observer feedforward (redesigned, leader-follower style) ==========
-  # Enable ONLY after E2 known-mass validation. Default OFF.
-  # Two-stage attenuation pipeline:
-  #   stage 1 = observer LPF @ 0.05 Hz on bias-subtracted output
-  #   stage 2 = soft ramp * gain * hard clamp, then routed through PID's
-  #             persistent_ff or i_comp_term (i.e. final command is also
-  #             capped by limit_sum / limit_i of the host PID).
-  # Recommended bring-up: enable=true, force_gain=0.05, torque_gain=0.05, ramp=10s.
-  # If hover stays clean for 60 s, raise gain stepwise to 0.2.
-  formation_observer_comp:
-    enable: false
-    force_gain:      0.2   # scalar on F_x/F_y/F_z FF acc [0,1]
-    torque_gain:     0.2   # scalar on T_x/T_y/T_z FF ang-acc [0,1]
-    ff_force_limit:  5.0   # hard clamp on |FF acc|     [m/s^2]
-    ff_torque_limit: 2.0   # hard clamp on |FF ang-acc| [rad/s^2]
 
   yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
 

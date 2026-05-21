@@ -55,30 +55,6 @@ namespace aerial_robot_control
     // V1: 3D force estimation, debug-only (no control feedback).
     std::shared_ptr<FormationMomentumObserver> formation_observer_;
 
-    // Formation observer feedforward (redesigned, leader-follower-style two-stage attenuation)
-    //   Stage 1 = observer-internal LPF (very low cutoff, e.g. 0.05 Hz)
-    //   Stage 2 = soft ramp + per-axis hard clamp + injection through PID
-    //             integrator (limit_i / limit_sum naturally cap final command).
-    // Default disabled; enable only after E2 known-mass validation.
-    // Routing per axis:
-    //   X, Y, Z, YAW       → setPersistentFF (consumed via PID.result())
-    //   ROLL, PITCH        → additive direct FF on target_wrench_acc(3,4)
-    //                       (PID.getITerm() + fobs_comp_ff_torque_*_)
-    //                       Avoids the setICompTerm() accumulation pathology:
-    //                       PID::update() does err_i_ = clamp(err_i_+errp*du)+i_comp,
-    //                       so a constant i_comp written each frame grows err_i_
-    //                       linearly until limit_err_i clamps. A direct additive
-    //                       FF on wrench_acc has the SAME effect as one-shot i_comp
-    //                       (since wrench_acc(3,4)=ROLL/PITCH.getITerm()) but is
-    //                       stateless and cannot accumulate.
-    bool   fobs_comp_enable_;            // master switch (default false)
-    double fobs_comp_force_gain_;        // scalar gain on F_x/F_y/F_z FF acc [0,1]
-    double fobs_comp_torque_gain_;       // scalar gain on Tau_x/_y/_z FF ang-acc [0,1]
-    double fobs_comp_ff_force_limit_;    // hard clamp on |FF acc|     [m/s^2]
-    double fobs_comp_ff_torque_limit_;   // hard clamp on |FF ang-acc| [rad/s^2]
-    // v4: roll/pitch FF on wrench_acc removed — spinal owns full P+I+D roll/pitch,
-    // so PC's target_wrench_acc(3,4) ≡ 0. Yaw FF still applied via setPersistentFF.
-
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;
     bool setUnifiedModeCb(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res);
@@ -158,39 +134,6 @@ namespace aerial_robot_control
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;
     int unified_reference_warmup_frames_;
-
-    // Differential-mode damping gain: injects a passive dissipation term
-    // -K_damp * inter_wrench/mass into target_wrench_acc. D3 architecture:
-    //   diff_i = est_residual_list_[my_id] - formation_observer_wrench_/N
-    // where the common-mode is taken from FormationMomentumObserver (an
-    // INDEPENDENT formation-level external-wrench estimator), not from the
-    // simple per-module average. The previous "residual_i - mean(residual)"
-    // formula had no immunity against common-mode model error (same CoG /
-    // inertia mismatch in every module's observer) and was the source of the
-    // persistent diff-damping signal at hover.
-    // Zero = disabled.
-    double unified_diff_damp_gain_;
-
-    // D3 common-mode source: cached output of the global formation observer
-    // (published by the leader to /assemble/formation_observer/est_ext_wrench).
-    // 6D in formation_body frame ([force(3); torque(3)]).
-    Eigen::VectorXd formation_observer_wrench_;
-    ros::Time formation_observer_wrench_stamp_;
-    ros::Subscriber formation_observer_wrench_sub_;
-    void formationObserverWrenchCallback(const geometry_msgs::WrenchStamped & msg);
-
-    // PID-settled gating for FormationObserver bias calibration (leader only).
-    // Bias is only calibrated when |d/dt of roll/pitch/yaw I-terms| stays below
-    // bias_pid_settled_rate_thresh_ for bias_pid_settled_frames_ consecutive frames,
-    // AND the state is HOVER. This prevents bias absorbing still-growing I-terms
-    // (real-hardware cog model error would otherwise be "calibrated away").
-    double bias_pid_settled_rate_thresh_;  // [Nm / frame] summed over R/P/Y I-terms
-    int    bias_pid_settled_frames_;       // required consecutive quiet frames
-    int    pid_settled_count_;             // running counter
-    double last_roll_i_for_settle_;
-    double last_pitch_i_for_settle_;
-    double last_yaw_i_for_settle_;
-    bool   pid_settle_tracker_init_;
 
     void unifiedReferenceCallback(const beetle::UnifiedControlReference& msg);
     void ensureUnifiedReferenceSubscription();

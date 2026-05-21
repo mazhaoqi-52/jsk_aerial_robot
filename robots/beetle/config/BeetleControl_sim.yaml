@@ -15,20 +15,6 @@ controller:
   unified_control_mode: false
   unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
 
-  # Differential-mode damping gain (passive internal-force dissipation).
-  # Each module injects -K * inter_wrench/mass into its local target_wrench_acc,
-  # where inter_wrench = est_wrench_module - mean(est_wrench_all_modules).
-  # Dissipates disagreement between per-module momentum observers arising from
-  # non-rigid assembly + mounting error + IMU/estimator drift + vibration.
-  # Zero = disabled. Small positive values (0.02~0.1) recommended; too large
-  # will fight the cascade P+D inner loop (since spinal P+D asymmetry leaks
-  # into the per-module observer as an apparent internal wrench).
-  unified_diff_damp_gain: 0.05
-
-  # FormationObserver bias-calibration PID-settled gate. See BeetleControl.yaml
-  # for semantics. Sim tolerances can be tighter since noise is lower.
-  bias_pid_settled_rate_thresh: 0.03   # [Nm/frame], summed over roll+pitch+yaw I-terms
-  bias_pid_settled_frames:      40     # ~1 s @ 40 Hz
   # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
   # handles LF↔unified switching directly in initUnifiedMode().
 

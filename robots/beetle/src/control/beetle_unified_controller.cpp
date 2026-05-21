@@ -26,8 +26,6 @@ BeetleUnifiedController::BeetleUnifiedController()
     external_formation_mass_(0),
     external_formation_cog_offset_(Eigen::Vector3d::Zero()),
     external_formation_inertia_(Eigen::Matrix3d::Zero()),
-    target_roll_(0),
-    target_pitch_(0),
     candidate_yaw_term_(0),
     cascade_alloc_sent_(false),
     has_cascade_gain_cache_(false),
@@ -206,8 +204,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // XY-PID drove monotonic pitch divergence; outer PITCH-I wound up to +5 N·m
   // without ever correcting the body angle. See gimbalrotor_controller.cpp
   // fully-actuated branch for the equivalent pattern.
-  target_roll_  = navigator_->getTargetRPY().x();
-  target_pitch_ = navigator_->getTargetRPY().y();
+  // (Per-frame value is read directly from navigator at buildModuleThrustCommand.)
 
   // Compute candidate yaw term for spinal yaw reconstruction.
   // When yaw already participates in unified allocation, do NOT reconstruct the
@@ -495,8 +492,8 @@ bool BeetleUnifiedController::buildModuleThrustCommand(
   for (int i = 0; i < elems_per_module; i++) {
     thrust_msg.base_thrust[i] = static_cast<float>(target_vectoring_f_(col_start + i));
   }
-  thrust_msg.angles[0] = target_roll_;
-  thrust_msg.angles[1] = target_pitch_;
+  thrust_msg.angles[0] = static_cast<float>(navigator_->getTargetRPY().x());
+  thrust_msg.angles[1] = static_cast<float>(navigator_->getTargetRPY().y());
   thrust_msg.angles[2] = candidate_yaw_term_;
   return true;
 }

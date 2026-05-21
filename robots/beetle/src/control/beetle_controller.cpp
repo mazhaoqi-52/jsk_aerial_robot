@@ -20,22 +20,9 @@ namespace aerial_robot_control
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
-    unified_diff_damp_gain_(0.0),
-    bias_pid_settled_rate_thresh_(0.05),
-    bias_pid_settled_frames_(40),
-    pid_settled_count_(0),
-    last_roll_i_for_settle_(0.0),
-    last_pitch_i_for_settle_(0.0),
-    last_yaw_i_for_settle_(0.0),
-    pid_settle_tracker_init_(false),
     unified_transition_count_(-1),
     yaw_in_allocation_(false),
-    gains_switched_(false),
-    fobs_comp_enable_(false),
-    fobs_comp_force_gain_(0.0),
-    fobs_comp_torque_gain_(0.0),
-    fobs_comp_ff_force_limit_(0.5),
-    fobs_comp_ff_torque_limit_(0.3)
+    gains_switched_(false)
   {
   }
 
@@ -87,15 +74,6 @@ namespace aerial_robot_control
     inter_disagreement_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("inter_disagreement", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
     formation_desired_wrench_sub_ = nh_.subscribe("formation_desired_wrench", 1, &BeetleController::formationDesiredWrenchCallback, this);
-    // D3: subscribe to the global formation observer output (leader publishes;
-    // every module — leader and followers — receives it). Used as common-mode
-    // reference in unified diff-damping so the differential signal is immune
-    // to common-mode model error in the per-module observers.
-    formation_observer_wrench_ = Eigen::VectorXd::Zero(6);
-    formation_observer_wrench_stamp_ = ros::Time(0);
-    formation_observer_wrench_sub_ = nh_.subscribe(
-        "/assemble/formation_observer/est_ext_wrench", 1,
-        &BeetleController::formationObserverWrenchCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
@@ -355,9 +333,6 @@ namespace aerial_robot_control
       formation_observer_->setActive(true);
       ROS_INFO("[UnifiedCtrl] Formation observer activated (reset + active)");
     }
-    // Reset PID-settled tracker so new takeoff starts with a clean state.
-    pid_settle_tracker_init_ = false;
-    pid_settled_count_ = 0;
 
     ROS_WARN("[UnifiedCtrl] %s id=%d mode switch: reset targets, sent cascade gains%s, "
              "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
@@ -1054,11 +1029,6 @@ namespace aerial_robot_control
              unified_xy_gains_.p, unified_xy_gains_.i, unified_xy_gains_.d,
              unified_z_gains_.p, unified_z_gains_.i, unified_z_gains_.d,
              unified_yaw_gains_.p, unified_yaw_gains_.i, unified_yaw_gains_.d);
-    // NOTE: ζ = D / (2·√P) damping-ratio heuristic was removed — it assumes a
-    // unit-mass 2nd-order plant ẍ=u, but our XY PID outputs target_acc_cog,
-    // which feeds atan2 → target attitude → 1 kHz spinal inner loop → motor
-    // → gravity projection (≥4-order dynamics). Stability cannot be inferred
-    // from PID gains in isolation; use frequency-domain identification.
   }
 
   void BeetleController::restoreIndependentGains()
@@ -1346,19 +1316,6 @@ namespace aerial_robot_control
     getParam<int>(control_nh, "unified_reference_warmup_frames", unified_reference_warmup_frames_, 20);
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
 
-    // Differential-mode damping gain for symmetric-local unified control.
-    // Injects -K * inter_wrench/mass into target_wrench_acc as passive dissipation
-    // on the disagreement between per-module external-wrench estimators. Zero disables.
-    getParam<double>(control_nh, "unified_diff_damp_gain", unified_diff_damp_gain_, 0.0);
-
-    // Bias-calibration PID-settled gate (real-hardware safety): the FormationObserver
-    // bias will only be calibrated once |d(R/P/Y I-term)/dt| summed drops below the
-    // threshold for N consecutive frames while HOVER state is active.
-    getParam<double>(control_nh, "bias_pid_settled_rate_thresh",
-                     bias_pid_settled_rate_thresh_, 0.05);
-    getParam<int>(control_nh, "bias_pid_settled_frames",
-                  bias_pid_settled_frames_, 40);
-
     // Roll/Pitch I-term keep ratio removed: outer R/P I-channel disabled in unified mode.
 
     // Load unified-mode PID gains for roll/pitch.
@@ -1412,16 +1369,6 @@ namespace aerial_robot_control
     getParam<double>(u_yaw_nh, "limit_i", unified_yaw_gains_.limit_i, 5.0);
     getParam<double>(u_yaw_nh, "limit_d", unified_yaw_gains_.limit_d, 20.0);
 
-    // Formation observer feedforward (redesigned). Default disabled.
-    // Force/torque gains scale ramped, bias-subtracted, LPF-filtered observer output;
-    // ff_*_limit then hard-clamps the resulting FF acceleration.
-    ros::NodeHandle obs_comp_nh(control_nh, "formation_observer_comp");
-    getParam<bool>(obs_comp_nh,   "enable",          fobs_comp_enable_,           false);
-    getParam<double>(obs_comp_nh, "force_gain",      fobs_comp_force_gain_,       0.0);
-    getParam<double>(obs_comp_nh, "torque_gain",     fobs_comp_torque_gain_,      0.0);
-    getParam<double>(obs_comp_nh, "ff_force_limit",  fobs_comp_ff_force_limit_,   0.5);
-    getParam<double>(obs_comp_nh, "ff_torque_limit", fobs_comp_ff_torque_limit_,  0.3);
-
   }
 
   void BeetleController::externalWrenchEstimate()
@@ -1439,9 +1386,6 @@ namespace aerial_robot_control
     // residual that contaminates inter_wrench during tilted or accelerated
     // flight. In LF / independent mode the legacy single-module expression is
     // retained.
-    //
-    // Only the differential component (est - mean, via calcInteractionWrench)
-    // is fed back through unified_diff_damp_gain_, which is small by design.
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&
@@ -1646,21 +1590,6 @@ namespace aerial_robot_control
     formation_desired_wrench_(3) = msg.wrench.torque.x;
     formation_desired_wrench_(4) = msg.wrench.torque.y;
     formation_desired_wrench_(5) = msg.wrench.torque.z;
-  }
-
-  void BeetleController::formationObserverWrenchCallback(const geometry_msgs::WrenchStamped& msg)
-  {
-    // D3: cache the formation-level external wrench estimate published by the
-    // leader's FormationMomentumObserver. Used as common-mode reference when
-    // computing the per-module differential signal in unified diff-damping.
-    // Frame convention: world-frame force, body-frame torque (matches observer output).
-    formation_observer_wrench_(0) = msg.wrench.force.x;
-    formation_observer_wrench_(1) = msg.wrench.force.y;
-    formation_observer_wrench_(2) = msg.wrench.force.z;
-    formation_observer_wrench_(3) = msg.wrench.torque.x;
-    formation_observer_wrench_(4) = msg.wrench.torque.y;
-    formation_observer_wrench_(5) = msg.wrench.torque.z;
-    formation_observer_wrench_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
   }
 
   void BeetleController::publishAssembleDebug(
@@ -1881,10 +1810,7 @@ namespace aerial_robot_control
       s_dbg_prev_pos = formation_pos;
     }
 
-    // XY task feedforward only. Formation-observer FF (fobs_comp) was deleted
-    // in v5: empirically it formed a positive-feedback loop with the bias
-    // calibration in the momentum observer, and provided no benefit over the
-    // PID I-term integration in steady-state.
+    // XY task feedforward only (formation-observer FF was removed in v5).
     {
       double mass_inv_f = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
       double ff_x = 0.0, ff_y = 0.0;
@@ -1933,7 +1859,6 @@ namespace aerial_robot_control
     {
       double mass_inv_z = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
       double ff_z = 0.0;
-      // fobs_comp Z FF removed (v5). Task FF only.
       if (task_ff_active) {
         ff_z += desired_total_ff(2) * mass_inv_z;
       }
@@ -1967,8 +1892,7 @@ namespace aerial_robot_control
     double du_rp = du;
     if (!start_rp_integration_) du_rp = 0;
 
-    // Yaw task-torque feedforward (only). fobs_comp torque FF removed in v5
-    // along with the rest of the observer-FF chain.
+    // Yaw task-torque feedforward (only).
     {
       double ff_yaw = 0.0;
       if (task_ff_active) {
@@ -2075,23 +1999,6 @@ namespace aerial_robot_control
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
     }
 
-    // v5: D3 differential-mode damping deleted.
-    //   - Mathematically the diff signal was injected at the allocation
-    //     layer instead of at a PID I-output (no integration smoothing,
-    //     no dead-zone, no LPF) which mixes high-frequency observer noise
-    //     with the wrench command.
-    //   - Functionally it duplicated the role originally served by the
-    //     pre-2025 leader-follower setICompTerm path, but at the wrong
-    //     point in the cascade.
-    //   - Phase 3 will revisit "module-internal-force compensation"
-    //     by reviving the original-beetle calcInteractionWrench /
-    //     setICompTerm route, which acts on each module's PID I-term
-    //     channel.
-    // The formation observer subscription itself is preserved so that
-    // diagnostics ( /formation_observer/wrench ) are still published.
-    (void)formation_observer_wrench_stamp_;
-    (void)unified_diff_damp_gain_;
-
     // [DBG-NANGUARD] Catch non-finite or absurd target_wrench_acc BEFORE feeding
     // it to allocation pseudoinverse. SIGSEGV in spinal pipeline is typically
     // caused by NaN/Inf propagating through Eigen path. Print FULL context so
@@ -2133,18 +2040,6 @@ namespace aerial_robot_control
     unified_controller_->clearFormationModelOverride();
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
 
-    // v5 (db6cec4d-style): close the outer R/P pseudo-error loop.
-    //   The allocator computes target_roll_/target_pitch_ internally from the
-    //   commanded thrust direction. Writing them back into navigator's
-    //   target_rpy ensures the next frame's outer R/P PID computes
-    //   err = navigator_target_rpy - rpy_, i.e. the *real* attitude tracking
-    //   error rather than (0 - rpy_) which would saturate the I-term toward
-    //   the cog_offset bias and oscillate at hover.
-    if (ok) {
-      navigator_->setTargetRoll(unified_controller_->getTargetRoll());
-      navigator_->setTargetPitch(unified_controller_->getTargetPitch());
-    }
-
     // [DBG-NANGUARD2] Detect non-finite allocation output: if the pseudoinverse
     // produced NaN, downstream spinal packing will likely SIGSEGV.
     if (ok) {
@@ -2177,40 +2072,10 @@ namespace aerial_robot_control
           Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
           Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
 
-          // PID-settled gate: block bias calibration while R/P/Y I-terms are
-          // still drifting (otherwise a real cog model error would be absorbed
-          // as observer bias and the FF path would stop compensating it).
+          // Arm bias calibration only while the formation is in hover.
           const bool in_hover =
               (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
-          bool pid_settled = false;
-          double last_drift = 0.0;
-          if (!in_hover) {
-            pid_settled_count_ = 0;
-            pid_settle_tracker_init_ = false;
-          } else {
-            double cur_roll_i  = pid_controllers_.at(ROLL).getITerm();
-            double cur_pitch_i = pid_controllers_.at(PITCH).getITerm();
-            double cur_yaw_i   = pid_controllers_.at(YAW).getITerm();
-            if (!pid_settle_tracker_init_) {
-              pid_settle_tracker_init_ = true;
-              pid_settled_count_       = 0;
-            } else {
-              last_drift = std::fabs(cur_roll_i  - last_roll_i_for_settle_)
-                         + std::fabs(cur_pitch_i - last_pitch_i_for_settle_)
-                         + std::fabs(cur_yaw_i   - last_yaw_i_for_settle_);
-              if (last_drift < bias_pid_settled_rate_thresh_) pid_settled_count_++;
-              else                                            pid_settled_count_ = 0;
-            }
-            last_roll_i_for_settle_  = cur_roll_i;
-            last_pitch_i_for_settle_ = cur_pitch_i;
-            last_yaw_i_for_settle_   = cur_yaw_i;
-            pid_settled = (pid_settled_count_ >= bias_pid_settled_frames_);
-            ROS_INFO_THROTTLE(2.0,
-                "[UnifiedCtrl] PID-settle gate: count=%d/%d, drift=%.4f (<%.4f?), settled=%d",
-                pid_settled_count_, bias_pid_settled_frames_,
-                last_drift, bias_pid_settled_rate_thresh_, pid_settled ? 1 : 0);
-          }
-          formation_observer_->setFfArmed(in_hover && pid_settled);
+          formation_observer_->setFfArmed(in_hover);
           formation_observer_->update(
               unified_controller_->getFormationMass(),
               unified_controller_->getFormationInertia(),

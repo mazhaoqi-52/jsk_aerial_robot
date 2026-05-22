@@ -710,7 +710,7 @@ bool BeetleUnifiedController::buildModuleThrustCommand(
   const tf::Vector3 target_rpy = navigator_->getTargetRPY();
   const tf::Vector3 final_baselink_rpy = navigator_->getFinalTargetBaselinkRPY();
   const tf::Vector3 curr_baselink_rpy = navigator_->getCurrTargetBaselinkRPY();
-  ROS_INFO_THROTTLE(
+  ROS_DEBUG_THROTTLE(
       2.0,
       "[UnifiedCtrl PitchChain id=%d] cmd_angles=(%.3f,%.3f,%.3f) "
       "target_rpy=(%.3f,%.3f,%.3f) final_baselink_rp=(%.3f,%.3f) curr_baselink_rp=(%.3f,%.3f)",

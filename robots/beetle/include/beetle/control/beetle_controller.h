@@ -78,9 +78,10 @@ namespace aerial_robot_control
      *  to LEADER's own spinal. */
     void sendCascadeSetup();
 
-    /** @brief FOLLOWER-only: send cascade gains + gimbal_dof=1 to THIS module's own spinal
-     *  only (via base-class publishers). Does NOT send alloc_inv or affect other modules. */
+    /** @brief FOLLOWER-only: set gimbal_dof=1 on THIS module's own spinal.
+     *  Cascade gains are sent later by a local one-shot after alloc_inv is ready. */
     void sendFollowerCascadeSetup();
+    void sendFollowerCascadeGains();
 
     /** @brief Common exit path: restore gains, reset targets, seed Z I-term, clear RP/XY. */
     void resetToIndependentHover();
@@ -137,25 +138,29 @@ namespace aerial_robot_control
     // Reference msg fields cached on the follower side.
     // wrench_acc / desired_wrench / yaw_pid_raw : debug/monitoring (the
     //   follower still runs its own QP allocation; these are not consumed).
-    // leader_target_*                           : Phase B — drives the
+    // leader_target_* / final_target_baselink  : Phase B — drives the
     //   follower's target_pos/_vel/_acc/_rpy/_omega/_ang_acc via rigid-formation
-    //   kinematics inside runUnifiedControlCommon().
+    //   kinematics inside runUnifiedControlCommon() while keeping PID attitude
+    //   and physical baselink tilt separate.
     Eigen::VectorXd unified_reference_wrench_acc_;
     Eigen::VectorXd unified_reference_desired_wrench_;
     double unified_reference_yaw_pid_raw_;
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;
     int unified_reference_warmup_frames_;
+    bool local_unified_cascade_setup_sent_;
     tf::Vector3 leader_target_pos_;
     tf::Vector3 leader_target_vel_;
     tf::Vector3 leader_target_acc_;
     tf::Vector3 leader_target_rpy_;
+    tf::Vector3 leader_final_target_baselink_rpy_;
     tf::Vector3 leader_target_omega_;
     tf::Vector3 leader_target_ang_acc_;
 
     void unifiedReferenceCallback(const beetle::UnifiedControlReference& msg);
     void ensureUnifiedReferenceSubscription();
     bool publishLocalUnifiedCommand();
+    bool sendLocalUnifiedCascadeSetupOnce();
     bool publishLocalUnifiedTorqueAllocationMatrixInv();
     void publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                    const Eigen::VectorXd& desired_wrench,

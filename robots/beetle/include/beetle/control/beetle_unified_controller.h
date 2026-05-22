@@ -78,7 +78,7 @@ public:
 
   /** @brief Send torque_allocation_matrix_inv sub-blocks to each module's spinal.
    *  Each module receives only its own rows (motor_num_per_module_ * rotor_coef_ rows × 3 cols).
-   *  Called once at mode switch and periodically to handle late spinal startup.
+   *  Called at mode switch / one-shot resend; not part of the control loop.
    *  @return true if matrix was sent, false if not yet computed. */
   bool sendTorqueAllocationMatrixInv();
 

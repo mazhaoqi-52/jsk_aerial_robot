@@ -23,6 +23,7 @@ namespace aerial_robot_control
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
+    local_unified_cascade_setup_sent_(false),
     unified_internal_wrench_diag_(true),
     unified_internal_wrench_log_(true),
     unified_internal_wrench_log_period_(1.0),
@@ -31,6 +32,7 @@ namespace aerial_robot_control
     leader_target_vel_(0, 0, 0),
     leader_target_acc_(0, 0, 0),
     leader_target_rpy_(0, 0, 0),
+    leader_final_target_baselink_rpy_(0, 0, 0),
     leader_target_omega_(0, 0, 0),
     leader_target_ang_acc_(0, 0, 0),
     unified_transition_count_(-1),
@@ -347,8 +349,10 @@ namespace aerial_robot_control
 
     if (is_leader) {
       sendCascadeSetup();     // reads from unified_*_gains_ directly, order-independent
+      local_unified_cascade_setup_sent_ = true;  // leader one-shot is owned by BeetleUnifiedController
     } else {
-      sendFollowerCascadeSetup();  // follower: own spinal only
+      local_unified_cascade_setup_sent_ = false;
+      sendFollowerCascadeSetup();  // follower: gimbal_dof now, alloc_inv/gains after matrix is ready
       ensureUnifiedReferenceSubscription();  // still subscribe for debug/monitoring
     }
     applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
@@ -363,11 +367,12 @@ namespace aerial_robot_control
       ROS_INFO("[UnifiedCtrl] Formation observer activated (reset + active)");
     }
 
-    ROS_WARN("[UnifiedCtrl] %s id=%d mode switch: reset targets, sent cascade gains%s, "
+    ROS_WARN("[UnifiedCtrl] %s id=%d mode switch: reset targets, %s, "
              "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
              is_leader ? "LEADER" : "FOLLOWER",
              beetle_navigator_->getMyID(),
-             is_leader ? " + alloc_inv to all spinals" : " to own spinal",
+             is_leader ? "sent/deferred cascade setup to all spinals"
+                       : "deferred local alloc_inv/gains until matrix ready",
              unified_reference_warmup_frames_, ros::Time::now().toSec());
     formation_desired_wrench_.setZero();
     clearInternalWrenchState();
@@ -432,6 +437,7 @@ namespace aerial_robot_control
       unified_controller_->resetCascadeAllocSent();
       unified_controller_->resetQPState();
       unified_reference_warmup_count_ = 0;
+      local_unified_cascade_setup_sent_ = false;
       beetle_navigator_->setUnifiedControlMode(false);
 
       ros::NodeHandle control_nh(nh_, "controller");
@@ -783,6 +789,22 @@ namespace aerial_robot_control
     return true;
   }
 
+  bool BeetleController::sendLocalUnifiedCascadeSetupOnce()
+  {
+    if (local_unified_cascade_setup_sent_) return true;
+
+    if (!publishLocalUnifiedTorqueAllocationMatrixInv()) {
+      return false;
+    }
+
+    sendFollowerCascadeGains();
+    local_unified_cascade_setup_sent_ = true;
+    ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d one-shot local cascade setup: "
+             "alloc_inv + gains sent to own spinal",
+             beetle_navigator_->getMyID());
+    return true;
+  }
+
   void BeetleController::publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                                                  const Eigen::VectorXd& desired_wrench,
                                                  double yaw_pid_raw)
@@ -815,19 +837,25 @@ namespace aerial_robot_control
     msg.yaw_pid_raw = yaw_pid_raw;
 
     // Phase B: broadcast leader's navigator setpoints. Followers reconstruct
-    // their per-module reference from these via rigid-formation kinematics
-    // (see runUnifiedControlCommon "Phase B follower override" block).
+    // their per-module reference from these via rigid-formation kinematics.
+    // Keep PID target attitude and physical baselink attitude separate: unified
+    // roll/pitch tilt lives in final_target_baselink_rpy, not target_rpy_.
     {
       tf::Vector3 lt_pos     = navigator_->getTargetPos();
       tf::Vector3 lt_vel     = navigator_->getTargetVel();
       tf::Vector3 lt_acc     = navigator_->getTargetAcc();
       tf::Vector3 lt_rpy     = navigator_->getTargetRPY();
+      tf::Vector3 lt_final_baselink_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
       tf::Vector3 lt_omega   = navigator_->getTargetOmega();
       tf::Vector3 lt_ang_acc = navigator_->getTargetAngAcc();
+      lt_final_baselink_rpy.setZ(lt_rpy.z());
       msg.leader_target_pos.x     = lt_pos.x();     msg.leader_target_pos.y     = lt_pos.y();     msg.leader_target_pos.z     = lt_pos.z();
       msg.leader_target_vel.x     = lt_vel.x();     msg.leader_target_vel.y     = lt_vel.y();     msg.leader_target_vel.z     = lt_vel.z();
       msg.leader_target_acc.x     = lt_acc.x();     msg.leader_target_acc.y     = lt_acc.y();     msg.leader_target_acc.z     = lt_acc.z();
       msg.leader_target_rpy.x     = lt_rpy.x();     msg.leader_target_rpy.y     = lt_rpy.y();     msg.leader_target_rpy.z     = lt_rpy.z();
+      msg.leader_final_target_baselink_rpy.x = lt_final_baselink_rpy.x();
+      msg.leader_final_target_baselink_rpy.y = lt_final_baselink_rpy.y();
+      msg.leader_final_target_baselink_rpy.z = lt_final_baselink_rpy.z();
       msg.leader_target_omega.x   = lt_omega.x();   msg.leader_target_omega.y   = lt_omega.y();   msg.leader_target_omega.z   = lt_omega.z();
       msg.leader_target_ang_acc.x = lt_ang_acc.x(); msg.leader_target_ang_acc.y = lt_ang_acc.y(); msg.leader_target_ang_acc.z = lt_ang_acc.z();
     }
@@ -943,6 +971,9 @@ namespace aerial_robot_control
     leader_target_rpy_.setValue(msg.leader_target_rpy.x,
                                 msg.leader_target_rpy.y,
                                 msg.leader_target_rpy.z);
+    leader_final_target_baselink_rpy_.setValue(msg.leader_final_target_baselink_rpy.x,
+                                               msg.leader_final_target_baselink_rpy.y,
+                                               msg.leader_final_target_baselink_rpy.z);
     leader_target_omega_.setValue(msg.leader_target_omega.x,
                                   msg.leader_target_omega.y,
                                   msg.leader_target_omega.z);
@@ -1042,13 +1073,20 @@ namespace aerial_robot_control
 
   void BeetleController::sendFollowerCascadeSetup()
   {
-    // FOLLOWER-only: send P/D gains and gimbal_dof to THIS module's
-    // own spinal only (via base-class publishers).
-    //
-    // Read directly from unified_*_gains_ (not pid_controllers_) because
-    // FOLLOWER does not call applyUnifiedGains() (it doesn't run PID).
-    // pid_controllers_ may still hold independent-mode values at this point.
+    // Set gimbal_dof=1 on own spinal
+    {
+      std_msgs::UInt8 gimbal_dof_msg;
+      gimbal_dof_msg.data = 1;
+      gimbal_dof_pub_.publish(gimbal_dof_msg);
+    }
 
+    ROS_INFO("[UnifiedCtrl] Cascade setup (FOLLOWER id=%d): gimbal_dof=1 sent, "
+             "alloc_inv/gains deferred until local allocation matrix is ready",
+             beetle_navigator_->getMyID());
+  }
+
+  void BeetleController::sendFollowerCascadeGains()
+  {
     double roll_p  = unified_roll_gains_.p;
     double roll_i  = 0.0;  // v5: PC owns I; spinal P+D only
     double roll_d  = unified_roll_gains_.d;
@@ -1057,31 +1095,21 @@ namespace aerial_robot_control
     double pitch_d = unified_pitch_gains_.d;
     double yaw_d   = unified_yaw_gains_.d;
 
-    // Send gains to own spinal via base-class publisher (rpy_gain_pub_)
-    {
-      spinal::RollPitchYawTerms rpy_gain_msg;
-      rpy_gain_msg.motors.resize(1);  // torque-level path
-      rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p  * 1000);
-      rpy_gain_msg.motors[0].roll_i  = static_cast<int16_t>(roll_i  * 1000);  // v4: spinal owns I
-      rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d  * 1000);
-      rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(pitch_p * 1000);
-      rpy_gain_msg.motors[0].pitch_i = static_cast<int16_t>(pitch_i * 1000);  // v4: spinal owns I
-      rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(pitch_d * 1000);
-      rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d   * 1000);
-      rpy_gain_pub_.publish(rpy_gain_msg);
-    }
+    spinal::RollPitchYawTerms rpy_gain_msg;
+    rpy_gain_msg.motors.resize(1);  // torque-level path
+    rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p  * 1000);
+    rpy_gain_msg.motors[0].roll_i  = static_cast<int16_t>(roll_i  * 1000);
+    rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d  * 1000);
+    rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(pitch_p * 1000);
+    rpy_gain_msg.motors[0].pitch_i = static_cast<int16_t>(pitch_i * 1000);
+    rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(pitch_d * 1000);
+    rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d   * 1000);
+    rpy_gain_pub_.publish(rpy_gain_msg);
 
-    // Set gimbal_dof=1 on own spinal
-    {
-      std_msgs::UInt8 gimbal_dof_msg;
-      gimbal_dof_msg.data = 1;
-      gimbal_dof_pub_.publish(gimbal_dof_msg);
-    }
-
-    ROS_INFO("[UnifiedCtrl] Cascade setup (FOLLOWER id=%d): sent gains"
-             "(P_r=%.1f D_r=%.1f P_p=%.1f D_p=%.1f D_y=%.1f) + gimbal_dof=1 to own spinal only",
+    ROS_INFO("[UnifiedCtrl] FOLLOWER id=%d sent cascade gains "
+             "(P_r=%.1f I_r=%.2f D_r=%.1f P_p=%.1f I_p=%.2f D_p=%.1f D_y=%.1f) to own spinal",
              beetle_navigator_->getMyID(),
-             roll_p, roll_d, pitch_p, pitch_d, yaw_d);
+             roll_p, roll_i, roll_d, pitch_p, pitch_i, pitch_d, yaw_d);
   }
 
   void BeetleController::applyUnifiedGains()
@@ -1269,13 +1297,17 @@ namespace aerial_robot_control
             ROS_INFO_STREAM("[UnifiedCtrl] change unified gain for controller '" << pid_controllers_.at(index).getName() << "'");
           }
 
-        // Resend P/D gains to all Spinals when unified roll/pitch/yaw gains change.
-        // Since sendCascadeSetup() reads from unified_*_gains_ directly, it will
-        // pick up the new value automatically.
+        // Resend P/D gains when unified roll/pitch/yaw gains change. Followers
+        // keep the same matrix-first ordering via their local one-shot path.
         if (level == Levels::RECONFIGURE_P_GAIN || level == Levels::RECONFIGURE_D_GAIN) {
           if (unified_controller_) {
-            sendCascadeSetup();
-            ROS_INFO("[UnifiedCtrl] Resent cascade gains to Spinals after dynreconf P/D change");
+            if (beetle_navigator_->getModuleState() == FOLLOWER) {
+              local_unified_cascade_setup_sent_ = false;
+              ROS_INFO("[UnifiedCtrl] Marked follower local cascade setup dirty after dynreconf P/D change");
+            } else {
+              sendCascadeSetup();
+              ROS_INFO("[UnifiedCtrl] Resent cascade gains to Spinals after dynreconf P/D change");
+            }
           }
         }
       }
@@ -1450,17 +1482,20 @@ namespace aerial_robot_control
            << ",rmsT=" << rms_t
            << ",pairs=" << n_pairs << "]";
       }
-      ss << " modules:";
+      ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, ss.str());
+
+      std::ostringstream detail_ss;
+      detail_ss << ss.str() << " modules:";
       for (int i = 1; i <= max_modules_num; ++i) {
         if (!assembly_flag[i]) continue;
-        ss << " m" << i
-           << "{est=" << fmtWrench(est_wrench_list_[i])
-           << ",task=" << fmtWrench(est_wrench_task_list_[i])
-           << ",res=" << fmtWrench(est_residual_list_[i])
-           << ",inter=" << fmtWrench(inter_wrench_list_[i])
-           << ",comp=" << fmtWrench(wrench_comp_list_[i]) << "}";
+        detail_ss << " m" << i
+                  << "{est=" << fmtWrench(est_wrench_list_[i])
+                  << ",task=" << fmtWrench(est_wrench_task_list_[i])
+                  << ",res=" << fmtWrench(est_residual_list_[i])
+                  << ",inter=" << fmtWrench(inter_wrench_list_[i])
+                  << ",comp=" << fmtWrench(wrench_comp_list_[i]) << "}";
       }
-      ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, ss.str());
+      ROS_DEBUG_STREAM_THROTTLE(unified_internal_wrench_log_period_, detail_ss.str());
     }
   }
 
@@ -1899,6 +1934,12 @@ namespace aerial_robot_control
     // pose_linear_controller.cpp:244).
     target_rpy_ = navigator_->getTargetRPY();
     tf::Matrix3x3 target_rot; target_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
+    tf::Vector3 target_baselink_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
+    target_baselink_rpy.setZ(target_rpy_.z());
+    tf::Matrix3x3 target_baselink_rot;
+    target_baselink_rot.setRPY(target_baselink_rpy.x(),
+                               target_baselink_rpy.y(),
+                               target_baselink_rpy.z());
     tf::Vector3 target_omega = navigator_->getTargetOmega();
     target_omega_ = cog_rot.inverse() * target_rot * target_omega;
     target_ang_acc_ = navigator_->getTargetAngAcc();
@@ -1934,17 +1975,15 @@ namespace aerial_robot_control
     }
 
     // ---- Phase B follower override --------------------------------------
-    // In unified mode the follower's own navigator never receives the
-    // user/trajectory setpoint (only the leader's does). Reading
-    // navigator_->getTargetPos() above on a follower therefore yields a stale
-    // value and the QP allocation diverges from the leader's. Here we replace
-    // the follower's target_pos/_vel/_acc/_rpy/_omega/_ang_acc with values
-    // derived from the leader's broadcast plus rigid-formation kinematics.
+    // In unified mode the follower must derive its module reference from the
+    // leader's broadcast so all modules close the same formation target, even
+    // if a local navigator command is late, absent, or expressed in a different
+    // intermediate frame.
     //
     //   delta_body = (leader_baselink → formation_CoG) − (follower_baselink → formation_CoG)
     //              = follower_baselink → leader_baselink   [shared body frame]
-    //   p_follower = p_leader + R_target * delta_body
-    //   v_follower = v_leader + ω × (R_target * delta_body)
+    //   p_follower = p_leader + R_baselink_target * delta_body
+    //   v_follower = v_leader + ω × (R_baselink_target * delta_body)
     //   a_follower = a_leader + α × Δworld + ω × (ω × Δworld)
     // For the leader itself this branch is skipped (its own navigator already
     // holds the correct setpoint). If no leader message has arrived yet, we
@@ -1954,17 +1993,23 @@ namespace aerial_robot_control
       const tf::Vector3& lt_vel     = leader_target_vel_;
       const tf::Vector3& lt_acc     = leader_target_acc_;
       const tf::Vector3& lt_rpy     = leader_target_rpy_;
+      const tf::Vector3& lt_final_baselink_rpy = leader_final_target_baselink_rpy_;
       const tf::Vector3& lt_omega   = leader_target_omega_;
       const tf::Vector3& lt_ang_acc = leader_target_ang_acc_;
 
       // Recompute target_rot with leader's RPY (rigid assembly ⇒ shared orientation).
       target_rpy_ = lt_rpy;
       target_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
+      target_baselink_rpy = lt_final_baselink_rpy;
+      target_baselink_rpy.setZ(target_rpy_.z());
+      target_baselink_rot.setRPY(target_baselink_rpy.x(),
+                                 target_baselink_rpy.y(),
+                                 target_baselink_rpy.z());
 
       tf::Vector3 delta_body(cog_offset_leader_frame.x() - cog_offset_self.x(),
                              cog_offset_leader_frame.y() - cog_offset_self.y(),
                              cog_offset_leader_frame.z() - cog_offset_self.z());
-      tf::Vector3 delta_world      = target_rot * delta_body;
+      tf::Vector3 delta_world      = target_baselink_rot * delta_body;
       tf::Vector3 lt_omega_world   = target_rot * lt_omega;
       tf::Vector3 lt_ang_acc_world = target_rot * lt_ang_acc;
 
@@ -1982,7 +2027,7 @@ namespace aerial_robot_control
     tf::Vector3 formation_pos = pos_ + offset_world;
     tf::Vector3 omega_world = cog_rot * omega_;
     tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
-    tf::Vector3 target_formation_pos = target_pos_ + target_rot * offset_body;
+    tf::Vector3 target_formation_pos = target_pos_ + target_baselink_rot * offset_body;
 
     // --- Position PID (X/Y/Z) with formation CoG ---
     double du = ros::Time::now().toSec() - control_timestamp_;
@@ -2198,8 +2243,10 @@ namespace aerial_robot_control
     }
 
     if (ok) {
+      if (!is_leader) {
+        sendLocalUnifiedCascadeSetupOnce();
+      }
       publishLocalUnifiedCommand();
-      publishLocalUnifiedTorqueAllocationMatrixInv();
       if (is_leader) {
         publishUnifiedReference(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
         if (formation_observer_ && formation_observer_->isActive()) {

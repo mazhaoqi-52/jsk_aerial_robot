@@ -8,7 +8,6 @@ namespace aerial_robot_control
     GimbalrotorController(),
     pd_wrench_comp_mode_(false),
     pre_module_state_(SEPARATED),
-    desired_external_wrench_(Eigen::VectorXd::Zero(6)),
     formation_desired_wrench_(Eigen::VectorXd::Zero(6)),
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
@@ -20,6 +19,8 @@ namespace aerial_robot_control
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
+    unified_internal_wrench_diag_(true),
+    unified_internal_wrench_secondary_gain_(0.0),
     leader_target_pos_(0, 0, 0),
     leader_target_vel_(0, 0, 0),
     leader_target_acc_(0, 0, 0),
@@ -246,6 +247,18 @@ namespace aerial_robot_control
     pid_controllers_.at(Z).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
     formation_desired_wrench_.setZero();
+    clearInternalWrenchState();
+  }
+
+  void BeetleController::clearInternalWrenchState()
+  {
+    for (auto& kv : est_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
+    for (auto& kv : est_residual_list_) kv.second = Eigen::VectorXd::Zero(6);
+    for (auto& kv : inter_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
+    for (auto& kv : wrench_comp_list_) kv.second = Eigen::VectorXd::Zero(6);
+    if (unified_controller_) {
+      unified_controller_->clearInternalWrenchSecondaryReference();
+    }
   }
 
   void BeetleController::initUnifiedMode(bool is_leader)
@@ -347,6 +360,7 @@ namespace aerial_robot_control
              is_leader ? " + alloc_inv to all spinals" : " to own spinal",
              unified_reference_warmup_frames_, ros::Time::now().toSec());
     formation_desired_wrench_.setZero();
+    clearInternalWrenchState();
   }
 
   void BeetleController::controlCore()
@@ -458,7 +472,7 @@ namespace aerial_robot_control
       /* current version: I term reconfig mehod */
       /* wrench_comp accumulates the parasitic residual (task prediction
          already subtracted upstream in calcInteractionWrench), so no
-         separate desired_external_wrench_ injection here — that would
+         separate formation_desired_wrench_ injection here — that would
          double-count the task component. */
       Eigen::VectorXd I_reconfig_acc_cog_term = Eigen::VectorXd::Zero(6);
       I_reconfig_acc_cog_term.head(3) = mass_inv * wrench_comp_term.head(3);
@@ -708,6 +722,7 @@ namespace aerial_robot_control
     unified_reference_leader_id_ = -1;
     unified_reference_warmup_count_ = 0;
     unified_controller_->clearFormationModelOverride();
+    unified_controller_->clearInternalWrenchSecondaryReference();
   }
 
   void BeetleController::ensureUnifiedReferenceSubscription()
@@ -1360,6 +1375,11 @@ namespace aerial_robot_control
 
     getParam<int>(control_nh, "unified_reference_warmup_frames", unified_reference_warmup_frames_, 20);
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
+    getParam<bool>(control_nh, "unified_internal_wrench_diag", unified_internal_wrench_diag_, true);
+    getParam<double>(control_nh, "unified_internal_wrench_secondary_gain",
+                     unified_internal_wrench_secondary_gain_, 0.0);
+    unified_internal_wrench_secondary_gain_ =
+        std::max(0.0, unified_internal_wrench_secondary_gain_);
 
     // Roll/Pitch I-term keep ratio removed: outer R/P I-channel disabled in unified mode.
 
@@ -1551,11 +1571,12 @@ namespace aerial_robot_control
 
   void BeetleController::desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg)
   {
-    // Receive desired total external wrench for the whole assembly (body frame).
+    // Legacy topic alias for formation-level desired wrench.
     //
     // Storage semantic:
-    //   desired_external_wrench_ = FULL formation-level wrench on EVERY module.
-    //   Used directly by runUnifiedControlCommon as the formation-level task FF.
+    //   formation_desired_wrench_ = FULL formation-level wrench on EVERY module.
+    //   Unified mode consumes it only in computeUnifiedAllocation(); it is not
+    //   injected as PID persistent FF.
     //
     // Per-module observer task prediction (est_wrench_task_list_) is published
     // by the demo layer (BeetleInterface) on /<robot>{i}/est_wrench_task and
@@ -1570,8 +1591,8 @@ namespace aerial_robot_control
     desired(4) = msg.wrench.torque.y;
     desired(5) = msg.wrench.torque.z;
 
-    // Every module stores the FULL desired wrench (semantic unified across modules)
-    desired_external_wrench_ = desired;
+    // Every module stores the FULL desired wrench (semantic unified across modules).
+    formation_desired_wrench_ = desired;
 
     // Only LEADER rebroadcasts to followers so every module sees the same value.
     if(beetle_navigator_->getModuleState() != LEADER) {
@@ -1583,7 +1604,7 @@ namespace aerial_robot_control
     ros::Time stamp = msg.header.stamp;
 
     // Rebroadcast FULL desired wrench to all followers so every module stores
-    // the same desired_external_wrench_ (FULL semantic).
+    // the same formation_desired_wrench_ (FULL semantic).
     for(const auto & item : assembly_flag) {
       if(!item.second) continue;
       if(item.first == leader_id) continue;  // skip LEADER to avoid cascade
@@ -1616,14 +1637,9 @@ namespace aerial_robot_control
   void BeetleController::formationDesiredWrenchCallback(const geometry_msgs::WrenchStamped& msg)
   {
     // Receive desired formation-level wrench (formation body frame, full 6D).
-    // Only used in unified LEADER mode via computeUnifiedAllocation().
-    // Independent-mode per-module distribution uses desiredExternalWrenchCallback() instead.
-    formation_desired_wrench_(0) = msg.wrench.force.x;
-    formation_desired_wrench_(1) = msg.wrench.force.y;
-    formation_desired_wrench_(2) = msg.wrench.force.z;
-    formation_desired_wrench_(3) = msg.wrench.torque.x;
-    formation_desired_wrench_(4) = msg.wrench.torque.y;
-    formation_desired_wrench_(5) = msg.wrench.torque.z;
+    // Reuse the legacy callback so leader rebroadcast and storage semantics
+    // stay identical across both input topics.
+    desiredExternalWrenchCallback(msg);
   }
 
   void BeetleController::publishAssembleDebug(
@@ -1845,33 +1861,33 @@ namespace aerial_robot_control
     if (du < 0.0) du = 0.0;
     if (du > 0.1) du = 0.1;  // clamp callback-stall gaps so PID-D and FF integrators stay sane
 
-    // --- Task-level external wrench feedforward (towing / valve_rotation) ---
-    // desired_external_wrench_ holds the FULL formation-level wrench (body frame).
-    // Every module independently uses it to compute the same formation acc:
-    //   acc_world = cog_rot * F_full / formation_mass
-    //   ang_acc   = inertia_inv * tau_full
-    // Sign: positive (drone provides +F to apply +F via interface, opposite of
-    // observer FF which compensates a detected residual push).
-    Eigen::VectorXd desired_total_ff = Eigen::VectorXd::Zero(6);
-    if (desired_external_wrench_.norm() > 1e-6 &&
-        !navigator_->getForceLandingFlag()) {
-      desired_total_ff = desired_external_wrench_;
+    // Optional LF-style internal wrench processing in unified mode.
+    // With gain=0 this is diagnostic only: it publishes the same residual /
+    // inter-wrench signals as the legacy leader-follower path without feeding
+    // them back into the allocator. A positive gain biases the QP secondary
+    // reference, not the primary formation wrench objective.
+    if (beetle_navigator_->getControlFlag() &&
+        (unified_internal_wrench_diag_ || unified_internal_wrench_secondary_gain_ > 0.0)) {
+      calcInteractionWrench();
     }
-    bool task_ff_active = (desired_total_ff.norm() > 1e-6);
+    if (unified_internal_wrench_secondary_gain_ > 0.0) {
+      unified_controller_->setInternalWrenchSecondaryReference(
+          wrench_comp_list_, unified_internal_wrench_secondary_gain_);
+    } else {
+      unified_controller_->clearInternalWrenchSecondaryReference();
+    }
 
-    // XY task feedforward only (formation-observer FF was removed in v5).
-    {
-      double mass_inv_f = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
-      double ff_x = 0.0, ff_y = 0.0;
-      if (task_ff_active) {
-        tf::Vector3 task_world = cog_rot * tf::Vector3(desired_total_ff(0),
-                                                       desired_total_ff(1),
-                                                       desired_total_ff(2));
-        ff_x += task_world.x() * mass_inv_f;
-        ff_y += task_world.y() * mass_inv_f;
-      }
-      pid_controllers_.at(X).setPersistentFF(ff_x);
-      pid_controllers_.at(Y).setPersistentFF(ff_y);
+    // Unified mode has a single task-wrench path: formation_desired_wrench_
+    // is added directly inside computeUnifiedAllocation(). Keep PID persistent
+    // FF clear so the same external wrench cannot be injected twice.
+    pid_controllers_.at(X).setPersistentFF(0.0);
+    pid_controllers_.at(Y).setPersistentFF(0.0);
+    pid_controllers_.at(Z).setPersistentFF(0.0);
+    pid_controllers_.at(YAW).setPersistentFF(0.0);
+
+    Eigen::VectorXd formation_wrench_cmd = formation_desired_wrench_;
+    if (navigator_->getForceLandingFlag()) {
+      formation_wrench_cmd.setZero();
     }
 
     switch (navigator_->getXyControlMode()) {
@@ -1905,14 +1921,6 @@ namespace aerial_robot_control
       err_v_z = 0;
       target_acc_.setZ(0);
     }
-    {
-      double mass_inv_z = 1.0 / std::max(unified_controller_->getFormationMass(), 0.01);
-      double ff_z = 0.0;
-      if (task_ff_active) {
-        ff_z += desired_total_ff(2) * mass_inv_z;
-      }
-      pid_controllers_.at(Z).setPersistentFF(ff_z);
-    }
     // [Fix C] sec(tilt) compensation: with non-zero baselink tilt the world-frame
     // vertical lift component drops by cos(roll)*cos(pitch). Scale the Z position
     // error so the outer PID commands enough total thrust to recover the world-Z
@@ -1940,17 +1948,6 @@ namespace aerial_robot_control
     }
     double du_rp = du;
     if (!start_rp_integration_) du_rp = 0;
-
-    // Yaw task-torque feedforward (only).
-    {
-      double ff_yaw = 0.0;
-      if (task_ff_active) {
-        Eigen::Vector3d task_alpha =
-            unified_controller_->getFormationInertia().inverse() * desired_total_ff.tail(3);
-        ff_yaw += task_alpha.z();
-      }
-      pid_controllers_.at(YAW).setPersistentFF(ff_yaw);
-    }
 
     // v5: Restored outer R/P PID. Mirrors beetle independent-mode
     // (gimbal_calc_in_fc=true && i_term_rp_calc_in_pc=true): PC runs full
@@ -2056,12 +2053,12 @@ namespace aerial_robot_control
 
     // --- Run unified 6-DOF allocation ---
     unified_controller_->clearFormationModelOverride();
-    bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
+    bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
 
     // [DBG-NANGUARD2] Detect non-finite allocation output: if the pseudoinverse
     // produced NaN, downstream spinal packing will likely SIGSEGV.
     if (ok) {
-      const Eigen::VectorXd& fw = formation_desired_wrench_;
+      const Eigen::VectorXd& fw = formation_wrench_cmd;
       bool fw_bad = false;
       for (int k = 0; k < fw.size(); ++k) {
         if (!std::isfinite(fw(k))) { fw_bad = true; break; }
@@ -2076,7 +2073,7 @@ namespace aerial_robot_control
       publishLocalUnifiedCommand();
       publishLocalUnifiedTorqueAllocationMatrixInv();
       if (is_leader) {
-        publishUnifiedReference(target_wrench_acc, formation_desired_wrench_, yaw_pid_raw);
+        publishUnifiedReference(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
         if (formation_observer_ && formation_observer_->isActive()) {
           Eigen::Matrix3d cog_rot_eigen;
           tf::matrixTFToEigen(uav_rot, cog_rot_eigen);

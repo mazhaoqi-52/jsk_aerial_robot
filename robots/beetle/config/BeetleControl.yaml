@@ -40,11 +40,18 @@ controller:
 
   yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
 
+  # Unified internal wrench management.
+  # diag=true reuses the legacy LF residual/inter-wrench calculation for logging.
+  # secondary_gain=0 keeps it diagnostic-only. Positive values bias QP secondary
+  # allocation reference from LF-style wrench_comp_list_ (experimental).
+  unified_internal_wrench_diag: true
+  unified_internal_wrench_secondary_gain: 0.0
+
   # Full-vector constrained QP allocation
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).
-  # Constraints: gimbal angle limits (linearized), component bounds, optional rate limits.
+  # Constraints: gimbal angle limits (linearized), component bounds.
   use_constrained_alloc: true
-  alloc_lambda: 1.0e-4          # regularization weight (larger → softer, smaller → tighter tracking)
+  alloc_lambda: 1.0e-4          # secondary objective weight toward balanced hover allocation
   alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
 

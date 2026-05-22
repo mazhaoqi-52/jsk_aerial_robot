@@ -67,6 +67,8 @@ namespace aerial_robot_control
     // 1 kHz cascade owns the entire roll/pitch attitude loop (P+I+D).
 
     bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
+    bool unified_internal_wrench_diag_;
+    double unified_internal_wrench_secondary_gain_;
 
     /** @brief LEADER-only: send cascade gains + allocation matrix inverse to ALL assembled
      *  modules' spinals. Uses unified_controller_'s publishers. Also sends gimbal_dof=1
@@ -92,6 +94,7 @@ namespace aerial_robot_control
     void applyUnifiedGains();
     /** @brief Restore original (per-module) roll/pitch PID gains. */
     void restoreIndependentGains();
+    void clearInternalWrenchState();
 
     // Unified-mode PID gain parameters (loaded from YAML)
     struct AxisGainSet {
@@ -186,16 +189,10 @@ namespace aerial_robot_control
 
     int pre_module_state_;
 
-    // Desired external wrench for the whole assembly (body frame, FULL value).
-    // Set on every module from desiredExternalWrenchCallback (leader receives from
-    // user, followers receive rebroadcast from leader). Used directly by
-    // runUnifiedControlCommon as the formation-level task FF. The leader
-    // does NOT distribute it as per-module ff_inter anymore — demo layer
-    // publishes est_wrench_task per module directly.
-    Eigen::VectorXd desired_external_wrench_;
-
     // Formation-level desired wrench for unified mode (full 6D, formation body frame),
-    // alternative input path bypassing the per-module share machinery.
+    // direct input to BeetleUnifiedController::computeUnifiedAllocation().
+    // The legacy desired_external_wrench topic is treated as an alias and is
+    // stored here too; unified mode does not inject task wrench via PID FF.
     Eigen::VectorXd formation_desired_wrench_;
     ros::Subscriber formation_desired_wrench_sub_;
 

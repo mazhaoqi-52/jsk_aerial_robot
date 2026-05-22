@@ -21,6 +21,7 @@
 #include <ros/ros.h>
 #include <Eigen/Dense>
 #include <memory>
+#include <map>
 
 // Forward-declare OsqpEigen::Solver so downstream packages that include this
 // header (e.g. ninja) do not need to link against OsqpEigen.
@@ -66,6 +67,13 @@ public:
                                 const Eigen::VectorXd& desired_ext_wrench,
                                 double yaw_pid_raw);
 
+  /** @brief Optional LF-style internal wrench compensation used only as a
+   *  secondary allocation reference. Gain 0 disables the effect. The input map
+   *  is keyed by module id and stores 6D body-frame compensation wrench. */
+  void setInternalWrenchSecondaryReference(const std::map<int, Eigen::VectorXd>& module_wrench_comp,
+                                           double gain);
+  void clearInternalWrenchSecondaryReference();
+
   /** @brief Send torque_allocation_matrix_inv sub-blocks to each module's spinal.
    *  Each module receives only its own rows (motor_num_per_module_ * rotor_coef_ rows × 3 cols).
    *  Called once at mode switch and periodically to handle late spinal startup.
@@ -94,8 +102,7 @@ public:
    *  Call this when exiting unified mode. */
   void resetCascadeAllocSent() { cascade_alloc_sent_ = false; }
 
-  /** @brief Reset QP solver state (previous solution, solver internals).
-   *  Call when entering unified mode so rate limits start clean. */
+  /** @brief Reset QP solver dimensions/solver internals when entering unified mode. */
   void resetQPState() {
     qp_n_vars_ = -1;
     qp_n_constraints_ = -1;
@@ -201,6 +208,8 @@ private:
   Eigen::MatrixXd integrated_map_inv_;    // pseudoinverse
   Eigen::MatrixXd integrated_map_inv_rot_; // last 3 cols of pseudoinverse (torque part)
   Eigen::VectorXd target_vectoring_f_;    // allocation result
+  std::map<int, Eigen::VectorXd> module_internal_wrench_comp_;
+  double internal_wrench_secondary_gain_;
 
   // Target yaw term for spinal cascade inner loop
   double candidate_yaw_term_;
@@ -248,7 +257,7 @@ private:
   //   - Gimbal angle:  |f_x| ≤ tan(θ_max) * f_z  (linearized)
   //   - Thrust bound:  each component within [-T_max, T_max], f_z ≥ 0
   bool use_constrained_alloc_;        // if true, use OsqpEigen QP; fallback to pseudoinverse
-  double alloc_lambda_;               // regularization weight
+  double alloc_lambda_;               // secondary objective weight toward balanced hover reference
   double alloc_t_max_;                // per-rotor thrust upper bound [N]
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
@@ -259,19 +268,25 @@ private:
    * @brief Full-vector constrained QP allocation.
    *
    * Formulation:
-   *   min_{f} ||A*f - w||^2 + λ||f||^2
+   *   min_{f} ||A*f - w||^2 + λ||f - f_ref||^2
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
-   *         rate limits (if enabled)
    *
    * @param alloc_matrix  Formation allocation matrix A (6 x n_cols)
    * @param w_total       Desired 6D wrench-acceleration vector
+   * @param secondary_ref Preferred allocation in the nullspace / soft secondary objective
    * @param vectoring_f_out  Output: full vectoring force vector (n_cols)
    * @return true on success, false on failure (caller falls back to pseudoinverse)
    */
   bool solveFullVectorQP(const Eigen::MatrixXd& alloc_matrix,
                          const Eigen::VectorXd& w_total,
+                         const Eigen::VectorXd& secondary_ref,
                          Eigen::VectorXd& vectoring_f_out);
+
+  /** @brief Build the current secondary allocation reference.
+   *  Base term is balanced hover load. Optional internal-wrench compensation
+   *  adds a small per-module bias when internal_wrench_secondary_gain_ > 0. */
+  Eigen::VectorXd buildSecondaryAllocationReference(const std::vector<int>& assembled_ids) const;
 
   void rosParamInit();
 };

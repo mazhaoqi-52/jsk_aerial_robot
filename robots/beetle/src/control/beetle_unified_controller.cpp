@@ -9,6 +9,8 @@
 #include <tf_conversions/tf_eigen.h>
 #include <tf2_ros/buffer.h>
 #include <geometry_msgs/TransformStamped.h>
+#include <algorithm>
+#include <cmath>
 
 namespace aerial_robot_control
 {
@@ -26,6 +28,7 @@ BeetleUnifiedController::BeetleUnifiedController()
     external_formation_mass_(0),
     external_formation_cog_offset_(Eigen::Vector3d::Zero()),
     external_formation_inertia_(Eigen::Matrix3d::Zero()),
+    internal_wrench_secondary_gain_(0.0),
     candidate_yaw_term_(0),
     cascade_alloc_sent_(false),
     has_cascade_gain_cache_(false),
@@ -92,6 +95,20 @@ void BeetleUnifiedController::rosParamInit()
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
   alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
+}
+
+void BeetleUnifiedController::setInternalWrenchSecondaryReference(
+    const std::map<int, Eigen::VectorXd>& module_wrench_comp,
+    double gain)
+{
+  module_internal_wrench_comp_ = module_wrench_comp;
+  internal_wrench_secondary_gain_ = std::max(0.0, gain);
+}
+
+void BeetleUnifiedController::clearInternalWrenchSecondaryReference()
+{
+  module_internal_wrench_comp_.clear();
+  internal_wrench_secondary_gain_ = 0.0;
 }
 
 bool BeetleUnifiedController::updateFormationGeometry()
@@ -185,13 +202,24 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     total_wrench_acc.tail(3) += inertia_inv * desired_ext_wrench.tail(3);
   }
 
-  // Allocate: vectoring_f = pseudoinverse * 6D_wrench_acc
+  Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
+
+  // Allocate: vectoring_f = primary wrench tracking + secondary balanced-load objective.
   // In cascade mode, the wrench_acc torque channels contain ONLY I-term
   // (P+D done by spinal). So base_thrust = allocation of (position PID + I-term only).
   bool qp_ok = use_constrained_alloc_ &&
-               solveFullVectorQP(integrated_map_, total_wrench_acc, target_vectoring_f_);
+               solveFullVectorQP(integrated_map_, total_wrench_acc, secondary_ref, target_vectoring_f_);
   if (!qp_ok) {
-    target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
+    if (alloc_lambda_ > 0.0 && secondary_ref.size() == integrated_map_.cols()) {
+      Eigen::MatrixXd lhs = integrated_map_ * integrated_map_.transpose()
+                           + alloc_lambda_ * Eigen::MatrixXd::Identity(integrated_map_.rows(),
+                                                                       integrated_map_.rows());
+      target_vectoring_f_ = secondary_ref
+          + integrated_map_.transpose()
+              * lhs.ldlt().solve(total_wrench_acc - integrated_map_ * secondary_ref);
+    } else {
+      target_vectoring_f_ = integrated_map_inv_ * total_wrench_acc;
+    }
   }
 
   // Target attitude for spinal inner loop is the operator's commanded attitude
@@ -260,23 +288,69 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   return true;
 }
 
+Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
+    const std::vector<int>& assembled_ids) const
+{
+  const int n_rotors = static_cast<int>(assembled_ids.size()) * motor_num_per_module_;
+  Eigen::VectorXd ref = Eigen::VectorXd::Zero(rotor_coef_ * n_rotors);
+  if (n_rotors <= 0 || rotor_coef_ <= 0 || formation_mass_ <= 0.0) return ref;
+
+  const double hover_per_rotor = formation_mass_ * aerial_robot_estimation::G / n_rotors;
+  const double bounded_hover = std::max(0.0, std::min(hover_per_rotor, alloc_t_max_));
+  for (int i = 0; i < n_rotors; i++) {
+    ref(i * rotor_coef_ + rotor_coef_ - 1) = bounded_hover;
+  }
+
+  if (internal_wrench_secondary_gain_ <= 0.0 || module_internal_wrench_comp_.empty()) {
+    return ref;
+  }
+
+  for (size_t m = 0; m < assembled_ids.size(); m++) {
+    auto it = module_internal_wrench_comp_.find(assembled_ids[m]);
+    if (it == module_internal_wrench_comp_.end() || it->second.size() < 3) continue;
+
+    const Eigen::VectorXd& comp = it->second;
+    if (!std::isfinite(comp(0)) || !std::isfinite(comp(2))) continue;
+
+    const double fx_per_rotor =
+        internal_wrench_secondary_gain_ * comp(0) / motor_num_per_module_;
+    const double fz_per_rotor =
+        internal_wrench_secondary_gain_ * comp(2) / motor_num_per_module_;
+    const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
+
+    for (int r = 0; r < motor_num_per_module_; r++) {
+      const int base = module_col + r * rotor_coef_;
+      if (rotor_coef_ >= 2) {
+        ref(base) = std::max(-alloc_t_max_, std::min(ref(base) + fx_per_rotor, alloc_t_max_));
+        ref(base + rotor_coef_ - 1) =
+            std::max(0.0, std::min(ref(base + rotor_coef_ - 1) + fz_per_rotor, alloc_t_max_));
+      }
+    }
+  }
+  return ref;
+}
+
 bool BeetleUnifiedController::solveFullVectorQP(
     const Eigen::MatrixXd& alloc_matrix,
     const Eigen::VectorXd& w_total,
+    const Eigen::VectorXd& secondary_ref,
     Eigen::VectorXd& vectoring_f_out)
 {
   // Full-vector QP: decision variables are all force components f ∈ R^{n_cols}.
   // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
   //
   // Objective:  min_f  0.5 * f' * P * f + q' * f
-  //   where P = A'A + λI,  q = -A'w
+  //   where P = A'A + λI,  q = -A'w - λ*f_ref
+  //
+  // This gives the primary wrench tracking priority while using the nullspace
+  // / residual freedom to stay near a balanced hover allocation. It is still a
+  // soft objective, not an internal-force controller yet.
   //
   // Constraints (all linear, OSQP-compatible):
   //   Per rotor i (rotor_coef=2, gimbal_dof=1):
   //     (a) Gimbal angle:  f_x + tan(θ_max)*f_z ≥ 0   (angle ≥ -θ_max)
   //                       -f_x + tan(θ_max)*f_z ≥ 0   (angle ≤ +θ_max)
   //     (b) Component bounds: -T_max ≤ f_x ≤ T_max,  0 ≤ f_z ≤ T_max
-  //     (c) Rate limits (optional): f_j_prev - Δ ≤ f_j ≤ f_j_prev + Δ
 
   const int n_cols = alloc_matrix.cols();
   if (n_cols == 0 || rotor_coef_ == 0 || n_cols % rotor_coef_ != 0) {
@@ -291,15 +365,19 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // --- Count constraints ---
   // For rotor_coef == 2:
   //   2 gimbal angle rows + 2 component-bound rows per rotor = 4 * n_rotors
-  //   + 2 rate-limit rows per rotor (if enabled) = 2 * n_rotors
   int n_gimbal_rows = (rotor_coef_ == 2) ? 2 * n_rotors : 0;
   int n_bound_rows = n_cols;  // one bound per variable
   int n_constraints = n_gimbal_rows + n_bound_rows;
 
+  Eigen::VectorXd f_ref = Eigen::VectorXd::Zero(n_cols);
+  if (secondary_ref.size() == n_cols) {
+    f_ref = secondary_ref;
+  }
+
   // --- Build Hessian P = A'A + λI ---
   Eigen::MatrixXd P_dense = alloc_matrix.transpose() * alloc_matrix
                            + alloc_lambda_ * Eigen::MatrixXd::Identity(n_cols, n_cols);
-  Eigen::VectorXd q_vec = -alloc_matrix.transpose() * w_total;
+  Eigen::VectorXd q_vec = -alloc_matrix.transpose() * w_total - alloc_lambda_ * f_ref;
 
   // --- Build constraint matrix C and bounds [lb, ub] ---
   // C * f ∈ [lb, ub]

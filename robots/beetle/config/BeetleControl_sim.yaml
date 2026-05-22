@@ -32,9 +32,13 @@ controller:
 
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
 
+  # Unified internal wrench management (diagnostic by default).
+  unified_internal_wrench_diag: true
+  unified_internal_wrench_secondary_gain: 0.0
+
   # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
   use_constrained_alloc: true
-  alloc_lambda: 1.0e-4          # regularization weight
+  alloc_lambda: 1.0e-4          # secondary objective weight toward balanced hover allocation
   alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
 

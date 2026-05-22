@@ -117,10 +117,11 @@ void BeetleUnifiedController::setModuleModelDescriptor(
     int module_id, const ModuleModelDescriptor& model)
 {
   if (module_id <= 0 || !model.valid(motor_num_per_module_)) {
-    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Reject invalid module model id=%d mass=%.3f rotors=%zu dirs=%zu",
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Reject invalid module model id=%d mass=%.3f rotors=%zu dirs=%zu mf_rate=%.6f",
                       module_id, model.mass,
                       model.rotor_origins_from_cog.size(),
-                      model.rotor_direction.size());
+                      model.rotor_direction.size(),
+                      model.mf_rate);
     return;
   }
 

@@ -20,6 +20,7 @@
 
 #include <ros/ros.h>
 #include <Eigen/Dense>
+#include <cmath>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -142,10 +143,17 @@ public:
 
     bool valid(int motor_num) const
     {
-      return mass > 0.0 &&
-             rotor_origins_from_cog.size() == static_cast<size_t>(motor_num) &&
-             static_cast<int>(rotor_direction.size()) >= motor_num &&
-             mf_rate > 0.0;
+      if (!std::isfinite(mass) || mass <= 0.0 ||
+          !inertia.allFinite() ||
+          rotor_origins_from_cog.size() != static_cast<size_t>(motor_num) ||
+          static_cast<int>(rotor_direction.size()) < motor_num ||
+          !std::isfinite(mf_rate)) {
+        return false;
+      }
+      for (const auto& origin : rotor_origins_from_cog) {
+        if (!origin.allFinite()) return false;
+      }
+      return true;
     }
   };
 

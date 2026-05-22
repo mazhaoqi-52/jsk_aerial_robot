@@ -857,6 +857,9 @@ namespace aerial_robot_control
     model.mf_rate = beetle_robot_model_->getMFRate();
 
     const int my_id = beetle_navigator_->getMyID();
+    const int rotor_num = beetle_robot_model_->getRotorNum();
+    if (!model.valid(rotor_num)) return;
+
     unified_controller_->setModuleModelDescriptor(my_id, model);
 
     beetle::ModuleModel msg;
@@ -874,8 +877,8 @@ namespace aerial_robot_control
       msg.rotor_origin_from_cog[i].y = model.rotor_origins_from_cog[i].y();
       msg.rotor_origin_from_cog[i].z = model.rotor_origins_from_cog[i].z();
     }
-    msg.rotor_direction.resize(beetle_robot_model_->getRotorNum());
-    for (int r = 0; r < beetle_robot_model_->getRotorNum(); r++) {
+    msg.rotor_direction.resize(rotor_num);
+    for (int r = 0; r < rotor_num; r++) {
       msg.rotor_direction[r] = static_cast<int8_t>(model.rotor_direction.at(r + 1));
     }
     msg.mf_rate = model.mf_rate;
@@ -904,6 +907,9 @@ namespace aerial_robot_control
       model.rotor_direction[static_cast<int>(i) + 1] = msg.rotor_direction[i];
     }
     model.mf_rate = msg.mf_rate;
+
+    if (!model.valid(static_cast<int>(msg.rotor_direction.size()))) return;
+
     unified_controller_->setModuleModelDescriptor(msg.id, model);
   }
 

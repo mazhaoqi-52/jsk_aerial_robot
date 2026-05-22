@@ -442,11 +442,25 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
   if (unified_control_mode_ &&
       (getModuleState() == LEADER || getModuleState() == FOLLOWER)) {
 
-    // Compute assembly CoG → this module's CoG offset (same as convertTargetPosFromCoG2CoM)
+    tf::Vector3 final_target_baselink_rpy = getFinalTargetBaselinkRPY();
+    if (msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
+      final_target_baselink_rpy.setY(msg->target_pitch);
+    }
+    if (msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
+      final_target_baselink_rpy.setX(msg->target_roll);
+    }
+
+    // Compute assembly CoG -> this module's CoG offset under the commanded
+    // baselink attitude. Yaw-only rotation keeps com_offset.z at zero during
+    // formation pitch/roll, so modules never receive the height split needed to
+    // keep the assembly CoG at the requested altitude.
     tf::Transform cog2com_tf;
     tf::transformKDLToTF(getCog2CoM<KDL::Frame>(), cog2com_tf);
-    tf::Vector3 com_offset = tf::Matrix3x3(tf::createQuaternionFromYaw(
-        msg->target_yaw)) * cog2com_tf.getOrigin();
+    tf::Matrix3x3 target_baselink_rot;
+    target_baselink_rot.setRPY(final_target_baselink_rpy.x(),
+                               final_target_baselink_rpy.y(),
+                               msg->target_yaw);
+    tf::Vector3 com_offset = target_baselink_rot * cog2com_tf.getOrigin();
 
     /* yaw */
     if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
@@ -544,9 +558,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
      * wind up unboundedly (verified failure: pitch=0.4 -> pitch_i +11.6 Nm in
      * 10 s, eating Z thrust until auto-land). */
     if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
-      tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
-      target_rp.setY(msg->target_pitch);
-      setFinalTargetBaselinkRPY(target_rp);
+      setFinalTargetBaselinkRPY(final_target_baselink_rpy);
       const tf::Vector3 final_rpy = getFinalTargetBaselinkRPY();
       const tf::Vector3 curr_rpy = getCurrTargetBaselinkRPY();
       const tf::Vector3 target_rpy = getTargetRPY();
@@ -558,9 +570,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
                target_rpy.x(), target_rpy.y());
     }
     if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
-      tf::Vector3 target_rp = getFinalTargetBaselinkRPY();
-      target_rp.setX(msg->target_roll);
-      setFinalTargetBaselinkRPY(target_rp);
+      setFinalTargetBaselinkRPY(final_target_baselink_rpy);
       const tf::Vector3 final_rpy = getFinalTargetBaselinkRPY();
       const tf::Vector3 curr_rpy = getCurrTargetBaselinkRPY();
       const tf::Vector3 target_rpy = getTargetRPY();

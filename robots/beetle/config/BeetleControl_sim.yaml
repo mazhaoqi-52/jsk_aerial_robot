@@ -34,6 +34,8 @@ controller:
 
   # Unified internal wrench management (diagnostic by default).
   unified_internal_wrench_diag: true
+  unified_internal_wrench_log: true
+  unified_internal_wrench_log_period: 1.0
   unified_internal_wrench_secondary_gain: 0.0
 
   # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false

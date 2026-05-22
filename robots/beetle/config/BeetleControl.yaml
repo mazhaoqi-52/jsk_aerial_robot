@@ -45,6 +45,8 @@ controller:
   # secondary_gain=0 keeps it diagnostic-only. Positive values bias QP secondary
   # allocation reference from LF-style wrench_comp_list_ (experimental).
   unified_internal_wrench_diag: true
+  unified_internal_wrench_log: true
+  unified_internal_wrench_log_period: 1.0
   unified_internal_wrench_secondary_gain: 0.0
 
   # Full-vector constrained QP allocation

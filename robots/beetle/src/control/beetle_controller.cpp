@@ -1,5 +1,8 @@
 #include <beetle/control/beetle_controller.h>
 
+#include <iomanip>
+#include <sstream>
+
 using namespace std;
 
 namespace aerial_robot_control
@@ -20,6 +23,8 @@ namespace aerial_robot_control
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
     unified_internal_wrench_diag_(true),
+    unified_internal_wrench_log_(true),
+    unified_internal_wrench_log_period_(1.0),
     unified_internal_wrench_secondary_gain_(0.0),
     leader_target_pos_(0, 0, 0),
     leader_target_vel_(0, 0, 0),
@@ -1281,16 +1286,18 @@ namespace aerial_robot_control
      *     control. Useful to detect divergent observer states between
      *     modules (model error, drift, comm dropout). */
     int leader_id_diag = beetle_navigator_->getLeaderID();
-    if (my_id == leader_id_diag) {
+    bool is_diag_leader = (my_id == leader_id_diag);
+    double max_f = 0.0, max_t = 0.0;
+    double rms_f = 0.0, rms_t = 0.0;
+    int n_pairs = 0;
+    if (is_diag_leader) {
       std::vector<int> active_ids;
       for (const auto& kv : inter_wrench_list_) {
         if (assembly_flag[kv.first] && kv.second.size() == 6) {
           active_ids.push_back(kv.first);
         }
       }
-      double max_f = 0.0, max_t = 0.0;
       double sum_f2 = 0.0, sum_t2 = 0.0;
-      int n_pairs = 0;
       for (size_t a = 0; a < active_ids.size(); ++a) {
         for (size_t b = a + 1; b < active_ids.size(); ++b) {
           Eigen::VectorXd diff =
@@ -1304,8 +1311,8 @@ namespace aerial_robot_control
           n_pairs++;
         }
       }
-      double rms_f = (n_pairs > 0) ? std::sqrt(sum_f2 / n_pairs) : 0.0;
-      double rms_t = (n_pairs > 0) ? std::sqrt(sum_t2 / n_pairs) : 0.0;
+      rms_f = (n_pairs > 0) ? std::sqrt(sum_f2 / n_pairs) : 0.0;
+      rms_t = (n_pairs > 0) ? std::sqrt(sum_t2 / n_pairs) : 0.0;
       std_msgs::Float32MultiArray diag_msg;
       diag_msg.data.resize(4);
       diag_msg.data[0] = static_cast<float>(max_f);
@@ -1342,6 +1349,45 @@ namespace aerial_robot_control
         wrench_comp_list_[i] = Eigen::VectorXd::Zero(6);
       }
     }
+
+    if (unified_control_mode_ && unified_internal_wrench_log_) {
+      auto fmtWrench = [](const Eigen::VectorXd& v) {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(3);
+        if (v.size() < 6) {
+          os << "[invalid:" << v.size() << "]";
+        } else {
+          os << "[" << v(0) << "," << v(1) << "," << v(2)
+             << ";" << v(3) << "," << v(4) << "," << v(5) << "]";
+        }
+        return os.str();
+      };
+
+      std::ostringstream ss;
+      ss << std::fixed << std::setprecision(3);
+      ss << "[UnifiedInternalWrench id=" << my_id
+         << " leader=" << leader_id
+         << " gain=" << unified_internal_wrench_secondary_gain_
+         << "] W_res_avg=" << fmtWrench(W_w);
+      if (is_diag_leader) {
+        ss << " disagree=[maxF=" << max_f
+           << ",maxT=" << max_t
+           << ",rmsF=" << rms_f
+           << ",rmsT=" << rms_t
+           << ",pairs=" << n_pairs << "]";
+      }
+      ss << " modules:";
+      for (int i = 1; i <= max_modules_num; ++i) {
+        if (!assembly_flag[i]) continue;
+        ss << " m" << i
+           << "{est=" << fmtWrench(est_wrench_list_[i])
+           << ",task=" << fmtWrench(est_wrench_task_list_[i])
+           << ",res=" << fmtWrench(est_residual_list_[i])
+           << ",inter=" << fmtWrench(inter_wrench_list_[i])
+           << ",comp=" << fmtWrench(wrench_comp_list_[i]) << "}";
+      }
+      ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, ss.str());
+    }
   }
 
   void BeetleController::rosParamInit()
@@ -1376,6 +1422,11 @@ namespace aerial_robot_control
     getParam<int>(control_nh, "unified_reference_warmup_frames", unified_reference_warmup_frames_, 20);
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
     getParam<bool>(control_nh, "unified_internal_wrench_diag", unified_internal_wrench_diag_, true);
+    getParam<bool>(control_nh, "unified_internal_wrench_log", unified_internal_wrench_log_, true);
+    getParam<double>(control_nh, "unified_internal_wrench_log_period",
+                     unified_internal_wrench_log_period_, 1.0);
+    unified_internal_wrench_log_period_ =
+        std::max(0.1, unified_internal_wrench_log_period_);
     getParam<double>(control_nh, "unified_internal_wrench_secondary_gain",
                      unified_internal_wrench_secondary_gain_, 0.0);
     unified_internal_wrench_secondary_gain_ =

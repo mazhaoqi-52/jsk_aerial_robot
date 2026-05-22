@@ -68,6 +68,8 @@ namespace aerial_robot_control
 
     bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
     bool unified_internal_wrench_diag_;
+    bool unified_internal_wrench_log_;
+    double unified_internal_wrench_log_period_;
     double unified_internal_wrench_secondary_gain_;
 
     /** @brief LEADER-only: send cascade gains + allocation matrix inverse to ALL assembled

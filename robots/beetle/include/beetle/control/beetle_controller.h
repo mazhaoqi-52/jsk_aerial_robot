@@ -4,6 +4,7 @@
 #include <beetle/model/beetle_robot_model.h>
 #include <beetle/beetle_navigation.h>
 #include <beetle/TaggedWrench.h>
+#include <beetle/ModuleModel.h>
 #include <beetle/UnifiedControlReference.h>
 #include <gimbalrotor/control/gimbalrotor_controller.h>
 #include <beetle/sensor/imu.h>
@@ -124,6 +125,9 @@ namespace aerial_robot_control
     ros::Subscriber unified_reference_sub_;
     ros::Publisher follower_thrust_pub_;   // re-publish to own four_axes/command
     ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl (only when !gimbal_calc_in_fc)
+    ros::Publisher module_model_pub_;
+    map<string, ros::Subscriber> module_model_subs_;
+    ros::Time last_module_model_pub_time_;
     spinal::FourAxisCommand unified_thrust_cmd_;
     bool unified_cmd_received_;
     ros::Time unified_cmd_stamp_;
@@ -156,6 +160,8 @@ namespace aerial_robot_control
     void publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                    const Eigen::VectorXd& desired_wrench,
                    double yaw_pid_raw);
+    void publishModuleModel();
+    void moduleModelCallback(const beetle::ModuleModel& msg);
     
     map<string, ros::Subscriber> est_wrench_task_subs_;
     map<int, ros::Publisher> est_wrench_task_pubs_;

@@ -22,6 +22,7 @@
 #include <Eigen/Dense>
 #include <memory>
 #include <map>
+#include <mutex>
 
 // Forward-declare OsqpEigen::Solver so downstream packages that include this
 // header (e.g. ninja) do not need to link against OsqpEigen.
@@ -132,6 +133,24 @@ public:
     std::vector<double> gimbal_angles;  // gimbal angles (size = motor_num_per_module_ * gimbal_dof_)
   };
 
+  struct ModuleModelDescriptor {
+    double mass = 0.0;
+    Eigen::Matrix3d inertia = Eigen::Matrix3d::Zero();
+    std::vector<Eigen::Vector3d> rotor_origins_from_cog;
+    std::map<int, int> rotor_direction;
+    double mf_rate = 0.0;
+
+    bool valid(int motor_num) const
+    {
+      return mass > 0.0 &&
+             rotor_origins_from_cog.size() == static_cast<size_t>(motor_num) &&
+             static_cast<int>(rotor_direction.size()) >= motor_num &&
+             mf_rate > 0.0;
+    }
+  };
+
+  void setModuleModelDescriptor(int module_id, const ModuleModelDescriptor& model);
+
   // Accessors — Formation Model Interface
   // Exposes the unified formation as a coherent "virtual robot model" for:
   //   - Model-based seed computation (Phase II)
@@ -171,6 +190,7 @@ public:
    *         Returns zero vector if allocation has not been computed yet.
    */
   Eigen::VectorXd getRealizedWrenchBody() const;
+  Eigen::VectorXd getLocalRealizedWrenchBody(int module_id) const;
 
   /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
   bool isAllocationSaturated() const;
@@ -202,6 +222,11 @@ private:
   // cog_offset (real-hw pitch=0.4 log). We now only recompute when the set
   // of assembled modules changes, freezing geometry during steady flight.
   std::vector<int> cached_assembled_ids_;
+  uint64_t module_model_revision_;
+  uint64_t cached_module_model_revision_;
+  std::map<int, ModuleModelDescriptor> module_models_;
+  mutable std::mutex module_model_mutex_;
+  mutable std::mutex allocation_mutex_;
 
   // Allocation matrices
   Eigen::MatrixXd integrated_map_;        // 6 x (rotor_coef * total_rotors)
@@ -247,6 +272,11 @@ private:
   Eigen::Matrix3d computeFormationInertia(
       const std::vector<int>& assembled_ids,
       const Eigen::Vector3d& formation_cog_offset);
+
+  ModuleModelDescriptor getModuleModelDescriptor(int module_id) const;
+  Eigen::Vector3d getModuleOffsetFromLeader(int module_id) const;
+  bool lookupModuleOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;
+  std::vector<Eigen::MatrixXd> buildRotorMask() const;
 
   void extractThrustAndGimbal(const Eigen::VectorXd& vectoring_f,
                               const std::vector<int>& assembled_ids);

@@ -28,6 +28,8 @@ BeetleUnifiedController::BeetleUnifiedController()
     external_formation_mass_(0),
     external_formation_cog_offset_(Eigen::Vector3d::Zero()),
     external_formation_inertia_(Eigen::Matrix3d::Zero()),
+    module_model_revision_(0),
+    cached_module_model_revision_(0),
     internal_wrench_secondary_gain_(0.0),
     candidate_yaw_term_(0),
     cascade_alloc_sent_(false),
@@ -111,6 +113,112 @@ void BeetleUnifiedController::clearInternalWrenchSecondaryReference()
   internal_wrench_secondary_gain_ = 0.0;
 }
 
+void BeetleUnifiedController::setModuleModelDescriptor(
+    int module_id, const ModuleModelDescriptor& model)
+{
+  if (module_id <= 0 || !model.valid(motor_num_per_module_)) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Reject invalid module model id=%d mass=%.3f rotors=%zu dirs=%zu",
+                      module_id, model.mass,
+                      model.rotor_origins_from_cog.size(),
+                      model.rotor_direction.size());
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(module_model_mutex_);
+  auto prev = module_models_.find(module_id);
+  if (prev != module_models_.end()) {
+    bool same = std::abs(prev->second.mass - model.mass) < 1e-9 &&
+                (prev->second.inertia - model.inertia).norm() < 1e-9 &&
+                std::abs(prev->second.mf_rate - model.mf_rate) < 1e-12 &&
+                prev->second.rotor_direction == model.rotor_direction &&
+                prev->second.rotor_origins_from_cog.size() == model.rotor_origins_from_cog.size();
+    if (same) {
+      for (size_t i = 0; i < model.rotor_origins_from_cog.size(); i++) {
+        if ((prev->second.rotor_origins_from_cog[i] - model.rotor_origins_from_cog[i]).norm() >= 1e-9) {
+          same = false;
+          break;
+        }
+      }
+    }
+    if (same) return;
+  }
+  module_models_[module_id] = model;
+  module_model_revision_++;
+}
+
+BeetleUnifiedController::ModuleModelDescriptor
+BeetleUnifiedController::getModuleModelDescriptor(int module_id) const
+{
+  {
+    std::lock_guard<std::mutex> lock(module_model_mutex_);
+    auto it = module_models_.find(module_id);
+    if (it != module_models_.end() && it->second.valid(motor_num_per_module_)) {
+      return it->second;
+    }
+  }
+
+  ModuleModelDescriptor fallback;
+  fallback.mass = robot_model_->getMass();
+  fallback.inertia = robot_model_->getInertia<Eigen::Matrix3d>();
+  fallback.rotor_origins_from_cog = robot_model_->getRotorsOriginFromCog<Eigen::Vector3d>();
+  fallback.rotor_direction = robot_model_->getRotorDirection();
+  fallback.mf_rate = robot_model_->getMFRate();
+  return fallback;
+}
+
+bool BeetleUnifiedController::lookupModuleOffsetFromLeader(
+    int module_id, Eigen::Vector3d& offset) const
+{
+  offset.setZero();
+  int leader_id = navigator_->getLeaderID();
+  if (module_id == leader_id) return true;
+
+  try {
+    std::string leader_cog_frame = navigator_->getMyName() + std::to_string(leader_id) + "/cog";
+    std::string module_cog_frame = navigator_->getMyName() + std::to_string(module_id) + "/cog";
+    geometry_msgs::TransformStamped tf_stamped =
+        navigator_->getTfBuffer().lookupTransform(leader_cog_frame, module_cog_frame, ros::Time(0));
+    offset << tf_stamped.transform.translation.x,
+              tf_stamped.transform.translation.y,
+              tf_stamped.transform.translation.z;
+    return true;
+  } catch (tf2::TransformException& ex) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] TF lookup for module offset failed: %s", ex.what());
+    return false;
+  }
+}
+
+Eigen::Vector3d BeetleUnifiedController::getModuleOffsetFromLeader(int module_id) const
+{
+  Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+  lookupModuleOffsetFromLeader(module_id, offset);
+  return offset;
+}
+
+std::vector<Eigen::MatrixXd> BeetleUnifiedController::buildRotorMask() const
+{
+  std::vector<KDL::Rotation> thrust_coords_rot =
+      robot_model_->getThrustCoordRot<KDL::Rotation>();
+
+  std::vector<Eigen::MatrixXd> masked_rot_single;
+  masked_rot_single.reserve(motor_num_per_module_);
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    tf::Quaternion quat;
+    tf::quaternionKDLToTF(thrust_coords_rot.at(r), quat);
+    Eigen::Matrix3d conv_cog_from_thrust;
+    tf::matrixTFToEigen(tf::Matrix3x3(quat), conv_cog_from_thrust);
+
+    if (gimbal_dof_ == 1) {
+      Eigen::MatrixXd mask(3, 2);
+      mask << 0, 0, 1, 0, 0, 1;
+      masked_rot_single.push_back(conv_cog_from_thrust * mask);
+    } else if (gimbal_dof_ == 2) {
+      masked_rot_single.push_back(conv_cog_from_thrust);
+    }
+  }
+  return masked_rot_single;
+}
+
 bool BeetleUnifiedController::updateFormationGeometry()
 {
   if (use_external_formation_model_) {
@@ -132,36 +240,33 @@ bool BeetleUnifiedController::updateFormationGeometry()
   // Re-running lookupTransform per cycle introduced ~10 cm Z drift in cog_offset
   // under sustained tilt (real-hw pitch=0.4). Geometry is structurally constant
   // for a given assembled set, so memoize on the IDs key.
-  if (assembled_ids == cached_assembled_ids_ && formation_mass_ > 0.0) {
-    return true;
+  uint64_t model_revision = 0;
+  {
+    std::lock_guard<std::mutex> lock(module_model_mutex_);
+    model_revision = module_model_revision_;
   }
+  if (assembled_ids == cached_assembled_ids_ && formation_mass_ > 0.0 &&
+      model_revision == cached_module_model_revision_) return true;
 
   int N = assembled_ids.size();
-  double single_mass = robot_model_->getMass();
-  formation_mass_ = single_mass * N;
-  int leader_id = navigator_->getLeaderID();
-  std::string leader_cog_frame = navigator_->getMyName() + std::to_string(leader_id) + "/cog";
-
-  Eigen::Vector3d cog_offset_sum = Eigen::Vector3d::Zero();
-  for (int i = 0; i < N; i++) {
-    int module_id = assembled_ids[i];
-    if (module_id != leader_id) {
-      try {
-        std::string module_cog_frame = navigator_->getMyName() + std::to_string(module_id) + "/cog";
-        geometry_msgs::TransformStamped tf_stamped =
-            navigator_->getTfBuffer().lookupTransform(leader_cog_frame, module_cog_frame, ros::Time(0));
-        cog_offset_sum.x() += tf_stamped.transform.translation.x;
-        cog_offset_sum.y() += tf_stamped.transform.translation.y;
-        cog_offset_sum.z() += tf_stamped.transform.translation.z;
-      } catch (tf2::TransformException& ex) {
-        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] TF lookup for formation geometry failed: %s", ex.what());
-        return false;
-      }
-    }
+  formation_mass_ = 0.0;
+  Eigen::Vector3d weighted_cog_offset = Eigen::Vector3d::Zero();
+  for (int module_id : assembled_ids) {
+    Eigen::Vector3d module_offset;
+    if (!lookupModuleOffsetFromLeader(module_id, module_offset)) return false;
+    const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
+    formation_mass_ += model.mass;
+    weighted_cog_offset += model.mass * module_offset;
   }
-  formation_cog_offset_ = cog_offset_sum / N;
+  if (formation_mass_ <= 0.0) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Invalid heterogeneous formation mass %.4f",
+                      formation_mass_);
+    return false;
+  }
+  formation_cog_offset_ = weighted_cog_offset / formation_mass_;
   formation_inertia_ = computeFormationInertia(assembled_ids, formation_cog_offset_);
   cached_assembled_ids_ = assembled_ids;  // ε-fix: latch
+  cached_module_model_revision_ = model_revision;
   ROS_INFO("[UnifiedCtrl] Formation geometry latched for assembled_ids=[%s] "
            "N=%d cog_offset=(%.4f,%.4f,%.4f) mass=%.3f",
            [&]{ std::string s; for(int id : assembled_ids){ s += std::to_string(id) + ","; } return s; }().c_str(),
@@ -182,6 +287,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
   // Update formation geometry
   if (!updateFormationGeometry()) return false;
+
+  std::lock_guard<std::mutex> alloc_lock(allocation_mutex_);
 
   // Build formation-wide allocation matrix (6 x rotor_coef*total_rotors)
   integrated_map_ = buildFormationAllocationMatrix(assembled_ids, formation_mass_,
@@ -295,10 +402,14 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
   Eigen::VectorXd ref = Eigen::VectorXd::Zero(rotor_coef_ * n_rotors);
   if (n_rotors <= 0 || rotor_coef_ <= 0 || formation_mass_ <= 0.0) return ref;
 
-  const double hover_per_rotor = formation_mass_ * aerial_robot_estimation::G / n_rotors;
-  const double bounded_hover = std::max(0.0, std::min(hover_per_rotor, alloc_t_max_));
-  for (int i = 0; i < n_rotors; i++) {
-    ref(i * rotor_coef_ + rotor_coef_ - 1) = bounded_hover;
+  for (size_t m = 0; m < assembled_ids.size(); m++) {
+    const ModuleModelDescriptor model = getModuleModelDescriptor(assembled_ids[m]);
+    const double hover_per_rotor = model.mass * aerial_robot_estimation::G / motor_num_per_module_;
+    const double bounded_hover = std::max(0.0, std::min(hover_per_rotor, alloc_t_max_));
+    const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
+    for (int r = 0; r < motor_num_per_module_; r++) {
+      ref(module_col + r * rotor_coef_ + rotor_coef_ - 1) = bounded_hover;
+    }
   }
 
   if (internal_wrench_secondary_gain_ <= 0.0 || module_internal_wrench_comp_.empty()) {
@@ -640,6 +751,7 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   //     T = I * w_acc.tail(3)
 
   Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
 
   if (integrated_map_.rows() != 6 || target_vectoring_f_.size() == 0) {
     return realized;
@@ -661,6 +773,39 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   //   T_body = I * w_acc.tail(3)
   realized.head(3) = formation_mass_ * w_acc.head(3);
   realized.tail(3) = formation_inertia_ * w_acc.tail(3);
+
+  return realized;
+}
+
+Eigen::VectorXd BeetleUnifiedController::getLocalRealizedWrenchBody(int module_id) const
+{
+  Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
+
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  int module_index = getModuleIndex(module_id);
+  if (module_index < 0) return realized;
+
+  const int elems_per_module = motor_num_per_module_ * rotor_coef_;
+  const int col_start = module_index * elems_per_module;
+  if (target_vectoring_f_.size() < col_start + elems_per_module) return realized;
+
+  const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
+  std::vector<Eigen::MatrixXd> masked_rot_single = buildRotorMask();
+  if (masked_rot_single.size() < static_cast<size_t>(motor_num_per_module_)) {
+    return realized;
+  }
+
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    const int base = col_start + r * rotor_coef_;
+    Eigen::VectorXd f_local = target_vectoring_f_.segment(base, rotor_coef_);
+    Eigen::Vector3d force_body = masked_rot_single.at(r) * f_local;
+    const int dir = model.rotor_direction.at(r + 1);
+    const Eigen::Vector3d torque_body =
+        aerial_robot_model::skew(model.rotor_origins_from_cog.at(r)) * force_body
+        + dir * model.mf_rate * force_body;
+    realized.head(3) += force_body;
+    realized.tail(3) += torque_body;
+  }
 
   return realized;
 }
@@ -776,41 +921,25 @@ Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
 
   Eigen::MatrixXd full_q_mat = Eigen::MatrixXd::Zero(6, 3 * total_rotors);
 
-  std::vector<Eigen::Vector3d> single_rotors_from_cog =
-      robot_model_->getRotorsOriginFromCog<Eigen::Vector3d>();
-  const auto& rotor_direction = robot_model_->getRotorDirection();
-  const double m_f_rate = robot_model_->getMFRate();
-
   Eigen::MatrixXd wrench_map = Eigen::MatrixXd::Zero(6, 3);
   wrench_map.block(0, 0, 3, 3) = Eigen::MatrixXd::Identity(3, 3);
-
-  int leader_id = navigator_->getLeaderID();
-  std::string leader_cog_frame = navigator_->getMyName() + std::to_string(leader_id) + "/cog";
 
   int col = 0;
   for (int m = 0; m < N; m++) {
     int module_id = assembled_ids[m];
+    const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
 
     Eigen::Vector3d module_offset = Eigen::Vector3d::Zero();
-    if (module_id != leader_id) {
-      try {
-        std::string module_cog_frame = navigator_->getMyName() + std::to_string(module_id) + "/cog";
-        geometry_msgs::TransformStamped tf_stamped =
-            navigator_->getTfBuffer().lookupTransform(leader_cog_frame, module_cog_frame, ros::Time(0));
-        module_offset << tf_stamped.transform.translation.x,
-                         tf_stamped.transform.translation.y,
-                         tf_stamped.transform.translation.z;
-      } catch (tf2::TransformException& ex) {
-        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] TF lookup failed: %s", ex.what());
-        return Eigen::MatrixXd::Zero(6, rotor_coef_ * total_rotors);
-      }
+    if (!lookupModuleOffsetFromLeader(module_id, module_offset)) {
+      return Eigen::MatrixXd::Zero(6, rotor_coef_ * total_rotors);
     }
 
     for (int r = 0; r < motor_num_per_module_; r++) {
-      Eigen::Vector3d rotor_pos = module_offset - formation_cog_offset + single_rotors_from_cog.at(r);
-      int dir = rotor_direction.at(r + 1);
+      Eigen::Vector3d rotor_pos =
+          module_offset - formation_cog_offset + model.rotor_origins_from_cog.at(r);
+      int dir = model.rotor_direction.at(r + 1);
       wrench_map.block(3, 0, 3, 3) =
-          aerial_robot_model::skew(rotor_pos) + dir * m_f_rate * Eigen::Matrix3d::Identity();
+          aerial_robot_model::skew(rotor_pos) + dir * model.mf_rate * Eigen::Matrix3d::Identity();
       full_q_mat.middleCols(col, 3) = wrench_map;
       col += 3;
     }
@@ -820,25 +949,7 @@ Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
   full_q_mat.topRows(3) = mass_inv * full_q_mat.topRows(3);
   full_q_mat.bottomRows(3) = inertia_inv * full_q_mat.bottomRows(3);
 
-  // Gimbal mask rotation matrix (same as GimbalrotorController)
-  std::vector<KDL::Rotation> thrust_coords_rot =
-      robot_model_->getThrustCoordRot<KDL::Rotation>();
-
-  std::vector<Eigen::MatrixXd> masked_rot_single;
-  for (int r = 0; r < motor_num_per_module_; r++) {
-    tf::Quaternion quat;
-    tf::quaternionKDLToTF(thrust_coords_rot.at(r), quat);
-    Eigen::Matrix3d conv_cog_from_thrust;
-    tf::matrixTFToEigen(tf::Matrix3x3(quat), conv_cog_from_thrust);
-
-    if (gimbal_dof_ == 1) {
-      Eigen::MatrixXd mask(3, 2);
-      mask << 0, 0, 1, 0, 0, 1;
-      masked_rot_single.push_back(conv_cog_from_thrust * mask);
-    } else if (gimbal_dof_ == 2) {
-      masked_rot_single.push_back(conv_cog_from_thrust);
-    }
-  }
+  std::vector<Eigen::MatrixXd> masked_rot_single = buildRotorMask();
 
   // Block-diagonal integrated_rot
   int total_cols = rotor_coef_ * total_rotors;
@@ -858,34 +969,17 @@ Eigen::Matrix3d BeetleUnifiedController::computeFormationInertia(
     const std::vector<int>& assembled_ids,
     const Eigen::Vector3d& formation_cog_offset)
 {
-  int N = assembled_ids.size();
-  double single_mass = robot_model_->getMass();
-  Eigen::Matrix3d single_inertia = robot_model_->getInertia<Eigen::Matrix3d>();
-
-  int leader_id = navigator_->getLeaderID();
-  std::string leader_cog_frame = navigator_->getMyName() + std::to_string(leader_id) + "/cog";
-
   Eigen::Matrix3d formation_inertia = Eigen::Matrix3d::Zero();
 
-  for (int i = 0; i < N; i++) {
-    int module_id = assembled_ids[i];
+  for (int module_id : assembled_ids) {
+    const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
     Eigen::Vector3d d = Eigen::Vector3d::Zero();
-    if (module_id != leader_id) {
-      try {
-        std::string module_cog_frame = navigator_->getMyName() + std::to_string(module_id) + "/cog";
-        geometry_msgs::TransformStamped tf_stamped =
-            navigator_->getTfBuffer().lookupTransform(leader_cog_frame, module_cog_frame, ros::Time(0));
-        d << tf_stamped.transform.translation.x,
-             tf_stamped.transform.translation.y,
-             tf_stamped.transform.translation.z;
-      } catch (tf2::TransformException& ex) {
-        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] TF lookup for inertia failed: %s", ex.what());
-        return Eigen::Matrix3d::Identity();
-      }
+    if (!lookupModuleOffsetFromLeader(module_id, d)) {
+      return Eigen::Matrix3d::Identity();
     }
     d -= formation_cog_offset;
-    formation_inertia += single_inertia
-                       + single_mass * (d.dot(d) * Eigen::Matrix3d::Identity() - d * d.transpose());
+    formation_inertia += model.inertia
+                       + model.mass * (d.dot(d) * Eigen::Matrix3d::Identity() - d * d.transpose());
   }
 
   return formation_inertia;

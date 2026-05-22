@@ -20,6 +20,7 @@ find_package(Eigen3 REQUIRED)
 find_package(OsqpEigen REQUIRED)
 
 add_message_files(FILES
+  ModuleModel.msg
   TaggedWrench.msg
   TaggedWrenches.msg
   UnifiedControlReference.msg

@@ -15,6 +15,7 @@ namespace aerial_robot_control
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
     unified_cmd_received_(false),
+    last_module_model_pub_time_(0),
     prev_navi_state_for_diag_(-1),
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
@@ -99,6 +100,8 @@ namespace aerial_robot_control
       est_wrench_task_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/est_wrench_task"), 1, &BeetleController::estWrenchTaskCallback, this)));
       est_wrench_task_pubs_[i+1] = nh_.advertise<beetle::TaggedWrench>(module_name + string("/est_wrench_task"), 1);
       desired_ext_wrench_pubs_[i+1] = nh_.advertise<geometry_msgs::WrenchStamped>(module_name + string("/desired_external_wrench"), 1);
+      module_model_subs_.insert(make_pair(module_name, nh_.subscribe(module_name + string("/unified_control/module_model"), 1,
+                                                                     &BeetleController::moduleModelCallback, this)));
     }
     pid_controllers_.push_back(PID("f_x", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
     pid_controllers_.push_back(PID("f_y", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
@@ -152,9 +155,11 @@ namespace aerial_robot_control
     formation_observer_->initialize(nh_);
 
     unified_reference_pub_ = nh_.advertise<beetle::UnifiedControlReference>("unified_control/reference", 1);
+    module_model_pub_ = nh_.advertise<beetle::ModuleModel>("unified_control/module_model", 1, true);
     // Publishers to this module's own spinal (same topic names as GimbalrotorController)
     follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
     follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
+    publishModuleModel();
 
     // Service for toggling unified control mode
     ros::NodeHandle srv_nh(nh_, "controller");
@@ -839,6 +844,69 @@ namespace aerial_robot_control
                        yaw_pid_raw);
   }
 
+  void BeetleController::publishModuleModel()
+  {
+    if (!beetle_robot_model_ || !unified_controller_) return;
+
+    BeetleUnifiedController::ModuleModelDescriptor model;
+    model.mass = beetle_robot_model_->getMass();
+    model.inertia = beetle_robot_model_->getInertia<Eigen::Matrix3d>();
+    model.rotor_origins_from_cog =
+        beetle_robot_model_->getRotorsOriginFromCog<Eigen::Vector3d>();
+    model.rotor_direction = beetle_robot_model_->getRotorDirection();
+    model.mf_rate = beetle_robot_model_->getMFRate();
+
+    const int my_id = beetle_navigator_->getMyID();
+    unified_controller_->setModuleModelDescriptor(my_id, model);
+
+    beetle::ModuleModel msg;
+    msg.header.stamp = ros::Time::now();
+    msg.id = my_id;
+    msg.mass = model.mass;
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 3; c++) {
+        msg.inertia[r * 3 + c] = model.inertia(r, c);
+      }
+    }
+    msg.rotor_origin_from_cog.resize(model.rotor_origins_from_cog.size());
+    for (size_t i = 0; i < model.rotor_origins_from_cog.size(); i++) {
+      msg.rotor_origin_from_cog[i].x = model.rotor_origins_from_cog[i].x();
+      msg.rotor_origin_from_cog[i].y = model.rotor_origins_from_cog[i].y();
+      msg.rotor_origin_from_cog[i].z = model.rotor_origins_from_cog[i].z();
+    }
+    msg.rotor_direction.resize(beetle_robot_model_->getRotorNum());
+    for (int r = 0; r < beetle_robot_model_->getRotorNum(); r++) {
+      msg.rotor_direction[r] = static_cast<int8_t>(model.rotor_direction.at(r + 1));
+    }
+    msg.mf_rate = model.mf_rate;
+    module_model_pub_.publish(msg);
+  }
+
+  void BeetleController::moduleModelCallback(const beetle::ModuleModel& msg)
+  {
+    if (!unified_controller_ || msg.id == 0) return;
+
+    BeetleUnifiedController::ModuleModelDescriptor model;
+    model.mass = msg.mass;
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 3; c++) {
+        model.inertia(r, c) = msg.inertia[r * 3 + c];
+      }
+    }
+    model.rotor_origins_from_cog.resize(msg.rotor_origin_from_cog.size());
+    for (size_t i = 0; i < msg.rotor_origin_from_cog.size(); i++) {
+      model.rotor_origins_from_cog[i] =
+          Eigen::Vector3d(msg.rotor_origin_from_cog[i].x,
+                          msg.rotor_origin_from_cog[i].y,
+                          msg.rotor_origin_from_cog[i].z);
+    }
+    for (size_t i = 0; i < msg.rotor_direction.size(); i++) {
+      model.rotor_direction[static_cast<int>(i) + 1] = msg.rotor_direction[i];
+    }
+    model.mf_rate = msg.mf_rate;
+    unified_controller_->setModuleModelDescriptor(msg.id, model);
+  }
+
   void BeetleController::unifiedReferenceCallback(const beetle::UnifiedControlReference& msg)
   {
     unified_reference_wrench_acc_(0) = msg.wrench_acc.force.x;
@@ -1489,28 +1557,24 @@ namespace aerial_robot_control
 
   void BeetleController::externalWrenchEstimate()
   {
-    // NOTE: in unified mode the assembled formation is controlled by the
-    // formation-level QP allocation in BeetleUnifiedController. The per-module
-    // single-mass momentum observer here has no consumer in that path
-    // (calcInteractionWrench / wrench_comp / diff-mode damping are NOT injected
-    // into runUnifiedControlCommon). Worse, this method runs on a dedicated
-    // 100Hz thread (wrench_estimate_thread_) and previously read
-    // unified_controller_->getLocalRealizedWrenchBody() which dereferences
-    // target_vectoring_f_ / integrated_map_ — the very Eigen members the main
-    // control thread resizes inside computeUnifiedAllocation(). At the takeoff
-    // edge those buffers are first allocated (N: 0 → assembled count), giving
-    // the wrench thread a window of free()'d memory and a hard SIGSEGV.
-    //
-    // Fix: in unified + assembled state, early-return. The observer remains
-    // fully active in LF / independent / SEPARATED states which depend on it.
+    bool use_direct_target_wrench = false;
+    Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
+
     if (unified_control_mode_ &&
         beetle_navigator_->getModuleState() != SEPARATED) {
-      prev_est_wrench_timestamp_ = 0;
-      integrate_term_ = Eigen::VectorXd::Zero(6);
-      return;
+      target_wrench_cog =
+          unified_controller_->getLocalRealizedWrenchBody(beetle_navigator_->getMyID());
+      use_direct_target_wrench = (target_wrench_cog.size() == 6 &&
+                                  target_wrench_cog.cwiseAbs().maxCoeff() > 1e-6);
+      if (!use_direct_target_wrench) {
+        prev_est_wrench_timestamp_ = 0;
+        integrate_term_ = Eigen::VectorXd::Zero(6);
+        return;
+      }
     }
 
-    const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
+    const Eigen::VectorXd target_wrench_acc_cog =
+        use_direct_target_wrench ? Eigen::VectorXd() : getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&
        navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE &&
@@ -1519,7 +1583,7 @@ namespace aerial_robot_control
         prev_est_wrench_timestamp_ = 0;
         integrate_term_ = Eigen::VectorXd::Zero(6);
         return;
-      }else if(target_wrench_acc_cog.size() == 0){
+      }else if(!use_direct_target_wrench && target_wrench_acc_cog.size() == 0){
         ROS_WARN("Target wrench value for wrench estimation is not setted.");
         prev_est_wrench_timestamp_ = 0;
         integrate_term_ = Eigen::VectorXd::Zero(6);
@@ -1540,9 +1604,10 @@ namespace aerial_robot_control
     sum_momentum.head(3) = mass * vel_w;
     sum_momentum.tail(3) = inertia * omega_cog;
 
-    Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
-    target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
-    target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
+    if (!use_direct_target_wrench) {
+      target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
+      target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
+    }
 
     Eigen::MatrixXd J_t = Eigen::MatrixXd::Identity(6,6);
     J_t.topLeftCorner(3,3) = cog_rot;
@@ -1796,6 +1861,12 @@ namespace aerial_robot_control
   {
     int my_id = beetle_navigator_->getMyID();
     int leader_id = beetle_navigator_->getLeaderID();
+    ros::Time now = ros::Time::now();
+    if (last_module_model_pub_time_.isZero() ||
+        (now - last_module_model_pub_time_).toSec() > 1.0) {
+      publishModuleModel();
+      last_module_model_pub_time_ = now;
+    }
 
     // --- Gather local state ---
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);

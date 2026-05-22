@@ -196,6 +196,17 @@ Eigen::Vector3d BeetleUnifiedController::getModuleOffsetFromLeader(int module_id
   return offset;
 }
 
+bool BeetleUnifiedController::getCachedModuleOffsetFromLeader(
+    int module_id, Eigen::Vector3d& offset) const
+{
+  auto it = cached_module_offsets_from_leader_.find(module_id);
+  if (it != cached_module_offsets_from_leader_.end()) {
+    offset = it->second;
+    return true;
+  }
+  return lookupModuleOffsetFromLeader(module_id, offset);
+}
+
 std::vector<Eigen::MatrixXd> BeetleUnifiedController::buildRotorMask() const
 {
   std::vector<KDL::Rotation> thrust_coords_rot =
@@ -231,30 +242,40 @@ bool BeetleUnifiedController::updateFormationGeometry()
     formation_cog_offset_ = external_formation_cog_offset_;
     formation_inertia_ = external_formation_inertia_;
     cached_assembled_ids_.clear();  // invalidate cache so next non-external call refreshes
+    cached_module_offsets_from_leader_.clear();
     return true;
   }
 
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) return false;
 
-  // ε-fix: reuse the latched geometry while the assembled-IDs set is unchanged.
+  // ε-fix: reuse the latched module offsets while the assembled-IDs set is unchanged.
   // Re-running lookupTransform per cycle introduced ~10 cm Z drift in cog_offset
   // under sustained tilt (real-hw pitch=0.4). Geometry is structurally constant
-  // for a given assembled set, so memoize on the IDs key.
+  // for a given assembled set; mass/inertia may update without relatching TF.
   uint64_t model_revision = 0;
   {
     std::lock_guard<std::mutex> lock(module_model_mutex_);
     model_revision = module_model_revision_;
   }
-  if (assembled_ids == cached_assembled_ids_ && formation_mass_ > 0.0 &&
+  bool ids_changed = assembled_ids != cached_assembled_ids_;
+  if (!ids_changed && formation_mass_ > 0.0 &&
       model_revision == cached_module_model_revision_) return true;
 
   int N = assembled_ids.size();
+  if (ids_changed) cached_module_offsets_from_leader_.clear();
+  for (int module_id : assembled_ids) {
+    if (cached_module_offsets_from_leader_.count(module_id) > 0) continue;
+    Eigen::Vector3d module_offset;
+    if (!lookupModuleOffsetFromLeader(module_id, module_offset)) return false;
+    cached_module_offsets_from_leader_[module_id] = module_offset;
+  }
+
   formation_mass_ = 0.0;
   Eigen::Vector3d weighted_cog_offset = Eigen::Vector3d::Zero();
   for (int module_id : assembled_ids) {
     Eigen::Vector3d module_offset;
-    if (!lookupModuleOffsetFromLeader(module_id, module_offset)) return false;
+    if (!getCachedModuleOffsetFromLeader(module_id, module_offset)) return false;
     const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
     formation_mass_ += model.mass;
     weighted_cog_offset += model.mass * module_offset;
@@ -931,7 +952,7 @@ Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
     const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
 
     Eigen::Vector3d module_offset = Eigen::Vector3d::Zero();
-    if (!lookupModuleOffsetFromLeader(module_id, module_offset)) {
+    if (!getCachedModuleOffsetFromLeader(module_id, module_offset)) {
       return Eigen::MatrixXd::Zero(6, rotor_coef_ * total_rotors);
     }
 
@@ -975,7 +996,7 @@ Eigen::Matrix3d BeetleUnifiedController::computeFormationInertia(
   for (int module_id : assembled_ids) {
     const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
     Eigen::Vector3d d = Eigen::Vector3d::Zero();
-    if (!lookupModuleOffsetFromLeader(module_id, d)) {
+    if (!getCachedModuleOffsetFromLeader(module_id, d)) {
       return Eigen::Matrix3d::Identity();
     }
     d -= formation_cog_offset;

@@ -227,9 +227,10 @@ private:
 
   // ε-fix: cache formation geometry keyed on the assembled-IDs set.
   // Per-cycle tf::lookupTransform under large tilt produced 10 cm Z drift in
-  // cog_offset (real-hw pitch=0.4 log). We now only recompute when the set
-  // of assembled modules changes, freezing geometry during steady flight.
+  // cog_offset (real-hw pitch=0.4 log). Latch module offsets when the
+  // assembled set changes, then reuse them even if module mass/inertia updates.
   std::vector<int> cached_assembled_ids_;
+  std::map<int, Eigen::Vector3d> cached_module_offsets_from_leader_;
   uint64_t module_model_revision_;
   uint64_t cached_module_model_revision_;
   std::map<int, ModuleModelDescriptor> module_models_;
@@ -284,6 +285,7 @@ private:
   ModuleModelDescriptor getModuleModelDescriptor(int module_id) const;
   Eigen::Vector3d getModuleOffsetFromLeader(int module_id) const;
   bool lookupModuleOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;
+  bool getCachedModuleOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;
   std::vector<Eigen::MatrixXd> buildRotorMask() const;
 
   void extractThrustAndGimbal(const Eigen::VectorXd& vectoring_f,

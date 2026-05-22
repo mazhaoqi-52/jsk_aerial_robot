@@ -44,8 +44,10 @@ controller:
   # diag=true reuses the legacy LF residual/inter-wrench calculation for logging.
   # secondary_gain=0 keeps it diagnostic-only. Positive values bias QP secondary
   # allocation reference from LF-style wrench_comp_list_ (experimental).
-  unified_internal_wrench_diag: true
-  unified_internal_wrench_log: true
+  # diag/log default off: with secondary_gain=0 they only add per-frame
+  # calcInteractionWrench() + string-logging load to the 40Hz control loop.
+  unified_internal_wrench_diag: false
+  unified_internal_wrench_log: false
   unified_internal_wrench_log_period: 1.0
   unified_internal_wrench_secondary_gain: 0.0
 

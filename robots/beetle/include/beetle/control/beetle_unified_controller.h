@@ -198,7 +198,6 @@ public:
    *         Returns zero vector if allocation has not been computed yet.
    */
   Eigen::VectorXd getRealizedWrenchBody() const;
-  Eigen::VectorXd getLocalRealizedWrenchBody(int module_id) const;
 
   /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
   bool isAllocationSaturated() const;

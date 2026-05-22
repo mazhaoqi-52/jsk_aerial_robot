@@ -799,39 +799,6 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   return realized;
 }
 
-Eigen::VectorXd BeetleUnifiedController::getLocalRealizedWrenchBody(int module_id) const
-{
-  Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
-
-  std::lock_guard<std::mutex> lock(allocation_mutex_);
-  int module_index = getModuleIndex(module_id);
-  if (module_index < 0) return realized;
-
-  const int elems_per_module = motor_num_per_module_ * rotor_coef_;
-  const int col_start = module_index * elems_per_module;
-  if (target_vectoring_f_.size() < col_start + elems_per_module) return realized;
-
-  const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
-  std::vector<Eigen::MatrixXd> masked_rot_single = buildRotorMask();
-  if (masked_rot_single.size() < static_cast<size_t>(motor_num_per_module_)) {
-    return realized;
-  }
-
-  for (int r = 0; r < motor_num_per_module_; r++) {
-    const int base = col_start + r * rotor_coef_;
-    Eigen::VectorXd f_local = target_vectoring_f_.segment(base, rotor_coef_);
-    Eigen::Vector3d force_body = masked_rot_single.at(r) * f_local;
-    const int dir = model.rotor_direction.at(r + 1);
-    const Eigen::Vector3d torque_body =
-        aerial_robot_model::skew(model.rotor_origins_from_cog.at(r)) * force_body
-        + dir * model.mf_rate * force_body;
-    realized.head(3) += force_body;
-    realized.tail(3) += torque_body;
-  }
-
-  return realized;
-}
-
 bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 {
   // Send the rotational part of the formation-level allocation pseudoinverse

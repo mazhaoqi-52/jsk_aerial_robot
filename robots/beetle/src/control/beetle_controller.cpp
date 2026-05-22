@@ -1598,24 +1598,22 @@ namespace aerial_robot_control
 
   void BeetleController::externalWrenchEstimate()
   {
-    bool use_direct_target_wrench = false;
-    Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
-
+    // In unified mode the assembled formation is controlled by the
+    // formation-level QP allocation in BeetleUnifiedController. The per-module
+    // single-mass momentum observer here has no consumer in that path
+    // (calcInteractionWrench / wrench_comp are diagnostic-only while
+    // unified_internal_wrench_secondary_gain == 0). It also runs on the
+    // dedicated 100Hz wrench_estimate_thread_; early-returning in unified +
+    // assembled state keeps that thread idle and avoids contending the main
+    // control loop. The observer stays active in LF / independent / SEPARATED.
     if (unified_control_mode_ &&
         beetle_navigator_->getModuleState() != SEPARATED) {
-      target_wrench_cog =
-          unified_controller_->getLocalRealizedWrenchBody(beetle_navigator_->getMyID());
-      use_direct_target_wrench = (target_wrench_cog.size() == 6 &&
-                                  target_wrench_cog.cwiseAbs().maxCoeff() > 1e-6);
-      if (!use_direct_target_wrench) {
-        prev_est_wrench_timestamp_ = 0;
-        integrate_term_ = Eigen::VectorXd::Zero(6);
-        return;
-      }
+      prev_est_wrench_timestamp_ = 0;
+      integrate_term_ = Eigen::VectorXd::Zero(6);
+      return;
     }
 
-    const Eigen::VectorXd target_wrench_acc_cog =
-        use_direct_target_wrench ? Eigen::VectorXd() : getTargetWrenchAccCog();
+    const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&
        navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE &&
@@ -1624,7 +1622,7 @@ namespace aerial_robot_control
         prev_est_wrench_timestamp_ = 0;
         integrate_term_ = Eigen::VectorXd::Zero(6);
         return;
-      }else if(!use_direct_target_wrench && target_wrench_acc_cog.size() == 0){
+      }else if(target_wrench_acc_cog.size() == 0){
         ROS_WARN("Target wrench value for wrench estimation is not setted.");
         prev_est_wrench_timestamp_ = 0;
         integrate_term_ = Eigen::VectorXd::Zero(6);
@@ -1645,10 +1643,9 @@ namespace aerial_robot_control
     sum_momentum.head(3) = mass * vel_w;
     sum_momentum.tail(3) = inertia * omega_cog;
 
-    if (!use_direct_target_wrench) {
-      target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
-      target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
-    }
+    Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
+    target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
+    target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
 
     Eigen::MatrixXd J_t = Eigen::MatrixXd::Identity(6,6);
     J_t.topLeftCorner(3,3) = cog_rot;

@@ -25,17 +25,11 @@ controller:
     torque_observer_gain: 2.5
     enable_force_observer: true
     enable_torque_observer: true
-    # Stage-1 LPF cutoff (output filt). 1.0 Hz lets real disturbances pass while
-    # rejecting attitude / IMU noise. Long-term drift is removed by the bias LPF below.
+    # Output LPF cutoff. No bias subtraction is applied; the observer is
+    # diagnostic until its allocation/momentum equation is validated on hardware.
     est_force_lpf_cutoff_freq: 1.0
     est_torque_lpf_cutoff_freq: 1.0
-    bias_settle_time: 3.0
-    # Continuous bias LPF cutoff. After settle, bias_force_w_ tracks long-term
-    # drift via this LPF (bias = (1-r)*bias + r*filt with r = dt*2pi*fc).
-    # 0.02 Hz ⇒ ~8 s effective time constant; chosen ≪ est_force_lpf_cutoff so
-    # corrected = filt - bias still captures mid-band disturbances.
-    bias_lpf_cutoff_freq: 0.02
-    # Stage-2 ramp: after bias completes, FF rises 0→1 over this many seconds.
+    # Future FF gate ramp only; current unified control does not consume FormObs.
     ff_ramp_seconds: 5.0
 
   yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP

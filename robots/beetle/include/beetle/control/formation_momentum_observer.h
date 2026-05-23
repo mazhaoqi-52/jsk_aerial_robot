@@ -6,10 +6,8 @@
 //   - Uses formation mass/inertia, not single-module parameters
 //   - Observer input = "realized wrench" from allocation (A * f), not PID commands
 //   - Cascade-agnostic: no dependency on which PID terms are in PC vs spinal
-//   - Auto bias calibration: after observer converges during unloaded hover,
-//     records steady-state estimate as baseline and subtracts it from output.
-//     This cancels the inherent offset from PID I-term compensating model error,
-//     analogous to original per-module observer's differential cancellation.
+//   - Diagnostic by default: the estimate is a model residual, not a guaranteed
+//     physical external force unless the allocation/thrust model is validated.
 //
 // Version 1 (Phase U2):
 //   - 3D external force estimation only (no torque)
@@ -84,10 +82,8 @@ public:
   // ---- Accessors (debug / future compensation) ----
 
   /** @brief Get estimated external force in world frame [N] (LPF-filtered).
-   *  Plan-A: NO bias subtraction. ninja-style: trust the observer output as the
-   *  true external force estimate. Initial-momentum baseline is locked once at
-   *  observer init, so steady-state DC is captured by it instead of by a
-   *  post-hoc bias snap. */
+   *  No bias subtraction is applied. Treat this as a diagnostic model residual
+   *  until the observer equation has been validated on hardware. */
   Eigen::Vector3d getEstExternalForceWorld() const { return est_ext_force_w_filt_; }
 
   /** @brief Get raw (pre-LPF) estimated external force in world frame [N]. */
@@ -121,7 +117,7 @@ public:
    *  ff_ramp_seconds_. */
   void setFfArmed(bool armed);
 
-  /** @brief Is the FF gate currently armed? (replaces isBiasCalibrated) */
+  /** @brief Is the future FF gate currently armed? */
   bool isFfReady() const { return ff_armed_ && initialized_; }
 
   /** @brief Soft-ramp factor [0,1] used by downstream FF compensation.
@@ -137,26 +133,19 @@ private:
 
   // Momentum observer internal state
   Eigen::Vector3d init_linear_momentum_;     // p_lin(t=0)
+  Eigen::Vector3d prev_linear_momentum_;     // p_lin(t-dt), for equation diagnostics
   Eigen::Vector3d integrate_term_force_;     // accumulated integral for force channel
   Eigen::Vector3d est_ext_force_w_;          // estimated external force in world frame
+  bool prev_linear_momentum_valid_;
 
   // V2: angular momentum observer (placeholder, zeroed in V1)
   Eigen::Vector3d init_angular_momentum_;    // p_ang(t=0)
   Eigen::Vector3d integrate_term_torque_;    // accumulated integral for torque channel
   Eigen::Vector3d est_ext_torque_body_;      // estimated external torque in body frame
 
-  // ---- FF arming (Plan A: no bias subtraction) ----
-  // Plan A discards the snap-and-LPF bias mechanism entirely. The observer's
-  // own init_linear_momentum_ / init_angular_momentum_ baseline already
-  // captures the steady-state DC component, so any post-hoc bias subtraction
-  // is double-counting and was the root cause of the positive-feedback
-  // divergence at t=17304 (snap froze a transient relative residual at 8.3 N
-  // and then FF gain=0.2 fed corrected=filt-bias back into target_wrench_acc).
-  //
-  // The only piece we keep is a simple time gate: once the controller arms
-  // the FF (typically at hover-stable transition), ramp 0→1 over
-  // ff_ramp_seconds_ to avoid stepping the wrench command. ff_armed_ replaces
-  // bias_calibrated_ in the downstream API.
+  // ---- FF arming (no bias subtraction) ----
+  // Kept only as a future feedforward gate; current unified control does not
+  // consume the observer output. The observer estimate remains diagnostic.
   bool   ff_armed_;                          // FF gate state (controlled by setFfArmed)
   double ff_armed_time_;                     // ros::Time::now().toSec() when armed (<0 = unarmed)
   double ff_ramp_seconds_;                   // duration of the 0→1 soft ramp [s]

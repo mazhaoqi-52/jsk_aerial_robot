@@ -2261,7 +2261,7 @@ namespace aerial_robot_control
           Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
           Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
 
-          // Arm bias calibration only while the formation is in hover.
+          // Arm the future observer-FF gate only while the formation is in hover.
           const bool in_hover =
               (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
           formation_observer_->setFfArmed(in_hover);
@@ -2276,11 +2276,11 @@ namespace aerial_robot_control
 
     if (unified_transition_count_ >= 0) unified_transition_count_++;
 
-    ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl %s id=%d] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d yaw_raw=%.4f",
-                      is_leader ? "LEADER" : "FOLLOWER", my_id,
-                      target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
-                      target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
-                      ok, yaw_pid_raw);
+    ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl %s id=%d] wrench_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f) ok=%d yaw_raw=%.4f",
+                       is_leader ? "LEADER" : "FOLLOWER", my_id,
+                       target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
+                       target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
+                       ok, yaw_pid_raw);
 
     // Only leader publishes assembly-debug topics (shared global namespace)
     if (is_leader) {

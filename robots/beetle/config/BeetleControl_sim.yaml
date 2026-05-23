@@ -24,11 +24,12 @@ controller:
   # Observer gain = bandwidth: higher → faster but noisier. Start conservative.
   formation_observer:
     force_observer_gain: 3.0       # K_f: observer gain for force channel [1/s]
-    torque_observer_gain: 2.5      # K_t: observer gain for torque channel (V2, unused in V1)
+    torque_observer_gain: 2.5      # K_t: observer gain for torque channel
     enable_force_observer: true    # V1: enable 3D force estimation
-    enable_torque_observer: true  # V2: enable torque estimation
-    bias_settle_time: 3.0          # seconds to wait for observer to converge before snapping bias
-    bias_lpf_cutoff_freq: 0.02     # continuous bias LPF cutoff [Hz] after snap (Dragon-style)
+    enable_torque_observer: true   # V2: enable torque estimation
+    est_force_lpf_cutoff_freq: 0.05 # preserve previous code default
+    est_torque_lpf_cutoff_freq: 0.05
+    ff_ramp_seconds: 5.0           # future FF gate only; current unified control does not consume FormObs
 
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
 

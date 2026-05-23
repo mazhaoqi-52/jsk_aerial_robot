@@ -17,15 +17,11 @@
 //   Observer output (raw):
 //     f_ext_hat_raw = K_f * (p_lin - p_lin_0 - integrate_term_f)
 //
-//   Bias calibration:
-//     After the observer settles (bias_settle_time seconds), average the raw
-//     estimate over bias_calib_samples to get bias_force_w_.
-//     Output = f_ext_hat_raw - bias_force_w_
-//
-//     This cancels the inherent offset from PID I-term compensating for model
-//     error (mass, thrust coefficient mismatch), which the observer cannot
-//     distinguish from true external force.  Analogous to the original per-module
-//     observer's differential cancellation (individual - average).
+// Diagnostic equation check:
+//   finite_diff_ext = d(M*v_w)/dt - (f_realized_w - M*g_w)
+// This should roughly match f_ext_hat when the allocation/thrust model is
+// consistent. If it does not, the observer output is a model residual rather
+// than a trustworthy physical external force.
 
 #include <beetle/control/formation_momentum_observer.h>
 #include <algorithm>
@@ -37,25 +33,27 @@ FormationMomentumObserver::FormationMomentumObserver()
   : initialized_(false),
     active_(false),
     init_linear_momentum_(Eigen::Vector3d::Zero()),
+    prev_linear_momentum_(Eigen::Vector3d::Zero()),
     integrate_term_force_(Eigen::Vector3d::Zero()),
     est_ext_force_w_(Eigen::Vector3d::Zero()),
-    est_ext_force_w_filt_(Eigen::Vector3d::Zero()),
-    est_force_lpf_cutoff_freq_(0.05),
-    est_force_lpf_initialized_(false),
+    prev_linear_momentum_valid_(false),
     init_angular_momentum_(Eigen::Vector3d::Zero()),
     integrate_term_torque_(Eigen::Vector3d::Zero()),
     est_ext_torque_body_(Eigen::Vector3d::Zero()),
-    est_ext_torque_body_filt_(Eigen::Vector3d::Zero()),
-    est_torque_lpf_cutoff_freq_(0.05),
-    est_torque_lpf_initialized_(false),
+    ff_armed_(false),
+    ff_armed_time_(-1.0),
+    ff_ramp_seconds_(5.0),
     last_cog_rot_(Eigen::Matrix3d::Identity()),
     force_observer_gain_(3.0),
     torque_observer_gain_(2.5),
+    est_force_lpf_cutoff_freq_(0.05),
+    est_force_lpf_initialized_(false),
+    est_ext_force_w_filt_(Eigen::Vector3d::Zero()),
+    est_torque_lpf_cutoff_freq_(0.05),
+    est_torque_lpf_initialized_(false),
+    est_ext_torque_body_filt_(Eigen::Vector3d::Zero()),
     enable_force_observer_(true),
-    enable_torque_observer_(false),
-    ff_armed_(false),
-    ff_armed_time_(-1.0),
-    ff_ramp_seconds_(5.0)
+    enable_torque_observer_(false)
 {
 }
 
@@ -96,8 +94,10 @@ void FormationMomentumObserver::reset()
 {
   initialized_ = false;
   init_linear_momentum_ = Eigen::Vector3d::Zero();
+  prev_linear_momentum_ = Eigen::Vector3d::Zero();
   integrate_term_force_ = Eigen::Vector3d::Zero();
   est_ext_force_w_ = Eigen::Vector3d::Zero();
+  prev_linear_momentum_valid_ = false;
   est_ext_force_w_filt_ = Eigen::Vector3d::Zero();
   est_force_lpf_initialized_ = false;
 
@@ -109,11 +109,11 @@ void FormationMomentumObserver::reset()
 
   last_cog_rot_ = Eigen::Matrix3d::Identity();
 
-  // Plan A: no bias state to reset. Just clear FF arming.
+  // No bias state to reset. Just clear the future FF arming gate.
   ff_armed_ = false;
   ff_armed_time_ = -1.0;
 
-  ROS_INFO("[FormationObserver] State reset (Plan A: no bias subtraction)");
+  ROS_INFO("[FormationObserver] State reset (no bias subtraction)");
 }
 
 void FormationMomentumObserver::setFfArmed(bool armed)
@@ -163,7 +163,7 @@ void FormationMomentumObserver::update(
       init_linear_momentum_ = p_lin;
       initialized_ = true;
       ROS_INFO("[FormationObserver] First update: p_lin_0 = (%.4f, %.4f, %.4f), "
-               "mass = %.3f (Plan A: no bias subtraction)",
+               "mass = %.3f (no bias subtraction)",
                init_linear_momentum_.x(), init_linear_momentum_.y(),
                init_linear_momentum_.z(), formation_mass);
     }
@@ -180,9 +180,21 @@ void FormationMomentumObserver::update(
     constexpr double G = 9.797;  // same as aerial_robot_estimation::G
     Eigen::Vector3d gravity_force_w = formation_mass * Eigen::Vector3d(0, 0, G);
 
+    Eigen::Vector3d model_net_force_w = realized_force_w - gravity_force_w;
+    Eigen::Vector3d p_dot_w = Eigen::Vector3d::Zero();
+    Eigen::Vector3d finite_diff_ext_w = Eigen::Vector3d::Zero();
+    const bool p_dot_ready = prev_linear_momentum_valid_ && dt > 1e-6;
+    if (p_dot_ready)
+    {
+      p_dot_w = (p_lin - prev_linear_momentum_) / dt;
+      finite_diff_ext_w = p_dot_w - model_net_force_w;
+    }
+    prev_linear_momentum_ = p_lin;
+    prev_linear_momentum_valid_ = true;
+
     // 5. Integration step:
     //    integrate_term_f += (f_realized_w - N_f + f_ext_hat) * dt
-    integrate_term_force_ += (realized_force_w - gravity_force_w + est_ext_force_w_) * dt;
+    integrate_term_force_ += (model_net_force_w + est_ext_force_w_) * dt;
 
     // 6. Observer output (raw, internal feedback uses this directly):
     residual = p_lin - init_linear_momentum_ - integrate_term_force_;
@@ -204,24 +216,23 @@ void FormationMomentumObserver::update(
       est_ext_force_w_filt_ = alpha * est_ext_force_w_filt_ + (1.0 - alpha) * est_ext_force_w_;
     }
 
-    // 7. Plan A: no bias snap, no slow-LPF bias tracker. The init_linear_momentum_
-    //    baseline captured at step 2 IS the steady-state reference; subtracting
-    //    a post-hoc bias is double-counting and was the root cause of the
-    //    positive-feedback divergence at t=17304 (snap froze a transient
-    //    residual at 8.3 N and then FF gain=0.2 fed corrected=filt-bias back
-    //    into target_wrench_acc).
-    //
-    //    Output for downstream consumers = est_ext_force_w_filt_ (raw observer
-    //    + 1 Hz LPF). DC component is handled by ninja-style trust:
-    //    if the observer estimates a steady residual, treat it as a real
-    //    external force and let FF compensate.
-    double f_raw_filt_dev = (est_ext_force_w_ - est_ext_force_w_filt_).norm();
-    ROS_INFO_THROTTLE(2.0, "[FormObs_F] raw=(%.3f,%.3f,%.3f) filt=(%.3f,%.3f,%.3f) "
-                      "|filt|=%.3f |raw-filt|=%.3f ff=%s",
-                      est_ext_force_w_.x(), est_ext_force_w_.y(), est_ext_force_w_.z(),
-                      est_ext_force_w_filt_.x(), est_ext_force_w_filt_.y(), est_ext_force_w_filt_.z(),
-                      est_ext_force_w_filt_.norm(), f_raw_filt_dev,
-                      ff_armed_ ? "ARMED" : "DISARMED");
+    // 7. Equation diagnostic. In unloaded hover, finite_diff_ext_w should stay
+    //    small; a persistent offset means the allocation/thrust model and the
+    //    measured momentum are not self-consistent.
+    ROS_INFO_THROTTLE(
+        2.0,
+        "[FormObsEq_F] f_real_w=(%.2f,%.2f,%.2f) Mg=(%.2f,%.2f,%.2f) "
+        "model_net=(%.2f,%.2f,%.2f) p_dot=(%.2f,%.2f,%.2f) "
+        "fd_ext=(%.2f,%.2f,%.2f) obs_raw=(%.2f,%.2f,%.2f) obs_filt=(%.2f,%.2f,%.2f) "
+        "ready=%d dt=%.3f ff=%s",
+        realized_force_w.x(), realized_force_w.y(), realized_force_w.z(),
+        gravity_force_w.x(), gravity_force_w.y(), gravity_force_w.z(),
+        model_net_force_w.x(), model_net_force_w.y(), model_net_force_w.z(),
+        p_dot_w.x(), p_dot_w.y(), p_dot_w.z(),
+        finite_diff_ext_w.x(), finite_diff_ext_w.y(), finite_diff_ext_w.z(),
+        est_ext_force_w_.x(), est_ext_force_w_.y(), est_ext_force_w_.z(),
+        est_ext_force_w_filt_.x(), est_ext_force_w_filt_.y(), est_ext_force_w_filt_.z(),
+        p_dot_ready ? 1 : 0, dt, ff_armed_ ? "ARMED" : "DISARMED");
   }
 
   // ========== 3D Torque Observer (V2) ==========
@@ -286,10 +297,11 @@ void FormationMomentumObserver::update(
       est_ext_torque_body_filt_ = alpha_t * est_ext_torque_body_filt_ + (1.0 - alpha_t) * est_ext_torque_body_;
     }
 
-    // 7. Plan A: no torque bias snap. Output = est_ext_torque_body_filt_.
+    // 7. Torque output diagnostic. Keep this at DEBUG to avoid log spam while
+    //    force-observer validation is the current focus.
     double tau_raw_filt_dev = (est_ext_torque_body_ - est_ext_torque_body_filt_).norm();
-    ROS_INFO_THROTTLE(2.0, "[FormObs_T] raw=(%.4f,%.4f,%.4f) filt=(%.4f,%.4f,%.4f) "
-                      "|raw-filt|=%.4f gyro=(%.4f,%.4f,%.4f)",
+    ROS_DEBUG_THROTTLE(2.0, "[FormObs_T] raw=(%.4f,%.4f,%.4f) filt=(%.4f,%.4f,%.4f) "
+                       "|raw-filt|=%.4f gyro=(%.4f,%.4f,%.4f)",
                       est_ext_torque_body_.x(), est_ext_torque_body_.y(), est_ext_torque_body_.z(),
                       est_ext_torque_body_filt_.x(), est_ext_torque_body_filt_.y(), est_ext_torque_body_filt_.z(),
                       tau_raw_filt_dev,
@@ -323,9 +335,8 @@ void FormationMomentumObserver::publishDebug(
     const Eigen::Vector3d& residual_force,
     const Eigen::Vector3d& residual_torque)
 {
-  // Snap+bias mechanism removed: observer output is the LPF-filtered estimate
-  // directly (ninja-style direct output). FF ramp gating is applied at the
-  // accessor (getEstExternalForceWorld), not here.
+  // Observer output is the LPF-filtered estimate directly. No bias subtraction
+  // is applied here.
   Eigen::Vector3d f_ext_corrected = est_ext_force_w_filt_;
 
   // Estimated external torque — body frame (LPF-filtered, no bias subtraction).
@@ -341,7 +352,7 @@ void FormationMomentumObserver::publishDebug(
     est_ext_torque_body_pub_.publish(msg);
   }
 
-  // Full 6D wrench in formation_body frame (bias-subtracted).
+  // Full 6D wrench in formation_body frame (no bias subtraction).
   // Both force and torque are in body frame for consistent interpretation.
   {
     Eigen::Vector3d force_body = last_cog_rot_.transpose() * f_ext_corrected;
@@ -386,8 +397,7 @@ void FormationMomentumObserver::publishDebug(
 Eigen::VectorXd FormationMomentumObserver::getEstExternalWrench6D() const
 {
   Eigen::VectorXd wrench = Eigen::VectorXd::Zero(6);
-  // Plan A: no bias subtraction. Trust LPF-filtered observer output as the
-  // true external wrench estimate.
+  // No bias subtraction. This is a diagnostic model residual until validated.
   wrench.head(3) = last_cog_rot_.transpose() * est_ext_force_w_filt_;
   wrench.tail(3) = est_ext_torque_body_filt_;
   return wrench;

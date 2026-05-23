@@ -289,6 +289,11 @@ bool BeetleUnifiedController::updateFormationGeometry()
   formation_inertia_ = computeFormationInertia(assembled_ids, formation_cog_offset_);
   cached_assembled_ids_ = assembled_ids;  // ε-fix: latch
   cached_module_model_revision_ = model_revision;
+  // Geometry actually changed → spinals' one-shot torque_alloc_inv + cascade
+  // gains are stale. Re-arm so computeUnifiedAllocation() will re-send this
+  // cycle (leader). Followers detect via getFormationRevision() bump from the
+  // BeetleController side.
+  cascade_alloc_sent_ = false;
   ROS_INFO("[UnifiedCtrl] Formation geometry latched for assembled_ids=[%s] "
            "N=%d cog_offset=(%.4f,%.4f,%.4f) mass=%.3f",
            [&]{ std::string s; for(int id : assembled_ids){ s += std::to_string(id) + ","; } return s; }().c_str(),

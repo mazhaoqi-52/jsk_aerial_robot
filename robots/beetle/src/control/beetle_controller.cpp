@@ -15,7 +15,6 @@ namespace aerial_robot_control
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
     unified_cmd_received_(false),
-    last_module_model_pub_time_(0),
     prev_navi_state_for_diag_(-1),
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
@@ -1899,12 +1898,13 @@ namespace aerial_robot_control
   {
     int my_id = beetle_navigator_->getMyID();
     int leader_id = beetle_navigator_->getLeaderID();
-    ros::Time now = ros::Time::now();
-    if (last_module_model_pub_time_.isZero() ||
-        (now - last_module_model_pub_time_).toSec() > 1.0) {
-      publishModuleModel();
-      last_module_model_pub_time_ = now;
-    }
+    // ModuleModel is published once at initialize() (latched). Periodic re-
+    // publish was sampling getRotorsOriginFromCog() / getInertia() at the live
+    // gimbal state, so per-module rotor positions and inertias drifted a few
+    // mm every second → module_model_revision_ kept bumping → formation
+    // geometry kept re-latching (log: "Formation geometry latched" @ ~2 Hz).
+    // Latched + single publish keeps the snapshot stable and only re-latches
+    // on genuine changes (peer ModuleModel late-arrival, assembled-id change).
 
     // --- Gather local state ---
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
@@ -1943,6 +1943,19 @@ namespace aerial_robot_control
 
     // --- Formation geometry: each module computes locally ---
     unified_controller_->updateFormationGeometry();
+    // Detect geometry changes (e.g., peer ModuleModel late-arrival flipping the
+    // formation from leader-only fallback to true heterogeneous mass-weighted).
+    // The leader's cascade_alloc_sent_ is re-armed internally by
+    // updateFormationGeometry; the follower's local one-shot lives here and
+    // needs to be re-armed too so the spinal does not keep a stale
+    // torque_alloc_inv built from the transient (pre-convergence) geometry.
+    uint64_t cur_formation_rev = unified_controller_->getFormationRevision();
+    if (cur_formation_rev != prev_formation_revision_) {
+      if (!is_leader) local_unified_cascade_setup_sent_ = false;
+      ROS_INFO("[UnifiedCtrl] id=%d formation_revision %lu → %lu, re-arm cascade one-shot",
+               my_id, (unsigned long)prev_formation_revision_, (unsigned long)cur_formation_rev);
+      prev_formation_revision_ = cur_formation_rev;
+    }
     const Eigen::Vector3d& cog_offset_leader_frame = unified_controller_->getFormationCogOffset();
     Eigen::Vector3d cog_offset_self = cog_offset_leader_frame;
     if (!is_leader) {

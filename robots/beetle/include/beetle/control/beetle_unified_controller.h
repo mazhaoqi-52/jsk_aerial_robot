@@ -104,6 +104,14 @@ public:
    *  Call this when exiting unified mode. */
   void resetCascadeAllocSent() { cascade_alloc_sent_ = false; }
 
+  /** @brief Monotonically increases whenever formation geometry (mass,
+   *  cog_offset, inertia, rotor lever arms) is actually re-latched in
+   *  updateFormationGeometry(). Callers cache the last seen value and detect
+   *  changes to re-arm side-effects such as the per-follower spinal one-shot
+   *  cascade matrix. The leader's own one-shot is reset internally by
+   *  updateFormationGeometry() itself. */
+  uint64_t getFormationRevision() const { return cached_module_model_revision_; }
+
   /** @brief Reset QP solver dimensions/solver internals when entering unified mode. */
   void resetQPState() {
     qp_n_vars_ = -1;

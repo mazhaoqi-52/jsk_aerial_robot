@@ -128,7 +128,11 @@ namespace aerial_robot_control
     ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl (only when !gimbal_calc_in_fc)
     ros::Publisher module_model_pub_;
     map<string, ros::Subscriber> module_model_subs_;
-    ros::Time last_module_model_pub_time_;
+    // Last formation revision seen in runUnifiedControlCommon. When the unified
+    // controller's getFormationRevision() bumps (peer ModuleModel late-arrival
+    // or assembled-id change), the follower local cascade one-shot is re-armed
+    // so the spinal does not keep a stale torque_alloc_inv.
+    uint64_t prev_formation_revision_ = 0;
     spinal::FourAxisCommand unified_thrust_cmd_;
     bool unified_cmd_received_;
     ros::Time unified_cmd_stamp_;

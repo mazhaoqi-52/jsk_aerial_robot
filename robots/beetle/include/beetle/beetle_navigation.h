@@ -4,6 +4,7 @@
 
 #include <gimbalrotor/gimbalrotor_navigation.h>
 #include <beetle/model/beetle_robot_model.h>
+#include <beetle/ModuleModel.h>
 #include <diagnostic_msgs/KeyValue.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -12,6 +13,7 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 
 namespace aerial_robot_navigation
 {
@@ -160,6 +162,15 @@ namespace aerial_robot_navigation
     boost::shared_ptr<BeetleRobotModel> beetle_robot_model_;
     map<string, ros::Subscriber> assembly_flag_subs_;
     void assemblyFlagCallback(const diagnostic_msgs::KeyValue & msg);
+
+    // Per-module mass cache for mass-weighted center of moving in calcCenterOfMoving().
+    // Mirrors the controller's per-module mass usage in
+    // BeetleUnifiedController::updateFormationGeometry(); keeps the Cog2CoM_
+    // definition consistent with formation_cog_offset_ on the control side.
+    map<string, ros::Subscriber> module_model_subs_;
+    std::map<int, double> module_masses_;
+    std::mutex mutex_module_masses_;
+    void moduleModelCallback(const beetle::ModuleModel& msg);
   };
 
   template<> inline KDL::Frame BeetleNavigator::getCog2CoM()

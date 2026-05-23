@@ -48,9 +48,19 @@ void BeetleNavigator::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   for(int i = 0; i < max_modules_num_; i++){
     std::string module_name  = string("/") + getMyName() + std::to_string(i+1);
     assembly_flag_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/assembly_flag"), 1, &BeetleNavigator::assemblyFlagCallback, this)));
+    // Mirror the unified controller's ModuleModel pub/sub so the nav can do
+    // mass-weighted calcCenterOfMoving — same `latched` publisher upstream.
+    module_model_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/unified_control/module_model"), 1, &BeetleNavigator::moduleModelCallback, this)));
     assembly_flags_.insert(std::make_pair(i+1,false));
   }
-  
+
+}
+
+void BeetleNavigator::moduleModelCallback(const beetle::ModuleModel& msg)
+{
+  if (msg.id == 0 || !std::isfinite(msg.mass) || msg.mass <= 0.0) return;
+  std::lock_guard<std::mutex> lock(mutex_module_masses_);
+  module_masses_[msg.id] = msg.mass;
 }
 
 void BeetleNavigator::joyStickControl(const sensor_msgs::JoyConstPtr & joy_msg)
@@ -876,7 +886,12 @@ void BeetleNavigator::rotateContactPointFrame()
 void BeetleNavigator::calcCenterOfMoving()
 {
   std::string cog_name = my_name_ + std::to_string(my_id_) + "/cog";
+  // Mass-weighted center: matches BeetleUnifiedController::updateFormationGeometry().
+  // Without weighting the navigator's Cog2CoM_ drifts ~5 mm from the controller's
+  // formation_cog_offset_ under asymmetric per-module masses, opening a residual
+  // bias in assemblyNavCallback's CoG↔CoM target conversion.
   Eigen::Vector3f center_of_moving = Eigen::Vector3f::Zero();
+  double total_mass = 0.0;
   int assembled_module = 0;
   geometry_msgs::Point cog_com_dist_msg;
   assembled_modules_ids_.clear();
@@ -889,8 +904,17 @@ void BeetleNavigator::calcCenterOfMoving()
       {
         transformStamped = tfBuffer_.lookupTransform(cog_name, my_name_ + std::to_string(id) + std::string("/cog") , ros::Time(0));
         auto& trans = transformStamped.transform.translation;
-        Eigen::Vector3f module_root(trans.x,trans.y,trans.z); 
-        center_of_moving += module_root;
+        Eigen::Vector3f module_root(trans.x,trans.y,trans.z);
+        // Use the module's published mass; fall back to this module's URDF mass
+        // before the per-module ModuleModel arrives (latched, so usually ≤1 cycle).
+        double m_i;
+        {
+          std::lock_guard<std::mutex> lock(mutex_module_masses_);
+          auto it = module_masses_.find(id);
+          m_i = (it != module_masses_.end()) ? it->second : beetle_robot_model_->getMass();
+        }
+        center_of_moving += static_cast<float>(m_i) * module_root;
+        total_mass += m_i;
         assembled_module ++;
         assembled_modules_ids_.push_back(id);
       }
@@ -936,7 +960,8 @@ void BeetleNavigator::calcCenterOfMoving()
   //   module_state_ = FOLLOWER;
   // }
 
-  center_of_moving = center_of_moving / assembled_module;
+  center_of_moving = (total_mass > 0.0) ? center_of_moving / static_cast<float>(total_mass)
+                                        : center_of_moving / assembled_module;
 
   geometry_msgs::TransformStamped tf;
   tf.header.stamp = ros::Time::now();

@@ -23,9 +23,6 @@ namespace aerial_robot_control
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
     local_unified_cascade_setup_sent_(false),
-    has_cached_module_model_(false),
-    last_module_model_republish_time_(0),
-    module_model_republish_count_(0),
     unified_internal_wrench_diag_(true),
     unified_internal_wrench_log_(true),
     unified_internal_wrench_log_period_(1.0),
@@ -163,7 +160,6 @@ namespace aerial_robot_control
     // Publishers to this module's own spinal (same topic names as GimbalrotorController)
     follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
     follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
-    publishModuleModel();
 
     // Service for toggling unified control mode
     ros::NodeHandle srv_nh(nh_, "controller");
@@ -310,11 +306,6 @@ namespace aerial_robot_control
     navigator_->setTargetYaw(cur_yaw);
     navigator_->setTargetOmegaZ(0);
     beetle_navigator_->setUnifiedControlMode(true);
-    module_model_republish_count_ = 0;
-    last_module_model_republish_time_ = ros::Time(0);
-    republishCachedModuleModel();
-    last_module_model_republish_time_ = ros::Time::now();
-    module_model_republish_count_ = 1;
 
     // v4 architecture — outer ROLL/PITCH PID is inert in unified mode
     // (target_wrench_acc(3,4) ≡ 0; spinal owns full P+I+D), so just zero them.
@@ -924,49 +915,11 @@ namespace aerial_robot_control
       msg.rotor_direction[r] = static_cast<int8_t>(model.rotor_direction.at(r + 1));
     }
     msg.mf_rate = model.mf_rate;
-    cached_module_model_msg_ = msg;
-    has_cached_module_model_ = true;
-    module_model_pub_.publish(cached_module_model_msg_);
+    module_model_pub_.publish(msg);
     ROS_INFO_THROTTLE(5.0,
                       "[UnifiedCtrl] Published ModuleModel snapshot id=%d mass=%.3f rotors=%zu dirs=%zu mf_rate=%.6f",
                       my_id, msg.mass, msg.rotor_origin_from_cog.size(),
                       msg.rotor_direction.size(), msg.mf_rate);
-  }
-
-  void BeetleController::republishCachedModuleModel()
-  {
-    if (!has_cached_module_model_) {
-      publishModuleModel();
-      return;
-    }
-    cached_module_model_msg_.header.stamp = ros::Time::now();
-    module_model_pub_.publish(cached_module_model_msg_);
-  }
-
-  void BeetleController::maybeRepublishModuleModel()
-  {
-    if (!beetle_navigator_ || beetle_navigator_->getAssemblyIds().size() < 2) return;
-    if (module_model_republish_count_ >= 5) return;
-
-    ros::Time now = ros::Time::now();
-    if (!last_module_model_republish_time_.isZero() &&
-        (now - last_module_model_republish_time_).toSec() < 1.0) {
-      return;
-    }
-
-    republishCachedModuleModel();
-    if (!has_cached_module_model_) {
-      last_module_model_republish_time_ = now;
-      ROS_WARN_THROTTLE(1.0,
-                        "[UnifiedCtrl] Cannot republish ModuleModel yet: no valid cached snapshot id=%d",
-                        beetle_navigator_->getMyID());
-      return;
-    }
-
-    last_module_model_republish_time_ = now;
-    module_model_republish_count_++;
-    ROS_INFO("[UnifiedCtrl] Re-published cached ModuleModel snapshot id=%d (%d/5)",
-             beetle_navigator_->getMyID(), module_model_republish_count_);
   }
 
   void BeetleController::moduleModelCallback(const beetle::ModuleModel& msg)
@@ -1852,6 +1805,9 @@ namespace aerial_robot_control
                                           std_srvs::SetBool::Response &res)
   {
     unified_control_mode_ = req.data;
+    if (req.data) {
+      publishModuleModel();
+    }
     // Write to rosparam for consistency (backward compat with rosparam-based tools)
     ros::NodeHandle control_nh(nh_, "controller");
     control_nh.setParam("unified_control_mode", req.data);
@@ -1972,12 +1928,6 @@ namespace aerial_robot_control
   {
     int my_id = beetle_navigator_->getMyID();
     int leader_id = beetle_navigator_->getLeaderID();
-    // ModuleModel is built once at initialize() and then re-published from the
-    // same cached snapshot for a few unified-mode cycles. Recomputing it from
-    // live gimbal state caused model drift; never re-sending it made late peer
-    // subscribers silently fall back to their local model.
-    maybeRepublishModuleModel();
-
     // --- Gather local state ---
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
     vel_ = estimator_->getVel(Frame::COG, estimate_mode_);

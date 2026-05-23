@@ -897,6 +897,7 @@ void BeetleNavigator::rotateContactPointFrame()
 void BeetleNavigator::calcCenterOfMoving()
 {
   std::string cog_name = my_name_ + std::to_string(my_id_) + "/cog";
+  const bool use_module_model_masses = unified_control_mode_;
   // Mass-weighted center: matches BeetleUnifiedController::updateFormationGeometry().
   // Without weighting the navigator's Cog2CoM_ drifts ~5 mm from the controller's
   // formation_cog_offset_ under asymmetric per-module masses, opening a residual
@@ -918,7 +919,7 @@ void BeetleNavigator::calcCenterOfMoving()
         transformStamped = tfBuffer_.lookupTransform(cog_name, my_name_ + std::to_string(id) + std::string("/cog") , ros::Time(0));
         auto& trans = transformStamped.transform.translation;
         Eigen::Vector3f module_root(trans.x,trans.y,trans.z);
-        {
+        if (use_module_model_masses) {
           std::lock_guard<std::mutex> lock(mutex_module_masses_);
           auto it = module_masses_.find(id);
           if (it == module_masses_.end()) {
@@ -938,14 +939,14 @@ void BeetleNavigator::calcCenterOfMoving()
       }
   }
   double total_mass = 0.0;
-  if (!all_module_masses_ready) {
+  if (use_module_model_masses && !all_module_masses_ready) {
     ROS_WARN_THROTTLE(1.0,
                       "[UnifiedNav id=%d] ModuleModel masses incomplete missing=[%s]; using equal weights for Cog2CoM",
                       my_id_, missing_module_model_ids.c_str());
   }
   for (const auto& module : module_offsets) {
     double m_i = 1.0;
-    if (all_module_masses_ready) {
+    if (use_module_model_masses && all_module_masses_ready) {
       std::lock_guard<std::mutex> lock(mutex_module_masses_);
       m_i = module_masses_[module.first];
     }

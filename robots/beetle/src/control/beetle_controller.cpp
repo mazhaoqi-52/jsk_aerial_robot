@@ -23,6 +23,8 @@ namespace aerial_robot_control
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
     local_unified_cascade_setup_sent_(false),
+    unified_torque_alloc_inv_pub_interval_(0.05),
+    last_unified_torque_alloc_inv_pub_time_(-1.0),
     unified_internal_wrench_diag_(true),
     unified_internal_wrench_log_(true),
     unified_internal_wrench_log_period_(1.0),
@@ -356,6 +358,7 @@ namespace aerial_robot_control
     applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
     unified_transition_count_ = 0;
     unified_reference_warmup_count_ = 0;
+    last_unified_torque_alloc_inv_pub_time_ = ros::Time::now().toSec();
 
     // Phase U2: activate formation observer on entering unified LEADER mode.
     // Follower does NOT run observer (leader is the observation point).
@@ -436,6 +439,7 @@ namespace aerial_robot_control
       unified_controller_->resetQPState();
       unified_reference_warmup_count_ = 0;
       local_unified_cascade_setup_sent_ = false;
+      last_unified_torque_alloc_inv_pub_time_ = -1.0;
       beetle_navigator_->setUnifiedControlMode(false);
 
       ros::NodeHandle control_nh(nh_, "controller");
@@ -1556,6 +1560,10 @@ namespace aerial_robot_control
 
     getParam<int>(control_nh, "unified_reference_warmup_frames", unified_reference_warmup_frames_, 20);
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
+    getParam<double>(control_nh, "torque_allocation_matrix_inv_pub_interval",
+                     unified_torque_alloc_inv_pub_interval_, 0.05);
+    unified_torque_alloc_inv_pub_interval_ =
+        std::max(0.0, unified_torque_alloc_inv_pub_interval_);
     getParam<bool>(control_nh, "unified_internal_wrench_diag", unified_internal_wrench_diag_, true);
     getParam<bool>(control_nh, "unified_internal_wrench_log", unified_internal_wrench_log_, true);
     getParam<double>(control_nh, "unified_internal_wrench_log_period",
@@ -2230,6 +2238,14 @@ namespace aerial_robot_control
         sendLocalUnifiedCascadeSetupOnce();
       }
       publishLocalUnifiedCommand();
+      const double now = ros::Time::now().toSec();
+      if (last_unified_torque_alloc_inv_pub_time_ < 0.0 ||
+          now - last_unified_torque_alloc_inv_pub_time_ >=
+              unified_torque_alloc_inv_pub_interval_) {
+        if (publishLocalUnifiedTorqueAllocationMatrixInv()) {
+          last_unified_torque_alloc_inv_pub_time_ = now;
+        }
+      }
       if (is_leader) {
         publishUnifiedReference(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
         if (formation_observer_ && formation_observer_->isActive()) {

@@ -58,9 +58,20 @@ void BeetleNavigator::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
 
 void BeetleNavigator::moduleModelCallback(const beetle::ModuleModel& msg)
 {
-  if (msg.id == 0 || !std::isfinite(msg.mass) || msg.mass <= 0.0) return;
+  if (msg.id == 0 || !std::isfinite(msg.mass) || msg.mass <= 0.0) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[UnifiedNav id=%d] Reject ModuleModel msg id=%d mass=%.6f",
+                      my_id_, msg.id, msg.mass);
+    return;
+  }
   std::lock_guard<std::mutex> lock(mutex_module_masses_);
+  const auto it = module_masses_.find(msg.id);
+  const bool changed = (it == module_masses_.end() || it->second != msg.mass);
   module_masses_[msg.id] = msg.mass;
+  if (changed) {
+    ROS_INFO("[UnifiedNav id=%d] Received ModuleModel mass id=%d mass=%.3f",
+             my_id_, msg.id, msg.mass);
+  }
 }
 
 void BeetleNavigator::joyStickControl(const sensor_msgs::JoyConstPtr & joy_msg)
@@ -893,6 +904,7 @@ void BeetleNavigator::calcCenterOfMoving()
   Eigen::Vector3f center_of_moving = Eigen::Vector3f::Zero();
   int assembled_module = 0;
   bool all_module_masses_ready = true;
+  std::string missing_module_model_ids;
   std::vector<std::pair<int, Eigen::Vector3f>> module_offsets;
   geometry_msgs::Point cog_com_dist_msg;
   assembled_modules_ids_.clear();
@@ -909,7 +921,11 @@ void BeetleNavigator::calcCenterOfMoving()
         {
           std::lock_guard<std::mutex> lock(mutex_module_masses_);
           auto it = module_masses_.find(id);
-          all_module_masses_ready = all_module_masses_ready && (it != module_masses_.end());
+          if (it == module_masses_.end()) {
+            all_module_masses_ready = false;
+            if (!missing_module_model_ids.empty()) missing_module_model_ids += ",";
+            missing_module_model_ids += std::to_string(id);
+          }
         }
         module_offsets.push_back(std::make_pair(id, module_root));
         assembled_module ++;
@@ -924,8 +940,8 @@ void BeetleNavigator::calcCenterOfMoving()
   double total_mass = 0.0;
   if (!all_module_masses_ready) {
     ROS_WARN_THROTTLE(1.0,
-                      "[UnifiedNav id=%d] ModuleModel masses incomplete; using equal weights for Cog2CoM",
-                      my_id_);
+                      "[UnifiedNav id=%d] ModuleModel masses incomplete missing=[%s]; using equal weights for Cog2CoM",
+                      my_id_, missing_module_model_ids.c_str());
   }
   for (const auto& module : module_offsets) {
     double m_i = 1.0;

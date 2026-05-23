@@ -893,7 +893,14 @@ namespace aerial_robot_control
 
     const int my_id = beetle_navigator_->getMyID();
     const int rotor_num = beetle_robot_model_->getRotorNum();
-    if (!model.valid(rotor_num)) return;
+    if (!model.valid(rotor_num)) {
+      ROS_WARN_THROTTLE(1.0,
+                        "[UnifiedCtrl] ModuleModel publish blocked id=%d mass=%.6f inertia_finite=%d rotor_origins=%zu rotor_dirs=%zu rotor_num=%d mf_rate=%.6f",
+                        my_id, model.mass, model.inertia.allFinite(),
+                        model.rotor_origins_from_cog.size(), model.rotor_direction.size(),
+                        rotor_num, model.mf_rate);
+      return;
+    }
 
     unified_controller_->setModuleModelDescriptor(my_id, model);
 
@@ -920,6 +927,10 @@ namespace aerial_robot_control
     cached_module_model_msg_ = msg;
     has_cached_module_model_ = true;
     module_model_pub_.publish(cached_module_model_msg_);
+    ROS_INFO_THROTTLE(5.0,
+                      "[UnifiedCtrl] Published ModuleModel snapshot id=%d mass=%.3f rotors=%zu dirs=%zu mf_rate=%.6f",
+                      my_id, msg.mass, msg.rotor_origin_from_cog.size(),
+                      msg.rotor_direction.size(), msg.mf_rate);
   }
 
   void BeetleController::republishCachedModuleModel()
@@ -944,6 +955,14 @@ namespace aerial_robot_control
     }
 
     republishCachedModuleModel();
+    if (!has_cached_module_model_) {
+      last_module_model_republish_time_ = now;
+      ROS_WARN_THROTTLE(1.0,
+                        "[UnifiedCtrl] Cannot republish ModuleModel yet: no valid cached snapshot id=%d",
+                        beetle_navigator_->getMyID());
+      return;
+    }
+
     last_module_model_republish_time_ = now;
     module_model_republish_count_++;
     ROS_INFO("[UnifiedCtrl] Re-published cached ModuleModel snapshot id=%d (%d/5)",
@@ -952,7 +971,13 @@ namespace aerial_robot_control
 
   void BeetleController::moduleModelCallback(const beetle::ModuleModel& msg)
   {
-    if (!unified_controller_ || msg.id == 0) return;
+    if (!unified_controller_ || msg.id == 0) {
+      ROS_WARN_THROTTLE(1.0,
+                        "[UnifiedCtrl] Reject ModuleModel msg: controller_ready=%d id=%d mass=%.6f",
+                        static_cast<int>(static_cast<bool>(unified_controller_)),
+                        msg.id, msg.mass);
+      return;
+    }
 
     BeetleUnifiedController::ModuleModelDescriptor model;
     model.mass = msg.mass;
@@ -973,9 +998,20 @@ namespace aerial_robot_control
     }
     model.mf_rate = msg.mf_rate;
 
-    if (!model.valid(static_cast<int>(msg.rotor_direction.size()))) return;
+    if (!model.valid(static_cast<int>(msg.rotor_direction.size()))) {
+      ROS_WARN_THROTTLE(1.0,
+                        "[UnifiedCtrl] Reject invalid ModuleModel msg id=%d mass=%.6f inertia_finite=%d rotors=%zu dirs=%zu mf_rate=%.6f",
+                        msg.id, model.mass, model.inertia.allFinite(),
+                        model.rotor_origins_from_cog.size(), model.rotor_direction.size(),
+                        model.mf_rate);
+      return;
+    }
 
     unified_controller_->setModuleModelDescriptor(msg.id, model);
+    ROS_INFO_THROTTLE(5.0,
+                      "[UnifiedCtrl] Accepted ModuleModel msg id=%d mass=%.3f rotors=%zu dirs=%zu",
+                      msg.id, msg.mass, msg.rotor_origin_from_cog.size(),
+                      msg.rotor_direction.size());
   }
 
   void BeetleController::unifiedReferenceCallback(const beetle::UnifiedControlReference& msg)

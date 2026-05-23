@@ -170,7 +170,13 @@ namespace aerial_robot_control
                    const Eigen::VectorXd& desired_wrench,
                    double yaw_pid_raw);
     void publishModuleModel();
+    void republishCachedModuleModel();
+    void maybeRepublishModuleModel();
     void moduleModelCallback(const beetle::ModuleModel& msg);
+    beetle::ModuleModel cached_module_model_msg_;
+    bool has_cached_module_model_;
+    ros::Time last_module_model_republish_time_;
+    int module_model_republish_count_;
     
     map<string, ros::Subscriber> est_wrench_task_subs_;
     map<int, ros::Publisher> est_wrench_task_pubs_;

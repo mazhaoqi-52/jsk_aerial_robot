@@ -147,24 +147,16 @@ void BeetleUnifiedController::setModuleModelDescriptor(
   module_model_revision_++;
 }
 
-BeetleUnifiedController::ModuleModelDescriptor
-BeetleUnifiedController::getModuleModelDescriptor(int module_id) const
+bool BeetleUnifiedController::getModuleModelDescriptor(int module_id,
+                                                       ModuleModelDescriptor& model) const
 {
-  {
-    std::lock_guard<std::mutex> lock(module_model_mutex_);
-    auto it = module_models_.find(module_id);
-    if (it != module_models_.end() && it->second.valid(motor_num_per_module_)) {
-      return it->second;
-    }
+  std::lock_guard<std::mutex> lock(module_model_mutex_);
+  auto it = module_models_.find(module_id);
+  if (it == module_models_.end() || !it->second.valid(motor_num_per_module_)) {
+    return false;
   }
-
-  ModuleModelDescriptor fallback;
-  fallback.mass = robot_model_->getMass();
-  fallback.inertia = robot_model_->getInertia<Eigen::Matrix3d>();
-  fallback.rotor_origins_from_cog = robot_model_->getRotorsOriginFromCog<Eigen::Vector3d>();
-  fallback.rotor_direction = robot_model_->getRotorDirection();
-  fallback.mf_rate = robot_model_->getMFRate();
-  return fallback;
+  model = it->second;
+  return true;
 }
 
 bool BeetleUnifiedController::lookupModuleOffsetFromLeader(
@@ -273,12 +265,24 @@ bool BeetleUnifiedController::updateFormationGeometry()
 
   formation_mass_ = 0.0;
   Eigen::Vector3d weighted_cog_offset = Eigen::Vector3d::Zero();
+  std::string missing_models;
   for (int module_id : assembled_ids) {
     Eigen::Vector3d module_offset;
     if (!getCachedModuleOffsetFromLeader(module_id, module_offset)) return false;
-    const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
+    ModuleModelDescriptor model;
+    if (!getModuleModelDescriptor(module_id, model)) {
+      missing_models += std::to_string(module_id) + ",";
+      continue;
+    }
     formation_mass_ += model.mass;
     weighted_cog_offset += model.mass * module_offset;
+  }
+  if (!missing_models.empty()) {
+    formation_mass_ = 0.0;
+    ROS_WARN_THROTTLE(1.0,
+                      "[UnifiedCtrl] Formation geometry blocked: missing ModuleModel for assembled ids=[%s]",
+                      missing_models.c_str());
+    return false;
   }
   if (formation_mass_ <= 0.0) {
     ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Invalid heterogeneous formation mass %.4f",
@@ -430,7 +434,8 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
   if (n_rotors <= 0 || rotor_coef_ <= 0 || formation_mass_ <= 0.0) return ref;
 
   for (size_t m = 0; m < assembled_ids.size(); m++) {
-    const ModuleModelDescriptor model = getModuleModelDescriptor(assembled_ids[m]);
+    ModuleModelDescriptor model;
+    if (!getModuleModelDescriptor(assembled_ids[m], model)) return ref;
     const double hover_per_rotor = model.mass * aerial_robot_estimation::G / motor_num_per_module_;
     const double bounded_hover = std::max(0.0, std::min(hover_per_rotor, alloc_t_max_));
     const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
@@ -921,7 +926,11 @@ Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
   int col = 0;
   for (int m = 0; m < N; m++) {
     int module_id = assembled_ids[m];
-    const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
+    ModuleModelDescriptor model;
+    if (!getModuleModelDescriptor(module_id, model)) {
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Allocation blocked: missing ModuleModel id=%d", module_id);
+      return Eigen::MatrixXd::Zero(6, rotor_coef_ * total_rotors);
+    }
 
     Eigen::Vector3d module_offset = Eigen::Vector3d::Zero();
     if (!getCachedModuleOffsetFromLeader(module_id, module_offset)) {
@@ -966,7 +975,11 @@ Eigen::Matrix3d BeetleUnifiedController::computeFormationInertia(
   Eigen::Matrix3d formation_inertia = Eigen::Matrix3d::Zero();
 
   for (int module_id : assembled_ids) {
-    const ModuleModelDescriptor model = getModuleModelDescriptor(module_id);
+    ModuleModelDescriptor model;
+    if (!getModuleModelDescriptor(module_id, model)) {
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] Inertia synthesis blocked: missing ModuleModel id=%d", module_id);
+      return Eigen::Matrix3d::Zero();
+    }
     Eigen::Vector3d d = Eigen::Vector3d::Zero();
     if (!getCachedModuleOffsetFromLeader(module_id, d)) {
       return Eigen::Matrix3d::Identity();

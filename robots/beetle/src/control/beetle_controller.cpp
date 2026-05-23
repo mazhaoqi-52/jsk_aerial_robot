@@ -23,6 +23,9 @@ namespace aerial_robot_control
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
     local_unified_cascade_setup_sent_(false),
+    has_cached_module_model_(false),
+    last_module_model_republish_time_(0),
+    module_model_republish_count_(0),
     unified_internal_wrench_diag_(true),
     unified_internal_wrench_log_(true),
     unified_internal_wrench_log_period_(1.0),
@@ -307,6 +310,11 @@ namespace aerial_robot_control
     navigator_->setTargetYaw(cur_yaw);
     navigator_->setTargetOmegaZ(0);
     beetle_navigator_->setUnifiedControlMode(true);
+    module_model_republish_count_ = 0;
+    last_module_model_republish_time_ = ros::Time(0);
+    republishCachedModuleModel();
+    last_module_model_republish_time_ = ros::Time::now();
+    module_model_republish_count_ = 1;
 
     // v4 architecture — outer ROLL/PITCH PID is inert in unified mode
     // (target_wrench_acc(3,4) ≡ 0; spinal owns full P+I+D), so just zero them.
@@ -909,7 +917,37 @@ namespace aerial_robot_control
       msg.rotor_direction[r] = static_cast<int8_t>(model.rotor_direction.at(r + 1));
     }
     msg.mf_rate = model.mf_rate;
-    module_model_pub_.publish(msg);
+    cached_module_model_msg_ = msg;
+    has_cached_module_model_ = true;
+    module_model_pub_.publish(cached_module_model_msg_);
+  }
+
+  void BeetleController::republishCachedModuleModel()
+  {
+    if (!has_cached_module_model_) {
+      publishModuleModel();
+      return;
+    }
+    cached_module_model_msg_.header.stamp = ros::Time::now();
+    module_model_pub_.publish(cached_module_model_msg_);
+  }
+
+  void BeetleController::maybeRepublishModuleModel()
+  {
+    if (!beetle_navigator_ || beetle_navigator_->getAssemblyIds().size() < 2) return;
+    if (module_model_republish_count_ >= 5) return;
+
+    ros::Time now = ros::Time::now();
+    if (!last_module_model_republish_time_.isZero() &&
+        (now - last_module_model_republish_time_).toSec() < 1.0) {
+      return;
+    }
+
+    republishCachedModuleModel();
+    last_module_model_republish_time_ = now;
+    module_model_republish_count_++;
+    ROS_INFO("[UnifiedCtrl] Re-published cached ModuleModel snapshot id=%d (%d/5)",
+             beetle_navigator_->getMyID(), module_model_republish_count_);
   }
 
   void BeetleController::moduleModelCallback(const beetle::ModuleModel& msg)
@@ -1898,13 +1936,11 @@ namespace aerial_robot_control
   {
     int my_id = beetle_navigator_->getMyID();
     int leader_id = beetle_navigator_->getLeaderID();
-    // ModuleModel is published once at initialize() (latched). Periodic re-
-    // publish was sampling getRotorsOriginFromCog() / getInertia() at the live
-    // gimbal state, so per-module rotor positions and inertias drifted a few
-    // mm every second → module_model_revision_ kept bumping → formation
-    // geometry kept re-latching (log: "Formation geometry latched" @ ~2 Hz).
-    // Latched + single publish keeps the snapshot stable and only re-latches
-    // on genuine changes (peer ModuleModel late-arrival, assembled-id change).
+    // ModuleModel is built once at initialize() and then re-published from the
+    // same cached snapshot for a few unified-mode cycles. Recomputing it from
+    // live gimbal state caused model drift; never re-sending it made late peer
+    // subscribers silently fall back to their local model.
+    maybeRepublishModuleModel();
 
     // --- Gather local state ---
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
@@ -2197,60 +2233,11 @@ namespace aerial_robot_control
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
     }
 
-    // [DBG-NANGUARD] Catch non-finite or absurd target_wrench_acc BEFORE feeding
-    // it to allocation pseudoinverse. SIGSEGV in spinal pipeline is typically
-    // caused by NaN/Inf propagating through Eigen path. Print FULL context so
-    // the offending source is identifiable from a single log line.
-    {
-      bool any_bad = false;
-      double max_abs = 0.0;
-      for (int k = 0; k < 6; ++k) {
-        double v = target_wrench_acc(k);
-        if (!std::isfinite(v)) { any_bad = true; break; }
-        max_abs = std::max(max_abs, std::fabs(v));
-      }
-      // Absurd threshold: 6 g translational or 50 rad/s^2 angular implies
-      // upstream divergence. Treat as soft alarm (still proceed, no behavioural
-      // change) so we capture the LAST sane frame before SIGSEGV.
-      if (any_bad || max_abs > 60.0) {
-        ROS_ERROR(
-          "[DBG-NANGUARD id=%d] wrench_acc=(%.3f,%.3f,%.3f, %.4f,%.4f,%.4f) "
-          "pitch_I=%.4f roll_I=%.4f yaw_I=%.4f "
-          "pos=(%.3f,%.3f,%.3f) tgt_pos=(%.3f,%.3f,%.3f) rpy=(%.3f,%.3f,%.3f) tgt_rpy=(%.3f,%.3f,%.3f) "
-          "off_body=(%.3f,%.3f,%.3f) any_bad=%d max_abs=%.3f",
-          my_id,
-          target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
-          target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
-          pid_controllers_.at(PITCH).getITerm(), pid_controllers_.at(ROLL).getITerm(),
-          pid_controllers_.at(YAW).getITerm(),
-          pos_.x(), pos_.y(), pos_.z(),
-          target_pos_.x(), target_pos_.y(), target_pos_.z(),
-          rpy_.x(), rpy_.y(), rpy_.z(),
-          target_rpy_.x(), target_rpy_.y(), target_rpy_.z(),
-          offset_body.x(), offset_body.y(), offset_body.z(),
-          any_bad ? 1 : 0, max_abs);
-      }
-    }
-
     setTargetWrenchAccCog(target_wrench_acc);
 
     // --- Run unified 6-DOF allocation ---
     unified_controller_->clearFormationModelOverride();
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
-
-    // [DBG-NANGUARD2] Detect non-finite allocation output: if the pseudoinverse
-    // produced NaN, downstream spinal packing will likely SIGSEGV.
-    if (ok) {
-      const Eigen::VectorXd& fw = formation_wrench_cmd;
-      bool fw_bad = false;
-      for (int k = 0; k < fw.size(); ++k) {
-        if (!std::isfinite(fw(k))) { fw_bad = true; break; }
-      }
-      if (fw_bad) {
-        ROS_ERROR("[DBG-NANGUARD2 id=%d] formation_desired_wrench has NaN/Inf, size=%ld",
-                  my_id, (long)fw.size());
-      }
-    }
 
     if (ok) {
       if (!is_leader) {

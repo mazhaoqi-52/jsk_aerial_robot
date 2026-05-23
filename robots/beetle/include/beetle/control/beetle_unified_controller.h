@@ -289,7 +289,7 @@ private:
       const std::vector<int>& assembled_ids,
       const Eigen::Vector3d& formation_cog_offset);
 
-  ModuleModelDescriptor getModuleModelDescriptor(int module_id) const;
+  bool getModuleModelDescriptor(int module_id, ModuleModelDescriptor& model) const;
   Eigen::Vector3d getModuleOffsetFromLeader(int module_id) const;
   bool lookupModuleOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;
   bool getCachedModuleOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;

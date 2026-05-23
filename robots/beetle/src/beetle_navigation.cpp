@@ -891,8 +891,9 @@ void BeetleNavigator::calcCenterOfMoving()
   // formation_cog_offset_ under asymmetric per-module masses, opening a residual
   // bias in assemblyNavCallback's CoG↔CoM target conversion.
   Eigen::Vector3f center_of_moving = Eigen::Vector3f::Zero();
-  double total_mass = 0.0;
   int assembled_module = 0;
+  bool all_module_masses_ready = true;
+  std::vector<std::pair<int, Eigen::Vector3f>> module_offsets;
   geometry_msgs::Point cog_com_dist_msg;
   assembled_modules_ids_.clear();
   for(const auto & item : assembly_flags_){
@@ -905,16 +906,12 @@ void BeetleNavigator::calcCenterOfMoving()
         transformStamped = tfBuffer_.lookupTransform(cog_name, my_name_ + std::to_string(id) + std::string("/cog") , ros::Time(0));
         auto& trans = transformStamped.transform.translation;
         Eigen::Vector3f module_root(trans.x,trans.y,trans.z);
-        // Use the module's published mass; fall back to this module's URDF mass
-        // before the per-module ModuleModel arrives (latched, so usually ≤1 cycle).
-        double m_i;
         {
           std::lock_guard<std::mutex> lock(mutex_module_masses_);
           auto it = module_masses_.find(id);
-          m_i = (it != module_masses_.end()) ? it->second : beetle_robot_model_->getMass();
+          all_module_masses_ready = all_module_masses_ready && (it != module_masses_.end());
         }
-        center_of_moving += static_cast<float>(m_i) * module_root;
-        total_mass += m_i;
+        module_offsets.push_back(std::make_pair(id, module_root));
         assembled_module ++;
         assembled_modules_ids_.push_back(id);
       }
@@ -923,6 +920,21 @@ void BeetleNavigator::calcCenterOfMoving()
         ROS_ERROR_STREAM("not exist module is mentioned. ID is "<<id );
         return;
       }
+  }
+  double total_mass = 0.0;
+  if (!all_module_masses_ready) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[UnifiedNav id=%d] ModuleModel masses incomplete; using equal weights for Cog2CoM",
+                      my_id_);
+  }
+  for (const auto& module : module_offsets) {
+    double m_i = 1.0;
+    if (all_module_masses_ready) {
+      std::lock_guard<std::mutex> lock(mutex_module_masses_);
+      m_i = module_masses_[module.first];
+    }
+    center_of_moving += static_cast<float>(m_i) * module.second;
+    total_mass += m_i;
   }
   setModuleNum(assembled_module);
   if(!assembled_module || assembled_module == 1 || !assembly_flags_[my_id_]){

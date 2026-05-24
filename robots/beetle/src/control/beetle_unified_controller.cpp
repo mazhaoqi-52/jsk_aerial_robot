@@ -11,6 +11,9 @@
 #include <geometry_msgs/TransformStamped.h>
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 
 namespace aerial_robot_control
 {
@@ -630,18 +633,75 @@ bool BeetleUnifiedController::solveFullVectorQP(
 
   vectoring_f_out = f_sol;
 
-  // Debug: log residual and per-rotor thrust/angle
+  // Short-term hardware diagnostic: expose hidden actuator saturation.
+  // QP constrains fx/fz components, while the spinal receives sqrt(fx^2+fz^2).
   {
     Eigen::VectorXd residual = alloc_matrix * vectoring_f_out - w_total;
-    ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl QP] residual_norm=%.4f n_rotors=%d",
-                       residual.norm(), n_rotors);
     if (rotor_coef_ == 2) {
+      const double low_voltage_limit = 17.2;   // MotorInfo ref4 (21.2V)
+      const double mid_voltage_limit = 18.44;  // MotorInfo ref3 (22.2V)
+      const double model_limit = robot_model_ ? robot_model_->getThrustUpperLimit() : alloc_t_max_;
+      double max_t = 0.0;
+      double max_abs_angle_deg = 0.0;
+      double max_abs_fx = 0.0;
+      double max_fz = 0.0;
+      double min_component_margin = std::numeric_limits<double>::infinity();
+      int over_low = 0;
+      int over_mid = 0;
+      int over_alloc = 0;
+      int over_model = 0;
+      int near_component_bound = 0;
+      std::ostringstream thrust_stream;
+      std::ostringstream angle_stream;
+      thrust_stream << std::fixed << std::setprecision(1);
+      angle_stream << std::fixed << std::setprecision(0);
+
       for (int i = 0; i < n_rotors; i++) {
         double fx = f_sol(2 * i), fz = f_sol(2 * i + 1);
         double tmag = std::sqrt(fx * fx + fz * fz);
         double angle_deg = std::atan2(-fx, fz) * 180.0 / M_PI;
-        ROS_DEBUG_THROTTLE(1.0, "[UnifiedCtrl QP] rotor%d: t=%.2f angle=%.1fdeg fx=%.2f fz=%.2f",
-                           i, tmag, angle_deg, fx, fz);
+
+        max_t = std::max(max_t, tmag);
+        max_abs_angle_deg = std::max(max_abs_angle_deg, std::abs(angle_deg));
+        max_abs_fx = std::max(max_abs_fx, std::abs(fx));
+        max_fz = std::max(max_fz, fz);
+        const double component_margin = std::min(alloc_t_max_ - std::abs(fx), alloc_t_max_ - fz);
+        min_component_margin = std::min(min_component_margin, component_margin);
+        if (component_margin < 0.2) near_component_bound++;
+        if (tmag > low_voltage_limit) over_low++;
+        if (tmag > mid_voltage_limit) over_mid++;
+        if (tmag > alloc_t_max_) over_alloc++;
+        if (tmag > model_limit) over_model++;
+
+        if (i > 0) {
+          thrust_stream << ",";
+          angle_stream << ",";
+        }
+        thrust_stream << tmag;
+        angle_stream << angle_deg;
+      }
+
+      const bool suspicious = over_low > 0 || over_alloc > 0 || over_model > 0 ||
+                              near_component_bound > 0 || residual.norm() > 1.0;
+      const char* fmt =
+          "[UnifiedCtrl QPDiag] residual=%.3f max_t=%.2f max_angle=%.1fdeg "
+          "max|fx|=%.2f max_fz=%.2f comp_margin_min=%.2f "
+          "over_t(17.2/18.44/alloc/model)=%d/%d/%d/%d "
+          "alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
+      if (suspicious) {
+        ROS_WARN_THROTTLE(1.0, fmt,
+                          residual.norm(), max_t, max_abs_angle_deg,
+                          max_abs_fx, max_fz, min_component_margin,
+                          over_low, over_mid, over_alloc, over_model,
+                          alloc_t_max_, model_limit,
+                          thrust_stream.str().c_str(), angle_stream.str().c_str());
+      } else {
+        ROS_INFO_THROTTLE(1.0, fmt,
+                          residual.norm(), max_t, max_abs_angle_deg,
+                          max_abs_fx, max_fz, min_component_margin,
+                          over_low, over_mid, over_alloc, over_model,
+                          alloc_t_max_, model_limit,
+                          thrust_stream.str().c_str(), angle_stream.str().c_str());
       }
     }
   }

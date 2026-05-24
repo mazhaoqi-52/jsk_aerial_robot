@@ -36,14 +36,13 @@ controller:
 
   # Unified internal wrench management.
   # diag=true reuses the legacy LF residual/inter-wrench calculation for logging.
-  # secondary_gain=0 keeps it diagnostic-only. Positive values bias QP secondary
-  # allocation reference from LF-style wrench_comp_list_ (experimental).
-  # diag/log default off: with secondary_gain=0 they only add per-frame
-  # calcInteractionWrench() + string-logging load to the 40Hz control loop.
-  unified_internal_wrench_diag: false
-  unified_internal_wrench_log: false
+  # secondary_gain=0 keeps it diagnostic-only. Positive values bias the QP
+  # secondary allocation reference from LF-style wrench_comp_list_ while HOVERing.
+  # Keep the gain small; the primary formation wrench tracking remains dominant.
+  unified_internal_wrench_diag: true
+  unified_internal_wrench_log: true
   unified_internal_wrench_log_period: 1.0
-  unified_internal_wrench_secondary_gain: 0.0
+  unified_internal_wrench_secondary_gain: 0.02
 
   # Full-vector constrained QP allocation
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).

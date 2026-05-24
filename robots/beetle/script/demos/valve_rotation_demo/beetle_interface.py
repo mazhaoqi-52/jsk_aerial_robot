@@ -253,6 +253,27 @@ class BeetleInterface(object):
             return None
         o = self.assembly_odom.pose.pose.orientation
         return euler_from_quaternion([o.x, o.y, o.z, o.w])
+
+    def _worldToFormationBodyWrench(self, force, torque, yaw_only=False):
+        """Rotate a world-frame wrench into the formation body frame."""
+        rpy = self.getAssemblyRPY()
+        if rpy is None:
+            return force, torque
+        roll, pitch, yaw = rpy
+        if yaw_only:
+            roll = 0.0
+            pitch = 0.0
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        body_to_world = np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ])
+        world_to_body = body_to_world.T
+        return ((world_to_body @ np.asarray(force, dtype=float)).tolist(),
+                (world_to_body @ np.asarray(torque, dtype=float)).tolist())
     
     def getEndEffectorPos(self):
         """Get end-effector position in world coordinates (pitch-aware)."""
@@ -390,7 +411,10 @@ class BeetleInterface(object):
     def addExternalWrench(self, force, torque, frame_id="world"):
         """Apply desired external wrench.
         
-        In assembly_mode, always rotates world-frame input to formation body frame (fc).
+        In assembly_mode, frame_id="world" rotates full RPY world-frame input
+        to formation body frame (fc). Use frame_id="world_yaw" for the legacy
+        yaw-only conversion, or frame_id="fc" if the wrench is already in the
+        formation body frame.
         Then routes to:
           - formation_desired_wrench  when isUnifiedMode() is True  (unified allocation)
           - desired_external_wrench   when isUnifiedMode() is False (lead-follower wrench_comp)
@@ -399,15 +423,13 @@ class BeetleInterface(object):
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
         
-        # Both unified and lead-follower paths need body-frame data; rotate world→body
-        if self.assembly_mode and frame_id == "world":
-            rpy = self.getAssemblyRPY()
-            yaw = rpy[2] if rpy else 0.0
-            c, s = math.cos(yaw), math.sin(yaw)
-            fx, fy = force_list[0], force_list[1]
-            force_list = [c*fx + s*fy, -s*fx + c*fy, force_list[2]]
-            tx, ty = torque_list[0], torque_list[1]
-            torque_list = [c*tx + s*ty, -s*tx + c*ty, torque_list[2]]
+        # Both unified and lead-follower paths need formation-body data.
+        frame_key = str(frame_id).lower()
+        if self.assembly_mode and frame_key in ("world", "map", "odom", "world_yaw"):
+            force_list, torque_list = self._worldToFormationBodyWrench(
+                force_list, torque_list, yaw_only=(frame_key == "world_yaw"))
+            frame_id = "fc"
+        elif frame_key in ("fc", "body", "formation", "formation_body"):
             frame_id = "fc"
         
         ff_msg = WrenchStamped()
@@ -592,6 +614,11 @@ class BeetleInterface(object):
         if self._inter_M_form_inv is None:
             # Level 1: mass-ratio split (force AND torque). OK only for tasks
             # without torque — retained for backward compatibility / towing.
+            if np.linalg.norm(tau) > 1e-6:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[BeetleInterface] task wrench has torque but Level-2 "
+                    "module geometry is unavailable; mass-ratio torque split is approximate")
             for mid in self._inter_module_ids:
                 share = self._inter_module_masses.get(mid, 0.0) / self._inter_m_total
                 per_module[mid] = ((share * F).tolist(), (share * tau).tolist())

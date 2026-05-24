@@ -1573,7 +1573,7 @@ namespace aerial_robot_control
     getParam<double>(control_nh, "unified_internal_wrench_secondary_gain",
                      unified_internal_wrench_secondary_gain_, 0.0);
     unified_internal_wrench_secondary_gain_ =
-        std::max(0.0, unified_internal_wrench_secondary_gain_);
+        std::min(0.2, std::max(0.0, unified_internal_wrench_secondary_gain_));
 
     // Roll/Pitch I-term keep ratio removed: outer R/P I-channel disabled in unified mode.
 
@@ -2079,11 +2079,18 @@ namespace aerial_robot_control
     // inter-wrench signals as the legacy leader-follower path without feeding
     // them back into the allocator. A positive gain biases the QP secondary
     // reference, not the primary formation wrench objective.
+    const bool unified_secondary_ready =
+        beetle_navigator_->getControlFlag() &&
+        navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
+        !navigator_->getForceLandingFlag();
+    const bool unified_secondary_active =
+        unified_internal_wrench_secondary_gain_ > 0.0 && unified_secondary_ready;
+
     if (beetle_navigator_->getControlFlag() &&
-        (unified_internal_wrench_diag_ || unified_internal_wrench_secondary_gain_ > 0.0)) {
+        (unified_internal_wrench_diag_ || unified_secondary_active)) {
       calcInteractionWrench();
     }
-    if (unified_internal_wrench_secondary_gain_ > 0.0) {
+    if (unified_secondary_active) {
       unified_controller_->setInternalWrenchSecondaryReference(
           wrench_comp_list_, unified_internal_wrench_secondary_gain_);
     } else {

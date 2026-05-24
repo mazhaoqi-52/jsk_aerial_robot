@@ -332,7 +332,8 @@ private:
 
   /** @brief Build the current secondary allocation reference.
    *  Base term is balanced hover load. Optional internal-wrench compensation
-   *  adds a small per-module bias when internal_wrench_secondary_gain_ > 0. */
+   *  adds a small per-module 6D bias through that module's allocation block
+   *  when internal_wrench_secondary_gain_ > 0. */
   Eigen::VectorXd buildSecondaryAllocationReference(const std::vector<int>& assembled_ids) const;
 
   void rosParamInit();

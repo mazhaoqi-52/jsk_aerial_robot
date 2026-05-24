@@ -451,25 +451,50 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
     return ref;
   }
 
+  const int cols_per_module = motor_num_per_module_ * rotor_coef_;
+  const bool has_allocation_block =
+      (integrated_map_.rows() == 6 && integrated_map_.cols() == ref.size());
+  const double delta_limit = 0.25 * alloc_t_max_;
+
   for (size_t m = 0; m < assembled_ids.size(); m++) {
     auto it = module_internal_wrench_comp_.find(assembled_ids[m]);
-    if (it == module_internal_wrench_comp_.end() || it->second.size() < 3) continue;
+    if (it == module_internal_wrench_comp_.end() || it->second.size() < 6) continue;
 
     const Eigen::VectorXd& comp = it->second;
-    if (!std::isfinite(comp(0)) || !std::isfinite(comp(2))) continue;
+    if (!comp.allFinite()) continue;
 
-    const double fx_per_rotor =
-        internal_wrench_secondary_gain_ * comp(0) / motor_num_per_module_;
-    const double fz_per_rotor =
-        internal_wrench_secondary_gain_ * comp(2) / motor_num_per_module_;
     const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
+    Eigen::VectorXd delta = Eigen::VectorXd::Zero(cols_per_module);
+
+    if (has_allocation_block) {
+      Eigen::VectorXd comp_acc = Eigen::VectorXd::Zero(6);
+      comp_acc.head(3) = comp.head(3) / formation_mass_;
+      comp_acc.tail(3) = formation_inertia_.inverse() * comp.tail(3);
+      const Eigen::MatrixXd module_map =
+          integrated_map_.middleCols(module_col, cols_per_module);
+      delta = aerial_robot_model::pseudoinverse(module_map) *
+              (internal_wrench_secondary_gain_ * comp_acc);
+    } else if (rotor_coef_ >= 2) {
+      // Fallback for early calls before the formation map is ready.
+      for (int r = 0; r < motor_num_per_module_; r++) {
+        delta(r * rotor_coef_) =
+            internal_wrench_secondary_gain_ * comp(0) / motor_num_per_module_;
+        delta(r * rotor_coef_ + rotor_coef_ - 1) =
+            internal_wrench_secondary_gain_ * comp(2) / motor_num_per_module_;
+      }
+    }
 
     for (int r = 0; r < motor_num_per_module_; r++) {
       const int base = module_col + r * rotor_coef_;
-      if (rotor_coef_ >= 2) {
-        ref(base) = std::max(-alloc_t_max_, std::min(ref(base) + fx_per_rotor, alloc_t_max_));
-        ref(base + rotor_coef_ - 1) =
-            std::max(0.0, std::min(ref(base + rotor_coef_ - 1) + fz_per_rotor, alloc_t_max_));
+      for (int c = 0; c < rotor_coef_; c++) {
+        const int idx = base + c;
+        const double bounded_delta =
+            std::max(-delta_limit, std::min(delta(r * rotor_coef_ + c), delta_limit));
+        if (rotor_coef_ == 2 && c == rotor_coef_ - 1) {
+          ref(idx) = std::max(0.0, std::min(ref(idx) + bounded_delta, alloc_t_max_));
+        } else {
+          ref(idx) = std::max(-alloc_t_max_, std::min(ref(idx) + bounded_delta, alloc_t_max_));
+        }
       }
     }
   }

@@ -16,6 +16,13 @@ from aerial_robot_msgs.msg import FlightNav
 from tf.transformations import euler_from_quaternion
 from sensor_msgs.msg import Joy
 
+
+def smoothstep01(value):
+    """C1-continuous easing for wrench/trajectory blend factors in [0, 1]."""
+    x = max(0.0, min(1.0, float(value)))
+    return x * x * (3.0 - 2.0 * x)
+
+
 # Import TaggedWrench message with fallback
 try:
     from beetle.msg import TaggedWrench
@@ -24,7 +31,7 @@ except (ImportError, AttributeError):
     original_path = sys.path.copy()
     try:
         # Remove conflicting paths temporarily
-        for path in [p for p in sys.path if os.path.exists(os.path.join(p, 'beetle')) 
+        for path in [p for p in sys.path if os.path.exists(os.path.join(p, 'beetle'))
                      and not os.path.exists(os.path.join(p, 'beetle', 'msg'))]:
             sys.path.remove(path)
         for mod in ['beetle', 'beetle.msg']:
@@ -44,7 +51,7 @@ except (ImportError, AttributeError):
 
 class BeetleInterface(object):
     """Interface for controlling Beetle UAV in single or assembly mode."""
-    
+
     # Flight state constants
     ARM_OFF_STATE = 0
     START_STATE = 1
@@ -53,20 +60,20 @@ class BeetleInterface(object):
     LAND_STATE = 4
     HOVER_STATE = 5
     STOP_STATE = 6
-    
+
     def __init__(self, module_id=1, debug_view=False, assembly_mode=False, assembly_tf_calculator=None):
         self.module_id = module_id
         self.debug_view = debug_view
         self.robot_name = f"beetle{module_id}"
         self.assembly_mode = assembly_mode
         self.assembly_tf_calculator = assembly_tf_calculator
-        
+
         # Parameters
         self.mass = rospy.get_param('~robot_mass', 1.5)
         self.default_pos_thresh = rospy.get_param('~default_pos_thresh', 0.03)
         self.default_rot_thresh = rospy.get_param('~default_rot_thresh', 0.05)
         self.is_simulation = rospy.get_param("~simulation", True)
-        
+
         # State variables
         self.uav_odom = Odometry()
         self.assembly_odom = Odometry()
@@ -74,10 +81,12 @@ class BeetleInterface(object):
         self.flight_state = self.ARM_OFF_STATE
         self.target_pos = np.array([0, 0, 0])
         self.est_wrench = None
-        
+
         # External wrench state
         self.external_wrench_active = False
         self.current_external_wrench = TaggedWrench()
+        self.current_ff_force = [0.0, 0.0, 0.0]
+        self.current_ff_torque = [0.0, 0.0, 0.0]
 
         # Task observer-prediction state (Level 2: spatial-inertia consistent).
         # `attach_module_id` is retained only as an opt-in marker; the
@@ -87,7 +96,7 @@ class BeetleInterface(object):
         self._inter_module_ids = []
         # Positions r_i in formation frame (will be auto-recentered to
         # formation CoG); diagonal inertias I_i (Ixx,Iyy,Izz) in module body
-        # frame. Both optional — if absent, helper falls back to mass-ratio
+        # frame. Both optional - if absent, helper falls back to mass-ratio
         # (Level 1) which is OK for pure-translational tasks like towing but
         # NOT for tasks with significant torque (e.g. valve rotation).
         self._inter_module_positions = {}
@@ -98,7 +107,7 @@ class BeetleInterface(object):
         self._inter_m_total = 0.0
         self._inter_auto_publish = False
         self._est_wrench_task_pubs = {}
-        # Track last published ŷ^task per module so clearExternalWrench can
+        # Track last published y_hat^task per module so clearExternalWrench can
         # zero them out cleanly.
         self._last_est_wrench_task = {}
 
@@ -106,7 +115,7 @@ class BeetleInterface(object):
         self.prev_joy_state = Joy()
         self.halt_task = False
         self.force_skip = False
-        
+
         # Setup publishers
         nav_topic = '/assembly/uav/nav' if assembly_mode else f'/beetle{module_id}/uav/nav'
         self.nav_pub = rospy.Publisher(nav_topic, FlightNav, queue_size=1)
@@ -127,22 +136,22 @@ class BeetleInterface(object):
             rospy.logwarn(f"[BeetleInterface] Wrench routed to C++ LEADER beetle{wrench_target_id} "
                           f"(Python EE module={module_id})")
 
-        # ----- Per-module task observer prediction (ŷ^task) publishers -----
+        # ----- Per-module task observer prediction (y_hat^task) publishers -----
         # Theory: the per-module momentum observer outputs
-        #     ŷ_i = c_i + d_i + b_i   (joint force + direct external + parasitic)
-        # We publish a task-space prediction ŷ_i^task and the C++ controller
+        #     y_hat_i = c_i + d_i + b_i   (joint force + direct external + parasitic)
+        # We publish a task-space prediction y_hat_i^task and the C++ controller
         # subtracts it BEFORE the joint-cut recursion in calcInteractionWrench,
         # so downstream inter_wrench_list_ is the task-subtracted residual
         # (~parasitic if the model is accurate). Two decomposition models are
         # supported:
-        #   Level 1 (mass ratio): ŷ_i^task = (m_i/m_tot) * W_ext
+        #   Level 1 (mass ratio): y_hat_i^task = (m_i/m_tot) * W_ext
         #     Only valid for pure-translational tasks (towing). Used when
         #     positions/inertias are not provided.
         #   Level 2 (spatial inertia): physically consistent decomposition
-        #     F_i = m_i (a + α × r_i), τ_{i,Ci} = I_i α, where
-        #     [a; α] = M_form^{-1} W_ext at formation CoG. Required when the
+        #     F_i = m_i (a + alpha x r_i), tau_{i,Ci} = I_i alpha, where
+        #     [a; alpha] = M_form^{-1} W_ext at formation CoG. Required when the
         #     task wrench has torque (e.g. valve rotation).
-        # Invariant: Σ ŷ_i^task = W_ext (Newton 2nd + parallel-axis identity).
+        # Invariant: sum y_hat_i^task = W_ext (Newton 2nd + parallel-axis identity).
         default_ids = [1, 2]
         self._inter_module_ids = rospy.get_param(
             f'/beetle{wrench_target_id}/assembly_ids', default_ids)
@@ -151,7 +160,7 @@ class BeetleInterface(object):
                 f'/beetle{mid}/est_wrench_task', TaggedWrench, queue_size=1)
             self._last_est_wrench_task[mid] = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
 
-        
+
         # Setup subscribers
         if assembly_mode:
             rospy.Subscriber('/assemble/cog/odom', Odometry, self._assembly_cb, queue_size=1)
@@ -159,42 +168,42 @@ class BeetleInterface(object):
                 rospy.Subscriber(f'/beetle{module_id}/mocap/pose', PoseStamped, self._uav_cb, queue_size=1)
         else:
             rospy.Subscriber(f'/beetle{module_id}/mocap/pose', PoseStamped, self._uav_cb, queue_size=1)
-        
+
         rospy.Subscriber(f'/beetle{module_id}/estimated_external_wrench', WrenchStamped, self._wrench_cb, queue_size=1)
         rospy.Subscriber('flight_state', UInt8, self._flight_state_cb, queue_size=1)
         rospy.Subscriber('joy', Joy, self._joy_cb, queue_size=1)
-        
+
         valve_topic = '/valve/odom' if self.is_simulation else '/valve/mocap/pose'
         if self.is_simulation:
             rospy.Subscriber(valve_topic, Odometry, self._valve_sim_cb, queue_size=1)
         else:
             rospy.Subscriber(valve_topic, PoseStamped, self._valve_cb, queue_size=1)
-        
+
         mode_str = "ASSEMBLY" if assembly_mode else "SINGLE"
         rospy.loginfo(f"BeetleInterface[{module_id}] initialized in {mode_str} mode")
-    
+
     # Callbacks
     def _uav_cb(self, msg):
         self.uav_odom.header = msg.header
         self.uav_odom.pose.pose.position = msg.pose.position
         self.uav_odom.pose.pose.orientation = msg.pose.orientation
-    
+
     def _assembly_cb(self, msg):
         self.assembly_odom = msg
-    
+
     def _valve_cb(self, msg):
         self.valve_pose = msg.pose
-    
+
     def _valve_sim_cb(self, msg):
         if hasattr(msg, 'child_frame_id') and msg.child_frame_id == "handle":
             self.valve_pose = msg.pose.pose
-    
+
     def _wrench_cb(self, msg):
         self.est_wrench = msg.wrench
-    
+
     def _flight_state_cb(self, msg):
         self.flight_state = msg.data
-    
+
     def _joy_cb(self, msg):
         if len(msg.buttons) > 4 and msg.buttons[4] == 1 and self.prev_joy_state.buttons[4] == 0:
             self.halt_task = True
@@ -203,50 +212,50 @@ class BeetleInterface(object):
             self.force_skip = True
             rospy.loginfo('Force skip')
         self.prev_joy_state = msg
-    
+
     # Basic flight commands
     def start(self, sleep=1.0):
         self.start_pub.publish()
         rospy.sleep(sleep)
-    
+
     def takeoff(self):
         self.takeoff_pub.publish()
-    
+
     def land(self):
         self.land_pub.publish()
-    
+
     def halt(self):
         self.halt_pub.publish()
-    
+
     # Position getters
     def getUavPos(self):
         """Get effective position (assembly CoG in assembly mode, UAV pos otherwise)."""
         odom = self.assembly_odom if self.assembly_mode else self.uav_odom
         p = odom.pose.pose.position
         return np.array([p.x, p.y, p.z])
-    
+
     def getAssemblyPos(self):
         """Get assembly CoG position (assembly mode only)."""
         if not self.assembly_mode:
             return None
         p = self.assembly_odom.pose.pose.position
         return np.array([p.x, p.y, p.z])
-    
+
     def getIndividualUavPos(self):
         """Get individual UAV position."""
         p = self.uav_odom.pose.pose.position
         return np.array([p.x, p.y, p.z])
-    
+
     def getUavRot(self):
         """Get effective orientation quaternion."""
         odom = self.assembly_odom if self.assembly_mode else self.uav_odom
         o = odom.pose.pose.orientation
         return np.array([o.x, o.y, o.z, o.w])
-    
+
     def getUavRPY(self):
         """Get effective orientation as roll, pitch, yaw."""
         return euler_from_quaternion(self.getUavRot())
-    
+
     def getAssemblyRPY(self):
         """Get assembly orientation as RPY (assembly mode only)."""
         if not self.assembly_mode:
@@ -274,7 +283,7 @@ class BeetleInterface(object):
         world_to_body = body_to_world.T
         return ((world_to_body @ np.asarray(force, dtype=float)).tolist(),
                 (world_to_body @ np.asarray(torque, dtype=float)).tolist())
-    
+
     def getEndEffectorPos(self):
         """Get end-effector position in world coordinates (pitch-aware)."""
         if self.assembly_mode and self.assembly_tf_calculator:
@@ -295,44 +304,44 @@ class BeetleInterface(object):
             return (uav_pos[0] + offset_x * math.cos(yaw),
                     uav_pos[1] + offset_x * math.sin(yaw),
                     uav_pos[2] + offset_z)
-    
+
     def getValvePos(self):
         """Get valve position."""
         if self.valve_pose is None:
             return None
         p = self.valve_pose.position
         return np.array([p.x, p.y, p.z])
-    
+
     def getValveRot(self):
         """Get valve orientation quaternion."""
         if self.valve_pose is None:
             return None
         o = self.valve_pose.orientation
         return np.array([o.x, o.y, o.z, o.w])
-    
+
     def getValveYaw(self):
         """Get valve yaw angle."""
         rot = self.getValveRot()
         return euler_from_quaternion(rot)[2] if rot is not None else None
-    
+
     def getFlightState(self):
         return self.flight_state
-        
+
     def getEstimatedWrench(self):
         return self.est_wrench
-    
+
     def getTaskHaltFlag(self):
         return self.halt_task
-    
+
     def resetTaskHaltFlag(self):
         self.halt_task = False
-    
+
     def getForceSkipFlag(self):
         return self.force_skip
-    
+
     def resetForceSkipFlag(self):
         self.force_skip = False
-    
+
     def _to_list3(self, data):
         """Convert various data formats to [x, y, z] list."""
         if data is None:
@@ -341,11 +350,11 @@ class BeetleInterface(object):
             return [float(data[0]), float(data[1]), float(data[2])]
         except (IndexError, TypeError, ValueError):
             return [0.0, 0.0, 0.0]
-    
+
     def targetMotion(self, pos, rot=None, linear_vel=None, angular_vel=None):
         """
         SE(3) position-velocity control.
-        
+
         Args:
             pos: Target position [x, y, z]
             rot: Target yaw angle or quaternion
@@ -354,27 +363,27 @@ class BeetleInterface(object):
         """
         pos_list = self._to_list3(pos)
         vel_list = self._to_list3(linear_vel)
-        
+
         nav_msg = FlightNav()
         nav_msg.control_frame = FlightNav.WORLD_FRAME
         nav_msg.target = FlightNav.COG
         nav_msg.header.stamp = rospy.Time.now()
-        
+
         # Use POS_VEL_MODE if velocity is provided
         mode = FlightNav.POS_VEL_MODE if (vel_list or angular_vel) else FlightNav.POS_MODE
-        
+
         nav_msg.pos_xy_nav_mode = mode
         nav_msg.pos_z_nav_mode = mode
         nav_msg.target_pos_x = pos_list[0]
         nav_msg.target_pos_y = pos_list[1]
         nav_msg.target_pos_z = pos_list[2]
-        
+
         # Linear velocity
         if vel_list:
             nav_msg.target_vel_x, nav_msg.target_vel_y, nav_msg.target_vel_z = vel_list
         else:
             nav_msg.target_vel_x = nav_msg.target_vel_y = nav_msg.target_vel_z = 0.0
-        
+
         # Yaw control
         if rot is not None:
             nav_msg.yaw_nav_mode = mode
@@ -385,7 +394,7 @@ class BeetleInterface(object):
         else:
             nav_msg.yaw_nav_mode = 0
             nav_msg.target_yaw = 0.0
-        
+
         # Angular velocity
         if angular_vel is not None:
             if isinstance(angular_vel, (list, tuple, np.ndarray)) and len(angular_vel) == 3:
@@ -395,14 +404,14 @@ class BeetleInterface(object):
                 nav_msg.target_omega_z = angular_vel
         else:
             nav_msg.target_omega_x = nav_msg.target_omega_y = nav_msg.target_omega_z = 0.0
-        
+
         nav_msg.roll_nav_mode = 0
         nav_msg.pitch_nav_mode = FlightNav.POS_MODE
         nav_msg.target_roll = nav_msg.target_pitch = 0.0
-        
+
         self.nav_pub.publish(nav_msg)
         self.target_pos = pos
-    
+
     def isUnifiedMode(self):
         """Query C++ runtime: is unified_control_mode currently active on the leader?"""
         leader_id = self.wrench_target_id if hasattr(self, 'wrench_target_id') else self.module_id
@@ -410,7 +419,7 @@ class BeetleInterface(object):
 
     def addExternalWrench(self, force, torque, frame_id="world"):
         """Apply desired external wrench.
-        
+
         In assembly_mode, frame_id="world" rotates full RPY world-frame input
         to formation body frame (fc). Use frame_id="world_yaw" for the legacy
         yaw-only conversion, or frame_id="fc" if the wrench is already in the
@@ -422,7 +431,7 @@ class BeetleInterface(object):
         """
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
-        
+
         # Both unified and lead-follower paths need formation-body data.
         frame_key = str(frame_id).lower()
         if self.assembly_mode and frame_key in ("world", "map", "odom", "world_yaw"):
@@ -431,7 +440,7 @@ class BeetleInterface(object):
             frame_id = "fc"
         elif frame_key in ("fc", "body", "formation", "formation_body"):
             frame_id = "fc"
-        
+
         ff_msg = WrenchStamped()
         ff_msg.header.stamp = rospy.Time.now()
         ff_msg.header.frame_id = frame_id
@@ -441,7 +450,7 @@ class BeetleInterface(object):
         ff_msg.wrench.torque.x = torque_list[0]
         ff_msg.wrench.torque.y = torque_list[1]
         ff_msg.wrench.torque.z = torque_list[2]
-        
+
         self.external_wrench_active = True
         self.current_ff_force = force_list
         self.current_ff_torque = torque_list
@@ -450,15 +459,33 @@ class BeetleInterface(object):
         else:
             self.desired_ext_wrench_pub.publish(ff_msg)
 
-        # ----- Also drive per-module ŷ^task in lockstep, if enabled -----
+        # ----- Also drive per-module y_hat^task in lockstep, if enabled -----
         # The body-frame force/torque is reused (same frame as the C++
         # est_wrench_task_list_).
         if self._inter_auto_publish:
             self._publishInternalWrenchFromExternal(force_list, torque_list, frame_id)
-    
-    def clearExternalWrench(self):
-        """Clear external wrench application."""
+
+    def clearExternalWrench(self, duration=0.0, rate_hz=25.0):
+        """Clear external wrench application.
+
+        When duration > 0, unload the last commanded body-frame wrench with an
+        S-curve profile before sending the final zero. The default keeps the
+        previous immediate-clear behavior.
+        """
         if self.external_wrench_active:
+            if duration > 1e-3 and rate_hz > 1e-3:
+                start_force = np.asarray(self.current_ff_force, dtype=float)
+                start_torque = np.asarray(self.current_ff_torque, dtype=float)
+                steps = max(1, int(duration * rate_hz))
+                rate = rospy.Rate(rate_hz)
+                for step in range(1, steps + 1):
+                    blend = smoothstep01(float(step) / steps)
+                    force = ((1.0 - blend) * start_force).tolist()
+                    torque = ((1.0 - blend) * start_torque).tolist()
+                    self.addExternalWrench(force, torque, frame_id="fc")
+                    if rospy.is_shutdown():
+                        break
+                    rate.sleep()
             zero_msg = WrenchStamped()
             zero_msg.header.stamp = rospy.Time.now()
             zero_msg.header.frame_id = "fc"
@@ -467,7 +494,9 @@ class BeetleInterface(object):
             else:
                 self.desired_ext_wrench_pub.publish(zero_msg)
             self.external_wrench_active = False
-        # Also zero per-module ŷ^task so the controller's residual
+            self.current_ff_force = [0.0, 0.0, 0.0]
+            self.current_ff_torque = [0.0, 0.0, 0.0]
+        # Also zero per-module y_hat^task so the controller's residual
         # subtraction no longer subtracts a stale task expectation.
         if self._inter_auto_publish:
             self._publishInternalWrenchRaw(
@@ -480,7 +509,7 @@ class BeetleInterface(object):
     def setAttachModule(self, module_id, module_masses=None,
                         module_positions=None, module_inertias_diag=None):
         """Declare an external load is bolted to one module and enable
-        per-module ŷ^task auto-publishing.
+        per-module y_hat^task auto-publishing.
 
         Decomposition model is selected by the data provided:
           * mass-ratio (Level 1) if positions+inertias are both missing;
@@ -504,14 +533,14 @@ class BeetleInterface(object):
             Will be auto-recentered to the mass-weighted centroid so the
             caller may use any consistent origin.
         module_inertias_diag : dict[int, list[float]] or None
-            Per-module diagonal inertia [Ixx,Iyy,Izz] (kg·m^2) about its own
+            Per-module diagonal inertia [Ixx,Iyy,Izz] (kg*m^2) about its own
             CoG, expressed in the module body frame.
         """
         if module_id is None:
             self._inter_attach_module_id = None
             self._inter_auto_publish = False
             # Best-effort clear so a previously running auto-publish
-            # doesn't leave stale ŷ^task on the bus.
+            # doesn't leave stale y_hat^task on the bus.
             self._publishInternalWrenchRaw(
                 {mid: ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
                  for mid in self._inter_module_ids})
@@ -520,7 +549,7 @@ class BeetleInterface(object):
         if module_id not in self._inter_module_ids:
             rospy.logwarn(
                 "[BeetleInterface] setAttachModule(%d) but module not in "
-                "assembly_ids=%s — est_wrench_task publish skipped",
+                "assembly_ids=%s - est_wrench_task publish skipped",
                 module_id, self._inter_module_ids)
             return
         self._inter_attach_module_id = int(module_id)
@@ -547,7 +576,7 @@ class BeetleInterface(object):
             level, self._inter_attach_module_id, self._inter_module_masses)
 
     def setInternalWrenchPerModule(self, per_module, frame_id="fc"):
-        """Explicit advanced API: directly publish ŷ^task for each module.
+        """Explicit advanced API: directly publish y_hat^task for each module.
 
         Parameters
         ----------
@@ -575,7 +604,7 @@ class BeetleInterface(object):
             return
         if not (self._inter_module_positions and self._inter_module_inertias_diag):
             return  # Level-1 path; no further caching needed.
-        # Mass-weighted centroid; recenter so Σ m_i r_i = 0.
+        # Mass-weighted centroid; recenter so sum m_i r_i = 0.
         ids = self._inter_module_ids
         r_cog = np.zeros(3)
         for mid in ids:
@@ -599,8 +628,8 @@ class BeetleInterface(object):
             self._inter_M_form_inv = None
 
     def _decomposeTaskWrench(self, force, torque):
-        """Return {mid: (F_i_body, τ_i_body)} for the body-frame external
-        wrench (F, τ) applied at formation CoG.
+        """Return {mid: (F_i_body, tau_i_body)} for the body-frame external
+        wrench (F, tau) applied at formation CoG.
 
         Level 2 (spatial inertia) used when geometry is cached; else falls
         back to Level 1 (mass ratio). Module body frames are assumed
@@ -613,7 +642,7 @@ class BeetleInterface(object):
         per_module = {}
         if self._inter_M_form_inv is None:
             # Level 1: mass-ratio split (force AND torque). OK only for tasks
-            # without torque — retained for backward compatibility / towing.
+            # without torque - retained for backward compatibility / towing.
             if np.linalg.norm(tau) > 1e-6:
                 rospy.logwarn_throttle(
                     2.0,
@@ -637,11 +666,11 @@ class BeetleInterface(object):
 
     def _publishInternalWrenchFromExternal(self, force_body, torque_body, frame_id):
         """Decompose the body-frame external wrench at formation CoG into
-        per-module observer task prediction ŷ^task and publish."""
+        per-module observer task prediction y_hat^task and publish."""
         per_module = self._decomposeTaskWrench(force_body, torque_body)
         if not per_module:
             return
-        # Optional self-check: Σ W_i^{task,F} == W_ext^F at formation CoG.
+        # Optional self-check: sum W_i^{task,F} == W_ext^F at formation CoG.
         # Only runs at DEBUG verbosity; cheap (constant work per call).
         if rospy.get_param('~debug_task_wrench_check', False):
             F_sum = np.zeros(3)
@@ -654,11 +683,11 @@ class BeetleInterface(object):
                                   tau_sum - np.asarray(torque_body)])
             if np.linalg.norm(err) > 1e-6:
                 rospy.logwarn_throttle(2.0,
-                    "[BeetleInterface] ΣW_i^task != W_ext, residual=%s", err)
+                    "[BeetleInterface] sumW_i^task != W_ext, residual=%s", err)
         self._publishInternalWrenchRaw(per_module, frame_id=frame_id)
 
     def _publishInternalWrenchRaw(self, per_module, frame_id="fc"):
-        """Publish raw per-module ŷ^task and cache last values."""
+        """Publish raw per-module y_hat^task and cache last values."""
         stamp = rospy.Time.now()
         for mid, (f, t) in per_module.items():
             pub = self._est_wrench_task_pubs.get(mid)
@@ -677,23 +706,23 @@ class BeetleInterface(object):
             pub.publish(msg)
             self._last_est_wrench_task[mid] = (list(f), list(t))
 
-    
+
     def executeTrajectoryWithWrench(self, pos, rot, linear_vel, angular_vel, force, torque):
         """Combined SE(3) control with external wrench feedforward."""
         self.addExternalWrench(force, torque)
         self.targetMotion(pos, rot, linear_vel, angular_vel)
         return True
-    
-    def goPoseWaitConvergence(self, pos, rot=None, pos_thresh=None, vel_thresh=0.1, 
+
+    def goPoseWaitConvergence(self, pos, rot=None, pos_thresh=None, vel_thresh=0.1,
                                rot_thresh=None, timeout=30, check_func=None):
         """Move to position and wait for convergence."""
         pos_thresh = pos_thresh or self.default_pos_thresh
         rot_thresh = rot_thresh or self.default_rot_thresh
         check_func = check_func or self.posYawConvergenceCheck
-        
+
         self.targetMotion(pos, rot=rot)
         start_time = rospy.get_time()
-        
+
         while not check_func(pos, rot, pos_thresh, vel_thresh, rot_thresh):
             if timeout > 0 and (rospy.get_time() - start_time) > timeout:
                 return False
@@ -704,41 +733,41 @@ class BeetleInterface(object):
                 return False
             rospy.sleep(0.1)
         return True
-    
+
     def posYawConvergenceCheck(self, target_pos, target_rot, pos_thresh, vel_thresh, rot_thresh):
         """Check if position and yaw have converged."""
         if isinstance(pos_thresh, list):
             pos_thresh = pos_thresh[2] if len(pos_thresh) >= 3 else self.default_pos_thresh
         if isinstance(rot_thresh, list):
             rot_thresh = rot_thresh[2] if len(rot_thresh) >= 3 else self.default_rot_thresh
-        
+
         current_pos = self.getUavPos()
         current_yaw = self.getUavRPY()[2]
-        
+
         if target_rot is None:
             target_yaw = current_yaw
         elif isinstance(target_rot, (list, tuple, np.ndarray)) and len(target_rot) == 4:
             target_yaw = euler_from_quaternion(target_rot)[2]
         else:
             target_yaw = target_rot
-        
+
         delta_pos = target_pos - current_pos
         delta_yaw = target_yaw - current_yaw
-        
+
         # Normalize yaw to [-pi, pi]
         while delta_yaw > np.pi:
             delta_yaw -= 2 * np.pi
         while delta_yaw < -np.pi:
             delta_yaw += 2 * np.pi
-        
+
         pos_error = np.linalg.norm(delta_pos)
         yaw_error = abs(delta_yaw)
-        
+
         if self.debug_view:
             rospy.loginfo_throttle(1.0, f'Convergence: pos={pos_error:.4f}, yaw={yaw_error:.4f}')
-        
+
         return pos_error < pos_thresh and yaw_error < rot_thresh
-    
+
     @staticmethod
     def _normalize_angle(angle):
         """Normalize angle to [-pi, pi]."""

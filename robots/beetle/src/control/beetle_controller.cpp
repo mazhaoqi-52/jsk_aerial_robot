@@ -1577,8 +1577,11 @@ namespace aerial_robot_control
       }
 
       std::map<int, Eigen::VectorXd> residual_biascorr_list;
+      std::map<int, Eigen::VectorXd> inter_biascorr_list;
+      std::map<int, Eigen::VectorXd> comp_biascorr_list;
       Eigen::VectorXd W_w_biascorr = Eigen::VectorXd::Zero(6);
       double max_res_biascorr_f = 0.0, max_res_biascorr_t = 0.0;
+      double max_comp_biascorr_f = 0.0, max_comp_biascorr_t = 0.0;
       if (unified_residual_bias_ready_) {
         int biascorr_module_num = 0;
         for (int i = 1; i <= max_modules_num; ++i) {
@@ -1597,6 +1600,48 @@ namespace aerial_robot_control
               std::max(max_res_biascorr_t, residual_biascorr_list[i].tail(3).norm());
         }
         if (biascorr_module_num > 0) W_w_biascorr /= biascorr_module_num;
+
+        Eigen::VectorXd left_inter_wrench_bc = Eigen::VectorXd::Zero(6);
+        for (const auto& item : residual_biascorr_list) {
+          if (assembly_flag[item.first]) {
+            Eigen::VectorXd right_inter_wrench_bc =
+                item.second - W_w_biascorr + left_inter_wrench_bc;
+            inter_biascorr_list[item.first] = right_inter_wrench_bc;
+            left_inter_wrench_bc = right_inter_wrench_bc;
+          } else {
+            inter_biascorr_list[item.first] = Eigen::VectorXd::Zero(6);
+          }
+        }
+
+        Eigen::VectorXd wrench_comp_sum_left_bc = Eigen::VectorXd::Zero(6);
+        for (int i = leader_id - 1; i > 0; --i) {
+          if (assembly_flag[i]) {
+            wrench_comp_sum_left_bc += inter_biascorr_list[i];
+            comp_biascorr_list[i] = wrench_comp_sum_left_bc;
+          } else {
+            comp_biascorr_list[i] = Eigen::VectorXd::Zero(6);
+          }
+        }
+        int left_module_id_bc = leader_id;
+        Eigen::VectorXd wrench_comp_sum_right_bc = Eigen::VectorXd::Zero(6);
+        for (int i = leader_id + 1; i <= max_modules_num; ++i) {
+          if (assembly_flag[i]) {
+            wrench_comp_sum_right_bc += -inter_biascorr_list[left_module_id_bc];
+            comp_biascorr_list[i] = wrench_comp_sum_right_bc;
+            left_module_id_bc = i;
+          } else {
+            comp_biascorr_list[i] = Eigen::VectorXd::Zero(6);
+          }
+        }
+        comp_biascorr_list[leader_id] = Eigen::VectorXd::Zero(6);
+
+        for (int i = 1; i <= max_modules_num; ++i) {
+          if (!assembly_flag[i] || comp_biascorr_list[i].size() < 6) continue;
+          max_comp_biascorr_f =
+              std::max(max_comp_biascorr_f, comp_biascorr_list[i].head(3).norm());
+          max_comp_biascorr_t =
+              std::max(max_comp_biascorr_t, comp_biascorr_list[i].tail(3).norm());
+        }
       }
 
       double max_res_f = 0.0, max_res_t = 0.0;
@@ -1637,7 +1682,9 @@ namespace aerial_robot_control
       if (unified_residual_bias_ready_) {
         ss << ",resAvgCorr=" << fmtWrench(W_w_biascorr)
            << ",maxResCorr=[F=" << max_res_biascorr_f
-           << ",T=" << max_res_biascorr_t << "]";
+           << ",T=" << max_res_biascorr_t << "]"
+           << ",maxCompCorr=[F=" << max_comp_biascorr_f
+           << ",T=" << max_comp_biascorr_t << "]";
       }
       ss << "]";
       if (is_diag_leader) {
@@ -1678,7 +1725,9 @@ namespace aerial_robot_control
                   << ",res=" << fmtWrench(est_residual_list_[i])
                   << ",bias=" << fmtWrench(unified_residual_bias_list_[i]);
         if (unified_residual_bias_ready_) {
-          detail_ss << ",res_bc=" << fmtWrench(residual_biascorr_list[i]);
+          detail_ss << ",res_bc=" << fmtWrench(residual_biascorr_list[i])
+                    << ",inter_bc=" << fmtWrench(inter_biascorr_list[i])
+                    << ",comp_bc=" << fmtWrench(comp_biascorr_list[i]);
         }
         detail_ss
                   << ",inter=" << fmtWrench(inter_wrench_list_[i])

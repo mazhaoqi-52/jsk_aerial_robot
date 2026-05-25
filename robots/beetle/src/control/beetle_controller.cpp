@@ -1503,9 +1503,17 @@ namespace aerial_robot_control
         }
         return os.str();
       };
+      auto fmtVec3 = [](const Eigen::Vector3d& v) {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(3)
+           << "[" << v(0) << "," << v(1) << "," << v(2) << "]";
+        return os.str();
+      };
 
       double max_res_f = 0.0, max_res_t = 0.0;
       double max_comp_f = 0.0, max_comp_t = 0.0;
+      std::map<int, Eigen::VectorXd> realized_wrench_list;
+      Eigen::Vector3d realized_force_sum = Eigen::Vector3d::Zero();
       for (int i = 1; i <= max_modules_num; ++i) {
         if (!assembly_flag[i]) continue;
         if (est_residual_list_[i].size() >= 6) {
@@ -1515,6 +1523,12 @@ namespace aerial_robot_control
         if (wrench_comp_list_[i].size() >= 6) {
           max_comp_f = std::max(max_comp_f, wrench_comp_list_[i].head(3).norm());
           max_comp_t = std::max(max_comp_t, wrench_comp_list_[i].tail(3).norm());
+        }
+        Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
+        if (unified_controller_ &&
+            unified_controller_->getRealizedModuleWrenchBody(i, realized)) {
+          realized_wrench_list[i] = realized;
+          realized_force_sum += realized.head(3);
         }
       }
 
@@ -1534,14 +1548,29 @@ namespace aerial_robot_control
            << ",rmsT=" << rms_t
            << ",pairs=" << n_pairs << "]";
       }
+      if (!realized_wrench_list.empty() && unified_controller_) {
+        Eigen::VectorXd realized_formation = unified_controller_->getRealizedWrenchBody();
+        if (realized_formation.size() >= 6) {
+          Eigen::Vector3d force_err = realized_force_sum - realized_formation.head(3);
+          ss << " allocDiag=[moduleFsum=" << fmtVec3(realized_force_sum)
+             << ",formF=" << fmtVec3(realized_formation.head(3))
+             << ",errF=" << force_err.norm() << "]";
+        }
+      }
       ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, ss.str());
 
       std::ostringstream detail_ss;
       detail_ss << ss.str() << " modules:";
       for (int i = 1; i <= max_modules_num; ++i) {
         if (!assembly_flag[i]) continue;
+        auto realized_it = realized_wrench_list.find(i);
+        const Eigen::VectorXd realized =
+            (realized_it != realized_wrench_list.end())
+                ? realized_it->second
+                : Eigen::VectorXd::Zero(6);
         detail_ss << " m" << i
-                  << "{est=" << fmtWrench(est_wrench_list_[i])
+                  << "{real=" << fmtWrench(realized)
+                  << ",est=" << fmtWrench(est_wrench_list_[i])
                   << ",task=" << fmtWrench(est_wrench_task_list_[i])
                   << ",res=" << fmtWrench(est_residual_list_[i])
                   << ",inter=" << fmtWrench(inter_wrench_list_[i])

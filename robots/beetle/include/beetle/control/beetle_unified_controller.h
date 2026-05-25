@@ -191,16 +191,15 @@ public:
   /**
    * @brief Compute the realized 6D wrench in body (CoG) frame from the allocation result.
    *
-   * This is the ACTUAL wrench being applied to the formation, computed as:
+   * This is the allocation-model wrench commanded by the PC-side allocator:
    *   w_realized_acc = A * f   (integrated_map_ * target_vectoring_f_)
    * then converted from acc-space to force/torque space:
    *   F = M * w_realized_acc.head(3)
    *   T = I * w_realized_acc.tail(3)
    *
-   * This is the correct observer input for cascade mode because it:
-   *   - Includes all PID terms (P+D from spinal are embedded in the base_thrust)
-   *   - Is formation-level (uses formation allocation matrix)
-   *   - Is cascade-agnostic (no dependency on PC vs spinal PID split)
+   * In cascade mode this does not include spinal-side P/D increments, motor
+   * dynamics, or thrust/gimbal tracking errors. Treat it as a diagnostic
+   * model input, not a measured actuator wrench.
    *
    * @return 6D wrench [Fx,Fy,Fz,Tx,Ty,Tz] in body frame (N, N·m).
    *         Returns zero vector if allocation has not been computed yet.

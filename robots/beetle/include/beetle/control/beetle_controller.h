@@ -72,6 +72,13 @@ namespace aerial_robot_control
     bool unified_internal_wrench_log_;
     double unified_internal_wrench_log_period_;
     double unified_internal_wrench_secondary_gain_;
+    // Unified residual hover-bias diagnostic. This is log-only: it never feeds
+    // wrench_comp_list_ or the allocation secondary.
+    bool unified_residual_bias_ready_;
+    int unified_residual_bias_samples_;
+    int unified_residual_bias_module_num_;
+    Eigen::VectorXd unified_residual_common_bias_;
+    std::map<int, Eigen::VectorXd> unified_residual_bias_list_;
 
     /** @brief LEADER-only: send cascade gains + allocation matrix inverse to ALL assembled
      *  modules' spinals. Uses unified_controller_'s publishers. Also sends gimbal_dof=1

@@ -240,13 +240,9 @@ namespace aerial_robot_control
       ROS_INFO("[UnifiedCtrl] Formation observer deactivated (reset + inactive)");
     }
 
-    // P0-fix: Re-init single-module momentum observer on unified exit.
-    // During unified mode, externalWrenchEstimate() returns early, so
-    // prev_est_wrench_timestamp_ is frozen at the pre-unified value.
-    // Without reset, the first post-exit call sees dt = entire unified duration
-    // → integrate_term_ explodes → est_external_wrench_ corrupted
-    // → wrench_comp → ICompTerm(PITCH) → pitch crash.
-    // Setting timestamp to 0 triggers the re-init path (new init_sum_momentum_).
+    // Re-init single-module momentum observer on unified exit. The observer is
+    // also used for short-term unified residual diagnostics, so do not carry
+    // momentum/integral state across controller modes.
     prev_est_wrench_timestamp_ = 0;
     integrate_term_ = Eigen::VectorXd::Zero(6);
     est_external_wrench_ = Eigen::VectorXd::Zero(6);
@@ -367,6 +363,15 @@ namespace aerial_robot_control
       formation_observer_->setActive(true);
       ROS_INFO("[UnifiedCtrl] Formation observer activated (reset + active)");
     }
+
+    // Start the per-module momentum observer from the unified-mode state.
+    // Its output feeds only the LF-style residual diagnostic by default; the
+    // secondary allocation path remains disabled unless the gain is set > 0.
+    prev_est_wrench_timestamp_ = 0;
+    integrate_term_ = Eigen::VectorXd::Zero(6);
+    est_external_wrench_ = Eigen::VectorXd::Zero(6);
+    init_sum_momentum_ = Eigen::VectorXd::Zero(6);
+    ROS_INFO("[UnifiedCtrl] Single-module observer reset for unified residual diagnostics");
 
     ROS_WARN("[UnifiedCtrl] %s id=%d mode switch: reset targets, %s, "
              "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
@@ -1499,12 +1504,29 @@ namespace aerial_robot_control
         return os.str();
       };
 
+      double max_res_f = 0.0, max_res_t = 0.0;
+      double max_comp_f = 0.0, max_comp_t = 0.0;
+      for (int i = 1; i <= max_modules_num; ++i) {
+        if (!assembly_flag[i]) continue;
+        if (est_residual_list_[i].size() >= 6) {
+          max_res_f = std::max(max_res_f, est_residual_list_[i].head(3).norm());
+          max_res_t = std::max(max_res_t, est_residual_list_[i].tail(3).norm());
+        }
+        if (wrench_comp_list_[i].size() >= 6) {
+          max_comp_f = std::max(max_comp_f, wrench_comp_list_[i].head(3).norm());
+          max_comp_t = std::max(max_comp_t, wrench_comp_list_[i].tail(3).norm());
+        }
+      }
+
       std::ostringstream ss;
       ss << std::fixed << std::setprecision(3);
       ss << "[UnifiedInternalWrench id=" << my_id
          << " leader=" << leader_id
          << " gain=" << unified_internal_wrench_secondary_gain_
-         << "] W_res_avg=" << fmtWrench(W_w);
+         << " src=single_module_observer"
+         << "] W_res_avg=" << fmtWrench(W_w)
+         << " maxRes=[F=" << max_res_f << ",T=" << max_res_t << "]"
+         << " maxComp=[F=" << max_comp_f << ",T=" << max_comp_t << "]";
       if (is_diag_leader) {
         ss << " disagree=[maxF=" << max_f
            << ",maxT=" << max_t
@@ -1525,7 +1547,7 @@ namespace aerial_robot_control
                   << ",inter=" << fmtWrench(inter_wrench_list_[i])
                   << ",comp=" << fmtWrench(wrench_comp_list_[i]) << "}";
       }
-      ROS_DEBUG_STREAM_THROTTLE(unified_internal_wrench_log_period_, detail_ss.str());
+      ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, detail_ss.str());
     }
   }
 
@@ -1632,21 +1654,10 @@ namespace aerial_robot_control
 
   void BeetleController::externalWrenchEstimate()
   {
-    // In unified mode the assembled formation is controlled by the
-    // formation-level QP allocation in BeetleUnifiedController. The per-module
-    // single-mass momentum observer here has no consumer in that path
-    // (calcInteractionWrench / wrench_comp are diagnostic-only while
-    // unified_internal_wrench_secondary_gain == 0). It also runs on the
-    // dedicated 100Hz wrench_estimate_thread_; early-returning in unified +
-    // assembled state keeps that thread idle and avoids contending the main
-    // control loop. The observer stays active in LF / independent / SEPARATED.
-    if (unified_control_mode_ &&
-        beetle_navigator_->getModuleState() != SEPARATED) {
-      prev_est_wrench_timestamp_ = 0;
-      integrate_term_ = Eigen::VectorXd::Zero(6);
-      return;
-    }
-
+    // In unified mode this single-module observer is kept alive for short-term
+    // residual diagnostics. Its estimate is not injected into pose/attitude PID;
+    // calcInteractionWrench() only feeds the allocation secondary when the
+    // explicit unified_internal_wrench_secondary_gain is positive and HOVER-gated.
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&

@@ -33,11 +33,12 @@ controller:
 
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
 
-  # Unified internal wrench management: LF-style residual as a small QP secondary.
+  # Unified internal wrench management: keep diagnostic-only until residual logs
+  # are validated, then try a small secondary gain such as 0.02.
   unified_internal_wrench_diag: true
   unified_internal_wrench_log: true
   unified_internal_wrench_log_period: 1.0
-  unified_internal_wrench_secondary_gain: 0.02
+  unified_internal_wrench_secondary_gain: 0.0
 
   # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
   use_constrained_alloc: true

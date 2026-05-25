@@ -817,6 +817,38 @@ bool BeetleUnifiedController::buildModuleThrustCommand(
   return true;
 }
 
+bool BeetleUnifiedController::getRealizedModuleWrenchBody(
+    int module_id,
+    Eigen::VectorXd& realized) const
+{
+  realized = Eigen::VectorXd::Zero(6);
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+
+  int module_index = getModuleIndex(module_id);
+  if (module_index < 0) return false;
+
+  int elems_per_module = motor_num_per_module_ * rotor_coef_;
+  int col_start = module_index * elems_per_module;
+  if (target_vectoring_f_.size() < col_start + elems_per_module) return false;
+
+  ModuleModelDescriptor model;
+  if (!getModuleModelDescriptor(module_id, model)) return false;
+
+  std::vector<Eigen::MatrixXd> masked_rot_single = buildRotorMask();
+  if (static_cast<int>(masked_rot_single.size()) < motor_num_per_module_) return false;
+
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    int block_start = col_start + r * rotor_coef_;
+    Eigen::Vector3d f_i =
+        masked_rot_single[r] * target_vectoring_f_.segment(block_start, rotor_coef_);
+    realized.head(3) += f_i;
+    realized.tail(3) += aerial_robot_model::skew(model.rotor_origins_from_cog.at(r)) * f_i
+                        + model.rotor_direction.at(r + 1) * model.mf_rate * f_i;
+  }
+
+  return true;
+}
+
 bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInv(
     int module_id,
     spinal::TorqueAllocationMatrixInv& msg) const

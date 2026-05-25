@@ -1,7 +1,6 @@
 #include <beetle/control/beetle_controller.h>
 
 #include <iomanip>
-#include <limits>
 #include <sstream>
 
 using namespace std;
@@ -1690,8 +1689,16 @@ namespace aerial_robot_control
     sum_momentum.tail(3) = inertia * omega_cog;
 
     Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
-    target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
-    target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
+    bool use_realized_module_wrench = false;
+    if (unified_control_mode_ && unified_controller_) {
+      use_realized_module_wrench =
+          unified_controller_->getRealizedModuleWrenchBody(
+              beetle_navigator_->getMyID(), target_wrench_cog);
+    }
+    if (!use_realized_module_wrench) {
+      target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
+      target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
+    }
 
     Eigen::MatrixXd J_t = Eigen::MatrixXd::Identity(6,6);
     J_t.topLeftCorner(3,3) = cog_rot;
@@ -2244,32 +2251,6 @@ namespace aerial_robot_control
         gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
       }
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
-    }
-
-    // Followers use the leader's formation-level wrench reference for allocation
-    // so all assembled modules solve the same QP and only pick their own block.
-    // Keep the spinal attitude target local for now; this limits reference-link
-    // latency to the 40Hz allocation input, not the lower-level attitude channel.
-    const double unified_ref_age =
-        (!is_leader && unified_cmd_received_) ?
-        (ros::Time::now() - unified_cmd_stamp_).toSec() :
-        std::numeric_limits<double>::infinity();
-    const bool use_leader_allocation_reference =
-        !is_leader && unified_cmd_received_ &&
-        unified_ref_age >= -0.05 && unified_ref_age < 0.5 &&
-        unified_reference_wrench_acc_.size() == 6 &&
-        unified_reference_desired_wrench_.size() == 6;
-    if (use_leader_allocation_reference) {
-      target_wrench_acc = unified_reference_wrench_acc_;
-      formation_wrench_cmd = unified_reference_desired_wrench_;
-      yaw_pid_raw = unified_reference_yaw_pid_raw_;
-      if (navigator_->getForceLandingFlag()) {
-        formation_wrench_cmd.setZero();
-      }
-    } else if (!is_leader && navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE) {
-      ROS_WARN_THROTTLE(1.0,
-                        "[UnifiedCtrl FOLLOWER id=%d] leader allocation reference unavailable/stale (received=%d age=%.3fs); using local PID wrench",
-                        my_id, unified_cmd_received_ ? 1 : 0, unified_ref_age);
     }
 
     setTargetWrenchAccCog(target_wrench_acc);

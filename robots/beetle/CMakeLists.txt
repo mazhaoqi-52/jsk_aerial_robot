@@ -51,12 +51,14 @@ add_dependencies(beetle_sensor_pluginlib aerial_robot_msgs_generate_messages_cpp
 
 add_library(beetle_controller src/control/beetle_controller.cpp src/control/beetle_unified_controller.cpp src/control/formation_momentum_observer.cpp)
 target_link_libraries(beetle_controller beetle_sensor_pluginlib ${catkin_LIBRARIES} ${OsqpEigen_LIBRARIES})
+add_dependencies(beetle_controller ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 add_library(beetle_robot_model src/model/beetle_robot_model.cpp)
 target_link_libraries(beetle_robot_model ${catkin_LIBRARIES})
 
 add_library(beetle_navigation src/beetle_navigation.cpp)
 target_link_libraries(beetle_navigation ${catkin_LIBRARIES})
+add_dependencies(beetle_navigation ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 install(TARGETS beetle_sensor_pluginlib beetle_robot_model beetle_controller beetle_navigation 
   DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}

@@ -1533,6 +1533,60 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         tang_angle = angle + math.pi / 2  # perpendicular to radius
         return [speed * math.cos(tang_angle), speed * math.sin(tang_angle), 0.0]
 
+    def _enable_task_wrench_prediction(self):
+        module_masses = rospy.get_param("~module_masses", None)
+        module_positions = rospy.get_param("~module_positions", None)
+        module_inertias_diag = rospy.get_param("~module_inertias_diag", None)
+        self.beetle.setAttachModule(self.beetle.module_id,
+                                    module_masses=module_masses,
+                                    module_positions=module_positions,
+                                    module_inertias_diag=module_inertias_diag)
+
+    def _clamp_directed_torque(self, torque_z, torque_min, torque_limit):
+        torque_limit = max(torque_min, abs(torque_limit))
+        mag = min(torque_limit, max(torque_min, abs(torque_z)))
+        return math.copysign(mag, self.rotation_direction)
+
+    def _centripetal_force_world(self, radius, angular_vel, angle):
+        if radius < 1e-3:
+            return [0.0, 0.0, 0.0]
+        vel = self.beetle.getUavLinearVel()
+        speed = np.linalg.norm(vel[:2]) if vel is not None else 0.0
+        speed = max(speed, abs(radius * angular_vel))
+        mass = self.beetle.getFormationMass()
+        force_mag = mass * speed * speed / radius
+        radial = np.array([math.cos(angle), math.sin(angle), 0.0])
+        force = -force_mag * radial
+        return force.tolist()
+
+    def _pid_axis_effort(self, axis):
+        try:
+            return float(axis.p_term[0]) + float(axis.i_term[0])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return 0.0
+
+    def _dragon_roll_moment_adjust(self, target_yaw, dt, moment_thresh, adjust_gain):
+        control_pid = self.beetle.getControlPid()
+        if control_pid is None:
+            return 0.0, 0.0
+        moment = np.array([
+            self._pid_axis_effort(control_pid.roll),
+            self._pid_axis_effort(control_pid.pitch),
+            self._pid_axis_effort(control_pid.yaw)
+        ])
+        # Dragon projects the controller moment into the valve target frame.
+        # Beetle valve tasks are yaw-only here, so use the target-yaw x-axis.
+        roll_moment = math.cos(target_yaw) * moment[0] + math.sin(target_yaw) * moment[1]
+        if abs(roll_moment) < moment_thresh:
+            roll_moment = 0.0
+        return roll_moment * adjust_gain * dt, roll_moment
+
+    def _formation_yaw_rate(self):
+        omega = self.beetle.getUavAngularVel()
+        if omega is None or len(omega) < 3 or not np.isfinite(omega[2]):
+            return 0.0
+        return float(omega[2])
+
     # ------------------------------------------------------------------
     def _streaming_circular_contact(self, valve_center, radius, start_angle):
         """Stream circular trajectory at 25Hz until valve engagement detected."""
@@ -1540,6 +1594,12 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         angular_vel = self.contact_angular_velocity * self.rotation_direction
         max_contact_time = 20.0
         ee_z = valve_center[2]
+        ff_enabled = rospy.get_param("controller/valve_rotation_feedforward/enabled", False)
+        contact_torque = rospy.get_param("controller/valve_rotation_feedforward/contact_init_torque", 0.1)
+        torque_ramp = rospy.get_param("controller/valve_rotation_feedforward/contact_torque_ramp", 0.1)
+        torque_limit = abs(rospy.get_param("controller/valve_rotation_feedforward/torque_z", 3.0)) or 3.0
+        torque_z = self._clamp_directed_torque(
+            contact_torque * self.rotation_direction, 0.05, torque_limit)
 
         start_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
         last_valve_yaw = start_valve_yaw
@@ -1547,14 +1607,22 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         max_detected = 0.0
 
         rospy.loginfo(f"Contact: radius={radius*1000:.1f}mm, omega={math.degrees(angular_vel):.1f} deg/s, "
-                      f"threshold={math.degrees(contact_threshold):.1f} deg, timeout={max_contact_time}s")
+                      f"threshold={math.degrees(contact_threshold):.1f} deg, timeout={max_contact_time}s, "
+                      f"ff={ff_enabled}, torque0={torque_z:.2f}N*m")
+
+        if ff_enabled:
+            self._enable_task_wrench_prediction()
 
         rate = rospy.Rate(25)
         t0 = rospy.get_time()
+        last_t = t0
         angle = start_angle
 
         while not rospy.is_shutdown():
-            t = rospy.get_time() - t0
+            now = rospy.get_time()
+            t = now - t0
+            dt = max(0.0, min(now - last_t, 0.1))
+            last_t = now
             if t > max_contact_time:
                 break
 
@@ -1565,11 +1633,13 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             ee_pos, ee_yaw = self._circular_ee_target(valve_center, radius, angle, ee_z)
             ee_vel = self._circular_ee_velocity(radius, angular_vel, angle)
 
-            # Send wrench together (torque for push)
-            self.beetle.addExternalWrench(
-                force=[0.0, 0.0, 0.0],
-                torque=[0.0, 0.0, 0.1 * self.rotation_direction]
-            )
+            # Dragon-style contact torque: start small and ramp slowly.
+            if ff_enabled:
+                self.beetle.addExternalWrench(
+                    force=[0.0, 0.0, 0.0],
+                    torque=[0.0, 0.0, torque_z],
+                    frame_id="world_yaw"
+                )
             self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
 
             # Monitor valve rotation
@@ -1593,8 +1663,12 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                               f"current={math.degrees(cur_valve_yaw):.1f} deg, achieved={math.degrees(valve_rot):.1f} deg")
                 # Save angle for rotation phase continuity
                 self._contact_end_angle = angle
+                self._contact_final_torque_z = torque_z
                 return True
 
+            torque_z = self._clamp_directed_torque(
+                torque_z + self.rotation_direction * torque_ramp * dt,
+                0.05, torque_limit)
             rate.sleep()
 
         rospy.logerr(f"Contact failed: max valve movement {math.degrees(max_detected):.2f} deg")
@@ -1610,28 +1684,34 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         angular_vel = self.rotation_angular_velocity * self.rotation_direction
         ee_z = valve_center[2]
 
-        # Read feedforward parameters from launch config
+        # Read feedforward parameters from launch config. Defaults mirror the
+        # Dragon valve task: small initial torque, slow adaptation, capped output.
         ff_enabled = rospy.get_param("controller/valve_rotation_feedforward/enabled", False)
         ff_force_z = rospy.get_param("controller/valve_rotation_feedforward/force_z", 0.0)
         ff_torque_z_max = rospy.get_param("controller/valve_rotation_feedforward/torque_z", 0.0)
+        torque_min = rospy.get_param("controller/valve_rotation_feedforward/torque_min", 0.1)
+        torque_limit = rospy.get_param(
+            "controller/valve_rotation_feedforward/torque_limit",
+            abs(ff_torque_z_max) if ff_torque_z_max != 0.0 else 3.0)
+        torque_ramp_up = rospy.get_param("controller/valve_rotation_feedforward/torque_ramp_up", 0.3)
+        torque_ramp_down = rospy.get_param("controller/valve_rotation_feedforward/torque_ramp_down", 0.2)
+        roll_moment_thresh = rospy.get_param("controller/valve_rotation_feedforward/roll_moment_thresh", 0.2)
+        torque_adjust_roll_k = rospy.get_param("controller/valve_rotation_feedforward/torque_adjust_roll_k", 0.01)
+        torque_adjust_yaw_k = rospy.get_param("controller/valve_rotation_feedforward/torque_adjust_yaw_k", 1.0)
+        yaw_velocity_thresh = rospy.get_param("controller/valve_rotation_feedforward/yaw_velocity_thresh", 0.05)
+        rp_guard = rospy.get_param("controller/valve_rotation_feedforward/rp_guard", math.radians(12.0))
 
-        # Adaptive torque state - same pattern as towing force adaptation
-        # target_omega = commanded angular velocity magnitude
-        target_omega = abs(self.rotation_angular_velocity)  # 0.1 rad/s = 5.7 deg/s
-        current_torque = 0.5  # start from small baseline (N*m)
-        TORQUE_MIN = 0.1
-        TORQUE_MAX = abs(ff_torque_z_max) if ff_torque_z_max != 0.0 else 6.0
-        # Ramp rates per control cycle (25Hz)
-        TORQUE_RAMP_UP = 0.04    # +1.0 N*m/s when stalled
-        TORQUE_RAMP_DOWN = 0.02  # -0.5 N*m/s when too fast
-        # Threshold bands relative to target_omega
-        SLOW_THRESH = 0.3   # below 30% -> increase
-        FAST_THRESH = 1.5   # above 150% -> decrease
+        target_omega = abs(self.rotation_angular_velocity)
+        torque_z = getattr(self, '_contact_final_torque_z',
+                           torque_min * self.rotation_direction)
+        torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
+        slow_thresh = 0.3
+        fast_thresh = 1.5
 
         rospy.loginfo(f">>> Phase 2: Rotation {math.degrees(self.target_rotation):.1f} deg "
                       f"@ {math.degrees(angular_vel):.1f} deg/s")
         rospy.loginfo(f"Feedforward: enabled={ff_enabled}, force_z={ff_force_z}, "
-                      f"torque_z_max={TORQUE_MAX:.1f} N*m (adaptive from {current_torque:.1f})")
+                      f"torque_limit={torque_limit:.1f} N*m (adaptive from {torque_z:.2f})")
 
         # Enable per-module y_hat^task auto-publish for the duration of the
         # rotation. The valve reaction wrench is applied at the EE module;
@@ -1639,13 +1719,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         # /beetle{i}/est_wrench_task so the C++ controller can subtract the
         # task component before forming inter_wrench_list_ (Step C).
         if ff_enabled:
-            module_masses = rospy.get_param("~module_masses", None)
-            module_positions = rospy.get_param("~module_positions", None)
-            module_inertias_diag = rospy.get_param("~module_inertias_diag", None)
-            self.beetle.setAttachModule(self.beetle.module_id,
-                                        module_masses=module_masses,
-                                        module_positions=module_positions,
-                                        module_inertias_diag=module_inertias_diag)
+            self._enable_task_wrench_prediction()
 
 
         start_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
@@ -1656,9 +1730,13 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
         rate = rospy.Rate(25)
         t0 = rospy.get_time()
+        last_t = t0
 
         while not rospy.is_shutdown():
-            t = rospy.get_time() - t0
+            now = rospy.get_time()
+            t = now - t0
+            dt = max(0.0, min(now - last_t, 0.1))
+            last_t = now
 
             # Monitor valve rotation
             cur_time = rospy.get_time()
@@ -1676,7 +1754,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             if valve_rot >= self.target_rotation:
                 rospy.loginfo(f"Valve rotation completed: {math.degrees(valve_rot):.1f} deg "
                               f"(target: {math.degrees(self.target_rotation):.1f} deg) in {t:.1f}s")
-                rospy.loginfo(f"Final adaptive torque: {current_torque:.2f} N*m")
+                rospy.loginfo(f"Final adaptive torque: {torque_z:.2f} N*m")
                 self.beetle.clearExternalWrench(duration=1.0, rate_hz=25.0)
                 self.beetle.setAttachModule(None)
                 userdata.trajectory_state = {
@@ -1685,7 +1763,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                     'radius_locked': True,
                     'valve_center': self.valve_center
                 }
-                userdata.contact_final_torque = [0.0, 0.0, 0.1]
+                userdata.contact_final_torque = [0.0, 0.0, torque_z]
                 return 'succeeded'
 
             # Timeout
@@ -1697,12 +1775,12 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
             # --- Adaptive torque based on valve response ---
             if updated and t > 1.0:  # skip first second for sensor settling
-                if valve_omega < target_omega * SLOW_THRESH:
+                if valve_omega < target_omega * slow_thresh:
                     # Valve barely moving -> increase torque
-                    current_torque = min(TORQUE_MAX, current_torque + TORQUE_RAMP_UP)
-                elif valve_omega > target_omega * FAST_THRESH:
+                    torque_z += self.rotation_direction * torque_ramp_up * dt
+                elif valve_omega > target_omega * fast_thresh:
                     # Valve moving too fast -> decrease torque
-                    current_torque = max(TORQUE_MIN, current_torque - TORQUE_RAMP_DOWN)
+                    torque_z -= self.rotation_direction * torque_ramp_down * dt
                 # else: within [30%, 150%] of target -> hold (hysteresis band)
 
             # Advance angle (streaming)
@@ -1714,9 +1792,25 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
             # Wrench feedforward with adaptive torque
             if ff_enabled:
+                roll_adjust, roll_moment = self._dragon_roll_moment_adjust(
+                    ee_yaw, dt, roll_moment_thresh, torque_adjust_roll_k)
+                delta_yaw_rate = angular_vel - self._formation_yaw_rate()
+                if abs(delta_yaw_rate) < yaw_velocity_thresh:
+                    delta_yaw_rate = 0.0
+                torque_z += roll_adjust + delta_yaw_rate * torque_adjust_yaw_k * dt
+                rpy = self.beetle.getAssemblyRPY()
+                if rpy is not None and max(abs(rpy[0]), abs(rpy[1])) > rp_guard:
+                    torque_z *= 0.8
+                    rospy.logwarn_throttle(
+                        1.0, "Valve FF roll/pitch guard active: roll=%.1f deg, pitch=%.1f deg",
+                        math.degrees(rpy[0]), math.degrees(rpy[1]))
+                torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
+                ff_force = self._centripetal_force_world(radius, angular_vel, angle)
+                ff_force[2] += ff_force_z
                 self.beetle.addExternalWrench(
-                    force=[0.0, 0.0, ff_force_z],
-                    torque=[0.0, 0.0, current_torque * self.rotation_direction]
+                    force=ff_force,
+                    torque=[0.0, 0.0, torque_z],
+                    frame_id="world_yaw"
                 )
 
             self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
@@ -1724,7 +1818,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             # Log every 5s
             rospy.loginfo_throttle(5.0,
                 f"Rotation: {math.degrees(valve_rot):.1f} deg/{math.degrees(self.target_rotation):.1f} deg, "
-                f"omega={math.degrees(valve_omega):.2f} deg/s, torque={current_torque:.2f}N*m, t={t:.1f}s")
+                f"omega={math.degrees(valve_omega):.2f} deg/s, torque={torque_z:.2f}N*m, t={t:.1f}s")
 
             rate.sleep()
 

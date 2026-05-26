@@ -59,10 +59,11 @@ controller:
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false
+  desired_wrench_timeout: 0.5
 
   external_force_upper_limit: 0.0
   external_force_lower_limit: 0.0
-  external_torque_lower_limit: 0.0
+  external_torque_upper_limit: 0.0
   external_torque_lower_limit: 0.0
 
   cutoff_freq: 1.0

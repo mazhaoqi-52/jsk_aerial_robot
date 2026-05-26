@@ -12,6 +12,8 @@ namespace aerial_robot_control
     pd_wrench_comp_mode_(false),
     pre_module_state_(SEPARATED),
     formation_desired_wrench_(Eigen::VectorXd::Zero(6)),
+    formation_desired_wrench_timestamp_(-1.0),
+    desired_wrench_timeout_(0.5),
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
     unified_cmd_received_(false),
@@ -275,6 +277,7 @@ namespace aerial_robot_control
       for (auto& kv : wrench_comp_list_) kv.second = Eigen::VectorXd::Zero(6);
       for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
       formation_desired_wrench_.setZero();
+      formation_desired_wrench_timestamp_ = -1.0;
       unified_residual_bias_ready_ = false;
       unified_residual_bias_samples_ = 0;
       unified_residual_bias_module_num_ = 0;
@@ -484,6 +487,33 @@ namespace aerial_robot_control
     double mass_inv = 1 / beetle_robot_model_->getMass();
     Eigen::Matrix3d inertia_inv = (beetle_robot_model_->getInertia<Eigen::Matrix3d>()).inverse();
     int my_id = beetle_navigator_->getMyID();
+    Eigen::VectorXd lf_task_ff_acc = Eigen::VectorXd::Zero(6);
+    bool lf_task_ff_active = false;
+    if(module_state != SEPARATED &&
+       beetle_navigator_->getControlFlag() &&
+       !unified_control_mode_){
+      Eigen::VectorXd task_wrench_cog = Eigen::VectorXd::Zero(6);
+      {
+        std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+        const double now = ros::Time::now().toSec();
+        lf_task_ff_active =
+            formation_desired_wrench_timestamp_ > 0.0 &&
+            (desired_wrench_timeout_ <= 0.0 ||
+             now - formation_desired_wrench_timestamp_ <= desired_wrench_timeout_) &&
+            est_wrench_task_list_.count(my_id) > 0;
+        if(lf_task_ff_active) task_wrench_cog = est_wrench_task_list_[my_id];
+      }
+      if(lf_task_ff_active && task_wrench_cog.size() == 6 && task_wrench_cog.norm() > 1e-6){
+        Eigen::Matrix3d cog_rot;
+        tf::matrixTFToEigen(estimator_->getOrientation(Frame::COG, estimate_mode_), cog_rot);
+        Eigen::VectorXd task_wrench_world = task_wrench_cog;
+        task_wrench_world.head(3) = cog_rot * task_wrench_cog.head(3);
+        lf_task_ff_acc.head(3) = mass_inv * task_wrench_world.head(3);
+        lf_task_ff_acc.tail(3) = inertia_inv * task_wrench_world.tail(3);
+      }else{
+        lf_task_ff_active = false;
+      }
+    }
 
     if(module_state == FOLLOWER &&
        pd_wrench_comp_mode_ &&
@@ -514,14 +544,15 @@ namespace aerial_robot_control
       Eigen::VectorXd wrench_comp_term = wrench_comp_term_cog; 
       wrench_comp_term.head(3) = cog_rot * wrench_comp_term.head(3); // regarding world
 
-      /* current version: I term reconfig mehod */
-      /* wrench_comp accumulates the parasitic residual (task prediction
-         already subtracted upstream in calcInteractionWrench), so no
-         separate formation_desired_wrench_ injection here — that would
-         double-count the task component. */
+      /* current version: I term reconfig method */
+      /* wrench_comp is the parasitic residual (task prediction already
+         subtracted upstream). The known task component itself is injected
+         separately from est_wrench_task_list_[my_id], so LF and unified
+         both receive the same task feedforward semantics. */
       Eigen::VectorXd I_reconfig_acc_cog_term = Eigen::VectorXd::Zero(6);
       I_reconfig_acc_cog_term.head(3) = mass_inv * wrench_comp_term.head(3);
       I_reconfig_acc_cog_term.tail(3) = inertia_inv * wrench_comp_term.tail(3); //inavailable
+      Eigen::VectorXd lf_total_acc_term = I_reconfig_acc_cog_term + lf_task_ff_acc;
 
       double IGain_Fx = pid_controllers_.at(X).getIGain();
       double IGain_Fy = pid_controllers_.at(Y).getIGain();
@@ -555,26 +586,26 @@ namespace aerial_robot_control
       I_comp_Ty_ = pid_controllers_.at(TY).result();
       I_comp_Tz_ = pid_controllers_.at(TZ).result();
 
-      // X/Y: inject wrench_comp acceleration as persistent feedforward on position PID
+      // X/Y: inject parasitic compensation + task feedforward as persistent FF
       // Uses setPersistentFF to avoid race condition with nav callback clearing target_acc_
-      pid_controllers_.at(X).setPersistentFF(I_reconfig_acc_cog_term(0));
-      pid_controllers_.at(Y).setPersistentFF(I_reconfig_acc_cog_term(1));
+      pid_controllers_.at(X).setPersistentFF(lf_total_acc_term(0));
+      pid_controllers_.at(Y).setPersistentFF(lf_total_acc_term(1));
       pid_controllers_.at(X).setICompTerm(0.0);
       pid_controllers_.at(Y).setICompTerm(0.0);
       // Z and torque: keep original ICompTerm path
-      pid_controllers_.at(Z).setICompTerm(I_comp_Fz_);
-      pid_controllers_.at(ROLL).setICompTerm(I_comp_Tx_);
-      pid_controllers_.at(PITCH).setICompTerm(I_comp_Ty_);
-      pid_controllers_.at(YAW).setICompTerm(I_comp_Tz_);
+      pid_controllers_.at(Z).setICompTerm(I_comp_Fz_ + lf_task_ff_acc(2));
+      pid_controllers_.at(ROLL).setICompTerm(I_comp_Tx_ + lf_task_ff_acc(3));
+      pid_controllers_.at(PITCH).setICompTerm(I_comp_Ty_ + lf_task_ff_acc(4));
+      pid_controllers_.at(YAW).setICompTerm(I_comp_Tz_ + lf_task_ff_acc(5));
 
       geometry_msgs::WrenchStamped wrench_msg;
       wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
-      wrench_msg.wrench.force.x = I_reconfig_acc_cog_term(0);
-      wrench_msg.wrench.force.y = I_reconfig_acc_cog_term(1);
-      wrench_msg.wrench.force.z = I_reconfig_acc_cog_term(2);
-      wrench_msg.wrench.torque.x = I_reconfig_acc_cog_term(3);
-      wrench_msg.wrench.torque.y = I_reconfig_acc_cog_term(4);
-      wrench_msg.wrench.torque.z = I_reconfig_acc_cog_term(5);
+      wrench_msg.wrench.force.x = lf_total_acc_term(0);
+      wrench_msg.wrench.force.y = lf_total_acc_term(1);
+      wrench_msg.wrench.force.z = lf_total_acc_term(2);
+      wrench_msg.wrench.torque.x = lf_total_acc_term(3);
+      wrench_msg.wrench.torque.y = lf_total_acc_term(4);
+      wrench_msg.wrench.torque.z = lf_total_acc_term(5);
       external_wrench_compensation_pub_.publish(wrench_msg);
 
       /* publish wrench comp pid value*/
@@ -618,17 +649,17 @@ namespace aerial_robot_control
       pid_controllers_.at(TY).reset();
       pid_controllers_.at(TZ).reset();
 
-      // Clear persistent FF (legacy LEADER task-FF injection removed; unified
-      // mode handles task FF inside runUnifiedControlCommon).
-      pid_controllers_.at(X).setPersistentFF(0.0);
-      pid_controllers_.at(Y).setPersistentFF(0.0);
+      // Leader / non-wrench-comp modules still receive the known task
+      // feedforward in LF mode; residual compensation is follower-only.
+      pid_controllers_.at(X).setPersistentFF(lf_task_ff_acc(0));
+      pid_controllers_.at(Y).setPersistentFF(lf_task_ff_acc(1));
       pid_controllers_.at(Z).setPersistentFF(0.0);
       pid_controllers_.at(X).setICompTerm(0.0);
       pid_controllers_.at(Y).setICompTerm(0.0);
-      pid_controllers_.at(Z).setICompTerm(0.0);
-      pid_controllers_.at(ROLL).setICompTerm(0.0);
-      pid_controllers_.at(PITCH).setICompTerm(0.0);
-      pid_controllers_.at(YAW).setICompTerm(0.0);
+      pid_controllers_.at(Z).setICompTerm(lf_task_ff_acc(2));
+      pid_controllers_.at(ROLL).setICompTerm(lf_task_ff_acc(3));
+      pid_controllers_.at(PITCH).setICompTerm(lf_task_ff_acc(4));
+      pid_controllers_.at(YAW).setICompTerm(lf_task_ff_acc(5));
     }
       
     GimbalrotorController::controlCore();
@@ -1395,6 +1426,11 @@ namespace aerial_robot_control
      *    and the rest of the function reduces to the pre-existing behaviour.
      */
     std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
+    const double now = ros::Time::now().toSec();
+    const bool task_prediction_active =
+        formation_desired_wrench_timestamp_ > 0.0 &&
+        (desired_wrench_timeout_ <= 0.0 ||
+         now - formation_desired_wrench_timestamp_ <= desired_wrench_timeout_);
     int module_num = 0;
     Eigen::VectorXd W_sum = Eigen::VectorXd::Zero(6);
     for(const auto & item : est_wrench_list_){
@@ -1402,6 +1438,7 @@ namespace aerial_robot_control
         Eigen::VectorXd y_task = est_wrench_task_list_.count(item.first)
                                   ? est_wrench_task_list_[item.first]
                                   : Eigen::VectorXd::Zero(6);
+        if (!task_prediction_active) y_task = Eigen::VectorXd::Zero(6);
         if(y_task.size() != 6) y_task = Eigen::VectorXd::Zero(6);
         Eigen::VectorXd residual = item.second - y_task;
         est_residual_list_[item.first] = residual;
@@ -1758,6 +1795,7 @@ namespace aerial_robot_control
     GimbalrotorController::rosParamInit();
     ros::NodeHandle control_nh(nh_, "controller");
     getParam<bool>(control_nh, "pd_wrench_comp_mode", pd_wrench_comp_mode_, false);
+    getParam<double>(control_nh, "desired_wrench_timeout", desired_wrench_timeout_, 0.5);
 
     double external_force_upper_limit, external_force_lower_limit, external_torque_upper_limit, external_torque_lower_limit;
     getParam<double>(control_nh, "external_force_upper_limit", external_force_upper_limit, 0.5);
@@ -2017,6 +2055,8 @@ namespace aerial_robot_control
     {
       std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
       formation_desired_wrench_ = desired;
+      formation_desired_wrench_timestamp_ =
+          msg.header.stamp.isZero() ? ros::Time::now().toSec() : msg.header.stamp.toSec();
     }
 
     // Only LEADER rebroadcasts to followers so every module sees the same value.
@@ -2397,11 +2437,17 @@ namespace aerial_robot_control
     pid_controllers_.at(YAW).setPersistentFF(0.0);
 
     Eigen::VectorXd formation_wrench_cmd;
+    double formation_wrench_stamp = -1.0;
     {
       std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
       formation_wrench_cmd = formation_desired_wrench_;
+      formation_wrench_stamp = formation_desired_wrench_timestamp_;
     }
-    if (navigator_->getForceLandingFlag()) {
+    const bool formation_wrench_fresh =
+        formation_wrench_stamp > 0.0 &&
+        (desired_wrench_timeout_ <= 0.0 ||
+         ros::Time::now().toSec() - formation_wrench_stamp <= desired_wrench_timeout_);
+    if (navigator_->getForceLandingFlag() || !formation_wrench_fresh) {
       formation_wrench_cmd.setZero();
     }
 
@@ -2533,6 +2579,7 @@ namespace aerial_robot_control
 
     // --- Run unified 6-DOF allocation ---
     unified_controller_->clearFormationModelOverride();
+    unified_controller_->setCommandTargetRPY(target_rpy_);
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
 
     if (ok) {

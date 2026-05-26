@@ -682,7 +682,7 @@ class TowingWithFeedforwardState(TowingStateBase):
         zero = [0.0, 0.0, 0.0]
         self.beetle.clearExternalWrench(duration=1.0, rate_hz=25.0)
         for _ in range(3):
-            self.beetle.addExternalWrench(zero, zero)
+            self.beetle.addExternalWrench(zero, zero, frame_id="fc")
             rospy.sleep(0.04)
         self.beetle.clearExternalWrench()
         # Disable internal-wrench auto-publish (also broadcasts a final zero).
@@ -705,7 +705,7 @@ class TowingWithFeedforwardState(TowingStateBase):
         # BeetleInterface.addExternalWrench() automatically routes to:
         #   - formation_desired_wrench  when unified_control_mode is active
         #   - desired_external_wrench   when leader-follower (wrench_comp) is active
-        # It also handles world->body frame rotation internally.
+        # We publish towing force in world_yaw to keep it horizontal.
         control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
         rospy.loginfo(f"Wrench feedforward via BeetleInterface (mode: {control_mode})")
 
@@ -818,9 +818,11 @@ class TowingWithFeedforwardState(TowingStateBase):
             )
 
             # ---- Publish desired external wrench via BeetleInterface ----
-            # addExternalWrench() handles world->body rotation and unified/LF topic routing.
+            # Keep towing force horizontal in yaw/world plane; do not let current
+            # roll/pitch rotate it into an unintended vertical feedforward.
             ff_world = target_state['force']
-            self.beetle.addExternalWrench(force=ff_world, torque=[0.0, 0.0, 0.0])
+            self.beetle.addExternalWrench(force=ff_world, torque=[0.0, 0.0, 0.0],
+                                          frame_id="world_yaw")
 
             # Debug: log ff force and progress every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):

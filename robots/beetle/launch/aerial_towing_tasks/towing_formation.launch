@@ -36,9 +36,6 @@
        doc="Initial towing force (N), ramps adaptively"/>
   <arg name="debug" default="false"/>
 
-  <param name="controller/towing_feedforward/enabled" value="true"/>
-  <param name="controller/towing_feedforward/force_x" value="$(arg towing_force)"/>
-
   ###########  Demo  ###########
   <node name="formation_load_towing" pkg="beetle" type="load_towing_formation.py"
         output="screen">

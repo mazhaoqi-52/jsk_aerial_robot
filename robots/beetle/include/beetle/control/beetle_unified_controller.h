@@ -35,6 +35,7 @@ namespace OsqpEigen { class Solver; }
 #include <geometry_msgs/WrenchStamped.h>
 #include <std_msgs/Float32MultiArray.h>
 #include <std_msgs/UInt8.h>
+#include <tf/LinearMath/Vector3.h>
 
 #include <beetle/model/beetle_robot_model.h>
 #include <beetle/beetle_navigation.h>
@@ -184,6 +185,7 @@ public:
   double getCandidateYawTerm() const { return candidate_yaw_term_; }
   const Eigen::VectorXd& getTargetVectoringForce() const { return target_vectoring_f_; }
   const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
+  void setCommandTargetRPY(const tf::Vector3& rpy) { command_target_rpy_ = rpy; }
   int getModuleIndex(int module_id) const;
   bool buildModuleThrustCommand(int module_id, spinal::FourAxisCommand& thrust_msg) const;
   bool buildModuleTorqueAllocationMatrixInv(int module_id, spinal::TorqueAllocationMatrixInv& msg) const;
@@ -254,6 +256,7 @@ private:
 
   // Target yaw term for spinal cascade inner loop
   double candidate_yaw_term_;
+  tf::Vector3 command_target_rpy_;
 
   // Per-module commands
   std::map<int, ModuleCommand> module_commands_;

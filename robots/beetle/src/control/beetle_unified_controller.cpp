@@ -35,6 +35,7 @@ BeetleUnifiedController::BeetleUnifiedController()
     cached_module_model_revision_(0),
     internal_wrench_secondary_gain_(0.0),
     candidate_yaw_term_(0),
+    command_target_rpy_(0, 0, 0),
     cascade_alloc_sent_(false),
     has_cascade_gain_cache_(false),
     cached_cascade_roll_p_(0),
@@ -373,7 +374,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // XY-PID drove monotonic pitch divergence; outer PITCH-I wound up to +5 N·m
   // without ever correcting the body angle. See gimbalrotor_controller.cpp
   // fully-actuated branch for the equivalent pattern.
-  // (Per-frame value is read directly from navigator at buildModuleThrustCommand.)
+  // (Per-frame value is latched by BeetleController after follower leader-reference override.)
 
   // Compute candidate yaw term for spinal yaw reconstruction.
   // When yaw already participates in unified allocation, do NOT reconstruct the
@@ -798,11 +799,11 @@ bool BeetleUnifiedController::buildModuleThrustCommand(
   for (int i = 0; i < elems_per_module; i++) {
     thrust_msg.base_thrust[i] = static_cast<float>(target_vectoring_f_(col_start + i));
   }
-  thrust_msg.angles[0] = static_cast<float>(navigator_->getTargetRPY().x());
-  thrust_msg.angles[1] = static_cast<float>(navigator_->getTargetRPY().y());
+  thrust_msg.angles[0] = static_cast<float>(command_target_rpy_.x());
+  thrust_msg.angles[1] = static_cast<float>(command_target_rpy_.y());
   thrust_msg.angles[2] = candidate_yaw_term_;
 
-  const tf::Vector3 target_rpy = navigator_->getTargetRPY();
+  const tf::Vector3 target_rpy = command_target_rpy_;
   const tf::Vector3 final_baselink_rpy = navigator_->getFinalTargetBaselinkRPY();
   const tf::Vector3 curr_baselink_rpy = navigator_->getCurrTargetBaselinkRPY();
   ROS_DEBUG_THROTTLE(

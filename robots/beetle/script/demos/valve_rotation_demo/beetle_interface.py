@@ -12,7 +12,7 @@ import os
 from std_msgs.msg import Empty, UInt8
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from nav_msgs.msg import Odometry
-from aerial_robot_msgs.msg import FlightNav
+from aerial_robot_msgs.msg import FlightNav, PoseControlPid
 from tf.transformations import euler_from_quaternion
 from sensor_msgs.msg import Joy
 
@@ -81,6 +81,7 @@ class BeetleInterface(object):
         self.flight_state = self.ARM_OFF_STATE
         self.target_pos = np.array([0, 0, 0])
         self.est_wrench = None
+        self.control_pid = None
 
         # External wrench state
         self.external_wrench_active = False
@@ -170,6 +171,8 @@ class BeetleInterface(object):
             rospy.Subscriber(f'/beetle{module_id}/mocap/pose', PoseStamped, self._uav_cb, queue_size=1)
 
         rospy.Subscriber(f'/beetle{module_id}/estimated_external_wrench', WrenchStamped, self._wrench_cb, queue_size=1)
+        pid_topic = '/assemble/debug/pose/pid' if assembly_mode else f'/beetle{module_id}/debug/pose/pid'
+        rospy.Subscriber(pid_topic, PoseControlPid, self._control_pid_cb, queue_size=1)
         rospy.Subscriber('flight_state', UInt8, self._flight_state_cb, queue_size=1)
         rospy.Subscriber('joy', Joy, self._joy_cb, queue_size=1)
 
@@ -200,6 +203,9 @@ class BeetleInterface(object):
 
     def _wrench_cb(self, msg):
         self.est_wrench = msg.wrench
+
+    def _control_pid_cb(self, msg):
+        self.control_pid = msg
 
     def _flight_state_cb(self, msg):
         self.flight_state = msg.data
@@ -262,6 +268,28 @@ class BeetleInterface(object):
             return None
         o = self.assembly_odom.pose.pose.orientation
         return euler_from_quaternion([o.x, o.y, o.z, o.w])
+
+    def getUavLinearVel(self):
+        """Get effective linear velocity (assembly CoG in assembly mode)."""
+        odom = self.assembly_odom if self.assembly_mode else self.uav_odom
+        v = odom.twist.twist.linear
+        return np.array([v.x, v.y, v.z])
+
+    def getUavAngularVel(self):
+        """Get effective angular velocity (assembly CoG in assembly mode)."""
+        odom = self.assembly_odom if self.assembly_mode else self.uav_odom
+        w = odom.twist.twist.angular
+        return np.array([w.x, w.y, w.z])
+
+    def getControlPid(self):
+        return self.control_pid
+
+    def getFormationMass(self):
+        if self._inter_m_total > 1e-6:
+            return self._inter_m_total
+        if self.assembly_mode:
+            return self.mass * max(1, len(self._inter_module_ids))
+        return self.mass
 
     def _worldToFormationBodyWrench(self, force, torque, yaw_only=False):
         """Rotate a world-frame wrench into the formation body frame."""

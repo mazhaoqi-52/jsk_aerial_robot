@@ -52,9 +52,10 @@ controller:
   alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
 
+  desired_wrench_timeout: 0.5
   external_force_upper_limit: 0.0
   external_force_lower_limit: 0.0
-  external_torque_lower_limit: 0.0
+  external_torque_upper_limit: 0.0
   external_torque_lower_limit: 0.0
   cutoff_freq: 1.0
   sample_freq: 40.0

@@ -229,6 +229,8 @@ namespace aerial_robot_control
     // The legacy desired_external_wrench topic is treated as an alias and is
     // stored here too; unified mode does not inject task wrench via PID FF.
     Eigen::VectorXd formation_desired_wrench_;
+    double formation_desired_wrench_timestamp_;
+    double desired_wrench_timeout_;
     ros::Subscriber formation_desired_wrench_sub_;
 
     double comp_term_update_freq_;

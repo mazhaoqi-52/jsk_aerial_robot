@@ -504,10 +504,11 @@ namespace aerial_robot_control
         if(lf_task_ff_active) task_wrench_cog = est_wrench_task_list_[my_id];
       }
       if(lf_task_ff_active && task_wrench_cog.size() == 6 && task_wrench_cog.norm() > 1e-6){
-        Eigen::Matrix3d cog_rot;
-        tf::matrixTFToEigen(estimator_->getOrientation(Frame::COG, estimate_mode_), cog_rot);
+        Eigen::Matrix3d yaw_rot;
+        double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
+        tf::matrixTFToEigen(tf::Matrix3x3(tf::createQuaternionFromYaw(cur_yaw)), yaw_rot);
         Eigen::VectorXd task_wrench_world = task_wrench_cog;
-        task_wrench_world.head(3) = cog_rot * task_wrench_cog.head(3);
+        task_wrench_world.head(3) = yaw_rot * task_wrench_cog.head(3);
         lf_task_ff_acc.head(3) = mass_inv * task_wrench_world.head(3);
         lf_task_ff_acc.tail(3) = inertia_inv * task_wrench_world.tail(3);
       }else{

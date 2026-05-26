@@ -9,7 +9,7 @@ navigation:
 
   max_modules_num: 8  # maximum number of modules in the system
 
-  takeoff_height: 0.8 # raised from 1.0 to 1.2for aerial-towing box clearance:
+  takeoff_height: 1.2 # raised from 1.0 to 1.2for aerial-towing box clearance:
                      # box top ≈ 0.876m + ~0.25m XY-transit sag + ~0.07m safety
                      # margin ⇒ ≥ 1.20m. Box-anchored phases (insert/hook/tow)
                      # are unaffected; transit/return auto-track this value.

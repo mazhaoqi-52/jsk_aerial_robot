@@ -37,8 +37,14 @@ controller:
   # are validated, then try a small secondary gain such as 0.02.
   unified_internal_wrench_diag: true
   unified_internal_wrench_log: true
+  unified_internal_wrench_detail_log: false
   unified_internal_wrench_log_period: 1.0
   unified_internal_wrench_secondary_gain: 0.0
+
+  # Leader-only compact log for aerial towing validation. Prints only while a
+  # nonzero formation_desired_wrench is active.
+  unified_towing_debug_log: true
+  unified_towing_debug_log_period: 1.0
 
   # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
   use_constrained_alloc: true

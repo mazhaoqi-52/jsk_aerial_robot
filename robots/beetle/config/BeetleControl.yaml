@@ -40,8 +40,14 @@ controller:
   # only after the est/task/res/comp logs look physically consistent in flight.
   unified_internal_wrench_diag: true
   unified_internal_wrench_log: true
+  unified_internal_wrench_detail_log: false
   unified_internal_wrench_log_period: 1.0
   unified_internal_wrench_secondary_gain: 0.0
+
+  # Leader-only compact log for aerial towing validation. Prints only while a
+  # nonzero formation_desired_wrench is active.
+  unified_towing_debug_log: true
+  unified_towing_debug_log_period: 1.0
 
   # Full-vector constrained QP allocation
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).

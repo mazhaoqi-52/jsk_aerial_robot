@@ -11,6 +11,7 @@
 #include <beetle/control/beetle_unified_controller.h>
 #include <beetle/control/formation_momentum_observer.h>
 #include <std_srvs/SetBool.h>
+#include <mutex>
 
 namespace aerial_robot_control
 {
@@ -40,7 +41,11 @@ namespace aerial_robot_control
     //   ŷ_i^task = predicted observer output for module i under the active
     //   task model (sums to W_ext across modules). Retained as the public
     //   setter for external controllers (e.g. NinjaController joint PID).
-    void setTaskWrench(int id, Eigen::VectorXd y_task){est_wrench_task_list_[id] = y_task;}
+    void setTaskWrench(int id, Eigen::VectorXd y_task)
+    {
+      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+      est_wrench_task_list_[id] = y_task;
+    }
     
   private:
     boost::shared_ptr<BeetleRobotModel> beetle_robot_model_;
@@ -70,8 +75,11 @@ namespace aerial_robot_control
     bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
     bool unified_internal_wrench_diag_;
     bool unified_internal_wrench_log_;
+    bool unified_internal_wrench_detail_log_;
     double unified_internal_wrench_log_period_;
     double unified_internal_wrench_secondary_gain_;
+    bool unified_towing_debug_log_;
+    double unified_towing_debug_log_period_;
     // Unified residual hover-bias diagnostic. This is log-only: it never feeds
     // wrench_comp_list_ or the allocation secondary.
     bool unified_residual_bias_ready_;
@@ -207,6 +215,7 @@ namespace aerial_robot_control
     std::map<int, Eigen::VectorXd> est_residual_list_;
     std::map<int, Eigen::VectorXd> inter_wrench_list_;
     std::map<int, Eigen::VectorXd> wrench_comp_list_;
+    std::mutex unified_wrench_state_mutex_;
 
     /* external wrench compensation */
     bool pd_wrench_comp_mode_;
@@ -254,7 +263,10 @@ namespace aerial_robot_control
     ros::Publisher assemble_formation_wrench_pub_;
     aerial_robot_msgs::PoseControlPid assemble_pid_msg_;
     void publishAssembleDebug(const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
-                              const tf::Vector3& target_formation_pos, bool alloc_ok);
+                              const tf::Vector3& target_formation_pos, bool alloc_ok,
+                              const Eigen::VectorXd& target_wrench_acc,
+                              const Eigen::VectorXd& formation_wrench_cmd,
+                              double yaw_pid_raw);
     void controlCore() override;
     bool update() override;
     

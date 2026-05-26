@@ -27,8 +27,11 @@ namespace aerial_robot_control
     last_unified_torque_alloc_inv_pub_time_(-1.0),
     unified_internal_wrench_diag_(true),
     unified_internal_wrench_log_(true),
+    unified_internal_wrench_detail_log_(false),
     unified_internal_wrench_log_period_(1.0),
     unified_internal_wrench_secondary_gain_(0.0),
+    unified_towing_debug_log_(true),
+    unified_towing_debug_log_period_(1.0),
     unified_residual_bias_ready_(false),
     unified_residual_bias_samples_(0),
     unified_residual_bias_module_num_(0),
@@ -259,21 +262,24 @@ namespace aerial_robot_control
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
-    formation_desired_wrench_.setZero();
     clearInternalWrenchState();
   }
 
   void BeetleController::clearInternalWrenchState()
   {
-    for (auto& kv : est_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
-    for (auto& kv : est_residual_list_) kv.second = Eigen::VectorXd::Zero(6);
-    for (auto& kv : inter_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
-    for (auto& kv : wrench_comp_list_) kv.second = Eigen::VectorXd::Zero(6);
-    for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
-    unified_residual_bias_ready_ = false;
-    unified_residual_bias_samples_ = 0;
-    unified_residual_bias_module_num_ = 0;
-    unified_residual_common_bias_ = Eigen::VectorXd::Zero(6);
+    {
+      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+      for (auto& kv : est_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
+      for (auto& kv : est_residual_list_) kv.second = Eigen::VectorXd::Zero(6);
+      for (auto& kv : inter_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
+      for (auto& kv : wrench_comp_list_) kv.second = Eigen::VectorXd::Zero(6);
+      for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
+      formation_desired_wrench_.setZero();
+      unified_residual_bias_ready_ = false;
+      unified_residual_bias_samples_ = 0;
+      unified_residual_bias_module_num_ = 0;
+      unified_residual_common_bias_ = Eigen::VectorXd::Zero(6);
+    }
     if (unified_controller_) {
       unified_controller_->clearInternalWrenchSecondaryReference();
     }
@@ -390,7 +396,6 @@ namespace aerial_robot_control
              is_leader ? "sent/deferred cascade setup to all spinals"
                        : "deferred local alloc_inv/gains until matrix ready",
              unified_reference_warmup_frames_, ros::Time::now().toSec());
-    formation_desired_wrench_.setZero();
     clearInternalWrenchState();
   }
 
@@ -466,10 +471,13 @@ namespace aerial_robot_control
       calcInteractionWrench();
       comp_update_flag = true;
     }else{
-      for(int i = 0; i < max_modules_num; i++){
-        est_wrench_list_[i+1] = Eigen::VectorXd::Zero(6);
-        inter_wrench_list_[i+1] = Eigen::VectorXd::Zero(6);
-        wrench_comp_list_[i+1] = Eigen::VectorXd::Zero(6);
+      {
+        std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+        for(int i = 0; i < max_modules_num; i++){
+          est_wrench_list_[i+1] = Eigen::VectorXd::Zero(6);
+          inter_wrench_list_[i+1] = Eigen::VectorXd::Zero(6);
+          wrench_comp_list_[i+1] = Eigen::VectorXd::Zero(6);
+        }
       }
     }
 
@@ -484,10 +492,15 @@ namespace aerial_robot_control
 
       /* set proper gains for wrench comp */
       int module_num = 0;
-      for(const auto & item : est_wrench_list_){
-        if(assembly_flag[item.first]){
-          module_num ++;
+      Eigen::VectorXd wrench_comp_term_cog = Eigen::VectorXd::Zero(6);
+      {
+        std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+        for(const auto & item : est_wrench_list_){
+          if(assembly_flag[item.first]){
+            module_num ++;
+          }
         }
+        wrench_comp_term_cog = wrench_comp_list_[my_id]; // regarding cog
       }
       std::vector<int> wrench_indices = {FX, FY, FZ, TX, TY, TZ};
       for(const auto& index: wrench_indices)
@@ -496,7 +509,6 @@ namespace aerial_robot_control
           pid_controllers_.at(index).setDGain(wrench_comp_d_gain_ / std::pow(2, module_num -2) );
           pid_controllers_.at(index).setIGain(wrench_comp_i_gain_ / std::pow(2, module_num -2) );
         }
-      Eigen::VectorXd wrench_comp_term_cog = wrench_comp_list_[my_id]; // regarding cog
       Eigen::Matrix3d cog_rot;
       tf::matrixTFToEigen(estimator_->getOrientation(Frame::COG, estimate_mode_), cog_rot);
       Eigen::VectorXd wrench_comp_term = wrench_comp_term_cog; 
@@ -1360,6 +1372,8 @@ namespace aerial_robot_control
 
   void BeetleController::calcInteractionWrench()
   {
+    std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+
     /* 1. Subtract per-module observer task prediction up-front.
      *
      *    est_residual_list_[i] = est_wrench_list_[i] - est_wrench_task_list_[i]
@@ -1709,31 +1723,33 @@ namespace aerial_robot_control
       }
       ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, ss.str());
 
-      std::ostringstream detail_ss;
-      detail_ss << ss.str() << " modules:";
-      for (int i = 1; i <= max_modules_num; ++i) {
-        if (!assembly_flag[i]) continue;
-        auto realized_it = realized_wrench_list.find(i);
-        const Eigen::VectorXd realized =
-            (realized_it != realized_wrench_list.end())
-                ? realized_it->second
-                : Eigen::VectorXd::Zero(6);
-        detail_ss << " m" << i
-                  << "{real=" << fmtWrench(realized)
-                  << ",est=" << fmtWrench(est_wrench_list_[i])
-                  << ",task=" << fmtWrench(est_wrench_task_list_[i])
-                  << ",res=" << fmtWrench(est_residual_list_[i])
-                  << ",bias=" << fmtWrench(unified_residual_bias_list_[i]);
-        if (unified_residual_bias_ready_) {
-          detail_ss << ",res_bc=" << fmtWrench(residual_biascorr_list[i])
-                    << ",inter_bc=" << fmtWrench(inter_biascorr_list[i])
-                    << ",comp_bc=" << fmtWrench(comp_biascorr_list[i]);
+      if (unified_internal_wrench_detail_log_) {
+        std::ostringstream detail_ss;
+        detail_ss << ss.str() << " modules:";
+        for (int i = 1; i <= max_modules_num; ++i) {
+          if (!assembly_flag[i]) continue;
+          auto realized_it = realized_wrench_list.find(i);
+          const Eigen::VectorXd realized =
+              (realized_it != realized_wrench_list.end())
+                  ? realized_it->second
+                  : Eigen::VectorXd::Zero(6);
+          detail_ss << " m" << i
+                    << "{real=" << fmtWrench(realized)
+                    << ",est=" << fmtWrench(est_wrench_list_[i])
+                    << ",task=" << fmtWrench(est_wrench_task_list_[i])
+                    << ",res=" << fmtWrench(est_residual_list_[i])
+                    << ",bias=" << fmtWrench(unified_residual_bias_list_[i]);
+          if (unified_residual_bias_ready_) {
+            detail_ss << ",res_bc=" << fmtWrench(residual_biascorr_list[i])
+                      << ",inter_bc=" << fmtWrench(inter_biascorr_list[i])
+                      << ",comp_bc=" << fmtWrench(comp_biascorr_list[i]);
+          }
+          detail_ss
+                    << ",inter=" << fmtWrench(inter_wrench_list_[i])
+                    << ",comp=" << fmtWrench(wrench_comp_list_[i]) << "}";
         }
-        detail_ss
-                  << ",inter=" << fmtWrench(inter_wrench_list_[i])
-                  << ",comp=" << fmtWrench(wrench_comp_list_[i]) << "}";
+        ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, detail_ss.str());
       }
-      ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, detail_ss.str());
     }
   }
 
@@ -1774,6 +1790,8 @@ namespace aerial_robot_control
         std::max(0.0, unified_torque_alloc_inv_pub_interval_);
     getParam<bool>(control_nh, "unified_internal_wrench_diag", unified_internal_wrench_diag_, true);
     getParam<bool>(control_nh, "unified_internal_wrench_log", unified_internal_wrench_log_, true);
+    getParam<bool>(control_nh, "unified_internal_wrench_detail_log",
+                   unified_internal_wrench_detail_log_, false);
     getParam<double>(control_nh, "unified_internal_wrench_log_period",
                      unified_internal_wrench_log_period_, 1.0);
     unified_internal_wrench_log_period_ =
@@ -1782,6 +1800,12 @@ namespace aerial_robot_control
                      unified_internal_wrench_secondary_gain_, 0.0);
     unified_internal_wrench_secondary_gain_ =
         std::min(0.2, std::max(0.0, unified_internal_wrench_secondary_gain_));
+    getParam<bool>(control_nh, "unified_towing_debug_log",
+                   unified_towing_debug_log_, true);
+    getParam<double>(control_nh, "unified_towing_debug_log_period",
+                     unified_towing_debug_log_period_, 1.0);
+    unified_towing_debug_log_period_ =
+        std::max(0.1, unified_towing_debug_log_period_);
 
     // Roll/Pitch I-term keep ratio removed: outer R/P I-channel disabled in unified mode.
 
@@ -1927,7 +1951,10 @@ namespace aerial_robot_control
     // zero) entry for this module within the same control tick. The cross-
     // module entries still arrive via estExternalWrenchCallback. Frame is
     // CoG (matches what the publish carries and what callbacks store).
-    est_wrench_list_[beetle_navigator_->getMyID()] = est_external_wrench_cog;
+    {
+      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+      est_wrench_list_[beetle_navigator_->getMyID()] = est_external_wrench_cog;
+    }
 
     prev_est_wrench_timestamp_ = ros::Time::now().toSec();
   }
@@ -1944,6 +1971,7 @@ namespace aerial_robot_control
     wrench(3) =  wrench_msg.torque.x;
     wrench(4) =  wrench_msg.torque.y;
     wrench(5) =  wrench_msg.torque.z;
+    std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
     est_wrench_list_[id] = wrench;
   }
 
@@ -1959,6 +1987,7 @@ namespace aerial_robot_control
     wrench(3) =  wrench_msg.torque.x;
     wrench(4) =  wrench_msg.torque.y;
     wrench(5) =  wrench_msg.torque.z;
+    std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
     est_wrench_task_list_[id] = wrench;
   }
 
@@ -1985,7 +2014,10 @@ namespace aerial_robot_control
     desired(5) = msg.wrench.torque.z;
 
     // Every module stores the FULL desired wrench (semantic unified across modules).
-    formation_desired_wrench_ = desired;
+    {
+      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+      formation_desired_wrench_ = desired;
+    }
 
     // Only LEADER rebroadcasts to followers so every module sees the same value.
     if(beetle_navigator_->getModuleState() != LEADER) {
@@ -2040,7 +2072,10 @@ namespace aerial_robot_control
 
   void BeetleController::publishAssembleDebug(
       const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
-      const tf::Vector3& target_formation_pos, bool alloc_ok)
+      const tf::Vector3& target_formation_pos, bool alloc_ok,
+      const Eigen::VectorXd& target_wrench_acc,
+      const Eigen::VectorXd& formation_wrench_cmd,
+      double yaw_pid_raw)
   {
     // 1. PID debug: formation-level pose control PID
     assemble_pid_msg_.header.stamp = ros::Time::now();
@@ -2128,6 +2163,52 @@ namespace aerial_robot_control
       wrench_msg.wrench.torque.y = rw(4);
       wrench_msg.wrench.torque.z = rw(5);
       assemble_formation_wrench_pub_.publish(wrench_msg);
+
+      if (unified_towing_debug_log_ && formation_wrench_cmd.size() >= 6) {
+        const double ff_norm = formation_wrench_cmd.head(3).norm() +
+                               formation_wrench_cmd.tail(3).norm();
+        if (ff_norm > 1e-3) {
+          auto fmtWrench = [](const Eigen::VectorXd& v) {
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(3);
+            if (v.size() < 6) {
+              os << "[invalid:" << v.size() << "]";
+            } else {
+              os << "[" << v(0) << "," << v(1) << "," << v(2)
+                 << ";" << v(3) << "," << v(4) << "," << v(5) << "]";
+            }
+            return os.str();
+          };
+          Eigen::VectorXd realized = unified_controller_->getRealizedWrenchBody();
+          std::ostringstream ss;
+          ss << std::fixed << std::setprecision(3)
+             << "[UnifiedTowingDiag] ff=" << fmtWrench(formation_wrench_cmd)
+             << " realized=" << fmtWrench(realized)
+             << " wrench_acc=" << fmtWrench(target_wrench_acc)
+             << " pid_acc_w=["
+             << pid_controllers_.at(X).result() << ","
+             << pid_controllers_.at(Y).result() << ","
+             << pid_controllers_.at(Z).result() << "]"
+             << " pos_err=["
+             << target_formation_pos.x() - formation_pos.x() << ","
+             << target_formation_pos.y() - formation_pos.y() << ","
+             << target_formation_pos.z() - formation_pos.z() << "]"
+             << " vel_err=["
+             << target_vel_.x() - formation_vel.x() << ","
+             << target_vel_.y() - formation_vel.y() << ","
+             << target_vel_.z() - formation_vel.z() << "]"
+             << " rpy=[cur="
+             << rpy_.x() << "," << rpy_.y() << "," << rpy_.z()
+             << ",target="
+             << target_rpy_.x() << "," << target_rpy_.y() << "," << target_rpy_.z()
+             << ",err="
+             << target_rpy_.x() - rpy_.x() << ","
+             << target_rpy_.y() - rpy_.y() << ","
+             << angles::shortest_angular_distance(rpy_.z(), target_rpy_.z()) << "]"
+             << " yaw_raw=" << yaw_pid_raw;
+          ROS_INFO_STREAM_THROTTLE(unified_towing_debug_log_period_, ss.str());
+        }
+      }
     }
   }
 
@@ -2296,8 +2377,13 @@ namespace aerial_robot_control
       calcInteractionWrench();
     }
     if (unified_secondary_active) {
+      std::map<int, Eigen::VectorXd> wrench_comp_snapshot;
+      {
+        std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+        wrench_comp_snapshot = wrench_comp_list_;
+      }
       unified_controller_->setInternalWrenchSecondaryReference(
-          wrench_comp_list_, unified_internal_wrench_secondary_gain_);
+          wrench_comp_snapshot, unified_internal_wrench_secondary_gain_);
     } else {
       unified_controller_->clearInternalWrenchSecondaryReference();
     }
@@ -2310,7 +2396,11 @@ namespace aerial_robot_control
     pid_controllers_.at(Z).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
 
-    Eigen::VectorXd formation_wrench_cmd = formation_desired_wrench_;
+    Eigen::VectorXd formation_wrench_cmd;
+    {
+      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+      formation_wrench_cmd = formation_desired_wrench_;
+    }
     if (navigator_->getForceLandingFlag()) {
       formation_wrench_cmd.setZero();
     }
@@ -2464,24 +2554,34 @@ namespace aerial_robot_control
           Eigen::Matrix3d cog_rot_eigen;
           tf::matrixTFToEigen(uav_rot, cog_rot_eigen);
           Eigen::Vector3d offset_w(offset_world.x(), offset_world.y(), offset_world.z());
-          auto imu_handler_obs = boost::dynamic_pointer_cast<sensor_plugin::Imu>(
-              estimator_->getImuHandler(0));
-          Eigen::Vector3d vel_leader_w, omega_body;
-          tf::vectorTFToEigen(imu_handler_obs->getFilteredVelCog(), vel_leader_w);
-          tf::vectorTFToEigen(imu_handler_obs->getFilteredOmegaCog(), omega_body);
-          Eigen::Vector3d omega_w = cog_rot_eigen * omega_body;
-          Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
-          Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
+          boost::shared_ptr<sensor_plugin::Imu> imu_handler_obs;
+          const auto& imu_handlers = estimator_->getImuHandlers();
+          if (!imu_handlers.empty()) {
+            imu_handler_obs =
+                boost::dynamic_pointer_cast<sensor_plugin::Imu>(imu_handlers.front());
+          }
 
-          // Arm the future observer-FF gate only while the formation is in hover.
-          const bool in_hover =
-              (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
-          formation_observer_->setFfArmed(in_hover);
-          formation_observer_->update(
-              unified_controller_->getFormationMass(),
-              unified_controller_->getFormationInertia(),
-              cog_rot_eigen, vel_formation_w, omega_body,
-              realized_wrench, du);
+          if (!imu_handler_obs) {
+            ROS_WARN_THROTTLE(1.0,
+                              "[UnifiedCtrl] Formation observer skipped: IMU handler unavailable");
+          } else {
+            Eigen::Vector3d vel_leader_w, omega_body;
+            tf::vectorTFToEigen(imu_handler_obs->getFilteredVelCog(), vel_leader_w);
+            tf::vectorTFToEigen(imu_handler_obs->getFilteredOmegaCog(), omega_body);
+            Eigen::Vector3d omega_w = cog_rot_eigen * omega_body;
+            Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
+            Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
+
+            // Arm the future observer-FF gate only while the formation is in hover.
+            const bool in_hover =
+                (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
+            formation_observer_->setFfArmed(in_hover);
+            formation_observer_->update(
+                unified_controller_->getFormationMass(),
+                unified_controller_->getFormationInertia(),
+                cog_rot_eigen, vel_formation_w, omega_body,
+                realized_wrench, du);
+          }
         }
       }
     }
@@ -2496,7 +2596,8 @@ namespace aerial_robot_control
 
     // Only leader publishes assembly-debug topics (shared global namespace)
     if (is_leader) {
-      publishAssembleDebug(formation_pos, formation_vel, target_formation_pos, ok);
+      publishAssembleDebug(formation_pos, formation_vel, target_formation_pos, ok,
+                           target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
     }
   }
 

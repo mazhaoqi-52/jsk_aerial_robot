@@ -721,11 +721,12 @@ class TowingWithFeedforwardState(TowingStateBase):
         module_masses = rospy.get_param("~module_masses", None)
         module_positions = rospy.get_param("~module_positions", None)
         module_inertias_diag = rospy.get_param("~module_inertias_diag", None)
-        self.beetle.setAttachModule(self.beetle.module_id,
-                                    module_masses=module_masses,
-                                    module_positions=module_positions,
-                                    module_inertias_diag=module_inertias_diag)
-
+        attach_ok = self.beetle.setAttachModule(self.beetle.module_id,
+                                                module_masses=module_masses,
+                                                module_positions=module_positions,
+                                                module_inertias_diag=module_inertias_diag)
+        if not attach_ok and control_mode == 'leader-follower':
+            rospy.logwarn("[Towing] LF task feedforward is disabled because setAttachModule failed")
 
         trajectory_gen = LinearTowingTrajectoryGenerator(
             start_pos=start_pos,

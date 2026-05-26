@@ -153,9 +153,22 @@ class BeetleInterface(object):
         #     [a; alpha] = M_form^{-1} W_ext at formation CoG. Required when the
         #     task wrench has torque (e.g. valve rotation).
         # Invariant: sum y_hat_i^task = W_ext (Newton 2nd + parallel-axis identity).
-        default_ids = [1, 2]
-        self._inter_module_ids = rospy.get_param(
-            f'/beetle{wrench_target_id}/assembly_ids', default_ids)
+        configured_ids = []
+        if assembly_tf_calculator is not None and hasattr(assembly_tf_calculator, 'module_ids'):
+            configured_ids = self._parse_module_ids(assembly_tf_calculator.module_ids)
+        if not configured_ids and assembly_mode:
+            configured_ids = self._parse_module_ids(rospy.get_param("~module_ids", ""))
+
+        default_ids = configured_ids if configured_ids else [1, 2]
+        param_ids = self._parse_module_ids(rospy.get_param(
+            f'/beetle{wrench_target_id}/assembly_ids', default_ids))
+        if assembly_mode and configured_ids:
+            if set(param_ids) != set(configured_ids):
+                rospy.logwarn("[BeetleInterface] assembly_ids param %s differs from configured module_ids %s; using configured ids",
+                              param_ids, configured_ids)
+            self._inter_module_ids = configured_ids
+        else:
+            self._inter_module_ids = param_ids
         for mid in self._inter_module_ids:
             self._est_wrench_task_pubs[mid] = rospy.Publisher(
                 f'/beetle{mid}/est_wrench_task', TaggedWrench, queue_size=1)
@@ -379,6 +392,13 @@ class BeetleInterface(object):
         except (IndexError, TypeError, ValueError):
             return [0.0, 0.0, 0.0]
 
+    def _parse_module_ids(self, value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [int(x.strip()) for x in value.split(',') if x.strip()]
+        return [int(x) for x in value]
+
     def targetMotion(self, pos, rot=None, linear_vel=None, angular_vel=None):
         """
         SE(3) position-velocity control.
@@ -573,13 +593,13 @@ class BeetleInterface(object):
                 {mid: ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
                  for mid in self._inter_module_ids})
             rospy.loginfo("[BeetleInterface] est_wrench_task auto-publish DISABLED")
-            return
+            return True
         if module_id not in self._inter_module_ids:
             rospy.logwarn(
                 "[BeetleInterface] setAttachModule(%d) but module not in "
                 "assembly_ids=%s - est_wrench_task publish skipped",
                 module_id, self._inter_module_ids)
-            return
+            return False
         self._inter_attach_module_id = int(module_id)
         if module_masses:
             self._inter_module_masses = {int(k): float(v) for k, v in module_masses.items()}
@@ -602,6 +622,7 @@ class BeetleInterface(object):
             "[BeetleInterface] est_wrench_task auto-publish ENABLED "
             "(level=%d, attach_module=%d, masses=%s)",
             level, self._inter_attach_module_id, self._inter_module_masses)
+        return True
 
     def setInternalWrenchPerModule(self, per_module, frame_id="fc"):
         """Explicit advanced API: directly publish y_hat^task for each module.

@@ -691,15 +691,14 @@ class TowingWithFeedforwardState(TowingStateBase):
         if not unified_mode:
             return force_world, [0.0, 0.0, 0.0], "world_yaw"
 
-        force_body, _ = self.beetle._worldToFormationBodyWrench(
-            force_world, [0.0, 0.0, 0.0], yaw_only=False)
         ee_offset_body = np.array([
             self.formation_adapter.base_offset_x,
             self.formation_adapter.base_offset_y,
             self.formation_adapter.total_offset_z,
         ])
-        torque_body = np.cross(ee_offset_body, np.asarray(force_body, dtype=float))
-        return force_body, torque_body.tolist(), "fc"
+        force_body, torque_body = self.beetle.buildFormationCoGWrench(
+            force_world, application_offset_body=ee_offset_body)
+        return force_body, torque_body, "fc"
 
     def execute(self, userdata):
         rospy.loginfo("=== Towing With Feedforward State ===")

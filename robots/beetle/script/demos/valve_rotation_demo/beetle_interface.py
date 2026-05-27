@@ -325,6 +325,22 @@ class BeetleInterface(object):
         return ((world_to_body @ np.asarray(force, dtype=float)).tolist(),
                 (world_to_body @ np.asarray(torque, dtype=float)).tolist())
 
+    def buildFormationCoGWrench(self, force_world, torque_world=None,
+                                application_offset_body=None,
+                                yaw_only=False):
+        """Build a formation-body CoG wrench from a world-frame point wrench."""
+        if torque_world is None:
+            torque_world = [0.0, 0.0, 0.0]
+        force_body, torque_body = self._worldToFormationBodyWrench(
+            force_world, torque_world, yaw_only=yaw_only)
+        if application_offset_body is not None:
+            torque_body = (
+                np.asarray(torque_body, dtype=float) +
+                np.cross(np.asarray(application_offset_body, dtype=float),
+                         np.asarray(force_body, dtype=float))
+            ).tolist()
+        return force_body, torque_body
+
     def getEndEffectorPos(self):
         """Get end-effector position in world coordinates (pitch-aware)."""
         if self.assembly_mode and self.assembly_tf_calculator:

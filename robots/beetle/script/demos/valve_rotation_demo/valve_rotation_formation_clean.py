@@ -1587,6 +1587,20 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             return 0.0
         return float(omega[2])
 
+    def _ee_offset_body(self):
+        return [
+            self.formation_adapter.base_offset_x,
+            self.formation_adapter.base_offset_y,
+            self.formation_adapter.total_offset_z,
+        ]
+
+    def _build_valve_wrench_command(self, force_world, torque_world):
+        if not self.beetle.isUnifiedMode():
+            return force_world, torque_world, "world_yaw"
+        force_body, torque_body = self.beetle.buildFormationCoGWrench(
+            force_world, torque_world, application_offset_body=self._ee_offset_body())
+        return force_body, torque_body, "fc"
+
     # ------------------------------------------------------------------
     def _streaming_circular_contact(self, valve_center, radius, start_angle):
         """Stream circular trajectory at 25Hz until valve engagement detected."""
@@ -1635,11 +1649,10 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
 
             # Dragon-style contact torque: start small and ramp slowly.
             if ff_enabled:
-                self.beetle.addExternalWrench(
-                    force=[0.0, 0.0, 0.0],
-                    torque=[0.0, 0.0, torque_z],
-                    frame_id="world_yaw"
-                )
+                ff_force, ff_torque, ff_frame = self._build_valve_wrench_command(
+                    [0.0, 0.0, 0.0], [0.0, 0.0, torque_z])
+                self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,
+                                              frame_id=ff_frame)
             self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
 
             # Monitor valve rotation
@@ -1807,11 +1820,10 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
                 ff_force = self._centripetal_force_world(radius, angular_vel, angle)
                 ff_force[2] += ff_force_z
-                self.beetle.addExternalWrench(
-                    force=ff_force,
-                    torque=[0.0, 0.0, torque_z],
-                    frame_id="world_yaw"
-                )
+                ff_force_cmd, ff_torque_cmd, ff_frame = self._build_valve_wrench_command(
+                    ff_force, [0.0, 0.0, torque_z])
+                self.beetle.addExternalWrench(force=ff_force_cmd, torque=ff_torque_cmd,
+                                              frame_id=ff_frame)
 
             self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
 

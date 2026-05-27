@@ -337,7 +337,9 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
   // Add external wrench feedforward (convert from force/torque to acceleration)
   Eigen::VectorXd total_wrench_acc = target_wrench_acc_cog;
-  if (desired_ext_wrench.size() == 6 && desired_ext_wrench.norm() > 1e-6) {
+  const bool has_desired_ext_wrench =
+      (desired_ext_wrench.size() == 6 && desired_ext_wrench.norm() > 1e-6);
+  if (has_desired_ext_wrench) {
     double mass_inv = 1.0 / formation_mass_;
     Eigen::Matrix3d inertia_inv = formation_inertia_.inverse();
     total_wrench_acc.head(3) += mass_inv * desired_ext_wrench.head(3);
@@ -349,9 +351,25 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Allocate: vectoring_f = primary wrench tracking + secondary balanced-load objective.
   // In cascade mode, the wrench_acc torque channels contain ONLY I-term
   // (P+D done by spinal). So base_thrust = allocation of (position PID + I-term only).
-  bool qp_ok = use_constrained_alloc_ &&
-               solveFullVectorQP(integrated_map_, total_wrench_acc, secondary_ref, target_vectoring_f_);
-  if (!qp_ok) {
+  if (use_constrained_alloc_) {
+    bool qp_ok = solveFullVectorQP(integrated_map_, total_wrench_acc,
+                                   secondary_ref, target_vectoring_f_);
+    if (!qp_ok && has_desired_ext_wrench) {
+      Eigen::VectorXd no_ext_wrench_acc = target_wrench_acc_cog;
+      qp_ok = solveFullVectorQP(integrated_map_, no_ext_wrench_acc,
+                                secondary_ref, target_vectoring_f_);
+      if (qp_ok) {
+        ROS_WARN_THROTTLE(1.0,
+                          "[UnifiedCtrl QP] external wrench dropped after constrained solve failed");
+        total_wrench_acc = no_ext_wrench_acc;
+      }
+    }
+    if (!qp_ok) {
+      ROS_ERROR_THROTTLE(1.0,
+                         "[UnifiedCtrl QP] constrained allocation failed; command not updated");
+      return false;
+    }
+  } else {
     if (alloc_lambda_ > 0.0 && secondary_ref.size() == integrated_map_.cols()) {
       Eigen::MatrixXd lhs = integrated_map_ * integrated_map_.transpose()
                            + alloc_lambda_ * Eigen::MatrixXd::Identity(integrated_map_.rows(),

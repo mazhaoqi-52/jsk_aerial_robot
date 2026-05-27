@@ -246,10 +246,8 @@ class LinearTowingTrajectoryGenerator:
         # Target velocity in world frame
         target_linear_vel = self.towing_direction * self.current_velocity
 
-        # Force feedforward: horizontal force in towing direction
-        # Z: set to 0. C++ LEADER injects body_z directly (bypassing cog_rot)
-        # to avoid pitch-coupling instability where cog_rot cross-couples
-        # large body_x into world_z at non-zero pitch angles.
+        # Force feedforward: world-horizontal force in towing direction.
+        # The state executor maps this to the frame required by each control mode.
         target_force = self.towing_direction * self.current_force
         target_force[2] = 0.0
 
@@ -688,6 +686,21 @@ class TowingWithFeedforwardState(TowingStateBase):
         # Disable internal-wrench auto-publish (also broadcasts a final zero).
         self.beetle.setAttachModule(None)
 
+    def _build_towing_wrench_command(self, force_world, unified_mode):
+        """Return (force, torque, frame_id) for BeetleInterface.addExternalWrench()."""
+        if not unified_mode:
+            return force_world, [0.0, 0.0, 0.0], "world_yaw"
+
+        force_body, _ = self.beetle._worldToFormationBodyWrench(
+            force_world, [0.0, 0.0, 0.0], yaw_only=False)
+        ee_offset_body = np.array([
+            self.formation_adapter.base_offset_x,
+            self.formation_adapter.base_offset_y,
+            self.formation_adapter.total_offset_z,
+        ])
+        torque_body = np.cross(ee_offset_body, np.asarray(force_body, dtype=float))
+        return force_body, torque_body.tolist(), "fc"
+
     def execute(self, userdata):
         rospy.loginfo("=== Towing With Feedforward State ===")
 
@@ -705,7 +718,8 @@ class TowingWithFeedforwardState(TowingStateBase):
         # BeetleInterface.addExternalWrench() automatically routes to:
         #   - formation_desired_wrench  when unified_control_mode is active
         #   - desired_external_wrench   when leader-follower (wrench_comp) is active
-        # We publish towing force in world_yaw to keep it horizontal.
+        # Unified allocation expects a formation-body wrench at the CoG. LF keeps
+        # the existing yaw-only path because wrench_comp reprojects body-yaw force.
         control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
         rospy.loginfo(f"Wrench feedforward via BeetleInterface (mode: {control_mode})")
 
@@ -819,17 +833,19 @@ class TowingWithFeedforwardState(TowingStateBase):
             )
 
             # ---- Publish desired external wrench via BeetleInterface ----
-            # Keep towing force horizontal in yaw/world plane; do not let current
-            # roll/pitch rotate it into an unintended vertical feedforward.
             ff_world = target_state['force']
-            self.beetle.addExternalWrench(force=ff_world, torque=[0.0, 0.0, 0.0],
-                                          frame_id="world_yaw")
+            unified_mode = self.beetle.isUnifiedMode()
+            ff_force, ff_torque, ff_frame = self._build_towing_wrench_command(
+                ff_world, unified_mode)
+            self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,
+                                          frame_id=ff_frame)
 
             # Debug: log ff force and progress every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
                 rospy.loginfo(f"[Towing FF] ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N, "
                              f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%, "
-                             f"mode={'unified' if self.beetle.isUnifiedMode() else 'LF'}")
+                             f"mode={'unified' if unified_mode else 'LF'}, "
+                             f"cmd_frame={ff_frame}, tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm")
 
             # Log progress every 5s
             if int(elapsed) % 5 == 0 and int(elapsed * 10) % 50 == 0:

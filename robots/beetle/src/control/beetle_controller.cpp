@@ -2056,8 +2056,8 @@ namespace aerial_robot_control
     {
       std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
       formation_desired_wrench_ = desired;
-      formation_desired_wrench_timestamp_ =
-          msg.header.stamp.isZero() ? ros::Time::now().toSec() : msg.header.stamp.toSec();
+      // Freshness is measured at receipt time to tolerate cross-machine clock skew.
+      formation_desired_wrench_timestamp_ = ros::Time::now().toSec();
     }
 
     // Only LEADER rebroadcasts to followers so every module sees the same value.

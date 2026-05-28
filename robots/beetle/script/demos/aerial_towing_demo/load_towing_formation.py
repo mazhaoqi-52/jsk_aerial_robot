@@ -61,6 +61,14 @@ APPROACH_HEIGHT_OFFSET = 0.18
 # drifts down during XY motion, the formation still clears the box.
 TRANSIT_CLEARANCE_OFFSET = 0.30
 
+# Feedforward wrench should be shifted from the virtual EE reference to the
+# actual hook contact point. From beetle_fang.urdf.xacro:
+#   virtual EE reference: x=0.246m, z=0.074382m
+#   hook bottom center:   x=0.246-0.02404m, z=0.0113823-0.0718283-0.0025m
+# The two hooks are symmetric in Y, so the equivalent towing contact uses y=0.
+TOWING_HOOK_CONTACT_DX_FROM_EE = -0.02404
+TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
+
 
 class LinearTowingTrajectoryGenerator:
     """
@@ -691,13 +699,13 @@ class TowingWithFeedforwardState(TowingStateBase):
         if not unified_mode:
             return force_world, [0.0, 0.0, 0.0], "world_yaw"
 
-        ee_offset_body = np.array([
-            self.formation_adapter.base_offset_x,
+        contact_offset_body = np.array([
+            self.formation_adapter.base_offset_x + TOWING_HOOK_CONTACT_DX_FROM_EE,
             self.formation_adapter.base_offset_y,
-            self.formation_adapter.total_offset_z,
+            self.formation_adapter.total_offset_z + TOWING_HOOK_CONTACT_DZ_FROM_EE,
         ])
         force_body, torque_body = self.beetle.buildFormationCoGWrench(
-            force_world, application_offset_body=ee_offset_body)
+            force_world, application_offset_body=contact_offset_body)
         return force_body, torque_body, "fc"
 
     def execute(self, userdata):

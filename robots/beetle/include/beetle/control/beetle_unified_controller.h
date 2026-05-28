@@ -24,6 +24,8 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 // Forward-declare OsqpEigen::Solver so downstream packages that include this
 // header (e.g. ninja) do not need to link against OsqpEigen.
@@ -117,6 +119,7 @@ public:
   void resetQPState() {
     qp_n_vars_ = -1;
     qp_n_constraints_ = -1;
+    prev_vectoring_f_.resize(0);
   }
 
   void setFormationModelOverride(double formation_mass,
@@ -280,6 +283,7 @@ private:
   // Debug publishers
   ros::Publisher formation_wrench_pub_;
   ros::Publisher formation_vectoring_f_pub_;
+  ros::Publisher interface_load_pub_;
 
   // Internal methods
   Eigen::MatrixXd buildFormationAllocationMatrix(
@@ -310,9 +314,17 @@ private:
   double alloc_lambda_;               // secondary objective weight toward balanced hover reference
   double alloc_t_max_;                // per-rotor thrust upper bound [N]
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
+  double alloc_rate_weight_;          // optional smoothness weight toward previous allocation
+  double alloc_rate_limit_;           // optional per-cycle component delta bound [N], <=0 disables
+  std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_
+  double alloc_interface_force_weight_;   // optional soft cost on interface force proxy [1/N^2]
+  double alloc_interface_torque_weight_;  // optional soft cost on interface torque proxy [1/(Nm)^2]
+  double alloc_interface_force_limit_;    // optional component-wise interface force proxy limit [N]
+  double alloc_interface_torque_limit_;   // optional component-wise interface torque proxy limit [Nm]
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
   int qp_n_constraints_;              // number of linear constraints, -1 = uninit
   std::unique_ptr<OsqpEigen::Solver> qp_solver_;
+  Eigen::VectorXd prev_vectoring_f_;   // previous successful allocation, used by rate terms
 
   /**
    * @brief Full-vector constrained QP allocation.
@@ -331,6 +343,8 @@ private:
   bool solveFullVectorQP(const Eigen::MatrixXd& alloc_matrix,
                          const Eigen::VectorXd& w_total,
                          const Eigen::VectorXd& secondary_ref,
+                         const std::vector<int>& assembled_ids,
+                         const Eigen::MatrixXd& interface_load_matrix,
                          Eigen::VectorXd& vectoring_f_out);
 
   /** @brief Build the current secondary allocation reference.
@@ -338,6 +352,21 @@ private:
    *  adds a small per-module 6D bias through that module's allocation block
    *  when internal_wrench_secondary_gain_ > 0. */
   Eigen::VectorXd buildSecondaryAllocationReference(const std::vector<int>& assembled_ids) const;
+
+  /** @brief Build actuator-side cut-load proxy rows for each adjacent module
+   *  boundary. Rows are ordered [Fx,Fy,Fz,Tx,Ty,Tz] per cut, with the cut placed
+   *  halfway between adjacent module CoGs in formation body coordinates. This is
+   *  a model-based allocation proxy D*f, not a measured connector load and not
+   *  gravity/inertia compensated. */
+  bool buildInterfaceLoadMatrix(const std::vector<int>& assembled_ids,
+                                Eigen::MatrixXd& interface_load_matrix,
+                                std::vector<std::pair<int, int>>& interface_cuts) const;
+
+  void publishInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_load_matrix,
+                                       const std::vector<std::pair<int, int>>& interface_cuts,
+                                       const Eigen::VectorXd& vectoring_f);
+
+  double getModuleAllocationWeight(int module_id) const;
 
   void rosParamInit();
 };

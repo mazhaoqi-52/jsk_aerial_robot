@@ -51,6 +51,15 @@ controller:
   alloc_lambda: 1.0e-4          # secondary objective weight toward balanced hover allocation
   alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
+  # Optional QP load-sharing extensions. Conservative defaults keep current
+  # behavior: diagnostics are published, but extra costs/limits are off unless tuned.
+  alloc_rate_weight: 0.0        # soft penalty on |f[k] - f[k-1]|; try 1e-4~1e-3 after log review
+  alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
+  alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
+  alloc_interface_force_weight: 0.0   # soft cost on actuator-side cut force proxy [1/N^2]
+  alloc_interface_torque_weight: 0.0  # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
+  alloc_interface_force_limit: 0.0    # component-wise cut force proxy bound [N]; 0 disables
+  alloc_interface_torque_limit: 0.0   # component-wise cut torque proxy bound [Nm]; 0 disables
 
   desired_wrench_timeout: 0.5
   external_force_upper_limit: 0.0

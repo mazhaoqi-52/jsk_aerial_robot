@@ -2624,11 +2624,23 @@ namespace aerial_robot_control
             const bool in_hover =
                 (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
             formation_observer_->setFfArmed(in_hover);
+            ROS_INFO_THROTTLE(
+                1.0,
+                "[TEMP_BREADCRUMB][UnifiedCtrl] before observer update id=%d nav=%d hover=%d "
+                "mass=%.3f rw_size=%d du=%.4f vel_norm=%.3f omega_norm=%.3f",
+                my_id, navigator_->getNaviState(), in_hover ? 1 : 0,
+                unified_controller_->getFormationMass(),
+                static_cast<int>(realized_wrench.size()), du,
+                vel_formation_w.norm(), omega_body.norm());
             formation_observer_->update(
                 unified_controller_->getFormationMass(),
                 unified_controller_->getFormationInertia(),
                 cog_rot_eigen, vel_formation_w, omega_body,
                 realized_wrench, du);
+            ROS_INFO_THROTTLE(
+                1.0,
+                "[TEMP_BREADCRUMB][UnifiedCtrl] after observer update id=%d nav=%d du=%.4f",
+                my_id, navigator_->getNaviState(), du);
           }
         }
       }

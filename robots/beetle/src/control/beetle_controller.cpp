@@ -1,5 +1,6 @@
 #include <beetle/control/beetle_controller.h>
 
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 
@@ -27,6 +28,7 @@ namespace aerial_robot_control
     local_unified_cascade_setup_sent_(false),
     unified_torque_alloc_inv_pub_interval_(0.05),
     last_unified_torque_alloc_inv_pub_time_(-1.0),
+    last_unified_command_pub_time_(-1.0),
     unified_internal_wrench_diag_(true),
     unified_internal_wrench_log_(true),
     unified_internal_wrench_detail_log_(false),
@@ -374,6 +376,7 @@ namespace aerial_robot_control
     unified_transition_count_ = 0;
     unified_reference_warmup_count_ = 0;
     last_unified_torque_alloc_inv_pub_time_ = ros::Time::now().toSec();
+    last_unified_command_pub_time_ = -1.0;
 
     // Phase U2: activate formation observer on entering unified LEADER mode.
     // Follower does NOT run observer (leader is the observation point).
@@ -463,6 +466,7 @@ namespace aerial_robot_control
       unified_reference_warmup_count_ = 0;
       local_unified_cascade_setup_sent_ = false;
       last_unified_torque_alloc_inv_pub_time_ = -1.0;
+      last_unified_command_pub_time_ = -1.0;
       beetle_navigator_->setUnifiedControlMode(false);
 
       ros::NodeHandle control_nh(nh_, "controller");
@@ -754,12 +758,19 @@ namespace aerial_robot_control
          four_axes/command from the single-module control path. */
       bool base_ok = ControlBase::update();
       if (!base_ok) {
-        if (module_state == LEADER) {
-          ROS_WARN_THROTTLE(0.5,
-                            "[UnifiedCtrl LEADER] unified loop gated before controlCore: navi_state=%d control_timestamp=%.4f unified=%s module_state=%d",
-                            navigator_->getNaviState(), control_timestamp_,
-                            unified_control_mode_ ? "ON" : "OFF", module_state);
-        }
+        const double now = ros::Time::now().toSec();
+        const double since_pub =
+            (last_unified_command_pub_time_ >= 0.0)
+                ? now - last_unified_command_pub_time_ : -1.0;
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[TEMP_UNIFIED_CMD] id=%d role=%s stage=base_gated nav=%d "
+            "module_state=%d since_pub=%.3f control_timestamp=%.4f unified=%s",
+            beetle_navigator_->getMyID(),
+            module_state == LEADER ? "LEADER" :
+                (module_state == FOLLOWER ? "FOLLOWER" : "OTHER"),
+            navigator_->getNaviState(), module_state, since_pub,
+            control_timestamp_, unified_control_mode_ ? "ON" : "OFF");
         return false;
       }
 
@@ -834,6 +845,35 @@ namespace aerial_robot_control
 
     unified_thrust_cmd_ = local_cmd;
     follower_thrust_pub_.publish(unified_thrust_cmd_);
+    const double now = ros::Time::now().toSec();
+    const double dt_prev =
+        (last_unified_command_pub_time_ >= 0.0)
+            ? now - last_unified_command_pub_time_ : -1.0;
+    last_unified_command_pub_time_ = now;
+
+    double max_abs_component = 0.0;
+    double max_pair_norm = 0.0;
+    for (size_t i = 0; i < unified_thrust_cmd_.base_thrust.size(); i++) {
+      max_abs_component =
+          std::max(max_abs_component,
+                   static_cast<double>(std::abs(unified_thrust_cmd_.base_thrust[i])));
+    }
+    for (size_t i = 0; i + 1 < unified_thrust_cmd_.base_thrust.size(); i += 2) {
+      const double fx = unified_thrust_cmd_.base_thrust[i];
+      const double fz = unified_thrust_cmd_.base_thrust[i + 1];
+      max_pair_norm = std::max(max_pair_norm, std::sqrt(fx * fx + fz * fz));
+    }
+    ROS_INFO_THROTTLE(
+        0.5,
+        "[TEMP_UNIFIED_CMD] id=%d stage=publish nav=%d module_state=%d "
+        "dt_prev=%.3f elems=%zu max_pair=%.2f max_abs_comp=%.2f "
+        "angles=(%.3f,%.3f,%.3f)",
+        beetle_navigator_->getMyID(), navigator_->getNaviState(),
+        beetle_navigator_->getModuleState(), dt_prev,
+        unified_thrust_cmd_.base_thrust.size(), max_pair_norm,
+        max_abs_component,
+        unified_thrust_cmd_.angles[0], unified_thrust_cmd_.angles[1],
+        unified_thrust_cmd_.angles[2]);
     return true;
   }
 
@@ -923,14 +963,16 @@ namespace aerial_robot_control
 
     unified_reference_pub_.publish(msg);
 
-    ROS_DEBUG_THROTTLE(1.0,
-                       "[UnifiedCtrl REF_PUB] leader_id=%d stamp=%.4f mass=%.3f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
-                       beetle_navigator_->getMyID(),
-                       msg.header.stamp.toSec(),
-                       msg.formation_mass,
-                       target_wrench_acc(2),
-                       target_wrench_acc(4),
-                       yaw_pid_raw);
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[TEMP_UNIFIED_CMD] id=%d stage=ref_pub stamp=%.4f mass=%.3f "
+        "wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+        beetle_navigator_->getMyID(),
+        msg.header.stamp.toSec(),
+        msg.formation_mass,
+        target_wrench_acc(2),
+        target_wrench_acc(4),
+        yaw_pid_raw);
   }
 
   void BeetleController::publishModuleModel()
@@ -1073,14 +1115,16 @@ namespace aerial_robot_control
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
 
-    ROS_DEBUG_THROTTLE(1.0,
-              "[UnifiedCtrl REF_RX] follower_id=%d leader_id=%d age=%.4f wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
-              beetle_navigator_->getMyID(),
-              beetle_navigator_->getLeaderID(),
-              (ros::Time::now() - unified_cmd_stamp_).toSec(),
-              unified_reference_wrench_acc_(2),
-              unified_reference_wrench_acc_(4),
-              unified_reference_yaw_pid_raw_);
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[TEMP_UNIFIED_CMD] id=%d stage=ref_rx leader_id=%d age=%.4f "
+        "wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+        beetle_navigator_->getMyID(),
+        beetle_navigator_->getLeaderID(),
+        (ros::Time::now() - unified_cmd_stamp_).toSec(),
+        unified_reference_wrench_acc_(2),
+        unified_reference_wrench_acc_(4),
+        unified_reference_yaw_pid_raw_);
 
     // Auto-latch: if this FOLLOWER receives a unified reference from the LEADER
     // but unified_control_mode_ is false (e.g. rosparam was overwritten by a
@@ -2581,7 +2625,32 @@ namespace aerial_robot_control
     // --- Run unified 6-DOF allocation ---
     unified_controller_->clearFormationModelOverride();
     unified_controller_->setCommandTargetRPY(target_rpy_);
+    const double alloc_start = ros::Time::now().toSec();
+    const double since_pub_before_alloc =
+        (last_unified_command_pub_time_ >= 0.0)
+            ? alloc_start - last_unified_command_pub_time_ : -1.0;
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
+    const double alloc_end = ros::Time::now().toSec();
+    const int local_module_state = beetle_navigator_->getModuleState();
+    ROS_INFO_THROTTLE(
+        0.5,
+        "[TEMP_UNIFIED_CMD] id=%d role=%s stage=after_alloc ok=%d nav=%d "
+        "module_state=%d alloc_ms=%.2f since_pub=%.3f "
+        "wrench_acc=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) yaw_raw=%.3f",
+        my_id, is_leader ? "LEADER" : "FOLLOWER", ok ? 1 : 0,
+        navigator_->getNaviState(), local_module_state,
+        1000.0 * (alloc_end - alloc_start), since_pub_before_alloc,
+        target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
+        target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
+        yaw_pid_raw);
+    if (!ok) {
+      ROS_WARN_THROTTLE(
+          0.2,
+          "[TEMP_UNIFIED_CMD] id=%d role=%s stage=allocation_failed nav=%d "
+          "module_state=%d since_pub=%.3f",
+          my_id, is_leader ? "LEADER" : "FOLLOWER",
+          navigator_->getNaviState(), local_module_state, since_pub_before_alloc);
+    }
 
     if (ok) {
       if (!is_leader) {
@@ -2624,23 +2693,11 @@ namespace aerial_robot_control
             const bool in_hover =
                 (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
             formation_observer_->setFfArmed(in_hover);
-            ROS_INFO_THROTTLE(
-                1.0,
-                "[TEMP_BREADCRUMB][UnifiedCtrl] before observer update id=%d nav=%d hover=%d "
-                "mass=%.3f rw_size=%d du=%.4f vel_norm=%.3f omega_norm=%.3f",
-                my_id, navigator_->getNaviState(), in_hover ? 1 : 0,
-                unified_controller_->getFormationMass(),
-                static_cast<int>(realized_wrench.size()), du,
-                vel_formation_w.norm(), omega_body.norm());
             formation_observer_->update(
                 unified_controller_->getFormationMass(),
                 unified_controller_->getFormationInertia(),
                 cog_rot_eigen, vel_formation_w, omega_body,
                 realized_wrench, du);
-            ROS_INFO_THROTTLE(
-                1.0,
-                "[TEMP_BREADCRUMB][UnifiedCtrl] after observer update id=%d nav=%d du=%.4f",
-                my_id, navigator_->getNaviState(), du);
           }
         }
       }

@@ -170,6 +170,7 @@ namespace aerial_robot_control
     bool local_unified_cascade_setup_sent_;
     double unified_torque_alloc_inv_pub_interval_;
     double last_unified_torque_alloc_inv_pub_time_;
+    double last_unified_command_pub_time_;
     tf::Vector3 leader_target_pos_;
     tf::Vector3 leader_target_vel_;
     tf::Vector3 leader_target_acc_;

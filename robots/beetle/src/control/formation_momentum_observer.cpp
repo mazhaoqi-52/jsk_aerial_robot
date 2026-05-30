@@ -308,25 +308,8 @@ void FormationMomentumObserver::update(
                       gyroscopic.x(), gyroscopic.y(), gyroscopic.z());
   }
 
-  ROS_INFO_THROTTLE(
-      1.0,
-      "[TEMP_BREADCRUMB][FormObs] after force/torque calc mass=%.3f dt=%.4f "
-      "rw_size=%d force_en=%d torque_en=%d residual_norm=%.3f torque_residual_norm=%.3f",
-      formation_mass, dt, static_cast<int>(realized_wrench_body.size()),
-      enable_force_observer_ ? 1 : 0, enable_torque_observer_ ? 1 : 0,
-      residual.norm(), residual_torque.norm());
-
   // ========== Publish all debug topics ==========
-  ROS_INFO_THROTTLE(
-      1.0,
-      "[TEMP_BREADCRUMB][FormObs] before publishDebug residual_norm=%.3f "
-      "torque_residual_norm=%.3f",
-      residual.norm(), residual_torque.norm());
   publishDebug(ros::Time::now(), residual, residual_torque);
-  ROS_INFO_THROTTLE(
-      1.0,
-      "[TEMP_BREADCRUMB][FormObs] after publishDebug before realized_wrench_pub rw_size=%d",
-      static_cast<int>(realized_wrench_body.size()));
 
   // Publish realized wrench input for verification
   {
@@ -345,10 +328,6 @@ void FormationMomentumObserver::update(
     }
     realized_wrench_debug_pub_.publish(rw_msg);
   }
-  ROS_INFO_THROTTLE(
-      1.0,
-      "[TEMP_BREADCRUMB][FormObs] update complete rw_size=%d",
-      static_cast<int>(realized_wrench_body.size()));
 }
 
 void FormationMomentumObserver::publishDebug(

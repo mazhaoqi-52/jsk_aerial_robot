@@ -10,6 +10,7 @@ import math
 import threading
 import time
 import rospy
+import rosgraph
 import smach
 import smach_ros
 import numpy as np
@@ -1001,12 +1002,106 @@ class DisengageAndReturnState(TowingStateBase):
         return 'succeeded'
 
 
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _parse_module_ids(module_ids_str):
+    try:
+        return [int(x.strip()) for x in str(module_ids_str).split(',') if x.strip()]
+    except ValueError:
+        rospy.logerr("[TowingPreflight] Invalid module_ids: %s", module_ids_str)
+        return []
+
+
+def _names_for_topic(system_state_entries, topic_name):
+    for name, nodes in system_state_entries:
+        if name == topic_name:
+            return nodes
+    return []
+
+
+def log_towing_preflight(module_ids, real_machine, simulation):
+    """Log master/module readiness without changing task behavior."""
+    master_uri = os.environ.get('ROS_MASTER_URI', '<unset>')
+    ros_ip = os.environ.get('ROS_IP', '<unset>')
+    ros_hostname = os.environ.get('ROS_HOSTNAME', '<unset>')
+    rospy.loginfo("[TowingPreflight] ROS_MASTER_URI=%s ROS_IP=%s ROS_HOSTNAME=%s",
+                  master_uri, ros_ip, ros_hostname)
+    rospy.loginfo("[TowingPreflight] module_ids=%s real_machine=%s simulation=%s",
+                  module_ids, real_machine, simulation)
+    if real_machine and ('localhost' in master_uri or '127.0.0.1' in master_uri):
+        rospy.logwarn("[TowingPreflight] real_machine with local ROS_MASTER_URI; "
+                      "this is only valid on the machine running the shared ROS master")
+    if ros_ip != '<unset>' and ros_hostname != '<unset>':
+        rospy.logwarn("[TowingPreflight] Both ROS_IP and ROS_HOSTNAME are set; "
+                      "prefer setting only one to avoid advertised-address ambiguity")
+
+    try:
+        master = rosgraph.Master('/formation_load_towing_preflight')
+        pubs, subs, srvs = master.getSystemState()
+    except Exception as e:
+        rospy.logerr("[TowingPreflight] Cannot query ROS master: %s", e)
+        return
+
+    published_topics = {name for name, _ in pubs}
+    service_names = {name for name, _ in srvs}
+
+    missing_mocap = [
+        f"/beetle{module_id}/mocap/pose"
+        for module_id in module_ids
+        if f"/beetle{module_id}/mocap/pose" not in published_topics
+    ]
+    if missing_mocap:
+        rospy.logwarn("[TowingPreflight] Missing module mocap topics: %s", missing_mocap)
+
+    load_topic = '/load/odom' if simulation else '/load/mocap/pose'
+    if load_topic not in published_topics:
+        rospy.logwarn("[TowingPreflight] Missing load pose topic: %s", load_topic)
+
+    nav_subscribers = _names_for_topic(subs, '/assembly/uav/nav')
+    if nav_subscribers:
+        rospy.loginfo("[TowingPreflight] /assembly/uav/nav subscribers: %s", nav_subscribers)
+    else:
+        rospy.logwarn("[TowingPreflight] No subscriber on /assembly/uav/nav; towing commands would be ignored")
+
+    missing_unified_services = [
+        f"/beetle{module_id}/controller/set_unified_mode"
+        for module_id in module_ids
+        if f"/beetle{module_id}/controller/set_unified_mode" not in service_names
+    ]
+    if missing_unified_services:
+        rospy.logwarn("[TowingPreflight] Missing set_unified_mode services: %s", missing_unified_services)
+
+    cpp_leaders = {}
+    for module_id in module_ids:
+        param_name = f"/beetle{module_id}/assembly_leader_id"
+        if rospy.has_param(param_name):
+            cpp_leaders[module_id] = rospy.get_param(param_name)
+    if cpp_leaders:
+        python_ee_leader = module_ids[-1] if module_ids else None
+        rospy.loginfo("[TowingPreflight] C++ assembly_leader_id params: %s; Python EE leader=%s",
+                      cpp_leaders, python_ee_leader)
+        unique_cpp_leaders = set(cpp_leaders.values())
+        if len(unique_cpp_leaders) == 1 and python_ee_leader not in unique_cpp_leaders:
+            rospy.logwarn("[TowingPreflight] Python EE leader differs from C++ control leader; "
+                          "this is OK only if the EE is on the last module and wrench routing uses assembly_leader_id")
+    else:
+        rospy.logwarn("[TowingPreflight] assembly_leader_id params are not available yet; "
+                      "launch after assembly/unified navigation has published them")
+
+
 def main():
     rospy.init_node('formation_load_towing')
 
     global TOWING_DISTANCE, TOWING_MAX_FORCE
     TOWING_DISTANCE = rospy.get_param("~towing_distance", 0.6)
     TOWING_MAX_FORCE = rospy.get_param("~towing_force", 5.0)
+    module_ids = _parse_module_ids(rospy.get_param("~module_ids", ""))
+    real_machine = _as_bool(rospy.get_param("~real_machine", False))
+    simulation = _as_bool(rospy.get_param("~simulation", True))
 
     rospy.loginfo("=" * 60)
     rospy.loginfo("Formation Load Towing Task")
@@ -1017,6 +1112,7 @@ def main():
     rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
     rospy.loginfo(f"Max towing force: {TOWING_MAX_FORCE}N (adaptive from 0N)")
     rospy.loginfo("=" * 60)
+    log_towing_preflight(module_ids, real_machine, simulation)
 
     try:
         # Create SMACH state machine

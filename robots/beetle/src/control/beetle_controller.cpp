@@ -369,7 +369,8 @@ namespace aerial_robot_control
       local_unified_cascade_setup_sent_ = true;  // leader one-shot is owned by BeetleUnifiedController
     } else {
       local_unified_cascade_setup_sent_ = false;
-      sendFollowerCascadeSetup();  // follower: gimbal_dof now, alloc_inv/gains after matrix is ready
+      // follower: gimbal_dof + alloc_inv + gains are sent together by the
+      // local one-shot after the first successful allocation.
       ensureUnifiedReferenceSubscription();  // still subscribe for debug/monitoring
     }
     applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
@@ -399,8 +400,8 @@ namespace aerial_robot_control
              "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
              is_leader ? "LEADER" : "FOLLOWER",
              beetle_navigator_->getMyID(),
-             is_leader ? "sent/deferred cascade setup to all spinals"
-                       : "deferred local alloc_inv/gains until matrix ready",
+             is_leader ? "sent/deferred cascade setup to own spinal"
+                       : "deferred local gimbal_dof/alloc_inv/gains until matrix ready",
              unified_reference_warmup_frames_, ros::Time::now().toSec());
     clearInternalWrenchState();
   }
@@ -774,6 +775,16 @@ namespace aerial_robot_control
         return false;
       }
 
+      if (module_state != LEADER && module_state != FOLLOWER) {
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[TEMP_UNIFIED_CMD] id=%d role=OTHER stage=role_gated nav=%d "
+            "module_state=%d unified=ON suppressing_LF_command=1",
+            beetle_navigator_->getMyID(), navigator_->getNaviState(),
+            module_state);
+        return false;
+      }
+
       controlCore();
       PoseLinearController::sendCmd();
       return true;
@@ -894,6 +905,8 @@ namespace aerial_robot_control
   {
     if (local_unified_cascade_setup_sent_) return true;
 
+    sendFollowerCascadeSetup();
+
     if (!publishLocalUnifiedTorqueAllocationMatrixInv()) {
       return false;
     }
@@ -901,7 +914,7 @@ namespace aerial_robot_control
     sendFollowerCascadeGains();
     local_unified_cascade_setup_sent_ = true;
     ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d one-shot local cascade setup: "
-             "alloc_inv + gains sent to own spinal",
+             "gimbal_dof + alloc_inv + gains sent to own spinal",
              beetle_navigator_->getMyID());
     return true;
   }
@@ -1146,7 +1159,7 @@ namespace aerial_robot_control
   void BeetleController::sendCascadeSetup()
   {
     // LEADER-only: send torque allocation matrix inverse and P/I/D gains
-    // to ALL assembled modules' spinals. This configures each spinal for 1000Hz
+    // to this module's spinal. This configures the spinal for 1000Hz
     // P+I+D attitude tracking using thrustGainMapping().
     //
     // v5 architecture: spinal owns the high-bandwidth P+D inner loop only.
@@ -1197,11 +1210,10 @@ namespace aerial_robot_control
       gimbal_dof_pub_.publish(gimbal_dof_msg);
     }
 
-    ROS_INFO("[UnifiedCtrl] Cascade setup (LEADER): alloc_inv %s, gains %s, "
-             "(P_r=%.1f I_r=%.2f D_r=%.1f P_p=%.1f I_p=%.2f D_p=%.1f D_y=%.1f) %zu modules + gimbal_dof=1",
+    ROS_INFO("[UnifiedCtrl] Cascade setup (LEADER): local alloc_inv %s, local gains %s, "
+             "(P_r=%.1f I_r=%.2f D_r=%.1f P_p=%.1f I_p=%.2f D_p=%.1f D_y=%.1f) own spinal + gimbal_dof=1",
              matrix_sent ? "SENT" : "DEFERRED", matrix_sent ? "SENT" : "DEFERRED",
-             roll_p, roll_i, roll_d, pitch_p, pitch_i, pitch_d, yaw_d,
-             beetle_navigator_->getAssemblyIds().size());
+             roll_p, roll_i, roll_d, pitch_p, pitch_i, pitch_d, yaw_d);
   }
 
   void BeetleController::sendFollowerCascadeSetup()
@@ -1213,8 +1225,8 @@ namespace aerial_robot_control
       gimbal_dof_pub_.publish(gimbal_dof_msg);
     }
 
-    ROS_INFO("[UnifiedCtrl] Cascade setup (FOLLOWER id=%d): gimbal_dof=1 sent, "
-             "alloc_inv/gains deferred until local allocation matrix is ready",
+    ROS_INFO("[UnifiedCtrl] Cascade setup (FOLLOWER id=%d): gimbal_dof=1 sent "
+             "inside local one-shot before alloc_inv/gains",
              beetle_navigator_->getMyID());
   }
 

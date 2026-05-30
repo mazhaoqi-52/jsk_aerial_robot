@@ -88,13 +88,13 @@ namespace aerial_robot_control
     Eigen::VectorXd unified_residual_common_bias_;
     std::map<int, Eigen::VectorXd> unified_residual_bias_list_;
 
-    /** @brief LEADER-only: send cascade gains + allocation matrix inverse to ALL assembled
-     *  modules' spinals. Uses unified_controller_'s publishers. Also sends gimbal_dof=1
+    /** @brief LEADER-only: send cascade gains + allocation matrix inverse to this
+     *  module's spinal. Uses unified_controller_'s publishers. Also sends gimbal_dof=1
      *  to LEADER's own spinal. */
     void sendCascadeSetup();
 
     /** @brief FOLLOWER-only: set gimbal_dof=1 on THIS module's own spinal.
-     *  Cascade gains are sent later by a local one-shot after alloc_inv is ready. */
+     *  Called by the local one-shot after alloc_inv is ready. */
     void sendFollowerCascadeSetup();
     void sendFollowerCascadeGains();
 
@@ -102,7 +102,7 @@ namespace aerial_robot_control
     void resetToIndependentHover();
 
     /** @brief Unified-mode switch (LEADER or FOLLOWER): reset targets, migrate I-terms,
-     *  configure spinal (all modules if leader, own only if follower), apply unified gains. */
+     *  configure this module's spinal when ready, apply unified gains. */
     void initUnifiedMode(bool is_leader);
 
     /** @brief Symmetric unified-mode control body. Both leader and follower run the full

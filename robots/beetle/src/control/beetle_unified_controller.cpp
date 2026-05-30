@@ -483,21 +483,23 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // matrix → roll/pitch P/D ≈ 0 → pitch divergence.
   //
   // Fix: on the FIRST successful computation of integrated_map_inv_rot_,
-  // resend the allocation matrix followed by cascade gains to ALL spinals.
+  // resend the allocation matrix followed by cascade gains to this module's spinal.
   // Order matters: matrix first, then gains, so thrustGainMapping() uses
   // the correct matrix when processing the new gains.
   if (!cascade_alloc_sent_ && integrated_map_inv_rot_.rows() > 0 && has_cascade_gain_cache_) {
-    sendTorqueAllocationMatrixInv();
-    sendCascadeGains(cached_cascade_roll_p_, cached_cascade_roll_i_, cached_cascade_roll_d_,
-                     cached_cascade_pitch_p_, cached_cascade_pitch_i_, cached_cascade_pitch_d_,
-                     cached_cascade_yaw_d_);
-    cascade_alloc_sent_ = true;
-    ROS_WARN("[UnifiedCtrl] One-shot cascade resend: allocation matrix (%ldx%ld) + "
-             "gains(P_r=%.1f I_r=%.2f D_r=%.1f P_p=%.1f I_p=%.2f D_p=%.1f D_y=%.1f) sent to all spinals",
-             integrated_map_inv_rot_.rows(), integrated_map_inv_rot_.cols(),
-             cached_cascade_roll_p_, cached_cascade_roll_i_, cached_cascade_roll_d_,
-             cached_cascade_pitch_p_, cached_cascade_pitch_i_, cached_cascade_pitch_d_,
-             cached_cascade_yaw_d_);
+    bool matrix_sent = sendTorqueAllocationMatrixInv();
+    if (matrix_sent) {
+      sendCascadeGains(cached_cascade_roll_p_, cached_cascade_roll_i_, cached_cascade_roll_d_,
+                       cached_cascade_pitch_p_, cached_cascade_pitch_i_, cached_cascade_pitch_d_,
+                       cached_cascade_yaw_d_);
+      cascade_alloc_sent_ = true;
+      ROS_WARN("[UnifiedCtrl] One-shot cascade resend: local allocation matrix (%ldx%ld) + "
+               "gains(P_r=%.1f I_r=%.2f D_r=%.1f P_p=%.1f I_p=%.2f D_p=%.1f D_y=%.1f) sent to own spinal",
+               integrated_map_inv_rot_.rows(), integrated_map_inv_rot_.cols(),
+               cached_cascade_roll_p_, cached_cascade_roll_i_, cached_cascade_roll_d_,
+               cached_cascade_pitch_p_, cached_cascade_pitch_i_, cached_cascade_pitch_d_,
+               cached_cascade_yaw_d_);
+    }
   }
 
   return true;
@@ -1265,8 +1267,8 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
 
 bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 {
-  // Send the rotational part of the formation-level allocation pseudoinverse
-  // to each module's spinal. Each module receives only its sub-block:
+  // Send this module's rotational sub-block of the formation-level allocation
+  // pseudoinverse to its spinal:
   // rows [m*motor_per_module*rotor_coef .. (m+1)*motor_per_module*rotor_coef) × 3 cols.
   //
   // Spinal uses this in thrustGainMapping():
@@ -1278,31 +1280,30 @@ bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
     return false;
   }
 
-  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   int rows_per_module = motor_num_per_module_ * rotor_coef_;
+  int module_id = navigator_->getMyID();
 
-  for (size_t m = 0; m < assembled_ids.size(); m++) {
-    int module_id = assembled_ids[m];
-    if (!module_torque_alloc_inv_pubs_.count(module_id)) continue;
-
-    spinal::TorqueAllocationMatrixInv msg;
-    msg.rows.resize(rows_per_module);
-
-    if (integrated_map_inv_rot_.cwiseAbs().maxCoeff() > INT16_MAX * 0.001f) {
-      ROS_ERROR_THROTTLE(1.0, "[UnifiedCtrl] Torque Allocation Matrix overflow for module %d", module_id);
-    }
-
-    if (!buildModuleTorqueAllocationMatrixInv(module_id, msg)) {
-      continue;
-    }
-
-    module_torque_alloc_inv_pubs_[module_id].publish(msg);
+  if (!module_torque_alloc_inv_pubs_.count(module_id)) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] sendTorqueAllocationMatrixInv: no publisher for module %d", module_id);
+    return false;
   }
 
-  // Summary log (no throttle — this function is only called at mode switch / one-shot)
-  ROS_INFO("[UnifiedCtrl] Sent torque_alloc_inv to %zu modules (%d rows each), "
+  spinal::TorqueAllocationMatrixInv msg;
+  msg.rows.resize(rows_per_module);
+
+  if (integrated_map_inv_rot_.cwiseAbs().maxCoeff() > INT16_MAX * 0.001f) {
+    ROS_ERROR_THROTTLE(1.0, "[UnifiedCtrl] Torque Allocation Matrix overflow for module %d", module_id);
+  }
+
+  if (!buildModuleTorqueAllocationMatrixInv(module_id, msg)) {
+    return false;
+  }
+
+  module_torque_alloc_inv_pubs_[module_id].publish(msg);
+
+  ROS_INFO("[UnifiedCtrl] Sent local torque_alloc_inv to module %d (%d rows), "
            "inv_rot total rows=%ld cols=%ld",
-           assembled_ids.size(), rows_per_module,
+           module_id, rows_per_module,
            integrated_map_inv_rot_.rows(), integrated_map_inv_rot_.cols());
   return true;
 }
@@ -1312,36 +1313,32 @@ void BeetleUnifiedController::sendCascadeGains(
     double pitch_p, double pitch_i, double pitch_d,
     double yaw_d)
 {
-  // Send torque-level P/I/D gains to each module's spinal.
+  // Send torque-level P/I/D gains to this module's spinal.
   // Using motors.resize(1) → spinal stores as torque_{p,i,d}_gain and runs
   // thrustGainMapping() to compute per-motor gains using the
   // torque_allocation_matrix_inv.
-  // v4: roll_i / pitch_i are non-zero — the spinal cascade owns the entire
-  // roll/pitch attitude loop (P+I+D). PC's target_wrench_acc(3,4) is fixed at
-  // 0, so PC's outer ROLL/PITCH PIDs are inert in unified mode.
-
-  std::vector<int> assembled_ids = navigator_->getAssemblyIds();
-
-  for (size_t m = 0; m < assembled_ids.size(); m++) {
-    int module_id = assembled_ids[m];
-    if (!module_rpy_gain_pubs_.count(module_id)) continue;
-
-    spinal::RollPitchYawTerms rpy_gain_msg;
-    rpy_gain_msg.motors.resize(1);
-    rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p  * 1000);
-    rpy_gain_msg.motors[0].roll_i  = static_cast<int16_t>(roll_i  * 1000);
-    rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d  * 1000);
-    rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(pitch_p * 1000);
-    rpy_gain_msg.motors[0].pitch_i = static_cast<int16_t>(pitch_i * 1000);
-    rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(pitch_d * 1000);
-    rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d   * 1000);
-
-    module_rpy_gain_pubs_[module_id].publish(rpy_gain_msg);
+  // v5: PC owns roll/pitch I and passes zero roll_i/pitch_i to spinal.
+  int module_id = navigator_->getMyID();
+  if (!module_rpy_gain_pubs_.count(module_id)) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] sendCascadeGains: no publisher for module %d", module_id);
+    return;
   }
 
-  ROS_INFO_THROTTLE(2.0, "[UnifiedCtrl] Sent cascade gains to %zu modules: "
+  spinal::RollPitchYawTerms rpy_gain_msg;
+  rpy_gain_msg.motors.resize(1);
+  rpy_gain_msg.motors[0].roll_p  = static_cast<int16_t>(roll_p  * 1000);
+  rpy_gain_msg.motors[0].roll_i  = static_cast<int16_t>(roll_i  * 1000);
+  rpy_gain_msg.motors[0].roll_d  = static_cast<int16_t>(roll_d  * 1000);
+  rpy_gain_msg.motors[0].pitch_p = static_cast<int16_t>(pitch_p * 1000);
+  rpy_gain_msg.motors[0].pitch_i = static_cast<int16_t>(pitch_i * 1000);
+  rpy_gain_msg.motors[0].pitch_d = static_cast<int16_t>(pitch_d * 1000);
+  rpy_gain_msg.motors[0].yaw_d   = static_cast<int16_t>(yaw_d   * 1000);
+
+  module_rpy_gain_pubs_[module_id].publish(rpy_gain_msg);
+
+  ROS_INFO_THROTTLE(2.0, "[UnifiedCtrl] Sent local cascade gains to module %d: "
                     "roll(P=%.2f,I=%.2f,D=%.2f) pitch(P=%.2f,I=%.2f,D=%.2f) yaw(D=%.2f)",
-                    assembled_ids.size(), roll_p, roll_i, roll_d, pitch_p, pitch_i, pitch_d, yaw_d);
+                    module_id, roll_p, roll_i, roll_d, pitch_p, pitch_i, pitch_d, yaw_d);
 }
 
 void BeetleUnifiedController::cacheCascadeGains(

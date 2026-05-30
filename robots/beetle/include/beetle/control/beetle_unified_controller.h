@@ -79,17 +79,16 @@ public:
                                            double gain);
   void clearInternalWrenchSecondaryReference();
 
-  /** @brief Send torque_allocation_matrix_inv sub-blocks to each module's spinal.
-   *  Each module receives only its own rows (motor_num_per_module_ * rotor_coef_ rows × 3 cols).
+  /** @brief Send this module's torque_allocation_matrix_inv sub-block to its spinal.
    *  Called at mode switch / one-shot resend; not part of the control loop.
    *  @return true if matrix was sent, false if not yet computed. */
   bool sendTorqueAllocationMatrixInv();
 
-  /** @brief Send cascade P/I/D attitude gains to each module's spinal.
+  /** @brief Send cascade P/I/D attitude gains to this module's spinal.
    *  Uses motors.resize(1) path → spinal stores as torque-level gains and
    *  multiplies by torque_allocation_matrix_inv to get per-motor gains.
-   *  v4: I-term is now owned by each spinal (PC does NOT inject Mx/My into
-   *  target_wrench_acc anymore), so roll_i/pitch_i are passed through. */
+   *  v5: roll/pitch I-term is owned by the PC outer loop, so callers pass
+   *  zero roll_i/pitch_i for the spinal P+D cascade. */
   void sendCascadeGains(double roll_p, double roll_i, double roll_d,
                         double pitch_p, double pitch_i, double pitch_d,
                         double yaw_d);
@@ -103,7 +102,7 @@ public:
                          double yaw_d);
 
   /** @brief Reset the one-shot flag so the next computeUnifiedAllocation()
-   *  will re-send allocation matrix + cascade gains to all spinals.
+   *  will re-send allocation matrix + cascade gains to this module's spinal.
    *  Call this when exiting unified mode. */
   void resetCascadeAllocSent() { cascade_alloc_sent_ = false; }
 

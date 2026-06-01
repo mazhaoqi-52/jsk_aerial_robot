@@ -315,6 +315,7 @@ private:
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
   double alloc_rate_weight_;          // optional smoothness weight toward previous allocation
   double alloc_rate_limit_;           // optional per-cycle component delta bound [N], <=0 disables
+  Eigen::VectorXd alloc_wrench_weights_;  // 6D residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
   std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_
   double alloc_interface_force_weight_;   // optional soft cost on interface force proxy [1/N^2]
   double alloc_interface_torque_weight_;  // optional soft cost on interface torque proxy [1/(Nm)^2]
@@ -329,7 +330,7 @@ private:
    * @brief Full-vector constrained QP allocation.
    *
    * Formulation:
-   *   min_{f} ||A*f - w||^2 + λ||f - f_ref||^2
+   *   min_{f} ||W^(1/2)(A*f - w)||^2 + λ||f - f_ref||^2
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
    *

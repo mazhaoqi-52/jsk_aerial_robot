@@ -61,11 +61,15 @@ controller:
   # unless explicitly tuned.
   alloc_rate_weight: 0.0        # soft penalty on |f[k] - f[k-1]|; try 1e-4~1e-3 after log review
   alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
+  # Weighted wrench tracking residual [Fx,Fy,Fz,Tx,Ty,Tz].
+  # During contact-rich towing, horizontal task force is allowed to degrade
+  # before altitude and roll/pitch/yaw stabilization are sacrificed.
+  alloc_wrench_weights: [0.35, 0.35, 1.80, 2.50, 2.50, 1.20]
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
-  alloc_interface_force_weight: 0.0   # soft cost on actuator-side cut force proxy [1/N^2]
-  alloc_interface_torque_weight: 0.0  # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
-  alloc_interface_force_limit: 0.0    # component-wise cut force proxy bound [N]; 0 disables
-  alloc_interface_torque_limit: 0.0   # component-wise cut torque proxy bound [Nm]; 0 disables
+  alloc_interface_force_weight: 1.0e-4   # soft cost on actuator-side cut force proxy [1/N^2]
+  alloc_interface_torque_weight: 1.0e-3  # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
+  alloc_interface_force_limit: 70.0      # component-wise cut force proxy bound [N]; 0 disables
+  alloc_interface_torque_limit: 18.0     # component-wise cut torque proxy bound [Nm]; 0 disables
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

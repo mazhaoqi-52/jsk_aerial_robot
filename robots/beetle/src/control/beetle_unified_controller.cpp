@@ -52,6 +52,7 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_gimbal_limit_rad_(M_PI / 2.0),
 	    alloc_rate_weight_(0.0),
 	    alloc_rate_limit_(0.0),
+	    alloc_wrench_weights_(Eigen::VectorXd::Ones(6)),
 	    alloc_interface_force_weight_(0.0),
 	    alloc_interface_torque_weight_(0.0),
 	    alloc_interface_force_limit_(0.0),
@@ -122,6 +123,27 @@ void BeetleUnifiedController::rosParamInit()
   alloc_interface_torque_weight_ = std::max(0.0, alloc_interface_torque_weight_);
   alloc_interface_force_limit_ = std::max(0.0, alloc_interface_force_limit_);
   alloc_interface_torque_limit_ = std::max(0.0, alloc_interface_torque_limit_);
+
+  alloc_wrench_weights_ = Eigen::VectorXd::Ones(6);
+  XmlRpc::XmlRpcValue wrench_weights;
+  if (control_nh.getParam("alloc_wrench_weights", wrench_weights)) {
+    if (wrench_weights.getType() == XmlRpc::XmlRpcValue::TypeArray &&
+        wrench_weights.size() == 6) {
+      for (int i = 0; i < 6; i++) {
+        double weight = 1.0;
+        if (wrench_weights[i].getType() == XmlRpc::XmlRpcValue::TypeInt) {
+          weight = static_cast<int>(wrench_weights[i]);
+        } else if (wrench_weights[i].getType() == XmlRpc::XmlRpcValue::TypeDouble) {
+          weight = static_cast<double>(wrench_weights[i]);
+        } else {
+          ROS_WARN("[UnifiedCtrl] alloc_wrench_weights[%d] is not numeric; using 1.0", i);
+        }
+        alloc_wrench_weights_(i) = std::max(0.0, weight);
+      }
+    } else {
+      ROS_WARN("[UnifiedCtrl] alloc_wrench_weights must be a YAML list of 6 numbers; using all ones");
+    }
+  }
 
   alloc_module_weights_.clear();
   XmlRpc::XmlRpcValue module_weights;
@@ -735,8 +757,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
   //
   // Objective:  min_f  0.5 * f' * P * f + q' * f
-  //   where P = A'A + R + optional rate/interface terms,
-  //         q = -A'w - R*f_ref - rate_weight*f_prev
+  //   where P = A'WA + R + optional rate/interface terms,
+  //         q = -A'Ww - R*f_ref - rate_weight*f_prev
   //
   // This gives the primary wrench tracking priority while using the nullspace
   // / residual freedom to stay near a weighted hover allocation. Optional
@@ -792,9 +814,14 @@ bool BeetleUnifiedController::solveFullVectorQP(
     f_ref = secondary_ref;
   }
 
-  // --- Build Hessian P = A'A + weighted secondary/rate/interface terms ---
-  Eigen::MatrixXd P_dense = alloc_matrix.transpose() * alloc_matrix;
-  Eigen::VectorXd q_vec = -alloc_matrix.transpose() * w_total;
+  // --- Build Hessian P = A'WA + weighted secondary/rate/interface terms ---
+  Eigen::VectorXd wrench_weights = Eigen::VectorXd::Ones(alloc_matrix.rows());
+  if (alloc_wrench_weights_.size() == alloc_matrix.rows()) {
+    wrench_weights = alloc_wrench_weights_;
+  }
+  Eigen::MatrixXd wrench_weight_diag = wrench_weights.asDiagonal();
+  Eigen::MatrixXd P_dense = alloc_matrix.transpose() * wrench_weight_diag * alloc_matrix;
+  Eigen::VectorXd q_vec = -alloc_matrix.transpose() * wrench_weight_diag * w_total;
 
   for (int m = 0; m < static_cast<int>(assembled_ids.size()); m++) {
     const double module_weight = getModuleAllocationWeight(assembled_ids[m]);

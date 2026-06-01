@@ -711,13 +711,25 @@ namespace aerial_robot_control
         beetle_navigator_->getModuleState() == FOLLOWER)
     {
       double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
+      const int latch_navi_state = navigator_->getNaviState();
+      const bool latch_allowed =
+          !navigator_->getForceLandingFlag() &&
+          (latch_navi_state == aerial_robot_navigation::HOVER_STATE ||
+           latch_navi_state == aerial_robot_navigation::TAKEOFF_STATE);
       if (age < 0.5) {
-        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] FOLLOWER id=%d auto-latch in update(): "
-                 "unified reference fresh (age=%.3fs) but mode is off — forcing ON",
-                 beetle_navigator_->getMyID(), age);
-        unified_control_mode_ = true;
-        ros::NodeHandle ctrl_nh(nh_, "controller");
-        ctrl_nh.setParam("unified_control_mode", true);
+        if (latch_allowed) {
+          ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] FOLLOWER id=%d auto-latch in update(): "
+                   "unified reference fresh (age=%.3fs) but mode is off — forcing ON",
+                   beetle_navigator_->getMyID(), age);
+          unified_control_mode_ = true;
+          ros::NodeHandle ctrl_nh(nh_, "controller");
+          ctrl_nh.setParam("unified_control_mode", true);
+        } else {
+          ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] FOLLOWER id=%d suppress auto-latch: "
+                            "nav=%d force_landing=%d age=%.3fs",
+                            beetle_navigator_->getMyID(), latch_navi_state,
+                            navigator_->getForceLandingFlag(), age);
+        }
       }
     }
 
@@ -736,6 +748,8 @@ namespace aerial_robot_control
         ROS_ERROR("[T4.3] Auto-exit unified mode: %s detected — clearing unified_control_mode for all modules",
                   force_landing ? "FORCE_LANDING" : "HALT");
         unified_control_mode_ = false;
+        unified_cmd_received_ = false;
+        unified_cmd_stamp_ = ros::Time(0);
         // Write to rosparam so FOLLOWERs also pick up the change on next cycle
         ros::NodeHandle control_nh(nh_, "controller");
         control_nh.setParam("unified_control_mode", false);
@@ -1147,12 +1161,24 @@ namespace aerial_robot_control
     if (!unified_control_mode_ &&
         beetle_navigator_->getModuleState() == FOLLOWER)
     {
-      ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d AUTO-LATCH: received unified reference "
-               "while unified_control_mode is false — forcing unified mode ON",
-               beetle_navigator_->getMyID());
-      unified_control_mode_ = true;
-      ros::NodeHandle control_nh(nh_, "controller");
-      control_nh.setParam("unified_control_mode", true);
+      const int latch_navi_state = navigator_->getNaviState();
+      const bool latch_allowed =
+          !navigator_->getForceLandingFlag() &&
+          (latch_navi_state == aerial_robot_navigation::HOVER_STATE ||
+           latch_navi_state == aerial_robot_navigation::TAKEOFF_STATE);
+      if (latch_allowed) {
+        ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d AUTO-LATCH: received unified reference "
+                 "while unified_control_mode is false — forcing unified mode ON",
+                 beetle_navigator_->getMyID());
+        unified_control_mode_ = true;
+        ros::NodeHandle control_nh(nh_, "controller");
+        control_nh.setParam("unified_control_mode", true);
+      } else {
+        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] FOLLOWER id=%d suppress callback auto-latch: "
+                          "nav=%d force_landing=%d",
+                          beetle_navigator_->getMyID(), latch_navi_state,
+                          navigator_->getForceLandingFlag());
+      }
     }
   }
 

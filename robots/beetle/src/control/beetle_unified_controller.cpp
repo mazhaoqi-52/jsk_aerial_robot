@@ -747,10 +747,11 @@ bool BeetleUnifiedController::solveFullVectorQP(
   //   Per rotor i (rotor_coef=2, gimbal_dof=1):
   //     (a) Gimbal angle:  f_x + tan(θ_max)*f_z ≥ 0   (angle ≥ -θ_max)
   //                       -f_x + tan(θ_max)*f_z ≥ 0   (angle ≤ +θ_max)
-  //     (b) Component bounds: -T_max ≤ f_x ≤ T_max,  0 ≤ f_z ≤ T_max
+  //     (b) Thrust magnitude: inner polygon approximation of sqrt(f_x^2+f_z^2) ≤ T_max
+  //     (c) Component bounds: -T_max ≤ f_x ≤ T_max,  0 ≤ f_z ≤ T_max
   //   Optional:
-  //     (c) Rate bounds: |f - f_prev| ≤ Δf_max
-  //     (d) Interface cut-load component bounds: |D*f| ≤ load_max
+  //     (d) Rate bounds: |f - f_prev| ≤ Δf_max
+  //     (e) Interface cut-load component bounds: |D*f| ≤ load_max
 
   const int n_cols = alloc_matrix.cols();
   if (n_cols == 0 || rotor_coef_ == 0 || n_cols % rotor_coef_ != 0) {
@@ -764,8 +765,10 @@ bool BeetleUnifiedController::solveFullVectorQP(
 
   // --- Count constraints ---
   // For rotor_coef == 2:
-  //   2 gimbal angle rows + 2 component-bound rows per rotor = 4 * n_rotors
+  //   2 gimbal angle rows + thrust polygon rows + 2 component-bound rows per rotor
   int n_gimbal_rows = (rotor_coef_ == 2) ? 2 * n_rotors : 0;
+  const int thrust_poly_edges = (rotor_coef_ == 2 && alloc_t_max_ > 0.0) ? 16 : 0;
+  int n_thrust_rows = thrust_poly_edges * n_rotors;
   int n_bound_rows = n_cols;  // one bound per variable
   const bool has_prev_alloc = (prev_vectoring_f_.size() == n_cols);
   const bool use_rate_bound = has_prev_alloc && alloc_rate_limit_ > 0.0;
@@ -782,7 +785,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
       if (limit > 0.0) n_interface_rows++;
     }
   }
-  int n_constraints = n_gimbal_rows + n_bound_rows + n_rate_rows + n_interface_rows;
+  int n_constraints = n_gimbal_rows + n_thrust_rows + n_bound_rows + n_rate_rows + n_interface_rows;
 
   Eigen::VectorXd f_ref = Eigen::VectorXd::Zero(n_cols);
   if (secondary_ref.size() == n_cols) {
@@ -825,7 +828,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // --- Build constraint matrix C and bounds [lb, ub] ---
   // C * f ∈ [lb, ub]
   std::vector<Eigen::Triplet<double>> C_trips;
-  C_trips.reserve(n_gimbal_rows * 2 + n_bound_rows + n_rate_rows + n_interface_rows * n_cols);
+  C_trips.reserve(n_gimbal_rows * 2 + n_thrust_rows * 2 + n_bound_rows +
+                  n_rate_rows + n_interface_rows * n_cols);
   Eigen::VectorXd lb(n_constraints), ub(n_constraints);
 
   int row = 0;
@@ -855,7 +859,29 @@ bool BeetleUnifiedController::solveFullVectorQP(
     }
   }
 
-  // (b) Component bounds: identity rows
+  // (b) Per-rotor thrust magnitude constraints.
+  // OSQP accepts only linear constraints, so approximate the circle
+  // sqrt(f_x^2 + f_z^2) <= T_max with an inscribed regular polygon.
+  if (rotor_coef_ == 2 && thrust_poly_edges > 0) {
+    const double thrust_poly_bound = alloc_t_max_ * std::cos(M_PI / thrust_poly_edges);
+    for (int i = 0; i < n_rotors; i++) {
+      int fx_idx = rotor_coef_ * i;
+      int fz_idx = rotor_coef_ * i + 1;
+      for (int k = 0; k < thrust_poly_edges; k++) {
+        const double angle = 2.0 * M_PI * static_cast<double>(k) /
+                             static_cast<double>(thrust_poly_edges);
+        const double nx = std::cos(angle);
+        const double nz = std::sin(angle);
+        if (std::abs(nx) > 1e-12) C_trips.emplace_back(row, fx_idx, nx);
+        if (std::abs(nz) > 1e-12) C_trips.emplace_back(row, fz_idx, nz);
+        lb(row) = -OsqpEigen::INFTY;
+        ub(row) = thrust_poly_bound;
+        row++;
+      }
+    }
+  }
+
+  // (c) Component bounds: identity rows
   for (int j = 0; j < n_cols; j++) {
     C_trips.emplace_back(row, j, 1.0);
     if (rotor_coef_ == 2 && (j % rotor_coef_ == 1)) {

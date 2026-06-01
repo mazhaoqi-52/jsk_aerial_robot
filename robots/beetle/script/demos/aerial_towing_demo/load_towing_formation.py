@@ -119,11 +119,19 @@ class LinearTowingTrajectoryGenerator:
         # by more than this amount along towing direction, preventing PID saturation
         # when the load is stuck or slow.
         self.max_lead_distance = 0.17  # 170mm
+        self.max_lag_distance = 0.08   # 80mm
 
         # Force adaptation: S-curve ramp over 3 stall windows.
         self.current_force = 0.0
         self.force_locked = False
         self.force_ramp_progress = 0.0
+        self.breakaway_detected = False
+        self.breakaway_relief_applied = False
+        self.breakaway_force_ratio = 0.6
+        self.breakaway_distance = 0.01  # 10mm load motion confirms contact release
+        self.breakaway_velocity = self.target_velocity * 0.1
+        self.last_motion_distance = 0.0
+        self.motion_velocity = 0.0
 
         # Performance monitoring
         self.start_time = rospy.Time.now().to_sec()
@@ -173,6 +181,9 @@ class LinearTowingTrajectoryGenerator:
 
         # Prefer load displacement for progress/completion when available.
         motion_distance = self.current_load_distance if self.load_start_pos is not None else self.current_distance
+        motion_delta = motion_distance - self.last_motion_distance
+        self.motion_velocity = motion_delta / max(safe_dt, 1e-3)
+        self.last_motion_distance = motion_distance
 
         # Velocity profile with ramp-up and ramp-down
         remaining_distance = self.target_distance - motion_distance
@@ -200,6 +211,11 @@ class LinearTowingTrajectoryGenerator:
         # This prevents PID saturation when the load is stuck or slow.
         new_target_distance = min(new_target_distance,
                                   self.current_distance + self.max_lead_distance)
+        # Also keep the target from lagging too far behind the EE after breakaway.
+        # Otherwise position PID fights the towing feedforward while the load is moving.
+        new_target_distance = max(new_target_distance,
+                                  self.current_distance - self.max_lag_distance)
+        new_target_distance = min(self.target_distance, max(0.0, new_target_distance))
 
         self.target_pos[:2] = self.start_pos[:2] + self.towing_direction[:2] * new_target_distance
 
@@ -217,19 +233,25 @@ class LinearTowingTrajectoryGenerator:
             else:
                 self.stall_counter = max(0, self.stall_counter - 1)
 
-        # Adaptive force: ease in, then lock once the load starts moving.
-        if not self.force_locked:
-            vel_check = self._recent_velocity if hasattr(self, '_recent_velocity') else 0.0
-            if vel_check >= self.target_velocity * 0.05 and self.current_force > 0:
-                self.force_locked = True
-                rospy.loginfo(f"[Towing] Load moving, force locked at {self.current_force:.1f}N")
-            else:
-                ramp_time = 3.0 * self.stall_window_time  # 15s
-                self.force_ramp_progress = min(
-                    1.0, self.force_ramp_progress + 1.0 / (ramp_time * self.control_rate))
-                self.current_force = self.max_force * smoothstep01(self.force_ramp_progress)
-                if self.current_force >= self.max_force:
-                    self.force_locked = True
+        # Adaptive force: ease in while stuck, then unload once the load breaks away.
+        if (not self.breakaway_detected and self.load_start_pos is not None and
+                motion_distance >= self.breakaway_distance and
+                self.motion_velocity >= self.breakaway_velocity):
+            self.breakaway_detected = True
+
+        if self.breakaway_detected and not self.breakaway_relief_applied:
+            prev_force = self.current_force
+            self.current_force = prev_force * self.breakaway_force_ratio
+            self.force_locked = True
+            self.breakaway_relief_applied = True
+            rospy.loginfo(f"[Towing] Load breakaway detected: dist={motion_distance*1000:.0f}mm, "
+                         f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                         f"ff {prev_force:.1f}N -> {self.current_force:.1f}N")
+        elif not self.force_locked:
+            ramp_time = 3.0 * self.stall_window_time  # 15s
+            self.force_ramp_progress = min(
+                1.0, self.force_ramp_progress + 1.0 / (ramp_time * self.control_rate))
+            self.current_force = self.max_force * smoothstep01(self.force_ramp_progress)
 
         return {
             'current_distance': self.current_distance,
@@ -237,6 +259,8 @@ class LinearTowingTrajectoryGenerator:
             'target_distance': self.target_distance,
             'current_velocity': self.current_velocity,
             'current_force': self.current_force,
+            'motion_velocity': self.motion_velocity,
+            'breakaway_detected': self.breakaway_detected,
             'progress': motion_distance / self.target_distance,
             'stall_counter': self.stall_counter,
             'using_load_tracking': self.load_start_pos is not None

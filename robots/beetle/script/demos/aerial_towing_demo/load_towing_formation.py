@@ -127,9 +127,9 @@ class LinearTowingTrajectoryGenerator:
         self.force_ramp_progress = 0.0
         self.breakaway_detected = False
         self.breakaway_relief_applied = False
-        self.breakaway_force_ratio = 0.6
-        self.breakaway_distance = 0.01  # 10mm load motion confirms contact release
-        self.breakaway_velocity = self.target_velocity * 0.1
+        self.breakaway_force_ratio = 0.65
+        self.breakaway_distance = 0.05  # 50mm load motion confirms contact release
+        self.breakaway_velocity = self.target_velocity * 0.2
         self.last_motion_distance = 0.0
         self.motion_velocity = 0.0
 
@@ -729,8 +729,11 @@ class TowingWithFeedforwardState(TowingStateBase):
             self.formation_adapter.base_offset_y,
             self.formation_adapter.total_offset_z + TOWING_HOOK_CONTACT_DZ_FROM_EE,
         ])
+        # Keep towing feedforward horizontal in the formation-yaw frame. Current
+        # pitch/roll are tracking errors and should not create body-Z force.
         force_body, torque_body = self.beetle.buildFormationCoGWrench(
-            force_world, application_offset_body=contact_offset_body)
+            force_world, application_offset_body=contact_offset_body,
+            yaw_only=True)
         return force_body, torque_body, "fc"
 
     def execute(self, userdata):
@@ -792,6 +795,7 @@ class TowingWithFeedforwardState(TowingStateBase):
         STALL_TIMEOUT_COUNT = 4   # 4 consecutive stall windows (4x5s = 20s stuck) -> abort
         ABSOLUTE_MAX_TIME = 180.0 # safety net: 3 minutes absolute max
         control_rate = rospy.Rate(25)  # 25Hz
+        unified_mode_seen = False
 
         rospy.loginfo(f"Starting towing loop (stall abort after {STALL_TIMEOUT_COUNT} consecutive stalls, "
                       f"absolute max: {ABSOLUTE_MAX_TIME:.0f}s)...")
@@ -849,12 +853,23 @@ class TowingWithFeedforwardState(TowingStateBase):
 
             # Generate and execute target
             target_state = trajectory_gen.generate_target_state(maintain_yaw)
+            unified_mode = self.beetle.isUnifiedMode()
+            if unified_mode:
+                unified_mode_seen = True
+
+            rpy_result = self.beetle.getAssemblyRPY()
+            pitch_deg = np.degrees(rpy_result[1]) if rpy_result is not None else 0.0
+            raw_z_err = target_state['position'][2] - current_pos[2]
+
+            if unified_mode_seen and not unified_mode:
+                rospy.logwarn("Towing safety abort: unified mode exited during towing")
+                self._clear_external_wrench()
+                userdata.towing_end_position = current_pos
+                self.formation_adapter.set_pitch_compensation(False)
+                return 'timeout'
 
             # Debug: log position and pitch every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
-                rpy_result = self.beetle.getAssemblyRPY()
-                pitch_deg = np.degrees(rpy_result[1]) if rpy_result is not None else 0.0
-                raw_z_err = target_state['position'][2] - current_pos[2]
                 rospy.loginfo(f"[Towing Debug] target_pos={target_state['position']}, "
                              f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f} deg")
 
@@ -866,7 +881,6 @@ class TowingWithFeedforwardState(TowingStateBase):
 
             # ---- Publish desired external wrench via BeetleInterface ----
             ff_world = target_state['force']
-            unified_mode = self.beetle.isUnifiedMode()
             ff_force, ff_torque, ff_frame = self._build_towing_wrench_command(
                 ff_world, unified_mode)
             self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,

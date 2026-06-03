@@ -3,7 +3,7 @@
 //
 // Design: PC outer loop (40Hz) does formation-level 6-DOF allocation.
 // Spinal inner loop (1000Hz) does P+D attitude tracking per-motor.
-// PC retains I-term only for roll/pitch (formation-level slow bias).
+// PC retains roll/pitch I-term and may add a bounded P+D allocation pre-bias.
 //
 // Data flow:
 //   PC → spinal per module:
@@ -66,11 +66,14 @@ public:
    *                               In CoG frame, referenced to formation CoG.
    * @param desired_ext_wrench     6D external wrench demand in body frame [Fx,Fy,Fz,Tx,Ty,Tz] (N, Nm).
    *                               Added as feedforward BEFORE allocation.
+   * @param priority_wrench_acc_cog Optional 6D reference for hard priority bands. When empty,
+   *                                hard bands use target_wrench_acc_cog.
    * @return true if allocation succeeded, false otherwise.
    */
   bool computeUnifiedAllocation(const Eigen::VectorXd& target_wrench_acc_cog,
                                 const Eigen::VectorXd& desired_ext_wrench,
-                                double yaw_pid_raw);
+                                double yaw_pid_raw,
+                                const Eigen::VectorXd& priority_wrench_acc_cog = Eigen::VectorXd());
 
   /** @brief Optional LF-style internal wrench compensation used only as a
    *  secondary allocation reference. Gain 0 disables the effect. The input map
@@ -315,13 +318,15 @@ private:
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
   double alloc_rate_weight_;          // optional smoothness weight toward previous allocation
   double alloc_rate_limit_;           // optional per-cycle component delta bound [N], <=0 disables
-  Eigen::VectorXd alloc_wrench_weights_;  // 6D residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
+  Eigen::VectorXd alloc_wrench_weights_;  // 6D soft residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
   double alloc_effort_weight_;        // optional total-effort penalty on vectoring force
   std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_
   double alloc_interface_force_weight_;   // optional soft cost on interface force proxy [1/N^2]
   double alloc_interface_torque_weight_;  // optional soft cost on interface torque proxy [1/(Nm)^2]
   double alloc_interface_force_limit_;    // optional component-wise interface force proxy limit [N]
   double alloc_interface_torque_limit_;   // optional component-wise interface torque proxy limit [Nm]
+  bool alloc_priority_enabled_;       // hard-prioritize selected 6D wrench tracking rows
+  Eigen::VectorXd alloc_priority_tolerances_;  // [Fx,Fy,Fz,Tx,Ty,Tz] acc-space bands; <=0 disables row
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
   int qp_n_constraints_;              // number of linear constraints, -1 = uninit
   std::unique_ptr<OsqpEigen::Solver> qp_solver_;
@@ -334,15 +339,18 @@ private:
    *   min_{f} ||W^(1/2)(A*f - w)||^2 + ρ||f||^2 + λ||f - f_ref||^2
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
+   *         optional 6D wrench priority bands
    *
    * @param alloc_matrix  Formation allocation matrix A (6 x n_cols)
-   * @param w_total       Desired 6D wrench-acceleration vector
+   * @param w_total       Desired 6D wrench-acceleration vector for the soft objective
+   * @param w_priority    6D wrench-acceleration vector used as the center of hard priority bands
    * @param secondary_ref Preferred allocation in the nullspace / soft secondary objective
    * @param vectoring_f_out  Output: full vectoring force vector (n_cols)
    * @return true on success, false on failure (caller falls back to pseudoinverse)
    */
   bool solveFullVectorQP(const Eigen::MatrixXd& alloc_matrix,
                          const Eigen::VectorXd& w_total,
+                         const Eigen::VectorXd& w_priority,
                          const Eigen::VectorXd& secondary_ref,
                          const std::vector<int>& assembled_ids,
                          const Eigen::MatrixXd& interface_load_matrix,

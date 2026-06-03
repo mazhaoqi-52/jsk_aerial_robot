@@ -36,6 +36,7 @@ namespace aerial_robot_control
     unified_internal_wrench_secondary_gain_(0.0),
     unified_towing_debug_log_(true),
     unified_towing_debug_log_period_(1.0),
+    unified_alloc_attitude_pd_share_(0.0),
     unified_residual_bias_ready_(false),
     unified_residual_bias_samples_(0),
     unified_residual_bias_module_num_(0),
@@ -993,7 +994,7 @@ namespace aerial_robot_control
     ROS_INFO_THROTTLE(
         1.0,
         "[TEMP_UNIFIED_CMD] id=%d stage=ref_pub stamp=%.4f mass=%.3f "
-        "wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+        "wrench_z=%.3f pitch_alloc=%.3f yaw_raw=%.3f",
         beetle_navigator_->getMyID(),
         msg.header.stamp.toSec(),
         msg.formation_mass,
@@ -1145,7 +1146,7 @@ namespace aerial_robot_control
     ROS_INFO_THROTTLE(
         1.0,
         "[TEMP_UNIFIED_CMD] id=%d stage=ref_rx leader_id=%d age=%.4f "
-        "wrench_z=%.3f pitch_i=%.3f yaw_raw=%.3f",
+        "wrench_z=%.3f pitch_alloc=%.3f yaw_raw=%.3f",
         beetle_navigator_->getMyID(),
         beetle_navigator_->getLeaderID(),
         (ros::Time::now() - unified_cmd_stamp_).toSec(),
@@ -1927,8 +1928,12 @@ namespace aerial_robot_control
                      unified_towing_debug_log_period_, 1.0);
     unified_towing_debug_log_period_ =
         std::max(0.1, unified_towing_debug_log_period_);
+    getParam<double>(control_nh, "unified_alloc_attitude_pd_share",
+                     unified_alloc_attitude_pd_share_, 0.0);
+    unified_alloc_attitude_pd_share_ =
+        std::max(0.0, std::min(1.0, unified_alloc_attitude_pd_share_));
 
-    // Roll/Pitch I-term keep ratio removed: outer R/P I-channel disabled in unified mode.
+    // Roll/Pitch allocation P+D share is bounded separately from the spinal P+D path.
 
     // Load unified-mode PID gains for roll/pitch.
     // Full P/I/D: P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
@@ -2631,31 +2636,44 @@ namespace aerial_robot_control
                              pid_controllers_.at(Y).result(),
                              pid_controllers_.at(Z).result());
     tf::Vector3 target_acc_cog = uav_rot.inverse() * target_acc_w;
+    tf::Matrix3x3 priority_rot;
+    priority_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
+    tf::Vector3 priority_acc_cog = priority_rot.inverse() * target_acc_w;
 
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
-    // v5 architecture (mirrors beetle independent mode with i_term_rp_calc_in_pc=true):
-    //   target_wrench_acc(3,4) = (ROLL.getITerm(), PITCH.getITerm())
-    //   spinal owns P+D high-bandwidth (roll_i/pitch_i sent as 0 in sendCascadeSetup)
-    // The outer I-term integrates slow CoG-offset / model-error torques; spinal's P+D
-    // delivers the fast attitude-tracking response. This is the same dual-loop split
-    // db6cec4d adopted and that the original beetle / ninja architectures have used
-    // for years.
-    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
-    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
+    Eigen::VectorXd priority_wrench_acc = Eigen::VectorXd::Zero(6);
+    priority_wrench_acc.head(3) = Eigen::Vector3d(priority_acc_cog.x(), priority_acc_cog.y(), priority_acc_cog.z());
+    // Keep spinal as the high-bandwidth P+D owner, but let the 40 Hz formation
+    // allocator see a bounded share of the same attitude recovery demand. This
+    // prevents high towing/position wrenches from consuming all nominal authority
+    // while the QP is still blind to the downstream cascade correction. The
+    // hard-priority target below intentionally keeps only slow R/P I-term so
+    // fast attitude feedback does not become a positive-feedback constraint.
+    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm()
+        + unified_alloc_attitude_pd_share_ *
+          (pid_controllers_.at(ROLL).getPTerm() + pid_controllers_.at(ROLL).getDTerm());
+    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm()
+        + unified_alloc_attitude_pd_share_ *
+          (pid_controllers_.at(PITCH).getPTerm() + pid_controllers_.at(PITCH).getDTerm());
+    priority_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
+    priority_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
+    priority_wrench_acc(5) = target_wrench_acc(5);
 
     // Gravity FF with takeoff ramp
     {
       tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
       tf::Vector3 gravity_cog = uav_rot.inverse() * gravity_w;
+      tf::Vector3 priority_gravity_cog = priority_rot.inverse() * gravity_w;
       double gravity_ramp = 1.0;
       if (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) {
         constexpr int GRAVITY_RAMP_FRAMES = 20;
         gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
       }
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
+      priority_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(priority_gravity_cog.x(), priority_gravity_cog.y(), priority_gravity_cog.z());
     }
 
     setTargetWrenchAccCog(target_wrench_acc);
@@ -2667,7 +2685,8 @@ namespace aerial_robot_control
     const double since_pub_before_alloc =
         (last_unified_command_pub_time_ >= 0.0)
             ? alloc_start - last_unified_command_pub_time_ : -1.0;
-    bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
+    bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw,
+                                                            priority_wrench_acc);
     const double alloc_end = ros::Time::now().toSec();
     const int local_module_state = beetle_navigator_->getModuleState();
     ROS_INFO_THROTTLE(

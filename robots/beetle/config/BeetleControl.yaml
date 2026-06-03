@@ -48,29 +48,37 @@ controller:
   # nonzero formation_desired_wrench is active.
   unified_towing_debug_log: true
   unified_towing_debug_log_period: 1.0
+  # Share a bounded fraction of roll/pitch P+D with the formation QP. Spinal
+  # still owns the full high-rate P+D loop; this pre-bias keeps the allocator
+  # from consuming all authority before the cascade can correct attitude.
+  unified_alloc_attitude_pd_share: 0.35
 
   # Full-vector constrained QP allocation
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).
   # Constraints: gimbal angle limits (linearized), component bounds.
   use_constrained_alloc: true
   alloc_lambda: 1.0e-4          # secondary objective weight toward balanced hover allocation
-  alloc_t_max: 19.0             # per-rotor thrust upper bound [N]
+  alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   # Optional QP load-sharing extensions. Conservative defaults keep current
   # flight behavior: diagnostics are published, but extra costs/limits are off
   # unless explicitly tuned.
   alloc_rate_weight: 0.0        # soft penalty on |f[k] - f[k-1]|; try 1e-4~1e-3 after log review
   alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
-  # Weighted wrench tracking residual [Fx,Fy,Fz,Tx,Ty,Tz].
-  # During contact-rich towing, horizontal task force is allowed to degrade
-  # before altitude and roll/pitch/yaw stabilization are sacrificed.
-  alloc_wrench_weights: [0.35, 0.35, 1.80, 2.50, 2.50, 1.20]
-  alloc_effort_weight: 1.0e-3   # soft cost on total vectoring effort; prevents aggressive edge allocations
+  # Weighted soft wrench tracking residual [Fx,Fy,Fz,Tx,Ty,Tz]. The hard
+  # priority bands below use a target-frame/slow-feedback reference so fast
+  # attitude or current-tilt artifacts do not become mandatory constraints.
+  alloc_wrench_weights: [1.00, 1.00, 1.80, 2.50, 2.50, 1.20]
+  alloc_effort_weight: 0.0      # keep high-output allocation from being discouraged by a soft effort cost
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
-  alloc_interface_force_weight: 1.0e-4   # soft cost on actuator-side cut force proxy [1/N^2]
-  alloc_interface_torque_weight: 1.0e-3  # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
+  alloc_interface_force_weight: 0.0      # soft cost on actuator-side cut force proxy [1/N^2]
+  alloc_interface_torque_weight: 0.0     # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
   alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
+  alloc_priority_enabled: true
+  # Hard 6D wrench tracking bands [Fx,Fy,Fz,Tx,Ty,Tz] in acceleration space.
+  # Force rows: m/s^2. Torque rows: rad/s^2. Set a row <=0 to keep it soft-only.
+  alloc_priority_wrench_tolerances: [0.35, 0.35, 0.30, 0.40, 0.35, 0.40]
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

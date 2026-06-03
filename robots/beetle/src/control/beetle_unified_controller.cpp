@@ -58,6 +58,8 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_interface_torque_weight_(0.0),
 	    alloc_interface_force_limit_(0.0),
 	    alloc_interface_torque_limit_(0.0),
+	    alloc_priority_enabled_(false),
+	    alloc_priority_tolerances_(Eigen::VectorXd::Zero(6)),
 	    qp_n_vars_(-1),
 	    qp_n_constraints_(-1),
 	    qp_solver_(std::make_unique<OsqpEigen::Solver>())
@@ -115,6 +117,7 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_interface_torque_weight", alloc_interface_torque_weight_, 0.0);
   control_nh.param<double>("alloc_interface_force_limit", alloc_interface_force_limit_, 0.0);
   control_nh.param<double>("alloc_interface_torque_limit", alloc_interface_torque_limit_, 0.0);
+  control_nh.param<bool>("alloc_priority_enabled", alloc_priority_enabled_, false);
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
   alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
@@ -126,6 +129,27 @@ void BeetleUnifiedController::rosParamInit()
   alloc_interface_torque_weight_ = std::max(0.0, alloc_interface_torque_weight_);
   alloc_interface_force_limit_ = std::max(0.0, alloc_interface_force_limit_);
   alloc_interface_torque_limit_ = std::max(0.0, alloc_interface_torque_limit_);
+
+  alloc_priority_tolerances_ = Eigen::VectorXd::Zero(6);
+  XmlRpc::XmlRpcValue priority_tolerances;
+  if (control_nh.getParam("alloc_priority_wrench_tolerances", priority_tolerances)) {
+    if (priority_tolerances.getType() == XmlRpc::XmlRpcValue::TypeArray &&
+        priority_tolerances.size() == 6) {
+      for (int i = 0; i < 6; i++) {
+        double tolerance = 0.0;
+        if (priority_tolerances[i].getType() == XmlRpc::XmlRpcValue::TypeInt) {
+          tolerance = static_cast<int>(priority_tolerances[i]);
+        } else if (priority_tolerances[i].getType() == XmlRpc::XmlRpcValue::TypeDouble) {
+          tolerance = static_cast<double>(priority_tolerances[i]);
+        } else {
+          ROS_WARN("[UnifiedCtrl] alloc_priority_wrench_tolerances[%d] is not numeric; disabling row", i);
+        }
+        alloc_priority_tolerances_(i) = std::max(0.0, tolerance);
+      }
+    } else {
+      ROS_WARN("[UnifiedCtrl] alloc_priority_wrench_tolerances must be a YAML list of 6 numbers; disabling priority rows");
+    }
+  }
 
   alloc_wrench_weights_ = Eigen::VectorXd::Ones(6);
   XmlRpc::XmlRpcValue wrench_weights;
@@ -378,7 +402,8 @@ bool BeetleUnifiedController::updateFormationGeometry()
 bool BeetleUnifiedController::computeUnifiedAllocation(
     const Eigen::VectorXd& target_wrench_acc_cog,
   const Eigen::VectorXd& desired_ext_wrench,
-  double yaw_pid_raw)
+  double yaw_pid_raw,
+  const Eigen::VectorXd& priority_wrench_acc_cog)
 {
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) {
@@ -409,8 +434,13 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Split: rotational part (last 3 cols) for torque_allocation_matrix_inv
   integrated_map_inv_rot_ = integrated_map_inv_.rightCols(3);
 
-  // Add external wrench feedforward (convert from force/torque to acceleration)
+  // Add external wrench feedforward (convert from force/torque to acceleration).
+  // The soft target may contain fast feedback terms, while the priority target
+  // is allowed to be a safer feedforward/slow-feedback reference.
   Eigen::VectorXd total_wrench_acc = target_wrench_acc_cog;
+  Eigen::VectorXd priority_wrench_acc =
+      (priority_wrench_acc_cog.size() == target_wrench_acc_cog.size())
+          ? priority_wrench_acc_cog : target_wrench_acc_cog;
   const bool has_desired_ext_wrench =
       (desired_ext_wrench.size() == 6 && desired_ext_wrench.norm() > 1e-6);
   if (has_desired_ext_wrench) {
@@ -418,6 +448,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     Eigen::Matrix3d inertia_inv = formation_inertia_.inverse();
     total_wrench_acc.head(3) += mass_inv * desired_ext_wrench.head(3);
     total_wrench_acc.tail(3) += inertia_inv * desired_ext_wrench.tail(3);
+    priority_wrench_acc.head(3) += mass_inv * desired_ext_wrench.head(3);
+    priority_wrench_acc.tail(3) += inertia_inv * desired_ext_wrench.tail(3);
   }
 
   Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
@@ -425,16 +457,22 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   std::vector<std::pair<int, int>> interface_cuts;
   buildInterfaceLoadMatrix(assembled_ids, interface_load_matrix, interface_cuts);
 
-  // Allocate: vectoring_f = primary wrench tracking + secondary balanced-load objective.
-  // In cascade mode, the wrench_acc torque channels contain ONLY I-term
-  // (P+D done by spinal). So base_thrust = allocation of (position PID + I-term only).
+  // Allocate: vectoring_f = soft full-wrench tracking + hard priority bands +
+  // secondary balanced-load objective. Spinal still owns the full high-rate
+  // roll/pitch P+D path; any PC-side P+D allocation share stays soft-only.
   if (use_constrained_alloc_) {
     bool qp_ok = solveFullVectorQP(integrated_map_, total_wrench_acc,
+                                   priority_wrench_acc,
                                    secondary_ref, assembled_ids,
                                    interface_load_matrix, target_vectoring_f_);
     if (!qp_ok && has_desired_ext_wrench) {
       Eigen::VectorXd no_ext_wrench_acc = target_wrench_acc_cog;
+      Eigen::VectorXd no_ext_priority_acc = priority_wrench_acc_cog;
+      if (no_ext_priority_acc.size() != target_wrench_acc_cog.size()) {
+        no_ext_priority_acc = target_wrench_acc_cog;
+      }
       qp_ok = solveFullVectorQP(integrated_map_, no_ext_wrench_acc,
+                                no_ext_priority_acc,
                                 secondary_ref, assembled_ids,
                                 interface_load_matrix, target_vectoring_f_);
       if (qp_ok) {
@@ -751,6 +789,7 @@ void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
 bool BeetleUnifiedController::solveFullVectorQP(
     const Eigen::MatrixXd& alloc_matrix,
     const Eigen::VectorXd& w_total,
+    const Eigen::VectorXd& w_priority,
     const Eigen::VectorXd& secondary_ref,
     const std::vector<int>& assembled_ids,
     const Eigen::MatrixXd& interface_load_matrix,
@@ -777,6 +816,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   //   Optional:
   //     (d) Rate bounds: |f - f_prev| ≤ Δf_max
   //     (e) Interface cut-load component bounds: |D*f| ≤ load_max
+  //     (f) Priority bands: selected 6D wrench rows must remain near target
 
   const int n_cols = alloc_matrix.cols();
   if (n_cols == 0 || rotor_coef_ == 0 || n_cols % rotor_coef_ != 0) {
@@ -810,7 +850,15 @@ bool BeetleUnifiedController::solveFullVectorQP(
       if (limit > 0.0) n_interface_rows++;
     }
   }
-  int n_constraints = n_gimbal_rows + n_thrust_rows + n_bound_rows + n_rate_rows + n_interface_rows;
+  std::vector<int> priority_rows;
+  if (alloc_priority_enabled_ && alloc_priority_tolerances_.size() == alloc_matrix.rows()) {
+    for (int r = 0; r < alloc_matrix.rows(); r++) {
+      if (alloc_priority_tolerances_(r) > 0.0) priority_rows.push_back(r);
+    }
+  }
+  const int n_priority_rows = static_cast<int>(priority_rows.size());
+  int n_constraints = n_gimbal_rows + n_thrust_rows + n_bound_rows + n_rate_rows +
+                      n_interface_rows + n_priority_rows;
 
   Eigen::VectorXd f_ref = Eigen::VectorXd::Zero(n_cols);
   if (secondary_ref.size() == n_cols) {
@@ -822,6 +870,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (alloc_wrench_weights_.size() == alloc_matrix.rows()) {
     wrench_weights = alloc_wrench_weights_;
   }
+  const Eigen::VectorXd& priority_target =
+      (w_priority.size() == alloc_matrix.rows()) ? w_priority : w_total;
   Eigen::MatrixXd wrench_weight_diag = wrench_weights.asDiagonal();
   Eigen::MatrixXd P_dense = alloc_matrix.transpose() * wrench_weight_diag * alloc_matrix;
   Eigen::VectorXd q_vec = -alloc_matrix.transpose() * wrench_weight_diag * w_total;
@@ -863,7 +913,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // C * f ∈ [lb, ub]
   std::vector<Eigen::Triplet<double>> C_trips;
   C_trips.reserve(n_gimbal_rows * 2 + n_thrust_rows * 2 + n_bound_rows +
-                  n_rate_rows + n_interface_rows * n_cols);
+                  n_rate_rows + n_interface_rows * n_cols + n_priority_rows * n_cols);
   Eigen::VectorXd lb(n_constraints), ub(n_constraints);
 
   int row = 0;
@@ -953,6 +1003,23 @@ bool BeetleUnifiedController::solveFullVectorQP(
       }
       lb(row) = -limit;
       ub(row) = limit;
+      row++;
+    }
+  }
+
+  // (f) Hard priority bands for task-level high-output allocation.
+  // The band center can differ from the soft target so fast feedback artifacts
+  // do not become hard constraints.
+  if (n_priority_rows > 0) {
+    for (int i = 0; i < n_priority_rows; i++) {
+      const int priority_row = priority_rows[i];
+      const double tol = alloc_priority_tolerances_(priority_row);
+      for (int c = 0; c < n_cols; c++) {
+        const double v = alloc_matrix(priority_row, c);
+        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
+      }
+      lb(row) = priority_target(priority_row) - tol;
+      ub(row) = priority_target(priority_row) + tol;
       row++;
     }
   }

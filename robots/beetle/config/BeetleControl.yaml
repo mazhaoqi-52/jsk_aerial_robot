@@ -54,7 +54,7 @@ controller:
   # Constraints: gimbal angle limits (linearized), component bounds.
   use_constrained_alloc: true
   alloc_lambda: 1.0e-4          # secondary objective weight toward balanced hover allocation
-  alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
+  alloc_t_max: 19.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   # Optional QP load-sharing extensions. Conservative defaults keep current
   # flight behavior: diagnostics are published, but extra costs/limits are off
@@ -65,11 +65,12 @@ controller:
   # During contact-rich towing, horizontal task force is allowed to degrade
   # before altitude and roll/pitch/yaw stabilization are sacrificed.
   alloc_wrench_weights: [0.35, 0.35, 1.80, 2.50, 2.50, 1.20]
+  alloc_effort_weight: 1.0e-3   # soft cost on total vectoring effort; prevents aggressive edge allocations
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
   alloc_interface_force_weight: 1.0e-4   # soft cost on actuator-side cut force proxy [1/N^2]
   alloc_interface_torque_weight: 1.0e-3  # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
-  alloc_interface_force_limit: 70.0      # component-wise cut force proxy bound [N]; 0 disables
-  alloc_interface_torque_limit: 18.0     # component-wise cut torque proxy bound [Nm]; 0 disables
+  alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
+  alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
 
   pd_wrench_comp_mode: true
   # pd_wrench_comp_mode: false

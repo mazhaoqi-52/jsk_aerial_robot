@@ -53,6 +53,7 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_rate_weight_(0.0),
 	    alloc_rate_limit_(0.0),
 	    alloc_wrench_weights_(Eigen::VectorXd::Ones(6)),
+	    alloc_effort_weight_(0.0),
 	    alloc_interface_force_weight_(0.0),
 	    alloc_interface_torque_weight_(0.0),
 	    alloc_interface_force_limit_(0.0),
@@ -109,6 +110,7 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_t_max", alloc_t_max_, 20.0);
   control_nh.param<double>("alloc_rate_weight", alloc_rate_weight_, 0.0);
   control_nh.param<double>("alloc_rate_limit", alloc_rate_limit_, 0.0);
+  control_nh.param<double>("alloc_effort_weight", alloc_effort_weight_, 0.0);
   control_nh.param<double>("alloc_interface_force_weight", alloc_interface_force_weight_, 0.0);
   control_nh.param<double>("alloc_interface_torque_weight", alloc_interface_torque_weight_, 0.0);
   control_nh.param<double>("alloc_interface_force_limit", alloc_interface_force_limit_, 0.0);
@@ -119,6 +121,7 @@ void BeetleUnifiedController::rosParamInit()
 
   alloc_rate_weight_ = std::max(0.0, alloc_rate_weight_);
   alloc_rate_limit_ = std::max(0.0, alloc_rate_limit_);
+  alloc_effort_weight_ = std::max(0.0, alloc_effort_weight_);
   alloc_interface_force_weight_ = std::max(0.0, alloc_interface_force_weight_);
   alloc_interface_torque_weight_ = std::max(0.0, alloc_interface_torque_weight_);
   alloc_interface_force_limit_ = std::max(0.0, alloc_interface_force_limit_);
@@ -757,7 +760,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
   //
   // Objective:  min_f  0.5 * f' * P * f + q' * f
-  //   where P = A'WA + R + optional rate/interface terms,
+  //   where P = A'WA + effort + R + optional rate/interface terms,
   //         q = -A'Ww - R*f_ref - rate_weight*f_prev
   //
   // This gives the primary wrench tracking priority while using the nullspace
@@ -814,7 +817,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
     f_ref = secondary_ref;
   }
 
-  // --- Build Hessian P = A'WA + weighted secondary/rate/interface terms ---
+  // --- Build Hessian P = A'WA + effort + weighted secondary/rate/interface terms ---
   Eigen::VectorXd wrench_weights = Eigen::VectorXd::Ones(alloc_matrix.rows());
   if (alloc_wrench_weights_.size() == alloc_matrix.rows()) {
     wrench_weights = alloc_wrench_weights_;
@@ -822,6 +825,10 @@ bool BeetleUnifiedController::solveFullVectorQP(
   Eigen::MatrixXd wrench_weight_diag = wrench_weights.asDiagonal();
   Eigen::MatrixXd P_dense = alloc_matrix.transpose() * wrench_weight_diag * alloc_matrix;
   Eigen::VectorXd q_vec = -alloc_matrix.transpose() * wrench_weight_diag * w_total;
+
+  if (alloc_effort_weight_ > 0.0) {
+    P_dense.diagonal().array() += alloc_effort_weight_;
+  }
 
   for (int m = 0; m < static_cast<int>(assembled_ids.size()); m++) {
     const double module_weight = getModuleAllocationWeight(assembled_ids[m]);

@@ -2631,33 +2631,25 @@ namespace aerial_robot_control
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
     Eigen::VectorXd priority_wrench_acc = Eigen::VectorXd::Zero(6);
-    // Keep local PID feedback out of hard-priority rows. The soft target carries
-    // position PID and slow roll/pitch I correction; desired task wrench is added
-    // to both soft and priority targets inside computeUnifiedAllocation().
+    // Keep local PID/gravity feedback out of hard-priority rows. The soft target
+    // carries position PID, gravity FF, and slow roll/pitch I correction; desired
+    // task wrench is added to both soft and priority targets in computeUnifiedAllocation().
     target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
     target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 
-    // Gravity FF with takeoff ramp
+    // Gravity FF with takeoff ramp. This stays soft-only so HOVER can still use
+    // Z PID feedback to recover altitude instead of being hard-clamped near g.
     {
       tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
       tf::Vector3 gravity_cog = uav_rot.inverse() * gravity_w;
-      tf::Matrix3x3 priority_rot;
-      priority_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
-      tf::Vector3 priority_gravity_cog = priority_rot.inverse() * gravity_w;
       double gravity_ramp = 1.0;
       if (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) {
         constexpr int GRAVITY_RAMP_FRAMES = 20;
         gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
       }
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
-      if (navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE) {
-        priority_wrench_acc.head(3) +=
-            gravity_ramp * Eigen::Vector3d(priority_gravity_cog.x(),
-                                           priority_gravity_cog.y(),
-                                           priority_gravity_cog.z());
-      }
     }
 
     setTargetWrenchAccCog(target_wrench_acc);

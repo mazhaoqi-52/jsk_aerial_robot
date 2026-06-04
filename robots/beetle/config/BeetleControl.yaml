@@ -49,7 +49,7 @@ controller:
   unified_towing_debug_log: true
   unified_towing_debug_log_period: 1.0
   # Spinal owns roll/pitch P+D. The formation QP receives only the slow PC
-  # I-term in its soft target; hard priority is reserved for gravity/task wrench.
+  # I-term in its soft target; hard priority is reserved for task wrench.
 
   # Full-vector constrained QP allocation
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).

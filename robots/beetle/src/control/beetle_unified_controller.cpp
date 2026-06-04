@@ -481,7 +481,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
   // Allocate: vectoring_f = soft full-wrench tracking + hard priority bands +
   // secondary balanced-load objective. Local feedback remains in the soft
-  // target; hard rows are reserved for gravity and nonzero task wrench.
+  // target; hard rows are reserved for nonzero task wrench.
   if (use_constrained_alloc_) {
     bool qp_ok = solveFullVectorQP(integrated_map_, total_wrench_acc,
                                    priority_wrench_acc,
@@ -892,7 +892,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (alloc_priority_enabled_ && alloc_priority_tolerances_.size() == alloc_matrix.rows()) {
     for (int r = 0; r < alloc_matrix.rows(); r++) {
       // A zero priority center means "do not make this local feedback axis hard".
-      // Nonzero task force/torque and gravity rows remain hard-prioritized.
+      // Nonzero task force/torque rows remain hard-prioritized.
       if (alloc_priority_tolerances_(r) > 0.0 &&
           std::abs(priority_target(r)) > 1e-6) {
         priority_rows.push_back(r);

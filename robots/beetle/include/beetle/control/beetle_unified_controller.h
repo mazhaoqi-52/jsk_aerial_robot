@@ -319,6 +319,7 @@ private:
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
   double alloc_rate_weight_;          // optional smoothness weight toward previous allocation
   double alloc_rate_limit_;           // optional per-cycle component delta bound [N], <=0 disables
+  double alloc_direction_rate_limit_rad_;  // optional per-cycle gimbal direction band [rad]
   Eigen::VectorXd alloc_wrench_weights_;  // 6D soft residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
   double alloc_effort_weight_;        // optional total-effort penalty on vectoring force
   std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_

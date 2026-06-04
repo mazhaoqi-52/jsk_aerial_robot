@@ -2652,7 +2652,12 @@ namespace aerial_robot_control
         gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
       }
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
-      priority_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(priority_gravity_cog.x(), priority_gravity_cog.y(), priority_gravity_cog.z());
+      if (navigator_->getNaviState() != aerial_robot_navigation::TAKEOFF_STATE) {
+        priority_wrench_acc.head(3) +=
+            gravity_ramp * Eigen::Vector3d(priority_gravity_cog.x(),
+                                           priority_gravity_cog.y(),
+                                           priority_gravity_cog.z());
+      }
     }
 
     setTargetWrenchAccCog(target_wrench_acc);

@@ -48,10 +48,8 @@ controller:
   # nonzero formation_desired_wrench is active.
   unified_towing_debug_log: true
   unified_towing_debug_log_period: 1.0
-  # Share a bounded fraction of roll/pitch P+D with the formation QP. Spinal
-  # still owns the full high-rate P+D loop; this pre-bias keeps the allocator
-  # from consuming all authority before the cascade can correct attitude.
-  unified_alloc_attitude_pd_share: 0.35
+  # Spinal owns roll/pitch P+D. The formation QP receives only the slow PC
+  # I-term in its soft target; hard priority is reserved for gravity/task wrench.
 
   # Full-vector constrained QP allocation
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).
@@ -63,11 +61,11 @@ controller:
   # Optional QP load-sharing extensions. Conservative defaults keep current
   # flight behavior: diagnostics are published, but extra costs/limits are off
   # unless explicitly tuned.
-  alloc_rate_weight: 0.0        # soft penalty on |f[k] - f[k-1]|; try 1e-4~1e-3 after log review
-  alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
+  alloc_rate_weight: 1.0e-3     # soft penalty on |f[k] - f[k-1]|
+  alloc_rate_limit: 1.5         # hard per-cycle component delta limit [N]; 0 disables
   # Weighted soft wrench tracking residual [Fx,Fy,Fz,Tx,Ty,Tz]. The hard
-  # priority bands below use a target-frame/slow-feedback reference so fast
-  # attitude or current-tilt artifacts do not become mandatory constraints.
+  # priority bands below use gravity plus nonzero task wrench, so local PID
+  # feedback does not become a distributed hard constraint.
   alloc_wrench_weights: [1.00, 1.00, 1.80, 2.50, 2.50, 1.20]
   alloc_effort_weight: 0.0      # keep high-output allocation from being discouraged by a soft effort cost
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
@@ -77,7 +75,8 @@ controller:
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
   alloc_priority_enabled: true
   # Hard 6D wrench tracking bands [Fx,Fy,Fz,Tx,Ty,Tz] in acceleration space.
-  # Force rows: m/s^2. Torque rows: rad/s^2. Set a row <=0 to keep it soft-only.
+  # Force rows: m/s^2. Torque rows: rad/s^2. Zero-valued priority rows are
+  # skipped at runtime, while nonzero task force/torque rows stay hard.
   alloc_priority_wrench_tolerances: [0.35, 0.35, 0.30, 0.40, 0.35, 0.40]
 
   pd_wrench_comp_mode: true

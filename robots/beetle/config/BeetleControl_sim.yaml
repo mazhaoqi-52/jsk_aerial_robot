@@ -45,6 +45,8 @@ controller:
   # nonzero formation_desired_wrench is active.
   unified_towing_debug_log: true
   unified_towing_debug_log_period: 1.0
+  # Spinal owns roll/pitch P+D. The formation QP receives only the slow PC
+  # I-term in its soft target; hard priority is reserved for gravity/task wrench.
 
   # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
   use_constrained_alloc: true
@@ -53,13 +55,23 @@ controller:
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
   # Optional QP load-sharing extensions. Conservative defaults keep current
   # behavior: diagnostics are published, but extra costs/limits are off unless tuned.
-  alloc_rate_weight: 0.0        # soft penalty on |f[k] - f[k-1]|; try 1e-4~1e-3 after log review
-  alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
+  alloc_rate_weight: 1.0e-3     # soft penalty on |f[k] - f[k-1]|
+  alloc_rate_limit: 1.5         # hard per-cycle component delta limit [N]; 0 disables
+  # Weighted soft wrench tracking residual [Fx,Fy,Fz,Tx,Ty,Tz]. The hard
+  # priority bands below use gravity plus nonzero task wrench, so local PID
+  # feedback does not become a distributed hard constraint.
+  alloc_wrench_weights: [1.00, 1.00, 1.80, 2.50, 2.50, 1.20]
+  alloc_effort_weight: 0.0      # keep high-output allocation from being discouraged by a soft effort cost
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
   alloc_interface_force_weight: 0.0   # soft cost on actuator-side cut force proxy [1/N^2]
   alloc_interface_torque_weight: 0.0  # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
   alloc_interface_force_limit: 0.0    # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0   # component-wise cut torque proxy bound [Nm]; 0 disables
+  alloc_priority_enabled: true
+  # Hard 6D wrench tracking bands [Fx,Fy,Fz,Tx,Ty,Tz] in acceleration space.
+  # Force rows: m/s^2. Torque rows: rad/s^2. Zero-valued priority rows are
+  # skipped at runtime, while nonzero task force/torque rows stay hard.
+  alloc_priority_wrench_tolerances: [0.35, 0.35, 0.30, 0.40, 0.35, 0.40]
 
   desired_wrench_timeout: 0.5
   external_force_upper_limit: 0.0

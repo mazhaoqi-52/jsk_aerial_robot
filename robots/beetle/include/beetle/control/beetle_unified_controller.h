@@ -3,7 +3,7 @@
 //
 // Design: PC outer loop (40Hz) does formation-level 6-DOF allocation.
 // Spinal inner loop (1000Hz) does P+D attitude tracking per-motor.
-// PC retains roll/pitch I-term and may add a bounded P+D allocation pre-bias.
+// PC retains roll/pitch I-term as a soft allocation target.
 //
 // Data flow:
 //   PC → spinal per module:
@@ -61,13 +61,14 @@ public:
   /**
    * @brief Main entry: compute thrust + gimbal commands for ALL rotors in the formation.
    *
-   * @param target_wrench_acc_cog  6D wrench in acceleration space (from LEADER's PID):
+   * @param target_wrench_acc_cog  6D soft wrench target in acceleration space:
    *                               [acc_x, acc_y, acc_z, ang_acc_roll, ang_acc_pitch, ang_acc_yaw]
    *                               In CoG frame, referenced to formation CoG.
    * @param desired_ext_wrench     6D external wrench demand in body frame [Fx,Fy,Fz,Tx,Ty,Tz] (N, Nm).
    *                               Added as feedforward BEFORE allocation.
    * @param priority_wrench_acc_cog Optional 6D reference for hard priority bands. When empty,
-   *                                hard bands use target_wrench_acc_cog.
+   *                                hard bands use target_wrench_acc_cog. Rows whose priority
+   *                                center is approximately zero are kept soft-only.
    * @return true if allocation succeeded, false otherwise.
    */
   bool computeUnifiedAllocation(const Eigen::VectorXd& target_wrench_acc_cog,

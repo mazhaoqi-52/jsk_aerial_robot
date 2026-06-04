@@ -70,7 +70,7 @@ namespace aerial_robot_control
     // LF↔unified switching uses a pure de-gravity bumpless transfer in initUnifiedMode():
     // i_new = i_old - gravity_ff_cog. No per-N seed lookup, no integral freeze, no Ki boost.
     // Unified roll/pitch keeps the spinal as the high-rate P+D owner, while
-    // the formation allocator receives the slow I-term plus an optional P+D share.
+    // the formation allocator receives only the slow PC I-term as a soft target.
 
     bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
     bool unified_internal_wrench_diag_;
@@ -80,7 +80,6 @@ namespace aerial_robot_control
     double unified_internal_wrench_secondary_gain_;
     bool unified_towing_debug_log_;
     double unified_towing_debug_log_period_;
-    double unified_alloc_attitude_pd_share_;
     // Unified residual hover-bias diagnostic. This is log-only: it never feeds
     // wrench_comp_list_ or the allocation secondary.
     bool unified_residual_bias_ready_;

@@ -36,7 +36,6 @@ namespace aerial_robot_control
     unified_internal_wrench_secondary_gain_(0.0),
     unified_towing_debug_log_(true),
     unified_towing_debug_log_period_(1.0),
-    unified_alloc_attitude_pd_share_(0.0),
     unified_residual_bias_ready_(false),
     unified_residual_bias_samples_(0),
     unified_residual_bias_module_num_(0),
@@ -1928,13 +1927,6 @@ namespace aerial_robot_control
                      unified_towing_debug_log_period_, 1.0);
     unified_towing_debug_log_period_ =
         std::max(0.1, unified_towing_debug_log_period_);
-    getParam<double>(control_nh, "unified_alloc_attitude_pd_share",
-                     unified_alloc_attitude_pd_share_, 0.0);
-    unified_alloc_attitude_pd_share_ =
-        std::max(0.0, std::min(1.0, unified_alloc_attitude_pd_share_));
-
-    // Roll/Pitch allocation P+D share is bounded separately from the spinal P+D path.
-
     // Load unified-mode PID gains for roll/pitch.
     // Full P/I/D: P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
     // I-term is retained on PC for slow formation-level bias correction.
@@ -2636,36 +2628,23 @@ namespace aerial_robot_control
                              pid_controllers_.at(Y).result(),
                              pid_controllers_.at(Z).result());
     tf::Vector3 target_acc_cog = uav_rot.inverse() * target_acc_w;
-    tf::Matrix3x3 priority_rot;
-    priority_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
-    tf::Vector3 priority_acc_cog = priority_rot.inverse() * target_acc_w;
-
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
     Eigen::VectorXd priority_wrench_acc = Eigen::VectorXd::Zero(6);
-    priority_wrench_acc.head(3) = Eigen::Vector3d(priority_acc_cog.x(), priority_acc_cog.y(), priority_acc_cog.z());
-    // Keep spinal as the high-bandwidth P+D owner, but let the 40 Hz formation
-    // allocator see a bounded share of the same attitude recovery demand. This
-    // prevents high towing/position wrenches from consuming all nominal authority
-    // while the QP is still blind to the downstream cascade correction. The
-    // hard-priority target below intentionally keeps only slow R/P I-term so
-    // fast attitude feedback does not become a positive-feedback constraint.
-    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm()
-        + unified_alloc_attitude_pd_share_ *
-          (pid_controllers_.at(ROLL).getPTerm() + pid_controllers_.at(ROLL).getDTerm());
-    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm()
-        + unified_alloc_attitude_pd_share_ *
-          (pid_controllers_.at(PITCH).getPTerm() + pid_controllers_.at(PITCH).getDTerm());
-    priority_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
-    priority_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
+    // Keep local PID feedback out of hard-priority rows. The soft target carries
+    // position PID and slow roll/pitch I correction; desired task wrench is added
+    // to both soft and priority targets inside computeUnifiedAllocation().
+    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
+    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
-    priority_wrench_acc(5) = target_wrench_acc(5);
 
     // Gravity FF with takeoff ramp
     {
       tf::Vector3 gravity_w(0, 0, aerial_robot_estimation::G);
       tf::Vector3 gravity_cog = uav_rot.inverse() * gravity_w;
+      tf::Matrix3x3 priority_rot;
+      priority_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
       tf::Vector3 priority_gravity_cog = priority_rot.inverse() * gravity_w;
       double gravity_ramp = 1.0;
       if (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) {

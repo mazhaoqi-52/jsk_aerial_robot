@@ -450,6 +450,19 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     total_wrench_acc.tail(3) += inertia_inv * desired_ext_wrench.tail(3);
     priority_wrench_acc.head(3) += mass_inv * desired_ext_wrench.head(3);
     priority_wrench_acc.tail(3) += inertia_inv * desired_ext_wrench.tail(3);
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[UnifiedCtrl QPRef] id=%d soft=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
+        "priority=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) task=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
+        "rate=(w=%.1e,lim=%.2f)",
+        navigator_ ? navigator_->getMyID() : 0,
+        total_wrench_acc(0), total_wrench_acc(1), total_wrench_acc(2),
+        total_wrench_acc(3), total_wrench_acc(4), total_wrench_acc(5),
+        priority_wrench_acc(0), priority_wrench_acc(1), priority_wrench_acc(2),
+        priority_wrench_acc(3), priority_wrench_acc(4), priority_wrench_acc(5),
+        desired_ext_wrench(0), desired_ext_wrench(1), desired_ext_wrench(2),
+        desired_ext_wrench(3), desired_ext_wrench(4), desired_ext_wrench(5),
+        alloc_rate_weight_, alloc_rate_limit_);
   }
 
   Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
@@ -458,8 +471,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   buildInterfaceLoadMatrix(assembled_ids, interface_load_matrix, interface_cuts);
 
   // Allocate: vectoring_f = soft full-wrench tracking + hard priority bands +
-  // secondary balanced-load objective. Spinal still owns the full high-rate
-  // roll/pitch P+D path; any PC-side P+D allocation share stays soft-only.
+  // secondary balanced-load objective. Local feedback remains in the soft
+  // target; hard rows are reserved for gravity and nonzero task wrench.
   if (use_constrained_alloc_) {
     bool qp_ok = solveFullVectorQP(integrated_map_, total_wrench_acc,
                                    priority_wrench_acc,
@@ -850,16 +863,6 @@ bool BeetleUnifiedController::solveFullVectorQP(
       if (limit > 0.0) n_interface_rows++;
     }
   }
-  std::vector<int> priority_rows;
-  if (alloc_priority_enabled_ && alloc_priority_tolerances_.size() == alloc_matrix.rows()) {
-    for (int r = 0; r < alloc_matrix.rows(); r++) {
-      if (alloc_priority_tolerances_(r) > 0.0) priority_rows.push_back(r);
-    }
-  }
-  const int n_priority_rows = static_cast<int>(priority_rows.size());
-  int n_constraints = n_gimbal_rows + n_thrust_rows + n_bound_rows + n_rate_rows +
-                      n_interface_rows + n_priority_rows;
-
   Eigen::VectorXd f_ref = Eigen::VectorXd::Zero(n_cols);
   if (secondary_ref.size() == n_cols) {
     f_ref = secondary_ref;
@@ -872,6 +875,20 @@ bool BeetleUnifiedController::solveFullVectorQP(
   }
   const Eigen::VectorXd& priority_target =
       (w_priority.size() == alloc_matrix.rows()) ? w_priority : w_total;
+  std::vector<int> priority_rows;
+  if (alloc_priority_enabled_ && alloc_priority_tolerances_.size() == alloc_matrix.rows()) {
+    for (int r = 0; r < alloc_matrix.rows(); r++) {
+      // A zero priority center means "do not make this local feedback axis hard".
+      // Nonzero task force/torque and gravity rows remain hard-prioritized.
+      if (alloc_priority_tolerances_(r) > 0.0 &&
+          std::abs(priority_target(r)) > 1e-6) {
+        priority_rows.push_back(r);
+      }
+    }
+  }
+  const int n_priority_rows = static_cast<int>(priority_rows.size());
+  int n_constraints = n_gimbal_rows + n_thrust_rows + n_bound_rows + n_rate_rows +
+                      n_interface_rows + n_priority_rows;
   Eigen::MatrixXd wrench_weight_diag = wrench_weights.asDiagonal();
   Eigen::MatrixXd P_dense = alloc_matrix.transpose() * wrench_weight_diag * alloc_matrix;
   Eigen::VectorXd q_vec = -alloc_matrix.transpose() * wrench_weight_diag * w_total;

@@ -320,6 +320,7 @@ private:
   double alloc_rate_weight_;          // optional smoothness weight toward previous allocation
   double alloc_rate_limit_;           // optional per-cycle component delta bound [N], <=0 disables
   double alloc_direction_rate_limit_rad_;  // optional per-cycle gimbal direction band [rad]
+  double alloc_lateral_rate_weight_;  // soft penalty on 1-DOF rotor fx changes
   Eigen::VectorXd alloc_wrench_weights_;  // 6D soft residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
   double alloc_effort_weight_;        // optional total-effort penalty on vectoring force
   std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_
@@ -338,7 +339,8 @@ private:
    * @brief Full-vector constrained QP allocation.
    *
    * Formulation:
-   *   min_{f} ||W^(1/2)(A*f - w)||^2 + ρ||f||^2 + λ||f - f_ref||^2
+   *   min_{f} ||W^(1/2)(A*f - w)||^2 + ρ||f||^2
+   *           + λ||f - f_ref||^2 + smoothness terms
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
    *         optional 6D wrench priority bands

@@ -53,6 +53,7 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_rate_weight_(0.0),
 	    alloc_rate_limit_(0.0),
 	    alloc_direction_rate_limit_rad_(0.0),
+	    alloc_lateral_rate_weight_(0.0),
 	    alloc_wrench_weights_(Eigen::VectorXd::Ones(6)),
 	    alloc_effort_weight_(0.0),
 	    alloc_interface_force_weight_(0.0),
@@ -115,6 +116,7 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_rate_limit", alloc_rate_limit_, 0.0);
   double direction_rate_limit_deg = 0.0;
   control_nh.param<double>("alloc_direction_rate_limit_deg", direction_rate_limit_deg, 0.0);
+  control_nh.param<double>("alloc_lateral_rate_weight", alloc_lateral_rate_weight_, 0.0);
   control_nh.param<double>("alloc_effort_weight", alloc_effort_weight_, 0.0);
   control_nh.param<double>("alloc_interface_force_weight", alloc_interface_force_weight_, 0.0);
   control_nh.param<double>("alloc_interface_torque_weight", alloc_interface_torque_weight_, 0.0);
@@ -129,6 +131,7 @@ void BeetleUnifiedController::rosParamInit()
   alloc_rate_limit_ = std::max(0.0, alloc_rate_limit_);
   alloc_direction_rate_limit_rad_ =
       std::max(0.0, direction_rate_limit_deg) * M_PI / 180.0;
+  alloc_lateral_rate_weight_ = std::max(0.0, alloc_lateral_rate_weight_);
   alloc_effort_weight_ = std::max(0.0, alloc_effort_weight_);
   alloc_interface_force_weight_ = std::max(0.0, alloc_interface_force_weight_);
   alloc_interface_torque_weight_ = std::max(0.0, alloc_interface_torque_weight_);
@@ -459,7 +462,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         1.0,
         "[UnifiedCtrl QPRef] id=%d soft=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
         "priority=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) task=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
-        "rate=(w=%.1e,lim=%.2f,dir=%.1fdeg)",
+        "rate=(w=%.1e,fx=%.1e,lim=%.2f,dir=%.1fdeg)",
         navigator_ ? navigator_->getMyID() : 0,
         total_wrench_acc(0), total_wrench_acc(1), total_wrench_acc(2),
         total_wrench_acc(3), total_wrench_acc(4), total_wrench_acc(5),
@@ -467,7 +470,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         priority_wrench_acc(3), priority_wrench_acc(4), priority_wrench_acc(5),
         desired_ext_wrench(0), desired_ext_wrench(1), desired_ext_wrench(2),
         desired_ext_wrench(3), desired_ext_wrench(4), desired_ext_wrench(5),
-        alloc_rate_weight_, alloc_rate_limit_,
+        alloc_rate_weight_, alloc_lateral_rate_weight_, alloc_rate_limit_,
         alloc_direction_rate_limit_rad_ * 180.0 / M_PI);
   }
 
@@ -818,8 +821,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
   //
   // Objective:  min_f  0.5 * f' * P * f + q' * f
-  //   where P = A'WA + effort + R + optional rate/interface terms,
-  //         q = -A'Ww - R*f_ref - rate_weight*f_prev
+  //   where P = A'WA + effort + R + optional rate/lateral-rate/interface terms,
+  //         q = -A'Ww - R*f_ref - smoothness refs
   //
   // This gives the primary wrench tracking priority while using the nullspace
   // / residual freedom to stay near a weighted hover allocation. Optional
@@ -922,6 +925,14 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (has_prev_alloc && alloc_rate_weight_ > 0.0) {
     P_dense.diagonal().array() += alloc_rate_weight_;
     q_vec -= alloc_rate_weight_ * prev_vectoring_f_;
+  }
+
+  if (has_prev_alloc && rotor_coef_ == 2 && alloc_lateral_rate_weight_ > 0.0) {
+    for (int i = 0; i < n_rotors; i++) {
+      const int fx_idx = rotor_coef_ * i;
+      P_dense(fx_idx, fx_idx) += alloc_lateral_rate_weight_;
+      q_vec(fx_idx) -= alloc_lateral_rate_weight_ * prev_vectoring_f_(fx_idx);
+    }
   }
 
   if (has_interface_map &&
@@ -1174,11 +1185,11 @@ bool BeetleUnifiedController::solveFullVectorQP(
     ROS_WARN_THROTTLE(
         1.0,
         "[TEMP_UNIFIED_CMD] stage=qp_solve_fail rows(priority=%d,rate=%d,dir=%d) "
-        "wz=(soft=%.3f,priority=%.3f) rate=(w=%.1e,lim=%.2f,dir=%.1fdeg)",
+        "wz=(soft=%.3f,priority=%.3f) rate=(w=%.1e,fx=%.1e,lim=%.2f,dir=%.1fdeg)",
         n_priority_rows, n_rate_rows, n_direction_rate_rows,
         w_total.size() > 2 ? w_total(2) : 0.0,
         priority_target.size() > 2 ? priority_target(2) : 0.0,
-        alloc_rate_weight_, alloc_rate_limit_,
+        alloc_rate_weight_, alloc_lateral_rate_weight_, alloc_rate_limit_,
         alloc_direction_rate_limit_rad_ * 180.0 / M_PI);
     return false;
   }

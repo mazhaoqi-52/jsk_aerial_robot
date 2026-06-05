@@ -17,6 +17,7 @@ import numpy as np
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav
+from std_msgs.msg import UInt8
 from tf.transformations import euler_from_quaternion
 
 # Add parent paths for imports
@@ -45,8 +46,6 @@ LOAD_BOX_HEIGHT = 0.86   # z dimension (m)
 LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
 
 # ============== Towing Task Parameters ==============
-# Command an extra 30mm descent during insertion after reaching the approach height.
-INSERTION_DEPTH = 0.02   # 20mm deeper insertion in DESCEND_AND_INSERT
 RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
 HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
 TOWING_DISTANCE = 0.6    # towing distance (m), overridden by ~towing_distance param
@@ -69,6 +68,13 @@ TRANSIT_CLEARANCE_OFFSET = 0.30
 # The two hooks are symmetric in Y, so the equivalent towing contact uses y=0.
 TOWING_HOOK_CONTACT_DX_FROM_EE = -0.02404
 TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
+# Final insertion is defined by the hook contact point, not by virtual EE descent.
+# Positive clearance keeps the hook contact above the box top; negative means
+# intentionally inserting below the box top.
+HOOK_CONTACT_INSERT_CLEARANCE = 0.02
+# Only split the descent when the final hook-insertion segment is long enough
+# to be meaningful. Shorter insertions are handled in one continuous descent.
+MIN_SPLIT_INSERTION_DROP = 0.10
 
 # Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Towing primarily tracks
 # horizontal pull force. The r x F torque from the hook offset is kept as a
@@ -369,6 +375,14 @@ class TowingStateBase(FormationSingleUAVStateBase):
 
     # Shared load interface across states
     _shared_load_interface = None
+    _debug_subscribers = []
+    _debug_module_ids = set()
+    _debug_lock = threading.Lock()
+    _last_four_axis_stamp = {}
+    _last_flight_state_stamp = {}
+    _last_flight_state = {}
+    _last_config_ack_stamp = {}
+    _last_config_ack = {}
 
     def __init__(self, outcomes, input_keys=None, output_keys=None):
         FormationSingleUAVStateBase.__init__(self, outcomes, input_keys, output_keys)
@@ -377,6 +391,70 @@ class TowingStateBase(FormationSingleUAVStateBase):
         if TowingStateBase._shared_load_interface is None:
             TowingStateBase._shared_load_interface = LoadInterface()
         self.load_interface = TowingStateBase._shared_load_interface
+        self._init_module_debug_monitors()
+
+    def _init_module_debug_monitors(self):
+        """Track command and force-landing heartbeat during insertion debug."""
+        with TowingStateBase._debug_lock:
+            missing_ids = [
+                module_id for module_id in self.formation_adapter.module_ids
+                if module_id not in TowingStateBase._debug_module_ids
+            ]
+            for module_id in missing_ids:
+                TowingStateBase._debug_subscribers.extend([
+                    rospy.Subscriber(f"/beetle{module_id}/four_axes/command",
+                                     rospy.AnyMsg, self._four_axis_debug_cb,
+                                     callback_args=module_id, queue_size=1),
+                    rospy.Subscriber(f"/beetle{module_id}/flight_state",
+                                     UInt8, self._flight_state_debug_cb,
+                                     callback_args=module_id, queue_size=1),
+                    rospy.Subscriber(f"/beetle{module_id}/flight_config_ack",
+                                     UInt8, self._config_ack_debug_cb,
+                                     callback_args=module_id, queue_size=1),
+                ])
+                TowingStateBase._debug_module_ids.add(module_id)
+
+    def _four_axis_debug_cb(self, _msg, module_id):
+        with TowingStateBase._debug_lock:
+            TowingStateBase._last_four_axis_stamp[module_id] = rospy.Time.now().to_sec()
+
+    def _flight_state_debug_cb(self, msg, module_id):
+        with TowingStateBase._debug_lock:
+            TowingStateBase._last_flight_state[module_id] = msg.data
+            TowingStateBase._last_flight_state_stamp[module_id] = rospy.Time.now().to_sec()
+
+    def _config_ack_debug_cb(self, msg, module_id):
+        with TowingStateBase._debug_lock:
+            TowingStateBase._last_config_ack[module_id] = msg.data
+            TowingStateBase._last_config_ack_stamp[module_id] = rospy.Time.now().to_sec()
+
+    def format_module_debug_status(self):
+        now = rospy.Time.now().to_sec()
+
+        def age_text(stamp, stale_limit=0.5):
+            if stamp is None:
+                return "NA"
+            age = now - stamp
+            suffix = "!" if age > stale_limit else ""
+            return f"{age:.2f}s{suffix}"
+
+        with TowingStateBase._debug_lock:
+            parts = []
+            for module_id in self.formation_adapter.module_ids:
+                cmd_stamp = TowingStateBase._last_four_axis_stamp.get(module_id)
+                state_stamp = TowingStateBase._last_flight_state_stamp.get(module_id)
+                ack_stamp = TowingStateBase._last_config_ack_stamp.get(module_id)
+                state = TowingStateBase._last_flight_state.get(module_id, "NA")
+                ack = TowingStateBase._last_config_ack.get(module_id, "NA")
+                parts.append(
+                    f"b{module_id}:cmd_age={age_text(cmd_stamp)} "
+                    f"state={state}/age={age_text(state_stamp)} "
+                    f"ack={ack}/age={age_text(ack_stamp, stale_limit=2.0)}"
+                )
+        return " module_debug=[" + "; ".join(parts) + "]"
+
+    def log_module_debug_status(self, prefix):
+        rospy.loginfo(f"{prefix}{self.format_module_debug_status()}")
 
     def get_load_position(self):
         """Get current load position."""
@@ -498,7 +576,7 @@ class ApproachLoadState(TowingStateBase):
         TowingStateBase.__init__(self,
             outcomes=['succeeded', 'failed'],
             input_keys=['load_position', 'approach_direction', 'approach_side', 'edge_position'],
-            output_keys=['insertion_position', 'insertion_yaw'])
+            output_keys=['approach_position', 'insertion_position', 'insertion_yaw'])
 
     def execute(self, userdata):
         rospy.loginfo("=== Approach Load State ===")
@@ -513,6 +591,9 @@ class ApproachLoadState(TowingStateBase):
         load_center_z = float(load_pos[2])
         load_top_z = load_center_z + LOAD_BOX_HEIGHT / 2
         approach_height = load_top_z + APPROACH_HEIGHT_OFFSET
+        insertion_z = (load_top_z + HOOK_CONTACT_INSERT_CLEARANCE -
+                       TOWING_HOOK_CONTACT_DZ_FROM_EE)
+        approach_hook_clearance = approach_height + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
 
         # Position slightly inside the box edge (overshoot by 110mm for insertion)
         overshoot = 0.11  # 110mm inside box edge
@@ -535,6 +616,10 @@ class ApproachLoadState(TowingStateBase):
             f"approach_offset={APPROACH_HEIGHT_OFFSET:.3f}m"
         )
         rospy.loginfo(f"Target height: {approach_height:.3f}m")
+        rospy.loginfo(
+            f"Hook contact clearance: approach={approach_hook_clearance*1000:.0f}mm, "
+            f"insert={HOOK_CONTACT_INSERT_CLEARANCE*1000:.0f}mm above box top"
+        )
         rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f} deg")
 
         # Phase 1: XY movement (Z = box-anchored safety floor or current Z, whichever higher)
@@ -572,10 +657,21 @@ class ApproachLoadState(TowingStateBase):
         if not success:
             rospy.logwarn("Phase 2 yaw adjustment incomplete, continuing...")
 
-        # Descent is handled entirely by DESCEND_AND_INSERT (single-stage descent)
-        insertion_z = approach_height - INSERTION_DEPTH
-        userdata.insertion_position = np.array([approach_xy[0], approach_xy[1], insertion_z])
+        # DESCEND_AND_INSERT conditionally splits at this approach height. If the
+        # final hook insertion would be too short, it descends directly instead.
+        approach_pos = np.array([approach_xy[0], approach_xy[1], approach_height])
+        insertion_pos = np.array([approach_xy[0], approach_xy[1], insertion_z])
+        userdata.insertion_position = insertion_pos
+        userdata.approach_position = approach_pos
         userdata.insertion_yaw = target_yaw
+
+        final_insert_drop = max(0.0, approach_height - insertion_z)
+        rospy.loginfo(
+            f"Insertion plan: approach_pos={FormationUtils.format_vec(approach_pos)}, "
+            f"insert_pos={FormationUtils.format_vec(insertion_pos)}, "
+            f"final_insert_drop={final_insert_drop*1000:.1f}mm "
+            f"(split_min={MIN_SPLIT_INSERTION_DROP*1000:.0f}mm)"
+        )
 
         rospy.loginfo("Approach complete")
         return 'succeeded'
@@ -587,7 +683,8 @@ class DescendAndInsertState(TowingStateBase):
     def __init__(self):
         TowingStateBase.__init__(self,
             outcomes=['succeeded', 'failed'],
-            input_keys=['insertion_position', 'insertion_yaw', 'approach_direction'],
+            input_keys=['approach_position', 'insertion_position', 'insertion_yaw',
+                        'approach_direction', 'load_position'],
             output_keys=['hook_position', 'hook_yaw'])
 
     def execute(self, userdata):
@@ -595,33 +692,88 @@ class DescendAndInsertState(TowingStateBase):
 
         insertion_pos = userdata.insertion_position
         insertion_yaw = userdata.insertion_yaw
+        approach_pos = userdata.approach_position
+        load_top_z = float(userdata.load_position[2]) + LOAD_BOX_HEIGHT / 2
 
+        rospy.loginfo(f"Approach-height target: {FormationUtils.format_vec(approach_pos)}")
         rospy.loginfo(f"Insertion target: {FormationUtils.format_vec(insertion_pos)}")
-        rospy.loginfo(f"Insertion depth: {INSERTION_DEPTH*1000:.0f}mm into box")
+        final_insert_drop = max(0.0, approach_pos[2] - insertion_pos[2])
+        rospy.loginfo(
+            f"Final hook insertion drop: {final_insert_drop*1000:.1f}mm "
+            f"(split_min={MIN_SPLIT_INSERTION_DROP*1000:.0f}mm)"
+        )
+        rospy.loginfo(
+            f"Hook contact target clearance: {HOOK_CONTACT_INSERT_CLEARANCE*1000:.0f}mm above box top "
+            f"(box_top={load_top_z:.3f}m, hook_dz_from_ee={TOWING_HOOK_CONTACT_DZ_FROM_EE:.3f}m)"
+        )
 
         current_pos = self.get_end_effector_position()
         if current_pos is None:
             rospy.logerr("Cannot get current position")
             return 'failed'
 
-        # Use streaming Z descent
-        success, achieved_pos = self.streaming_z_descent(
-            current_pos,
-            insertion_pos,
-            insertion_yaw,
-            descent_speed=0.05
-        )
+        if final_insert_drop < MIN_SPLIT_INSERTION_DROP:
+            rospy.loginfo("[Insertion] Final insertion segment is short; using one continuous descent")
+            self.log_module_debug_status("[Insertion Debug] before single insertion descent")
+            success, achieved_pos = self.streaming_z_descent(
+                current_pos,
+                insertion_pos,
+                insertion_yaw,
+                descent_speed=0.05
+            )
+        else:
+            self.log_module_debug_status("[Insertion Debug] before approach descent")
+
+            # Stage 1: descend from transit height to load-anchored approach height.
+            success, achieved_pos = self.streaming_z_descent(
+                current_pos,
+                approach_pos,
+                insertion_yaw,
+                descent_speed=0.05
+            )
+
+            if not success:
+                rospy.logerr("Approach-height descent failed (aborted). Exiting state machine.")
+                self.log_module_debug_status("[Insertion Debug] approach descent failed")
+                return 'failed'
+
+            self.log_module_debug_status("[Insertion Debug] before approach recenter")
+            recentered = self.active_position_convergence(
+                approach_pos, target_yaw=insertion_yaw,
+                pos_thresh=0.035, yaw_thresh=0.05, timeout=10.0,
+                max_linear_vel=0.04
+            )
+            if not recentered:
+                rospy.logwarn("Approach-height recenter incomplete; continuing to final insertion.")
+                self.log_module_debug_status("[Insertion Debug] approach recenter incomplete")
+
+            current_pos = self.get_end_effector_position()
+            if current_pos is None:
+                rospy.logerr("Cannot get current position before final insertion")
+                return 'failed'
+
+            # Stage 2: final insertion based on hook contact clearance.
+            self.log_module_debug_status("[Insertion Debug] before final insertion")
+            success, achieved_pos = self.streaming_z_descent(
+                current_pos,
+                insertion_pos,
+                insertion_yaw,
+                descent_speed=0.03
+            )
 
         if not success:
             # If descent aborted (e.g., retry limit hit), don't continue with hook/tow.
             rospy.logerr("Z descent failed (aborted). Exiting state machine.")
+            self.log_module_debug_status("[Insertion Debug] insertion descent failed")
             return 'failed'
 
-        # Verify achieved descent relative to the approach-height reference.
+        # Verify achieved hook contact clearance relative to the load top.
         if achieved_pos is not None:
-            reference_z = userdata.insertion_position[2] + INSERTION_DEPTH
-            actual_depth = reference_z - achieved_pos[2]
-            rospy.loginfo(f"Achieved insertion: {actual_depth*1000:.1f}mm (positive=deeper)")
+            achieved_clearance = achieved_pos[2] + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
+            rospy.loginfo(
+                f"Achieved hook contact clearance: {achieved_clearance*1000:.1f}mm "
+                f"(target={HOOK_CONTACT_INSERT_CLEARANCE*1000:.1f}mm, positive=above box top)"
+            )
 
         # Stabilize at insertion position
         rospy.loginfo("Stabilizing at insertion position...")
@@ -1151,7 +1303,7 @@ def main():
     rospy.loginfo("Formation Load Towing Task")
     rospy.loginfo("=" * 60)
     rospy.loginfo(f"Load box: {LOAD_BOX_LENGTH}m x {LOAD_BOX_WIDTH}m x {LOAD_BOX_HEIGHT}m")
-    rospy.loginfo(f"Insertion depth: {INSERTION_DEPTH*1000:.0f}mm")
+    rospy.loginfo(f"Hook contact insert clearance: {HOOK_CONTACT_INSERT_CLEARANCE*1000:.0f}mm above box top")
     rospy.loginfo(f"Retract distance: {RETRACT_DISTANCE*1000:.0f}mm")
     rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
     rospy.loginfo(f"Max towing force: {TOWING_MAX_FORCE}N (adaptive from 0N)")

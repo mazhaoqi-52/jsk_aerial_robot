@@ -637,12 +637,16 @@ class FormationSingleUAVStateBase(smach.State):
             rospy.logerr("[Z Descent] Missing start or target position")
             return False, None
 
+        def debug_suffix():
+            debug_fn = getattr(self, "format_module_debug_status", None)
+            return debug_fn() if callable(debug_fn) else ""
+
         target_x, target_y, target_z = final_target
         start_z = start_pos[2]
         total_descent = start_z - target_z
 
         if total_descent <= 0.01:
-            rospy.loginfo("[Z Descent] Small descent, direct convergence")
+            rospy.loginfo(f"[Z Descent] Small descent, direct convergence{debug_suffix()}")
             self.send_assembly_command_from_end_effector(final_target, final_yaw)
             success = self.active_position_convergence(
                 final_target, target_yaw=final_yaw,
@@ -650,7 +654,8 @@ class FormationSingleUAVStateBase(smach.State):
             achieved = self.get_end_effector_position() or final_target
             return success, achieved
 
-        rospy.loginfo(f"[Z Descent] {total_descent*1000:.1f}mm at {descent_speed*1000:.0f}mm/s")
+        rospy.loginfo(f"[Z Descent] {total_descent*1000:.1f}mm at "
+                      f"{descent_speed*1000:.0f}mm/s{debug_suffix()}")
 
         # Generate Z-only polynomial trajectory (XY locked, yaw locked)
         duration = max(total_descent / descent_speed, 2.0) / 0.7  # safety factor
@@ -717,7 +722,8 @@ class FormationSingleUAVStateBase(smach.State):
 
             # Safety: XY divergence abort
             if xy_error > xy_diverge_limit:
-                rospy.logwarn(f"[Z Descent] XY diverged to {xy_error*1000:.0f}mm, aborting")
+                rospy.logwarn(f"[Z Descent] XY diverged to {xy_error*1000:.0f}mm, "
+                              f"aborting{debug_suffix()}")
                 return False, actual_pos
 
             # Adaptive XY pause threshold (linearly narrows with descent progress)
@@ -733,7 +739,7 @@ class FormationSingleUAVStateBase(smach.State):
                                  f"(thresh={xy_resume_thresh*1000:.0f}mm)")
                 elif rospy.get_time() - pause_start > pause_timeout:
                     rospy.logwarn(f"[Z Descent] XY pause timeout {pause_timeout}s, "
-                                 f"XY_err={xy_error*1000:.0f}mm, aborting")
+                                 f"XY_err={xy_error*1000:.0f}mm, aborting{debug_suffix()}")
                     return False, actual_pos
             else:
                 if xy_error > xy_pause_thresh:
@@ -741,7 +747,8 @@ class FormationSingleUAVStateBase(smach.State):
                     pause_z = cmd_z
                     pause_start = rospy.get_time()
                     rospy.logwarn(f"[Z Descent] XY drift {xy_error*1000:.0f}mm > "
-                                 f"thresh {xy_pause_thresh*1000:.0f}mm, pausing at Z={cmd_z:.3f}m")
+                                 f"thresh {xy_pause_thresh*1000:.0f}mm, "
+                                 f"pausing at Z={cmd_z:.3f}m{debug_suffix()}")
 
             # Contact detection: actual Z stopped AND command is significantly below actual
             if not paused:
@@ -770,7 +777,7 @@ class FormationSingleUAVStateBase(smach.State):
                 status = " [PAUSED]" if paused else ""
                 rospy.loginfo(f"[Z Descent] t={traj_time:.1f}/{duration:.1f}s Z={actual_z:.3f}m "
                               f"descended={descended*1000:.0f}mm XY_err={xy_error*1000:.0f}mm"
-                              f" thresh={xy_pause_thresh*1000:.0f}mm{status}")
+                              f" thresh={xy_pause_thresh*1000:.0f}mm{status}{debug_suffix()}")
 
             rate.sleep()
 

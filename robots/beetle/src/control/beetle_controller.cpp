@@ -13,7 +13,9 @@ namespace aerial_robot_control
     pd_wrench_comp_mode_(false),
     pre_module_state_(SEPARATED),
     formation_desired_wrench_(Eigen::VectorXd::Zero(6)),
+    formation_desired_wrench_weights_(Eigen::VectorXd::Zero(6)),
     formation_desired_wrench_timestamp_(-1.0),
+    formation_desired_wrench_weights_timestamp_(-1.0),
     desired_wrench_timeout_(0.5),
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
@@ -100,7 +102,9 @@ namespace aerial_robot_control
     // [Step D'] Pairwise observer disagreement diagnostic (leader-only publish).
     inter_disagreement_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("inter_disagreement", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
+    desired_ext_wrench_weights_sub_ = nh_.subscribe("desired_external_wrench_weights", 1, &BeetleController::desiredExternalWrenchWeightsCallback, this);
     formation_desired_wrench_sub_ = nh_.subscribe("formation_desired_wrench", 1, &BeetleController::formationDesiredWrenchCallback, this);
+    formation_desired_wrench_weights_sub_ = nh_.subscribe("formation_desired_wrench_weights", 1, &BeetleController::formationDesiredWrenchWeightsCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
@@ -115,6 +119,7 @@ namespace aerial_robot_control
       est_wrench_task_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/est_wrench_task"), 1, &BeetleController::estWrenchTaskCallback, this)));
       est_wrench_task_pubs_[i+1] = nh_.advertise<beetle::TaggedWrench>(module_name + string("/est_wrench_task"), 1);
       desired_ext_wrench_pubs_[i+1] = nh_.advertise<geometry_msgs::WrenchStamped>(module_name + string("/desired_external_wrench"), 1);
+      desired_ext_wrench_weights_pubs_[i+1] = nh_.advertise<std_msgs::Float32MultiArray>(module_name + string("/desired_external_wrench_weights"), 1);
       module_model_subs_.insert(make_pair(module_name, nh_.subscribe(module_name + string("/unified_control/module_model"), 1,
                                                                      &BeetleController::moduleModelCallback, this)));
     }
@@ -279,7 +284,9 @@ namespace aerial_robot_control
       for (auto& kv : wrench_comp_list_) kv.second = Eigen::VectorXd::Zero(6);
       for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
       formation_desired_wrench_.setZero();
+      formation_desired_wrench_weights_.setZero();
       formation_desired_wrench_timestamp_ = -1.0;
+      formation_desired_wrench_weights_timestamp_ = -1.0;
       unified_residual_bias_ready_ = false;
       unified_residual_bias_samples_ = 0;
       unified_residual_bias_module_num_ = 0;
@@ -2166,6 +2173,40 @@ namespace aerial_robot_control
     }
   }
 
+  void BeetleController::desiredExternalWrenchWeightsCallback(const std_msgs::Float32MultiArray & msg)
+  {
+    if (msg.data.size() < 6) {
+      ROS_WARN_THROTTLE(1.0,
+                        "[BeetleController] desired_external_wrench_weights expects 6 values, got %zu",
+                        msg.data.size());
+      return;
+    }
+
+    Eigen::VectorXd weights = Eigen::VectorXd::Zero(6);
+    for (int i = 0; i < 6; i++) {
+      weights(i) = std::max(0.0, static_cast<double>(msg.data[i]));
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+      formation_desired_wrench_weights_ = weights;
+      formation_desired_wrench_weights_timestamp_ = ros::Time::now().toSec();
+    }
+
+    if (beetle_navigator_->getModuleState() != LEADER) {
+      return;
+    }
+
+    std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
+    int leader_id = beetle_navigator_->getLeaderID();
+    for (const auto & item : assembly_flag) {
+      if (!item.second) continue;
+      if (item.first == leader_id) continue;
+      if (desired_ext_wrench_weights_pubs_.count(item.first) == 0) continue;
+      desired_ext_wrench_weights_pubs_[item.first].publish(msg);
+    }
+  }
+
   bool BeetleController::setUnifiedModeCb(std_srvs::SetBool::Request &req,
                                           std_srvs::SetBool::Response &res)
   {
@@ -2188,6 +2229,11 @@ namespace aerial_robot_control
     // Reuse the legacy callback so leader rebroadcast and storage semantics
     // stay identical across both input topics.
     desiredExternalWrenchCallback(msg);
+  }
+
+  void BeetleController::formationDesiredWrenchWeightsCallback(const std_msgs::Float32MultiArray& msg)
+  {
+    desiredExternalWrenchWeightsCallback(msg);
   }
 
   void BeetleController::publishAssembleDebug(
@@ -2509,26 +2555,37 @@ namespace aerial_robot_control
     }
 
     // Unified mode has a single task-wrench path: formation_desired_wrench_
-    // is added directly inside computeUnifiedAllocation(). Keep PID persistent
-    // FF clear so the same external wrench cannot be injected twice.
+    // is tracked as a weighted QP task objective. Keep PID persistent FF clear
+    // so the same external wrench cannot be injected twice.
     pid_controllers_.at(X).setPersistentFF(0.0);
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
 
     Eigen::VectorXd formation_wrench_cmd;
+    Eigen::VectorXd formation_wrench_weights_cmd;
     double formation_wrench_stamp = -1.0;
+    double formation_wrench_weights_stamp = -1.0;
     {
       std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
       formation_wrench_cmd = formation_desired_wrench_;
       formation_wrench_stamp = formation_desired_wrench_timestamp_;
+      formation_wrench_weights_cmd = formation_desired_wrench_weights_;
+      formation_wrench_weights_stamp = formation_desired_wrench_weights_timestamp_;
     }
     const bool formation_wrench_fresh =
         formation_wrench_stamp > 0.0 &&
         (desired_wrench_timeout_ <= 0.0 ||
          ros::Time::now().toSec() - formation_wrench_stamp <= desired_wrench_timeout_);
+    const bool formation_wrench_weights_fresh =
+        formation_wrench_weights_stamp > 0.0 &&
+        (desired_wrench_timeout_ <= 0.0 ||
+         ros::Time::now().toSec() - formation_wrench_weights_stamp <= desired_wrench_timeout_);
     if (navigator_->getForceLandingFlag() || !formation_wrench_fresh) {
       formation_wrench_cmd.setZero();
+      formation_wrench_weights_cmd = Eigen::VectorXd();
+    } else if (!formation_wrench_weights_fresh || formation_wrench_weights_cmd.size() != 6) {
+      formation_wrench_weights_cmd = Eigen::VectorXd();
     }
 
     switch (navigator_->getXyControlMode()) {
@@ -2631,9 +2688,9 @@ namespace aerial_robot_control
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
     Eigen::VectorXd priority_wrench_acc = Eigen::VectorXd::Zero(6);
-    // Keep local PID/gravity feedback out of hard-priority rows. The soft target
-    // carries position PID, gravity FF, and slow roll/pitch I correction; desired
-    // task wrench is added to both soft and priority targets in computeUnifiedAllocation().
+    // Keep local PID/gravity feedback out of hard-priority rows. The control
+    // target carries position PID, gravity FF, and slow roll/pitch I correction;
+    // desired task wrench is added as a separate weighted soft objective.
     target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
     target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
@@ -2662,7 +2719,7 @@ namespace aerial_robot_control
         (last_unified_command_pub_time_ >= 0.0)
             ? alloc_start - last_unified_command_pub_time_ : -1.0;
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw,
-                                                            priority_wrench_acc);
+                                                            priority_wrench_acc, formation_wrench_weights_cmd);
     const double alloc_end = ros::Time::now().toSec();
     const int local_module_state = beetle_navigator_->getModuleState();
     ROS_INFO_THROTTLE(

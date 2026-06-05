@@ -11,6 +11,7 @@
 #include <beetle/control/beetle_unified_controller.h>
 #include <beetle/control/formation_momentum_observer.h>
 #include <std_srvs/SetBool.h>
+#include <std_msgs/Float32MultiArray.h>
 #include <mutex>
 
 namespace aerial_robot_control
@@ -193,7 +194,9 @@ namespace aerial_robot_control
     map<string, ros::Subscriber> est_wrench_task_subs_;
     map<int, ros::Publisher> est_wrench_task_pubs_;
     map<int, ros::Publisher> desired_ext_wrench_pubs_;
+    map<int, ros::Publisher> desired_ext_wrench_weights_pubs_;
     ros::Subscriber desired_ext_wrench_sub_;
+    ros::Subscriber desired_ext_wrench_weights_sub_;
 
     aerial_robot_msgs::PoseControlPid wrench_pid_msg_;
 
@@ -230,9 +233,12 @@ namespace aerial_robot_control
     // The legacy desired_external_wrench topic is treated as an alias and is
     // stored here too; unified mode does not inject task wrench via PID FF.
     Eigen::VectorXd formation_desired_wrench_;
+    Eigen::VectorXd formation_desired_wrench_weights_;
     double formation_desired_wrench_timestamp_;
+    double formation_desired_wrench_weights_timestamp_;
     double desired_wrench_timeout_;
     ros::Subscriber formation_desired_wrench_sub_;
+    ros::Subscriber formation_desired_wrench_weights_sub_;
 
     double comp_term_update_freq_;
     double prev_comp_update_time_;
@@ -275,7 +281,9 @@ namespace aerial_robot_control
     
     virtual void estWrenchTaskCallback(const beetle::TaggedWrench & msg);
     void desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg);
+    void desiredExternalWrenchWeightsCallback(const std_msgs::Float32MultiArray & msg);
     void formationDesiredWrenchCallback(const geometry_msgs::WrenchStamped& msg);
+    void formationDesiredWrenchWeightsCallback(const std_msgs::Float32MultiArray& msg);
     void rosParamInit() override;
     void externalWrenchEstimate() override;
     void reset() override;

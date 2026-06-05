@@ -34,6 +34,11 @@ from trajectory import PolynomialTrajectory
 from beetle_interface import BeetleInterface
 
 
+# Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Valve rotation primarily
+# tracks task yaw torque; force and roll/pitch torque remain soft helpers.
+VALVE_TASK_WRENCH_WEIGHTS = [0.30, 0.30, 0.10, 0.15, 0.15, 2.0]
+
+
 class WaitState(smach.State):
     """Pause between SMACH states while continuing to report progress."""
     def __init__(self, wait_time=3.0, state_name=""):
@@ -1652,7 +1657,8 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 ff_force, ff_torque, ff_frame = self._build_valve_wrench_command(
                     [0.0, 0.0, 0.0], [0.0, 0.0, torque_z])
                 self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,
-                                              frame_id=ff_frame)
+                                              frame_id=ff_frame,
+                                              task_weights=VALVE_TASK_WRENCH_WEIGHTS if self.beetle.isUnifiedMode() else None)
             self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
 
             # Monitor valve rotation
@@ -1823,7 +1829,8 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                 ff_force_cmd, ff_torque_cmd, ff_frame = self._build_valve_wrench_command(
                     ff_force, [0.0, 0.0, torque_z])
                 self.beetle.addExternalWrench(force=ff_force_cmd, torque=ff_torque_cmd,
-                                              frame_id=ff_frame)
+                                              frame_id=ff_frame,
+                                              task_weights=VALVE_TASK_WRENCH_WEIGHTS if self.beetle.isUnifiedMode() else None)
 
             self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
 

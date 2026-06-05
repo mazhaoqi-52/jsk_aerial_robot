@@ -70,6 +70,11 @@ TRANSIT_CLEARANCE_OFFSET = 0.30
 TOWING_HOOK_CONTACT_DX_FROM_EE = -0.02404
 TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
 
+# Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Towing primarily tracks
+# horizontal pull force. The r x F torque from the hook offset is kept as a
+# soft feedforward bias, with very low yaw-torque authority to protect heading.
+TOWING_TASK_WRENCH_WEIGHTS = [2.0, 2.0, 0.0, 0.12, 0.12, 0.02]
+
 
 class LinearTowingTrajectoryGenerator:
     """
@@ -884,7 +889,8 @@ class TowingWithFeedforwardState(TowingStateBase):
             ff_force, ff_torque, ff_frame = self._build_towing_wrench_command(
                 ff_world, unified_mode)
             self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,
-                                          frame_id=ff_frame)
+                                          frame_id=ff_frame,
+                                          task_weights=TOWING_TASK_WRENCH_WEIGHTS if unified_mode else None)
 
             # Debug: log ff force and progress every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):

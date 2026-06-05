@@ -64,17 +64,21 @@ public:
    * @param target_wrench_acc_cog  6D soft wrench target in acceleration space:
    *                               [acc_x, acc_y, acc_z, ang_acc_roll, ang_acc_pitch, ang_acc_yaw]
    *                               In CoG frame, referenced to formation CoG.
-   * @param desired_ext_wrench     6D external wrench demand in body frame [Fx,Fy,Fz,Tx,Ty,Tz] (N, Nm).
-   *                               Added as feedforward BEFORE allocation.
+   * @param desired_ext_wrench     6D external wrench demand at formation CoG in body frame
+   *                               [Fx,Fy,Fz,Tx,Ty,Tz] (N, Nm). This is tracked as a
+   *                               weighted soft task objective.
    * @param priority_wrench_acc_cog Optional 6D reference for hard priority bands. When empty,
    *                                hard bands use target_wrench_acc_cog. Rows whose priority
    *                                center is approximately zero are kept soft-only.
+   * @param task_wrench_weights    Optional 6D task soft tracking weights. When empty, controller
+   *                               parameters choose the task weighting.
    * @return true if allocation succeeded, false otherwise.
    */
   bool computeUnifiedAllocation(const Eigen::VectorXd& target_wrench_acc_cog,
                                 const Eigen::VectorXd& desired_ext_wrench,
                                 double yaw_pid_raw,
-                                const Eigen::VectorXd& priority_wrench_acc_cog = Eigen::VectorXd());
+                                const Eigen::VectorXd& priority_wrench_acc_cog = Eigen::VectorXd(),
+                                const Eigen::VectorXd& task_wrench_weights = Eigen::VectorXd());
 
   /** @brief Optional LF-style internal wrench compensation used only as a
    *  secondary allocation reference. Gain 0 disables the effect. The input map
@@ -321,7 +325,8 @@ private:
   double alloc_rate_limit_;           // optional per-cycle component delta bound [N], <=0 disables
   double alloc_direction_rate_limit_rad_;  // optional per-cycle gimbal direction band [rad]
   double alloc_lateral_rate_weight_;  // soft penalty on 1-DOF rotor fx changes
-  Eigen::VectorXd alloc_wrench_weights_;  // 6D soft residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
+  Eigen::VectorXd alloc_wrench_weights_;  // 6D control residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
+  Eigen::VectorXd alloc_task_wrench_weights_;  // 6D task residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
   double alloc_effort_weight_;        // optional total-effort penalty on vectoring force
   std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_
   double alloc_interface_force_weight_;   // optional soft cost on interface force proxy [1/N^2]
@@ -339,21 +344,27 @@ private:
    * @brief Full-vector constrained QP allocation.
    *
    * Formulation:
-   *   min_{f} ||W^(1/2)(A*f - w)||^2 + ρ||f||^2
+   *   min_{f} ||Wc^(1/2)(A*f - w_control)||^2
+   *           + ||Wt^(1/2)(A*f - (w_control + w_task))||^2
+   *           + ρ||f||^2
    *           + λ||f - f_ref||^2 + smoothness terms
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
    *         optional 6D wrench priority bands
    *
    * @param alloc_matrix  Formation allocation matrix A (6 x n_cols)
-   * @param w_total       Desired 6D wrench-acceleration vector for the soft objective
+   * @param w_control     Desired 6D control/stabilization wrench-acceleration vector
+   * @param w_task        6D task feedforward wrench-acceleration vector
+   * @param task_weights  6D task soft residual weights
    * @param w_priority    6D wrench-acceleration vector used as the center of hard priority bands
    * @param secondary_ref Preferred allocation in the nullspace / soft secondary objective
    * @param vectoring_f_out  Output: full vectoring force vector (n_cols)
    * @return true on success, false on failure (caller falls back to pseudoinverse)
    */
   bool solveFullVectorQP(const Eigen::MatrixXd& alloc_matrix,
-                         const Eigen::VectorXd& w_total,
+                         const Eigen::VectorXd& w_control,
+                         const Eigen::VectorXd& w_task,
+                         const Eigen::VectorXd& task_weights,
                          const Eigen::VectorXd& w_priority,
                          const Eigen::VectorXd& secondary_ref,
                          const std::vector<int>& assembled_ids,

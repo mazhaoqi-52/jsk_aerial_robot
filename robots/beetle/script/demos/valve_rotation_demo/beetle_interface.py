@@ -9,7 +9,7 @@ import numpy as np
 import math
 import sys
 import os
-from std_msgs.msg import Empty, UInt8
+from std_msgs.msg import Empty, UInt8, Float32MultiArray
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav, PoseControlPid
@@ -131,8 +131,10 @@ class BeetleInterface(object):
         wrench_target_id = rospy.get_param(f'/beetle{module_id}/assembly_leader_id', module_id) if assembly_mode else module_id
         self.wrench_target_id = wrench_target_id
         self.desired_ext_wrench_pub = rospy.Publisher(f'/beetle{wrench_target_id}/desired_external_wrench', WrenchStamped, queue_size=1)
+        self.desired_ext_wrench_weights_pub = rospy.Publisher(f'/beetle{wrench_target_id}/desired_external_wrench_weights', Float32MultiArray, queue_size=1)
         if assembly_mode:
             self.formation_wrench_pub = rospy.Publisher(f'/beetle{wrench_target_id}/formation_desired_wrench', WrenchStamped, queue_size=1)
+            self.formation_wrench_weights_pub = rospy.Publisher(f'/beetle{wrench_target_id}/formation_desired_wrench_weights', Float32MultiArray, queue_size=1)
         if assembly_mode and wrench_target_id != module_id:
             rospy.logwarn(f"[BeetleInterface] Wrench routed to C++ LEADER beetle{wrench_target_id} "
                           f"(Python EE module={module_id})")
@@ -481,7 +483,21 @@ class BeetleInterface(object):
         leader_id = self.wrench_target_id if hasattr(self, 'wrench_target_id') else self.module_id
         return rospy.get_param(f'/beetle{leader_id}/controller/unified_control_mode', False)
 
-    def addExternalWrench(self, force, torque, frame_id="world"):
+    def _publishExternalWrenchWeights(self, weights):
+        if weights is None:
+            return
+        vals = list(weights)
+        if len(vals) != 6:
+            rospy.logwarn_throttle(1.0, "[BeetleInterface] task_weights must have 6 values")
+            return
+        msg = Float32MultiArray()
+        msg.data = [max(0.0, float(v)) for v in vals]
+        if self.assembly_mode and hasattr(self, 'formation_wrench_weights_pub') and self.isUnifiedMode():
+            self.formation_wrench_weights_pub.publish(msg)
+        else:
+            self.desired_ext_wrench_weights_pub.publish(msg)
+
+    def addExternalWrench(self, force, torque, frame_id="world", task_weights=None):
         """Apply desired external wrench.
 
         In assembly_mode, frame_id="world" rotates full RPY world-frame input
@@ -518,6 +534,7 @@ class BeetleInterface(object):
         self.external_wrench_active = True
         self.current_ff_force = force_list
         self.current_ff_torque = torque_list
+        self._publishExternalWrenchWeights(task_weights)
         if self.assembly_mode and hasattr(self, 'formation_wrench_pub') and self.isUnifiedMode():
             self.formation_wrench_pub.publish(ff_msg)
         else:
@@ -553,6 +570,7 @@ class BeetleInterface(object):
             zero_msg = WrenchStamped()
             zero_msg.header.stamp = rospy.Time.now()
             zero_msg.header.frame_id = "fc"
+            self._publishExternalWrenchWeights([0.0] * 6)
             if self.assembly_mode and hasattr(self, 'formation_wrench_pub') and self.isUnifiedMode():
                 self.formation_wrench_pub.publish(zero_msg)
             else:

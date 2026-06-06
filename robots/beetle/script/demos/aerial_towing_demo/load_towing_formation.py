@@ -769,10 +769,10 @@ class ApproachLoadState(TowingStateBase):
 
         success = self.active_position_convergence(
             phase1_target, target_yaw=current_yaw,
-            pos_thresh=0.03, yaw_thresh=0.1, timeout=20.0
+            pos_thresh=0.06, yaw_thresh=0.1, timeout=4.0
         )
         if not success:
-            rospy.logwarn("Phase 1 XY convergence incomplete, continuing...")
+            rospy.logwarn("Phase 1 loose XY settling incomplete, continuing...")
 
         # Phase 2: Adjust yaw (keep position)
         rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(target_yaw):.1f} deg")

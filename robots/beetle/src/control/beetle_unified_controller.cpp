@@ -517,20 +517,35 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
                                    secondary_ref, assembled_ids,
                                    interface_load_matrix, target_vectoring_f_);
     if (!qp_ok && has_desired_ext_wrench) {
-      Eigen::VectorXd no_ext_wrench_acc = target_wrench_acc_cog;
-      Eigen::VectorXd no_ext_priority_acc = priority_wrench_acc_cog;
-      if (no_ext_priority_acc.size() != target_wrench_acc_cog.size()) {
-        no_ext_priority_acc = target_wrench_acc_cog;
-      }
-      qp_ok = solveFullVectorQP(integrated_map_, no_ext_wrench_acc,
-                                Eigen::VectorXd::Zero(6), effective_task_weights,
-                                no_ext_priority_acc,
-                                secondary_ref, assembled_ids,
-                                interface_load_matrix, target_vectoring_f_);
-      if (qp_ok) {
-        ROS_WARN_THROTTLE(1.0,
-                          "[UnifiedCtrl QP] external wrench dropped after constrained solve failed");
-        control_wrench_acc = no_ext_wrench_acc;
+      const double retry_task_scales[] = {0.7, 0.4, 0.0};
+      for (double retry_scale : retry_task_scales) {
+        Eigen::VectorXd retry_task_wrench_acc = retry_scale * task_wrench_acc;
+        Eigen::VectorXd retry_task_weights = retry_scale * effective_task_weights;
+        Eigen::VectorXd retry_priority_acc = priority_wrench_acc_cog;
+        if (retry_priority_acc.size() != target_wrench_acc_cog.size()) {
+          retry_priority_acc = target_wrench_acc_cog;
+        }
+
+        qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
+                                  retry_task_wrench_acc, retry_task_weights,
+                                  retry_priority_acc,
+                                  secondary_ref, assembled_ids,
+                                  interface_load_matrix, target_vectoring_f_);
+        if (!qp_ok) continue;
+
+        task_wrench_acc = retry_task_wrench_acc;
+        effective_task_weights = retry_task_weights;
+        if (retry_scale > 1e-6) {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "[UnifiedCtrl QP] task wrench objective scaled to %.0f%% after constrained solve failed",
+              retry_scale * 100.0);
+        } else {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "[UnifiedCtrl QP] external wrench dropped after constrained solve failed");
+        }
+        break;
       }
     }
     if (!qp_ok) {

@@ -131,14 +131,17 @@ class LinearTowingTrajectoryGenerator:
         # when the load is stuck or slow.
         self.max_lead_distance = 0.17  # 170mm
         self.max_lag_distance = 0.08   # 80mm
+        self.max_load_lead_distance = 0.08  # 80mm ahead of load progress
 
-        # Force adaptation: S-curve ramp over 3 stall windows.
+        # Force adaptation: ramp to breakaway, then keep adapting to load speed.
         self.current_force = 0.0
-        self.force_locked = False
         self.force_ramp_progress = 0.0
         self.breakaway_detected = False
         self.breakaway_relief_applied = False
-        self.breakaway_force_ratio = 0.65
+        self.breakaway_force_ratio = 0.80
+        self.continue_force_floor_ratio = 0.60
+        self.force_recover_rate = self.max_force / 15.0
+        self.force_relief_rate = self.max_force / 30.0
         self.breakaway_distance = 0.05  # 50mm load motion confirms contact release
         self.breakaway_velocity = self.target_velocity * 0.2
         self.last_motion_distance = 0.0
@@ -226,6 +229,13 @@ class LinearTowingTrajectoryGenerator:
         # Otherwise position PID fights the towing feedforward while the load is moving.
         new_target_distance = max(new_target_distance,
                                   self.current_distance - self.max_lag_distance)
+        # When load tracking is available, the commanded target should not keep
+        # walking away from a stalled load. Keep only a small lead to maintain
+        # tension while the feedforward force does the heavy work.
+        if self.load_start_pos is not None:
+            new_target_distance = min(
+                new_target_distance,
+                self.current_load_distance + self.max_load_lead_distance)
         new_target_distance = min(self.target_distance, max(0.0, new_target_distance))
 
         self.target_pos[:2] = self.start_pos[:2] + self.towing_direction[:2] * new_target_distance
@@ -244,7 +254,7 @@ class LinearTowingTrajectoryGenerator:
             else:
                 self.stall_counter = max(0, self.stall_counter - 1)
 
-        # Adaptive force: ease in while stuck, then unload once the load breaks away.
+        # Adaptive force: ease in until breakaway, then regulate force from load speed.
         if (not self.breakaway_detected and self.load_start_pos is not None and
                 motion_distance >= self.breakaway_distance and
                 self.motion_velocity >= self.breakaway_velocity):
@@ -252,17 +262,29 @@ class LinearTowingTrajectoryGenerator:
 
         if self.breakaway_detected and not self.breakaway_relief_applied:
             prev_force = self.current_force
-            self.current_force = prev_force * self.breakaway_force_ratio
-            self.force_locked = True
+            floor_force = min(prev_force, self.max_force * self.continue_force_floor_ratio)
+            self.current_force = max(prev_force * self.breakaway_force_ratio,
+                                     floor_force)
             self.breakaway_relief_applied = True
             rospy.loginfo(f"[Towing] Load breakaway detected: dist={motion_distance*1000:.0f}mm, "
                          f"vel={self.motion_velocity*1000:.0f}mm/s, "
                          f"ff {prev_force:.1f}N -> {self.current_force:.1f}N")
-        elif not self.force_locked:
+        elif not self.breakaway_detected:
             ramp_time = 3.0 * self.stall_window_time  # 15s
             self.force_ramp_progress = min(
                 1.0, self.force_ramp_progress + 1.0 / (ramp_time * self.control_rate))
             self.current_force = self.max_force * smoothstep01(self.force_ramp_progress)
+        else:
+            low_speed = self.target_velocity * 0.6
+            high_speed = self.target_velocity * 1.6
+            if self.motion_velocity < low_speed:
+                self.current_force += self.force_recover_rate * safe_dt
+            elif self.motion_velocity > high_speed:
+                self.current_force -= self.force_relief_rate * safe_dt
+            self.current_force = min(
+                self.max_force,
+                max(self.max_force * self.continue_force_floor_ratio,
+                    self.current_force))
 
         return {
             'current_distance': self.current_distance,

@@ -81,6 +81,19 @@ MIN_SPLIT_INSERTION_DROP = 0.10
 # soft feedforward bias, with very low yaw-torque authority to protect heading.
 TOWING_TASK_WRENCH_WEIGHTS = [2.0, 2.0, 0.0, 0.12, 0.12, 0.02]
 
+# Loose guards for real-machine towing. These are not precision convergence
+# checks; they only prevent obvious high-force/high-attitude transitions.
+TOWING_GOAL_TAPER_START_RATIO = 0.90
+TOWING_GOAL_FORCE_FLOOR_RATIO = 0.65
+TOWING_COMPLETE_SETTLE_TIME = 1.5
+TOWING_COMPLETE_MAX_SETTLE_TIME = 4.0
+TOWING_COMPLETE_ATTITUDE_SOFT_LIMIT = math.radians(18.0)
+TOWING_COMPLETE_ATTITUDE_HARD_LIMIT = math.radians(30.0)
+TOWING_COMPLETE_Z_ERROR_HARD_LIMIT = 0.35
+RETURN_ATTITUDE_HARD_LIMIT = math.radians(35.0)
+RETURN_LOOSE_RETRACT_TOLERANCE = 0.18
+RETURN_LOOSE_ASCENT_Z_TOLERANCE = 0.25
+
 
 class LinearTowingTrajectoryGenerator:
     """
@@ -285,6 +298,14 @@ class LinearTowingTrajectoryGenerator:
                 self.max_force,
                 max(self.max_force * self.continue_force_floor_ratio,
                     self.current_force))
+
+        progress_ratio = motion_distance / max(self.target_distance, 1e-6)
+        if progress_ratio > TOWING_GOAL_TAPER_START_RATIO:
+            taper_span = 1.0 - TOWING_GOAL_TAPER_START_RATIO
+            remaining_ratio = max(0.0, min(1.0, (1.0 - progress_ratio) / taper_span))
+            force_cap_ratio = (TOWING_GOAL_FORCE_FLOOR_RATIO +
+                               (1.0 - TOWING_GOAL_FORCE_FLOOR_RATIO) * remaining_ratio)
+            self.current_force = min(self.current_force, self.max_force * force_cap_ratio)
 
         return {
             'current_distance': self.current_distance,
@@ -882,7 +903,7 @@ class TowingWithFeedforwardState(TowingStateBase):
             input_keys=['towing_start_position', 'towing_direction', 'hook_yaw'],
             output_keys=['towing_end_position'])
 
-    def _clear_external_wrench(self):
+    def _clear_external_wrench(self, hold_pos=None, hold_yaw=None, duration=1.0):
         """Clear external wrench feedforward via BeetleInterface.
 
         Smoothly unloads the last command, then sends a few zero-wrench
@@ -890,8 +911,27 @@ class TowingWithFeedforwardState(TowingStateBase):
         """
         rospy.loginfo("Clearing external wrench feedforward")
         zero = [0.0, 0.0, 0.0]
-        self.beetle.clearExternalWrench(duration=1.0, rate_hz=25.0)
+        if hold_pos is None:
+            self.beetle.clearExternalWrench(duration=duration, rate_hz=25.0)
+        else:
+            start_force = np.asarray(self.beetle.current_ff_force, dtype=float)
+            start_torque = np.asarray(self.beetle.current_ff_torque, dtype=float)
+            rate = rospy.Rate(25)
+            steps = max(1, int(duration * 25.0))
+            for step in range(1, steps + 1):
+                self.send_assembly_command_from_end_effector(hold_pos, hold_yaw)
+                blend = smoothstep01(float(step) / steps)
+                force = ((1.0 - blend) * start_force).tolist()
+                torque = ((1.0 - blend) * start_torque).tolist()
+                self.beetle.addExternalWrench(
+                    force, torque, frame_id="fc",
+                    task_weights=TOWING_TASK_WRENCH_WEIGHTS if self.beetle.isUnifiedMode() else None)
+                if rospy.is_shutdown():
+                    break
+                rate.sleep()
         for _ in range(3):
+            if hold_pos is not None:
+                self.send_assembly_command_from_end_effector(hold_pos, hold_yaw)
             self.beetle.addExternalWrench(zero, zero, frame_id="fc")
             rospy.sleep(0.04)
         self.beetle.clearExternalWrench()
@@ -975,6 +1015,7 @@ class TowingWithFeedforwardState(TowingStateBase):
         ABSOLUTE_MAX_TIME = 180.0 # safety net: 3 minutes absolute max
         control_rate = rospy.Rate(25)  # 25Hz
         unified_mode_seen = False
+        completion_started_at = None
 
         rospy.loginfo(f"Starting towing loop (stall abort after {STALL_TIMEOUT_COUNT} consecutive stalls, "
                       f"absolute max: {ABSOLUTE_MAX_TIME:.0f}s)...")
@@ -1004,24 +1045,24 @@ class TowingWithFeedforwardState(TowingStateBase):
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
                 rospy.loginfo(f"[Towing Pos] actual={current_pos}, start={start_pos}")
 
-            # Check completion
-            if trajectory_gen.is_complete():
+            if trajectory_gen.is_complete() and completion_started_at is None:
                 done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
                 done_source = 'load' if state_info['using_load_tracking'] else 'ee'
-                rospy.loginfo(f"Towing complete! Distance: {done_dist*1000:.0f}mm ({done_source})")
-                break
+                completion_started_at = rospy.Time.now().to_sec()
+                rospy.loginfo(f"Towing distance reached: {done_dist*1000:.0f}mm ({done_source}); "
+                              "settling briefly before unload")
 
             # Timeout: stall-based (consecutive stall windows) + absolute safety net
             if state_info['stall_counter'] >= STALL_TIMEOUT_COUNT:
                 rospy.logwarn(f"Towing aborted: stalled for {state_info['stall_counter']} "
                              f"consecutive windows ({state_info['stall_counter']*5}s no progress)")
-                self._clear_external_wrench()
+                self._clear_external_wrench(hold_pos=current_pos, hold_yaw=current_yaw)
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
             if elapsed > ABSOLUTE_MAX_TIME:
                 rospy.logwarn(f"Towing absolute timeout after {elapsed:.1f}s")
-                self._clear_external_wrench()
+                self._clear_external_wrench(hold_pos=current_pos, hold_yaw=current_yaw)
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
@@ -1042,10 +1083,40 @@ class TowingWithFeedforwardState(TowingStateBase):
 
             if unified_mode_seen and not unified_mode:
                 rospy.logwarn("Towing safety abort: unified mode exited during towing")
-                self._clear_external_wrench()
+                self._clear_external_wrench(hold_pos=current_pos, hold_yaw=current_yaw)
                 userdata.towing_end_position = current_pos
                 self.formation_adapter.set_pitch_compensation(False)
                 return 'timeout'
+
+            if completion_started_at is not None:
+                settle_elapsed = rospy.Time.now().to_sec() - completion_started_at
+                if rpy_result is not None:
+                    max_rp = max(abs(rpy_result[0]), abs(rpy_result[1]))
+                else:
+                    max_rp = 0.0
+                attitude_soft_ok = max_rp < TOWING_COMPLETE_ATTITUDE_SOFT_LIMIT
+                hard_bad = (max_rp > TOWING_COMPLETE_ATTITUDE_HARD_LIMIT or
+                            abs(raw_z_err) > TOWING_COMPLETE_Z_ERROR_HARD_LIMIT)
+
+                if settle_elapsed >= TOWING_COMPLETE_SETTLE_TIME and attitude_soft_ok:
+                    done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+                    done_source = 'load' if state_info['using_load_tracking'] else 'ee'
+                    rospy.loginfo(f"Towing complete! Distance: {done_dist*1000:.0f}mm ({done_source}), "
+                                  f"settle={settle_elapsed:.1f}s, "
+                                  f"max_rp={math.degrees(max_rp):.1f}deg")
+                    break
+                if settle_elapsed >= TOWING_COMPLETE_MAX_SETTLE_TIME and not hard_bad:
+                    done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+                    done_source = 'load' if state_info['using_load_tracking'] else 'ee'
+                    rospy.logwarn(f"Towing complete with loose settle: distance={done_dist*1000:.0f}mm "
+                                  f"({done_source}), settle={settle_elapsed:.1f}s, "
+                                  f"max_rp={math.degrees(max_rp):.1f}deg, "
+                                  f"z_err={raw_z_err*1000:.0f}mm")
+                    break
+                rospy.logwarn_throttle(
+                    1.0,
+                    f"[Towing] completion settling: t={settle_elapsed:.1f}s, "
+                    f"max_rp={math.degrees(max_rp):.1f}deg, z_err={raw_z_err*1000:.0f}mm")
 
             # Debug: log position and pitch every 0.5s
             if int(elapsed * 2) != int((elapsed - 0.04) * 2):
@@ -1085,16 +1156,18 @@ class TowingWithFeedforwardState(TowingStateBase):
 
         # If loop ends due to ROS shutdown/Ctrl-C, this is not a successful towing completion.
         if rospy.is_shutdown():
-            self._clear_external_wrench()
+            self._clear_external_wrench(hold_pos=self.get_end_effector_position(), hold_yaw=maintain_yaw)
             userdata.towing_end_position = self.get_end_effector_position()
             self.formation_adapter.set_pitch_compensation(False)
             return 'timeout'
 
-        # ---- Clear feedforward after towing completes ----
-        self._clear_external_wrench()
+        # ---- Clear feedforward after towing completes while holding pose ----
+        unload_hold_pos = self.get_end_effector_position()
+        self._clear_external_wrench(hold_pos=unload_hold_pos, hold_yaw=maintain_yaw,
+                                    duration=2.0)
 
-        # Ensure pitch compensation stays disabled (already disabled, but defensive)
-        self.formation_adapter.set_pitch_compensation(False)
+        # With the task wrench cleared, use pitch-aware EE geometry for disengage/return.
+        self.formation_adapter.set_pitch_compensation(True)
 
         final_pos = self.get_end_effector_position()
         userdata.towing_end_position = final_pos
@@ -1111,6 +1184,32 @@ class DisengageAndReturnState(TowingStateBase):
             outcomes=['succeeded', 'failed'],
             input_keys=['start_position', 'start_yaw', 'towing_end_position',
                         'towing_direction', 'load_position'])
+
+    def _return_attitude_safe(self, context):
+        rpy = self.beetle.getAssemblyRPY()
+        if rpy is None:
+            return True
+        max_rp = max(abs(rpy[0]), abs(rpy[1]))
+        if max_rp > RETURN_ATTITUDE_HARD_LIMIT:
+            rospy.logerr(f"{context}: attitude too large for return "
+                         f"(roll={math.degrees(rpy[0]):.1f} deg, "
+                         f"pitch={math.degrees(rpy[1]):.1f} deg)")
+            return False
+        return True
+
+    def _loose_position_reached(self, target_pos, tolerance, context):
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable")
+            return False
+        pos_error = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+        if pos_error <= tolerance:
+            rospy.logwarn(f"{context}: convergence incomplete but close enough "
+                          f"({pos_error*1000:.0f}mm <= {tolerance*1000:.0f}mm)")
+            return True
+        rospy.logerr(f"{context}: convergence failed with large error "
+                     f"({pos_error*1000:.0f}mm > {tolerance*1000:.0f}mm)")
+        return False
 
     def execute(self, userdata):
         rospy.loginfo("=== Disengage and Return State ===")
@@ -1146,6 +1245,8 @@ class DisengageAndReturnState(TowingStateBase):
             rospy.sleep(0.1)
 
         rospy.loginfo(f"[Phase 0] Stabilization complete after {stabilize_duration}s")
+        if not self._return_attitude_safe("[Phase 0]"):
+            return 'failed'
 
         # Phase 0.5: Retract along towing reverse direction to disengage hook
         towing_dir = np.array(userdata.towing_direction)
@@ -1161,6 +1262,12 @@ class DisengageAndReturnState(TowingStateBase):
             pos_thresh=0.03, yaw_thresh=0.1, timeout=10.0,
             max_linear_vel=0.03
         )
+        if (not success and
+                (not self._loose_position_reached(retract_target,
+                                                  RETURN_LOOSE_RETRACT_TOLERANCE,
+                                                  "[Phase 0.5]") or
+                 not self._return_attitude_safe("[Phase 0.5]"))):
+            return 'failed'
         rospy.sleep(0.5)
 
         # Phase 1: Return to start height (hook is already disengaged in Phase 0.5).
@@ -1180,6 +1287,17 @@ class DisengageAndReturnState(TowingStateBase):
             pos_thresh=0.05, yaw_thresh=0.1, timeout=20.0,
             max_linear_vel=0.05
         )
+        if not success:
+            current_pos = self.get_end_effector_position()
+            if current_pos is None:
+                rospy.logerr("[Phase 1] Current position unavailable after ascent")
+                return 'failed'
+            z_gap = target_height - current_pos[2]
+            if z_gap > RETURN_LOOSE_ASCENT_Z_TOLERANCE or not self._return_attitude_safe("[Phase 1]"):
+                rospy.logerr(f"[Phase 1] Ascent failed with large Z gap ({z_gap*1000:.0f}mm)")
+                return 'failed'
+            rospy.logwarn(f"[Phase 1] Ascent incomplete but close enough "
+                          f"(z_gap={z_gap*1000:.0f}mm)")
 
         rospy.sleep(1.0)
 
@@ -1215,6 +1333,10 @@ class DisengageAndReturnState(TowingStateBase):
             return_target, target_yaw=start_yaw,
             pos_thresh=0.05, yaw_thresh=0.1, timeout=30.0
         )
+        if (not success and
+                (not self._loose_position_reached(return_target, 0.35, "[Phase 3]") or
+                 not self._return_attitude_safe("[Phase 3]"))):
+            return 'failed'
 
         rospy.loginfo("=== Towing Task Complete ===")
         return 'succeeded'

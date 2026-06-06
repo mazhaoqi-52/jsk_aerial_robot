@@ -102,6 +102,9 @@ TOWING_FORCE_HOLD_Z_ERROR = 0.15
 TOWING_FORCE_RELIEF_Z_ERROR = 0.22
 TOWING_BREAKAWAY_RECOVERY_DELAY = 2.5
 TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.50
+TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
+TOWING_BREAKAWAY_STABLE_Z_ERROR = 0.05
+TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.85
 TOWING_TASK_HOLD_SCALE = 0.40
 TOWING_TASK_RELIEF_SCALE = 0.15
 
@@ -208,7 +211,11 @@ class LinearTowingTrajectoryGenerator:
             task_scale = TOWING_TASK_RELIEF_SCALE
         elif cooldown:
             guard_state = "cooldown"
-            task_scale = TOWING_TASK_HOLD_SCALE
+            if (max_rp < TOWING_BREAKAWAY_STABLE_ATTITUDE and
+                    abs_z < TOWING_BREAKAWAY_STABLE_Z_ERROR):
+                task_scale = TOWING_TASK_STABLE_COOLDOWN_SCALE
+            else:
+                task_scale = TOWING_TASK_HOLD_SCALE
         elif max_rp > TOWING_FORCE_HOLD_ATTITUDE or abs_z > TOWING_FORCE_HOLD_Z_ERROR:
             guard_state = "hold"
             task_scale = TOWING_TASK_HOLD_SCALE

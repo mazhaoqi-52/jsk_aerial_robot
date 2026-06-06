@@ -131,7 +131,7 @@ class LinearTowingTrajectoryGenerator:
         # when the load is stuck or slow.
         self.max_lead_distance = 0.17  # 170mm
         self.max_lag_distance = 0.08   # 80mm
-        self.max_load_lead_distance = 0.08  # 80mm ahead of load progress
+        self.max_load_lead_distance = 0.12  # 120mm ahead of load progress
 
         # Force adaptation: ramp to breakaway, then keep adapting to load speed.
         self.current_force = 0.0

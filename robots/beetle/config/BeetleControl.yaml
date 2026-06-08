@@ -56,7 +56,7 @@ controller:
   # Constraints: gimbal angle limits (linearized), component bounds.
   use_constrained_alloc: true
   alloc_lambda: 1.0e-4          # secondary objective weight toward balanced hover allocation
-  alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
+  alloc_t_max: 19.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   # Optional QP load-sharing extensions. Conservative defaults keep current
   # flight behavior: diagnostics are published, but extra costs/limits are off

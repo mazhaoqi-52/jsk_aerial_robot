@@ -81,6 +81,14 @@ namespace aerial_robot_control
     double unified_internal_wrench_secondary_gain_;
     bool unified_towing_debug_log_;
     double unified_towing_debug_log_period_;
+    bool unified_command_stall_debug_;
+    double unified_command_stall_warn_gap_;
+    double unified_command_stall_trace_gap_;
+    double unified_command_stall_trace_duration_;
+    const char* unified_debug_stage_;
+    double unified_debug_stage_time_;
+    double unified_debug_cycle_start_time_;
+    double unified_debug_trace_until_time_;
     // Unified residual hover-bias diagnostic. This is log-only: it never feeds
     // wrench_comp_list_ or the allocation secondary.
     bool unified_residual_bias_ready_;
@@ -109,6 +117,8 @@ namespace aerial_robot_control
     /** @brief Symmetric unified-mode control body. Both leader and follower run the full
      *  outer PID + formation allocation locally using their own estimator state. */
     void runUnifiedControlCommon(bool is_leader);
+    void markUnifiedDebugStage(const char* stage);
+    void reportUnifiedCommandGap(const char* event, double gap, double now);
 
     /** @brief Switch roll/pitch PID gains for unified (formation) mode. */
     void applyUnifiedGains();

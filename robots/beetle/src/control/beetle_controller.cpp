@@ -39,6 +39,14 @@ namespace aerial_robot_control
     unified_internal_wrench_secondary_gain_(0.0),
     unified_towing_debug_log_(true),
     unified_towing_debug_log_period_(1.0),
+    unified_command_stall_debug_(true),
+    unified_command_stall_warn_gap_(0.12),
+    unified_command_stall_trace_gap_(0.08),
+    unified_command_stall_trace_duration_(1.0),
+    unified_debug_stage_("init"),
+    unified_debug_stage_time_(-1.0),
+    unified_debug_cycle_start_time_(-1.0),
+    unified_debug_trace_until_time_(-1.0),
     unified_residual_bias_ready_(false),
     unified_residual_bias_samples_(0),
     unified_residual_bias_module_num_(0),
@@ -185,6 +193,67 @@ namespace aerial_robot_control
     ros::NodeHandle srv_nh(nh_, "controller");
     set_unified_mode_srv_ = srv_nh.advertiseService("set_unified_mode",
                                                      &BeetleController::setUnifiedModeCb, this);
+  }
+
+  void BeetleController::markUnifiedDebugStage(const char* stage)
+  {
+    const double now = ros::Time::now().toSec();
+    const char* prev_stage = unified_debug_stage_ ? unified_debug_stage_ : "unset";
+    const double prev_stage_age =
+        (unified_debug_stage_time_ >= 0.0) ? now - unified_debug_stage_time_ : -1.0;
+
+    unified_debug_stage_ = stage;
+    unified_debug_stage_time_ = now;
+
+    if (!unified_command_stall_debug_ || !unified_control_mode_) return;
+
+    const double since_pub =
+        (last_unified_command_pub_time_ >= 0.0)
+            ? now - last_unified_command_pub_time_ : -1.0;
+    if (since_pub >= unified_command_stall_trace_gap_) {
+      const double trace_until = now + unified_command_stall_trace_duration_;
+      if (trace_until > unified_debug_trace_until_time_) {
+        unified_debug_trace_until_time_ = trace_until;
+      }
+    }
+    if (unified_debug_trace_until_time_ < now) return;
+
+    const double cycle_age =
+        (unified_debug_cycle_start_time_ >= 0.0)
+            ? now - unified_debug_cycle_start_time_ : -1.0;
+    const int module_state = beetle_navigator_ ? beetle_navigator_->getModuleState() : -1;
+    const int my_id = beetle_navigator_ ? beetle_navigator_->getMyID() : -1;
+    const int nav_state = navigator_ ? navigator_->getNaviState() : -1;
+    ROS_WARN(
+        "[UnifiedStallTrace] id=%d stage=%s prev=%s prev_age=%.4f "
+        "nav=%d module_state=%d since_pub=%.4f cycle_age=%.4f control_ts=%.4f",
+        my_id, stage, prev_stage, prev_stage_age, nav_state, module_state,
+        since_pub, cycle_age, control_timestamp_);
+  }
+
+  void BeetleController::reportUnifiedCommandGap(const char* event, double gap, double now)
+  {
+    if (!unified_command_stall_debug_ || gap < unified_command_stall_warn_gap_) return;
+
+    const double trace_until = now + unified_command_stall_trace_duration_;
+    if (trace_until > unified_debug_trace_until_time_) {
+      unified_debug_trace_until_time_ = trace_until;
+    }
+
+    const double stage_age =
+        (unified_debug_stage_time_ >= 0.0) ? now - unified_debug_stage_time_ : -1.0;
+    const double cycle_age =
+        (unified_debug_cycle_start_time_ >= 0.0)
+            ? now - unified_debug_cycle_start_time_ : -1.0;
+    const int module_state = beetle_navigator_ ? beetle_navigator_->getModuleState() : -1;
+    const int my_id = beetle_navigator_ ? beetle_navigator_->getMyID() : -1;
+    const int nav_state = navigator_ ? navigator_->getNaviState() : -1;
+    ROS_WARN(
+        "[UnifiedStall] id=%d event=%s gap=%.4f last_stage=%s stage_age=%.4f "
+        "nav=%d module_state=%d cycle_age=%.4f last_pub=%.4f control_ts=%.4f",
+        my_id, event, gap, unified_debug_stage_ ? unified_debug_stage_ : "unset",
+        stage_age, nav_state, module_state, cycle_age,
+        last_unified_command_pub_time_, control_timestamp_);
   }
 
   void BeetleController::resetToIndependentHover()
@@ -435,6 +504,7 @@ namespace aerial_robot_control
     if (unified_control_mode_ &&
         (module_state == LEADER || module_state == FOLLOWER) &&
         module_state != SEPARATED) {
+      markUnifiedDebugStage("control_core_unified_branch");
       bool is_leader = (module_state == LEADER);
       // Two independent edges trigger (re)initialization:
       //   - role_changed: module just became LEADER/FOLLOWER (assembly/reconfig)
@@ -442,10 +512,14 @@ namespace aerial_robot_control
       bool role_changed = (pre_module_state_ != module_state);
       bool mode_just_entered = !prev_unified_control_mode_;
       if (role_changed || mode_just_entered) {
+        markUnifiedDebugStage("init_unified_enter");
         initUnifiedMode(is_leader);
+        markUnifiedDebugStage("init_unified_exit");
       }
       prev_unified_control_mode_ = true;
+      markUnifiedDebugStage("run_common_enter");
       runUnifiedControlCommon(is_leader);
+      markUnifiedDebugStage("run_common_exit");
       pre_module_state_ = module_state;
       return;
     }
@@ -790,6 +864,13 @@ namespace aerial_robot_control
     }
 
     if (unified_control_mode_) {
+      unified_debug_cycle_start_time_ = ros::Time::now().toSec();
+      markUnifiedDebugStage("update_enter");
+      if (last_unified_command_pub_time_ >= 0.0) {
+        reportUnifiedCommandGap("update_entry_gap",
+                                unified_debug_cycle_start_time_ - last_unified_command_pub_time_,
+                                unified_debug_cycle_start_time_);
+      }
       int module_state = beetle_navigator_->getModuleState();
 
       /* In unified control mode, every assembled module (LEADER and FOLLOWER)
@@ -804,7 +885,9 @@ namespace aerial_robot_control
 
          Bypass GimbalrotorController::update() which would publish competing
          four_axes/command from the single-module control path. */
+      markUnifiedDebugStage("base_update_enter");
       bool base_ok = ControlBase::update();
+      markUnifiedDebugStage(base_ok ? "base_update_ok" : "base_update_gated");
       if (!base_ok) {
         const double now = ros::Time::now().toSec();
         const double since_pub =
@@ -823,6 +906,7 @@ namespace aerial_robot_control
       }
 
       if (module_state != LEADER && module_state != FOLLOWER) {
+        markUnifiedDebugStage("role_gated");
         ROS_WARN_THROTTLE(
             0.5,
             "[TEMP_UNIFIED_CMD] id=%d role=OTHER stage=role_gated nav=%d "
@@ -832,8 +916,12 @@ namespace aerial_robot_control
         return false;
       }
 
+      markUnifiedDebugStage("control_core_enter");
       controlCore();
+      markUnifiedDebugStage("control_core_exit");
+      markUnifiedDebugStage("pose_sendcmd_enter");
       PoseLinearController::sendCmd();
+      markUnifiedDebugStage("pose_sendcmd_exit");
       return true;
     }
 
@@ -894,19 +982,27 @@ namespace aerial_robot_control
 
   bool BeetleController::publishLocalUnifiedCommand()
   {
+    markUnifiedDebugStage("publish_command_enter");
     spinal::FourAxisCommand local_cmd;
     if (!unified_controller_->buildModuleThrustCommand(beetle_navigator_->getMyID(), local_cmd)) {
+      markUnifiedDebugStage("publish_command_build_failed");
       ROS_WARN_THROTTLE(0.5, "[UnifiedCtrl] id=%d failed to pick local module block from unified allocation",
                         beetle_navigator_->getMyID());
       return false;
     }
+    markUnifiedDebugStage("publish_command_built");
 
     unified_thrust_cmd_ = local_cmd;
+    markUnifiedDebugStage("publish_command_ros_publish_enter");
     follower_thrust_pub_.publish(unified_thrust_cmd_);
+    markUnifiedDebugStage("publish_command_ros_publish_exit");
     const double now = ros::Time::now().toSec();
     const double dt_prev =
         (last_unified_command_pub_time_ >= 0.0)
             ? now - last_unified_command_pub_time_ : -1.0;
+    if (dt_prev >= 0.0) {
+      reportUnifiedCommandGap("publish_gap_recovered", dt_prev, now);
+    }
     last_unified_command_pub_time_ = now;
 
     double max_abs_component = 0.0;
@@ -932,6 +1028,7 @@ namespace aerial_robot_control
         max_abs_component,
         unified_thrust_cmd_.angles[0], unified_thrust_cmd_.angles[1],
         unified_thrust_cmd_.angles[2]);
+    markUnifiedDebugStage("publish_command_exit");
     return true;
   }
 
@@ -1965,6 +2062,20 @@ namespace aerial_robot_control
                      unified_towing_debug_log_period_, 1.0);
     unified_towing_debug_log_period_ =
         std::max(0.1, unified_towing_debug_log_period_);
+    getParam<bool>(control_nh, "unified_command_stall_debug",
+                   unified_command_stall_debug_, true);
+    getParam<double>(control_nh, "unified_command_stall_warn_gap",
+                     unified_command_stall_warn_gap_, 0.12);
+    unified_command_stall_warn_gap_ =
+        std::max(0.03, unified_command_stall_warn_gap_);
+    getParam<double>(control_nh, "unified_command_stall_trace_gap",
+                     unified_command_stall_trace_gap_, 0.08);
+    unified_command_stall_trace_gap_ =
+        std::max(0.03, unified_command_stall_trace_gap_);
+    getParam<double>(control_nh, "unified_command_stall_trace_duration",
+                     unified_command_stall_trace_duration_, 1.0);
+    unified_command_stall_trace_duration_ =
+        std::max(0.0, unified_command_stall_trace_duration_);
     // Load unified-mode PID gains for roll/pitch.
     // Full P/I/D: P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
     // I-term is retained on PC for slow formation-level bias correction.
@@ -2420,6 +2531,7 @@ namespace aerial_robot_control
     int my_id = beetle_navigator_->getMyID();
     int leader_id = beetle_navigator_->getLeaderID();
     // --- Gather local state ---
+    markUnifiedDebugStage("run_common_state_enter");
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
     vel_ = estimator_->getVel(Frame::COG, estimate_mode_);
     target_pos_ = navigator_->getTargetPos();
@@ -2453,9 +2565,12 @@ namespace aerial_robot_control
     tf::Vector3 target_omega = navigator_->getTargetOmega();
     target_omega_ = cog_rot.inverse() * target_rot * target_omega;
     target_ang_acc_ = navigator_->getTargetAngAcc();
+    markUnifiedDebugStage("run_common_state_ready");
 
     // --- Formation geometry: each module computes locally ---
+    markUnifiedDebugStage("formation_geometry_enter");
     unified_controller_->updateFormationGeometry();
+    markUnifiedDebugStage("formation_geometry_ready");
     // Detect geometry changes (e.g., peer ModuleModel late-arrival flipping the
     // formation from leader-only fallback to true heterogeneous mass-weighted).
     // The leader's cascade_alloc_sent_ is re-armed internally by
@@ -2478,6 +2593,7 @@ namespace aerial_robot_control
       // (leader→formation_CoG) − (leader→my_CoG), all in the common orientation.
       // NOTE: tf2 frame_ids MUST NOT start with '/' (same convention as
       // BeetleUnifiedController::updateFormationGeometry).
+      markUnifiedDebugStage("follower_tf_lookup_enter");
       try {
         std::string leader_cog_frame = beetle_navigator_->getMyName()
                                       + std::to_string(leader_id) + "/cog";
@@ -2488,14 +2604,17 @@ namespace aerial_robot_control
         cog_offset_self.x() -= tf_stamped.transform.translation.x;
         cog_offset_self.y() -= tf_stamped.transform.translation.y;
         cog_offset_self.z() -= tf_stamped.transform.translation.z;
+        markUnifiedDebugStage("follower_tf_lookup_ok");
       } catch (tf2::TransformException& ex) {
         // Soft fallback: keep leader-frame offset. One-frame positional bias is
         // vastly safer than a full thrust drop-out from early-return. The next
         // frame will retry.
+        markUnifiedDebugStage("follower_tf_lookup_failed");
         ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER id=%d] cog_offset_self TF failed (%s), falling back to leader-frame offset",
                           my_id, ex.what());
       }
     }
+    markUnifiedDebugStage("formation_offset_ready");
 
     // ---- Phase B follower override --------------------------------------
     // In unified mode the follower must derive its module reference from the
@@ -2512,6 +2631,7 @@ namespace aerial_robot_control
     // holds the correct setpoint). If no leader message has arrived yet, we
     // fall back to the navigator value (bounded transient at first frame).
     if (!is_leader && unified_cmd_received_) {
+      markUnifiedDebugStage("follower_reference_enter");
       const tf::Vector3& lt_pos     = leader_target_pos_;
       const tf::Vector3& lt_vel     = leader_target_vel_;
       const tf::Vector3& lt_acc     = leader_target_acc_;
@@ -2544,6 +2664,7 @@ namespace aerial_robot_control
       target_omega    = lt_omega;
       target_omega_   = cog_rot.inverse() * target_rot * target_omega;
       target_ang_acc_ = lt_ang_acc;
+      markUnifiedDebugStage("follower_reference_ready");
     }
     tf::Vector3 offset_body(cog_offset_self.x(), cog_offset_self.y(), cog_offset_self.z());
     tf::Vector3 offset_world = cog_rot * offset_body;
@@ -2551,6 +2672,7 @@ namespace aerial_robot_control
     tf::Vector3 omega_world = cog_rot * omega_;
     tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
     tf::Vector3 target_formation_pos = target_pos_ + target_baselink_rot * offset_body;
+    markUnifiedDebugStage("formation_kinematics_ready");
 
     // --- Position PID (X/Y/Z) with formation CoG ---
     double du = ros::Time::now().toSec() - control_timestamp_;
@@ -2571,18 +2693,24 @@ namespace aerial_robot_control
 
     if (beetle_navigator_->getControlFlag() &&
         (unified_internal_wrench_diag_ || unified_secondary_active)) {
+      markUnifiedDebugStage("internal_wrench_calc_enter");
       calcInteractionWrench();
+      markUnifiedDebugStage("internal_wrench_calc_exit");
     }
     if (unified_secondary_active) {
       std::map<int, Eigen::VectorXd> wrench_comp_snapshot;
+      markUnifiedDebugStage("internal_wrench_secondary_lock_enter");
       {
         std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
         wrench_comp_snapshot = wrench_comp_list_;
       }
+      markUnifiedDebugStage("internal_wrench_secondary_lock_exit");
       unified_controller_->setInternalWrenchSecondaryReference(
           wrench_comp_snapshot, unified_internal_wrench_secondary_gain_);
     } else {
+      markUnifiedDebugStage("internal_wrench_secondary_clear_enter");
       unified_controller_->clearInternalWrenchSecondaryReference();
+      markUnifiedDebugStage("internal_wrench_secondary_clear_exit");
     }
 
     // Unified mode has a single task-wrench path: formation_desired_wrench_
@@ -2597,6 +2725,7 @@ namespace aerial_robot_control
     Eigen::VectorXd formation_wrench_weights_cmd;
     double formation_wrench_stamp = -1.0;
     double formation_wrench_weights_stamp = -1.0;
+    markUnifiedDebugStage("task_wrench_lock_enter");
     {
       std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
       formation_wrench_cmd = formation_desired_wrench_;
@@ -2604,6 +2733,7 @@ namespace aerial_robot_control
       formation_wrench_weights_cmd = formation_desired_wrench_weights_;
       formation_wrench_weights_stamp = formation_desired_wrench_weights_timestamp_;
     }
+    markUnifiedDebugStage("task_wrench_lock_exit");
     const bool formation_wrench_fresh =
         formation_wrench_stamp > 0.0 &&
         (desired_wrench_timeout_ <= 0.0 ||
@@ -2619,6 +2749,7 @@ namespace aerial_robot_control
       formation_wrench_weights_cmd = Eigen::VectorXd();
     }
 
+    markUnifiedDebugStage("position_pid_enter");
     switch (navigator_->getXyControlMode()) {
       case aerial_robot_navigation::POS_CONTROL_MODE:
         pid_controllers_.at(X).update(target_formation_pos.x() - formation_pos.x(), du,
@@ -2664,8 +2795,10 @@ namespace aerial_robot_control
       pid_controllers_.at(Z).setLimitP(z_p_limit);
       pid_controllers_.at(Z).setErrP(0);
     }
+    markUnifiedDebugStage("position_pid_exit");
 
     // --- Attitude PID (Roll/Pitch/Yaw) ---
+    markUnifiedDebugStage("attitude_pid_enter");
     if (!start_rp_integration_) {
       if (pos_.z() - navigator_->getInitHeight() > start_rp_integration_height_) {
         start_rp_integration_ = true;
@@ -2699,6 +2832,7 @@ namespace aerial_robot_control
     pid_controllers_.at(YAW).update(err_yaw, du, err_omega_z, target_ang_acc_.z());
 
     control_timestamp_ = ros::Time::now().toSec();
+    markUnifiedDebugStage("attitude_pid_exit");
 
     // Local warmup (same on leader and follower)
     if (unified_reference_warmup_count_ < unified_reference_warmup_frames_) {
@@ -2711,6 +2845,7 @@ namespace aerial_robot_control
     }
 
     // --- Build 6-DOF target wrench in acceleration space ---
+    markUnifiedDebugStage("target_wrench_build_enter");
     tf::Matrix3x3 uav_rot = estimator_->getOrientation(Frame::COG, estimate_mode_);
     tf::Vector3 target_acc_w(pid_controllers_.at(X).result(),
                              pid_controllers_.at(Y).result(),
@@ -2741,16 +2876,20 @@ namespace aerial_robot_control
     }
 
     setTargetWrenchAccCog(target_wrench_acc);
+    markUnifiedDebugStage("target_wrench_build_exit");
 
     // --- Run unified 6-DOF allocation ---
+    markUnifiedDebugStage("allocation_prepare_enter");
     unified_controller_->clearFormationModelOverride();
     unified_controller_->setCommandTargetRPY(target_rpy_);
     const double alloc_start = ros::Time::now().toSec();
     const double since_pub_before_alloc =
         (last_unified_command_pub_time_ >= 0.0)
             ? alloc_start - last_unified_command_pub_time_ : -1.0;
+    markUnifiedDebugStage("allocation_solve_enter");
     bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw,
                                                             priority_wrench_acc, formation_wrench_weights_cmd);
+    markUnifiedDebugStage(ok ? "allocation_solve_ok" : "allocation_solve_failed");
     const double alloc_end = ros::Time::now().toSec();
     const int local_module_state = beetle_navigator_->getModuleState();
     ROS_INFO_THROTTLE(
@@ -2775,20 +2914,29 @@ namespace aerial_robot_control
 
     if (ok) {
       if (!is_leader) {
+        markUnifiedDebugStage("cascade_setup_enter");
         sendLocalUnifiedCascadeSetupOnce();
+        markUnifiedDebugStage("cascade_setup_exit");
       }
+      markUnifiedDebugStage("local_publish_enter");
       publishLocalUnifiedCommand();
+      markUnifiedDebugStage("local_publish_exit");
       const double now = ros::Time::now().toSec();
       if (last_unified_torque_alloc_inv_pub_time_ < 0.0 ||
           now - last_unified_torque_alloc_inv_pub_time_ >=
               unified_torque_alloc_inv_pub_interval_) {
+        markUnifiedDebugStage("torque_alloc_inv_pub_enter");
         if (publishLocalUnifiedTorqueAllocationMatrixInv()) {
           last_unified_torque_alloc_inv_pub_time_ = now;
         }
+        markUnifiedDebugStage("torque_alloc_inv_pub_exit");
       }
       if (is_leader) {
+        markUnifiedDebugStage("reference_pub_enter");
         publishUnifiedReference(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
+        markUnifiedDebugStage("reference_pub_exit");
         if (formation_observer_ && formation_observer_->isActive()) {
+          markUnifiedDebugStage("formation_observer_enter");
           Eigen::Matrix3d cog_rot_eigen;
           tf::matrixTFToEigen(uav_rot, cog_rot_eigen);
           Eigen::Vector3d offset_w(offset_world.x(), offset_world.y(), offset_world.z());
@@ -2820,6 +2968,7 @@ namespace aerial_robot_control
                 cog_rot_eigen, vel_formation_w, omega_body,
                 realized_wrench, du);
           }
+          markUnifiedDebugStage("formation_observer_exit");
         }
       }
     }
@@ -2834,8 +2983,10 @@ namespace aerial_robot_control
 
     // Only leader publishes assembly-debug topics (shared global namespace)
     if (is_leader) {
+      markUnifiedDebugStage("assemble_debug_pub_enter");
       publishAssembleDebug(formation_pos, formation_vel, target_formation_pos, ok,
                            target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
+      markUnifiedDebugStage("assemble_debug_pub_exit");
     }
   }
 

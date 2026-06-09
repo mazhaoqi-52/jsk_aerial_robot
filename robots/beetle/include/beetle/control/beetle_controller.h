@@ -168,6 +168,7 @@ namespace aerial_robot_control
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;
     int unified_reference_warmup_frames_;
+    double unified_reference_timeout_;
     bool local_unified_cascade_setup_sent_;
     double unified_torque_alloc_inv_pub_interval_;
     double last_unified_torque_alloc_inv_pub_time_;

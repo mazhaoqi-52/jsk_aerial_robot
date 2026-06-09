@@ -65,6 +65,8 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_priority_tolerances_(Eigen::VectorXd::Zero(6)),
 	    qp_n_vars_(-1),
 	    qp_n_constraints_(-1),
+	    qp_hessian_nnz_(-1),
+	    qp_constraint_nnz_(-1),
 	    qp_solver_(std::make_unique<OsqpEigen::Solver>())
 {
 }
@@ -911,9 +913,39 @@ bool BeetleUnifiedController::solveFullVectorQP(
                       n_cols, rotor_coef_);
     return false;
   }
+  if (w_control.size() != alloc_matrix.rows() ||
+      !alloc_matrix.allFinite() ||
+      !w_control.allFinite() ||
+      (w_task.size() > 0 && !w_task.allFinite()) ||
+      (task_weights.size() > 0 && !task_weights.allFinite()) ||
+      (w_priority.size() > 0 && !w_priority.allFinite()) ||
+      (secondary_ref.size() > 0 && !secondary_ref.allFinite()) ||
+      (interface_load_matrix.size() > 0 && !interface_load_matrix.allFinite()) ||
+      !std::isfinite(alloc_t_max_) ||
+      !std::isfinite(alloc_gimbal_limit_rad_)) {
+    ROS_WARN_THROTTLE(
+        1.0,
+        "[UnifiedCtrl QP] reject non-finite or mismatched input: A=%dx%d wc=%d "
+        "wt=%d tw=%d pr=%d sec=%d D=%dx%d",
+        static_cast<int>(alloc_matrix.rows()),
+        static_cast<int>(alloc_matrix.cols()),
+        static_cast<int>(w_control.size()),
+        static_cast<int>(w_task.size()),
+        static_cast<int>(task_weights.size()),
+        static_cast<int>(w_priority.size()),
+        static_cast<int>(secondary_ref.size()),
+        static_cast<int>(interface_load_matrix.rows()),
+        static_cast<int>(interface_load_matrix.cols()));
+    return false;
+  }
 
   const int n_rotors = n_cols / rotor_coef_;
   const double tan_limit = std::tan(alloc_gimbal_limit_rad_);
+  if (!std::isfinite(tan_limit)) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] reject invalid gimbal limit %.3f rad",
+                      alloc_gimbal_limit_rad_);
+    return false;
+  }
 
   // --- Count constraints ---
   // For rotor_coef == 2:
@@ -1179,6 +1211,17 @@ bool BeetleUnifiedController::solveFullVectorQP(
                       row, n_constraints);
     return false;
   }
+  bool bounds_have_nan = false;
+  for (int i = 0; i < n_constraints; i++) {
+    if (std::isnan(lb(i)) || std::isnan(ub(i))) {
+      bounds_have_nan = true;
+      break;
+    }
+  }
+  if (!P_dense.allFinite() || !q_vec.allFinite() || bounds_have_nan) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] reject non-finite dense problem data");
+    return false;
+  }
 
   // --- Build sparse matrices ---
   Eigen::SparseMatrix<double> P_sparse(n_cols, n_cols);
@@ -1191,14 +1234,62 @@ bool BeetleUnifiedController::solveFullVectorQP(
       }
     }
     P_sparse.setFromTriplets(P_trips.begin(), P_trips.end());
+    P_sparse.makeCompressed();
   }
 
   Eigen::SparseMatrix<double> C_sparse(n_constraints, n_cols);
   C_sparse.setFromTriplets(C_trips.begin(), C_trips.end());
+  C_sparse.makeCompressed();
+
+  auto sparsePatternMatches =
+      [](const Eigen::SparseMatrix<double>& matrix,
+         const std::vector<int>& outer,
+         const std::vector<int>& inner,
+         int prev_nnz) {
+        if (prev_nnz != matrix.nonZeros()) return false;
+        if (static_cast<int>(outer.size()) != matrix.outerSize() + 1) return false;
+        if (static_cast<int>(inner.size()) != matrix.nonZeros()) return false;
+        for (int i = 0; i < matrix.outerSize() + 1; i++) {
+          if (outer[i] != matrix.outerIndexPtr()[i]) return false;
+        }
+        for (int i = 0; i < matrix.nonZeros(); i++) {
+          if (inner[i] != matrix.innerIndexPtr()[i]) return false;
+        }
+        return true;
+      };
+  auto storeSparsePattern =
+      [](const Eigen::SparseMatrix<double>& matrix,
+         std::vector<int>& outer,
+         std::vector<int>& inner,
+         int& nnz) {
+        nnz = matrix.nonZeros();
+        outer.resize(matrix.outerSize() + 1);
+        for (int i = 0; i < matrix.outerSize() + 1; i++) {
+          outer[i] = matrix.outerIndexPtr()[i];
+        }
+        inner.resize(matrix.nonZeros());
+        for (int i = 0; i < matrix.nonZeros(); i++) {
+          inner[i] = matrix.innerIndexPtr()[i];
+        }
+      };
 
   // --- Init or update solver ---
-  bool need_init = (qp_n_vars_ != n_cols || qp_n_constraints_ != n_constraints);
+  const bool same_dimensions =
+      (qp_n_vars_ == n_cols && qp_n_constraints_ == n_constraints);
+  const bool same_pattern =
+      same_dimensions &&
+      sparsePatternMatches(P_sparse, qp_hessian_outer_, qp_hessian_inner_, qp_hessian_nnz_) &&
+      sparsePatternMatches(C_sparse, qp_constraint_outer_, qp_constraint_inner_, qp_constraint_nnz_);
+  bool need_init = !qp_solver_ || !same_pattern;
   if (need_init) {
+    if (same_dimensions && qp_hessian_nnz_ >= 0 && qp_constraint_nnz_ >= 0) {
+      ROS_INFO_THROTTLE(
+          2.0,
+          "[UnifiedCtrl QP] reinit solver because sparse pattern changed "
+          "(P nnz %d->%d, C nnz %d->%d)",
+          qp_hessian_nnz_, static_cast<int>(P_sparse.nonZeros()),
+          qp_constraint_nnz_, static_cast<int>(C_sparse.nonZeros()));
+    }
     // Recreate solver to avoid OsqpEigen "already set" stderr warnings
     // (clearSolver() does not reset the Data object's internal flags)
     qp_solver_ = std::make_unique<OsqpEigen::Solver>();
@@ -1239,21 +1330,27 @@ bool BeetleUnifiedController::solveFullVectorQP(
     }
     qp_n_vars_ = n_cols;
     qp_n_constraints_ = n_constraints;
+    storeSparsePattern(P_sparse, qp_hessian_outer_, qp_hessian_inner_, qp_hessian_nnz_);
+    storeSparsePattern(C_sparse, qp_constraint_outer_, qp_constraint_inner_, qp_constraint_nnz_);
   } else {
     if (!qp_solver_->updateHessianMatrix(P_sparse)) {
       ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=hessian");
+      resetQPState();
       return false;
     }
     if (!qp_solver_->updateGradient(q_vec)) {
       ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=gradient");
+      resetQPState();
       return false;
     }
     if (!qp_solver_->updateLinearConstraintsMatrix(C_sparse)) {
       ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=constraint_matrix");
+      resetQPState();
       return false;
     }
     if (!qp_solver_->updateBounds(lb, ub)) {
       ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=bounds");
+      resetQPState();
       return false;
     }
   }
@@ -1276,6 +1373,11 @@ bool BeetleUnifiedController::solveFullVectorQP(
     ROS_WARN_THROTTLE(1.0,
                       "[TEMP_UNIFIED_CMD] stage=qp_solution_reject size=%d expected=%d",
                       static_cast<int>(f_sol.size()), n_cols);
+    return false;
+  }
+  if (!f_sol.allFinite()) {
+    ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_solution_reject non_finite=1");
+    resetQPState();
     return false;
   }
 

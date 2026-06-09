@@ -14,6 +14,7 @@ controller:
   pd_wrench_comp_mode: true
   unified_control_mode: false
   unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
+  unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
 
   # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
   # handles LF↔unified switching directly in initUnifiedMode().

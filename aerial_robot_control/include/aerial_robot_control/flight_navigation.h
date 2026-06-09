@@ -73,6 +73,15 @@ namespace aerial_robot_navigation
     inline bool getXyVelModePosCtrlTakeoff(){  return xy_vel_mode_pos_ctrl_takeoff_;}
     inline bool getForceLandingFlag() {return force_landing_flag_;}
     inline double getForceLandingStartTime() {return force_landing_start_time_.toSec();}
+    inline void requestForceLanding()
+    {
+      spinal::FlightConfigCmd flight_config_cmd;
+      flight_config_cmd.cmd = spinal::FlightConfigCmd::FORCE_LANDING_CMD;
+      flight_config_pub_.publish(flight_config_cmd);
+      force_landing_flag_ = true;
+
+      ROS_INFO("Force Landing state");
+    }
 
     inline tf::Vector3 getTargetPos() {return target_pos_;}
     inline tf::Vector3 getTargetVel() {return target_vel_;}
@@ -527,12 +536,7 @@ namespace aerial_robot_navigation
 
     void forceLandingCallback(const std_msgs::EmptyConstPtr & msg)
     {
-      spinal::FlightConfigCmd flight_config_cmd;
-      flight_config_cmd.cmd = spinal::FlightConfigCmd::FORCE_LANDING_CMD;
-      flight_config_pub_.publish(flight_config_cmd);
-      force_landing_flag_ = true;
-
-      ROS_INFO("Force Landing state");
+      requestForceLanding();
     }
 
     void xyControlModeCallback(const std_msgs::Int8ConstPtr & msg)

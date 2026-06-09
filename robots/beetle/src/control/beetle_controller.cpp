@@ -27,6 +27,7 @@ namespace aerial_robot_control
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
+    unified_reference_timeout_(0.8),
     local_unified_cascade_setup_sent_(false),
     unified_torque_alloc_inv_pub_interval_(0.05),
     last_unified_torque_alloc_inv_pub_time_(-1.0),
@@ -740,6 +741,31 @@ namespace aerial_robot_control
       }
     }
 
+    // ======== FOLLOWER leader-reference stale guard ========
+    // FOLLOWER still computes allocation locally, but its formation target comes
+    // from the LEADER reference. If that heartbeat disappears in flight, reuse
+    // the existing force-landing path instead of continuing with a stale target.
+    if (unified_control_mode_ &&
+        beetle_navigator_->getModuleState() == FOLLOWER &&
+        unified_cmd_received_ &&
+        unified_reference_timeout_ > 0.0 &&
+        !navigator_->getForceLandingFlag()) {
+      const double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
+      const int navi_state = navigator_->getNaviState();
+      const bool in_flight =
+          (navi_state == aerial_robot_navigation::TAKEOFF_STATE ||
+           navi_state == aerial_robot_navigation::HOVER_STATE ||
+           navi_state == aerial_robot_navigation::LAND_STATE);
+      if (in_flight && age > unified_reference_timeout_) {
+        ROS_ERROR_THROTTLE(
+            0.5,
+            "[UnifiedCtrl] FOLLOWER id=%d leader reference stale: age=%.3fs "
+            "> timeout=%.3fs, requesting force landing",
+            beetle_navigator_->getMyID(), age, unified_reference_timeout_);
+        navigator_->requestForceLanding();
+      }
+    }
+
     // ======== T4.3: Auto-exit unified mode on force landing / halt ========
     // When LEADER detects force_landing or halt (STOP_STATE) while in unified mode,
     // immediately clear unified_control_mode_ so BOTH LEADER and all FOLLOWERs
@@ -1146,8 +1172,11 @@ namespace aerial_robot_control
                                     msg.leader_target_ang_acc.y,
                                     msg.leader_target_ang_acc.z);
 
+    const ros::Time now = ros::Time::now();
+    const double transport_age =
+        msg.header.stamp.isZero() ? 0.0 : (now - msg.header.stamp).toSec();
     unified_cmd_received_ = true;
-    unified_cmd_stamp_ = msg.header.stamp.isZero() ? ros::Time::now() : msg.header.stamp;
+    unified_cmd_stamp_ = now;
 
     ROS_INFO_THROTTLE(
         1.0,
@@ -1155,7 +1184,7 @@ namespace aerial_robot_control
         "wrench_z=%.3f pitch_alloc=%.3f yaw_raw=%.3f",
         beetle_navigator_->getMyID(),
         beetle_navigator_->getLeaderID(),
-        (ros::Time::now() - unified_cmd_stamp_).toSec(),
+        transport_age,
         unified_reference_wrench_acc_(2),
         unified_reference_wrench_acc_(4),
         unified_reference_yaw_pid_raw_);
@@ -1912,6 +1941,8 @@ namespace aerial_robot_control
 
     getParam<int>(control_nh, "unified_reference_warmup_frames", unified_reference_warmup_frames_, 20);
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
+    getParam<double>(control_nh, "unified_reference_timeout", unified_reference_timeout_, 0.8);
+    unified_reference_timeout_ = std::max(0.0, unified_reference_timeout_);
     getParam<double>(control_nh, "torque_allocation_matrix_inv_pub_interval",
                      unified_torque_alloc_inv_pub_interval_, 0.05);
     unified_torque_alloc_inv_pub_interval_ =

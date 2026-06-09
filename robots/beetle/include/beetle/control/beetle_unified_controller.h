@@ -126,6 +126,12 @@ public:
   void resetQPState() {
     qp_n_vars_ = -1;
     qp_n_constraints_ = -1;
+    qp_hessian_nnz_ = -1;
+    qp_constraint_nnz_ = -1;
+    qp_hessian_outer_.clear();
+    qp_hessian_inner_.clear();
+    qp_constraint_outer_.clear();
+    qp_constraint_inner_.clear();
     prev_vectoring_f_.resize(0);
   }
 
@@ -337,6 +343,12 @@ private:
   Eigen::VectorXd alloc_priority_tolerances_;  // [Fx,Fy,Fz,Tx,Ty,Tz] acc-space bands; <=0 disables row
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
   int qp_n_constraints_;              // number of linear constraints, -1 = uninit
+  int qp_hessian_nnz_;                // sparse pattern guard for safe OsqpEigen updates
+  int qp_constraint_nnz_;
+  std::vector<int> qp_hessian_outer_;
+  std::vector<int> qp_hessian_inner_;
+  std::vector<int> qp_constraint_outer_;
+  std::vector<int> qp_constraint_inner_;
   std::unique_ptr<OsqpEigen::Solver> qp_solver_;
   Eigen::VectorXd prev_vectoring_f_;   // previous successful allocation, used by rate terms
 

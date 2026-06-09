@@ -317,6 +317,7 @@ private:
 
   void extractThrustAndGimbal(const Eigen::VectorXd& vectoring_f,
                               const std::vector<int>& assembled_ids);
+  void applyActuatorMarginGuard(Eigen::VectorXd& control_wrench_acc) const;
 
   // Full-vector QP constrained allocation
   // Decision variables: f ∈ R^{rotor_coef * n_rotors} (all force components).
@@ -341,6 +342,11 @@ private:
   double alloc_interface_torque_limit_;   // optional component-wise interface torque proxy limit [Nm]
   bool alloc_priority_enabled_;       // hard-prioritize selected 6D wrench tracking rows
   Eigen::VectorXd alloc_priority_tolerances_;  // [Fx,Fy,Fz,Tx,Ty,Tz] acc-space bands; <=0 disables row
+  bool alloc_power_guard_enabled_;     // shed noncritical feedback when previous allocation is near actuator limits
+  double alloc_power_guard_thrust_margin_;     // max thrust margin below alloc_t_max [N]
+  double alloc_power_guard_component_margin_;  // fx/fz component margin threshold [N]
+  double alloc_power_guard_lateral_scale_;     // control Fx/Fy scale while guard is active
+  double alloc_power_guard_yaw_scale_;         // control Tz scale while guard is active
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
   int qp_n_constraints_;              // number of linear constraints, -1 = uninit
   int qp_hessian_nnz_;                // sparse pattern guard for safe OsqpEigen updates

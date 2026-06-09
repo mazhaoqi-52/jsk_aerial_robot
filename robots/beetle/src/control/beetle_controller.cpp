@@ -41,8 +41,8 @@ namespace aerial_robot_control
     unified_towing_debug_log_period_(1.0),
     unified_command_stall_debug_(true),
     unified_command_stall_warn_gap_(0.12),
-    unified_command_stall_trace_gap_(0.08),
-    unified_command_stall_trace_duration_(1.0),
+    unified_command_stall_trace_gap_(0.12),
+    unified_command_stall_trace_duration_(0.25),
     unified_debug_stage_("init"),
     unified_debug_stage_time_(-1.0),
     unified_debug_cycle_start_time_(-1.0),
@@ -224,7 +224,7 @@ namespace aerial_robot_control
     const int module_state = beetle_navigator_ ? beetle_navigator_->getModuleState() : -1;
     const int my_id = beetle_navigator_ ? beetle_navigator_->getMyID() : -1;
     const int nav_state = navigator_ ? navigator_->getNaviState() : -1;
-    ROS_WARN(
+    ROS_DEBUG(
         "[UnifiedStallTrace] id=%d stage=%s prev=%s prev_age=%.4f "
         "nav=%d module_state=%d since_pub=%.4f cycle_age=%.4f control_ts=%.4f",
         my_id, stage, prev_stage, prev_stage_age, nav_state, module_state,
@@ -2069,11 +2069,11 @@ namespace aerial_robot_control
     unified_command_stall_warn_gap_ =
         std::max(0.03, unified_command_stall_warn_gap_);
     getParam<double>(control_nh, "unified_command_stall_trace_gap",
-                     unified_command_stall_trace_gap_, 0.08);
+                     unified_command_stall_trace_gap_, 0.12);
     unified_command_stall_trace_gap_ =
         std::max(0.03, unified_command_stall_trace_gap_);
     getParam<double>(control_nh, "unified_command_stall_trace_duration",
-                     unified_command_stall_trace_duration_, 1.0);
+                     unified_command_stall_trace_duration_, 0.25);
     unified_command_stall_trace_duration_ =
         std::max(0.0, unified_command_stall_trace_duration_);
     // Load unified-mode PID gains for roll/pitch.

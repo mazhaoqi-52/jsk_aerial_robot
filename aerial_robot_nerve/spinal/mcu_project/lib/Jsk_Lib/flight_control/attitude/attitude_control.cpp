@@ -10,6 +10,7 @@
 #endif
 
 #include "flight_control/attitude/attitude_control.h"
+#include <cstdio>
 
 #ifdef SIMULATION
 #include <sensor_msgs/JointState.h>
@@ -1054,6 +1055,8 @@ void AttitudeController::pwmConversion()
           max_thrust_index = i;
         }
     }
+  const float sat_check_max_thrust = max_thrust;
+  const int sat_check_max_thrust_index = max_thrust_index;
   if(start_control_flag_)
     {
       float residual_term = thrust_limit - max_thrust / rotor_devider_;
@@ -1132,7 +1135,43 @@ void AttitudeController::pwmConversion()
             }
         }
     }
-  
+
+  if(start_control_flag_ && base_thrust_decreasing_rate < -0.05f)
+    {
+      const int base_idx = rotor_coef_ * sat_check_max_thrust_index;
+      const float denom = (sat_check_max_thrust_index >= 0 && sat_check_max_thrust_index < motor_number_) ?
+        base_thrust_term_[sat_check_max_thrust_index] : 0.0f;
+      const float base0 = (base_idx >= 0 && base_idx < motor_number_) ? base_thrust_term_[base_idx] : 0.0f;
+      const float base1 = (base_idx + 1 >= 0 && base_idx + 1 < motor_number_) ? base_thrust_term_[base_idx + 1] : 0.0f;
+      const float rp0 = (base_idx >= 0 && base_idx < motor_number_) ? roll_pitch_term_[base_idx] : 0.0f;
+      const float rp1 = (base_idx + 1 >= 0 && base_idx + 1 < motor_number_) ? roll_pitch_term_[base_idx + 1] : 0.0f;
+#ifdef SIMULATION
+      ROS_WARN_THROTTLE(
+        0.2,
+        "[SAT_DIAG] base_shed rate=%.3f yaw_rate=%.3f thrust=%.3f limit=%.3f "
+        "rotor=%d denom_idx=%d denom=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
+        "v_factor=%.3f ref=%d rotor_coef=%d",
+        base_thrust_decreasing_rate, yaw_decreasing_rate, sat_check_max_thrust,
+        thrust_limit, sat_check_max_thrust_index, sat_check_max_thrust_index, denom,
+        base0, base1, rp0, rp1, v_factor_, motor_ref_index_, rotor_coef_);
+#else
+      static uint32_t sat_diag_last_time = 0;
+      if(HAL_GetTick() - sat_diag_last_time > 200)
+        {
+          sat_diag_last_time = HAL_GetTick();
+          char log_msg[240];
+          snprintf(log_msg, sizeof(log_msg),
+                   "[SAT_DIAG] base_shed rate=%.3f yaw_rate=%.3f thrust=%.3f limit=%.3f "
+                   "rotor=%d denom_idx=%d denom=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
+                   "v_factor=%.3f ref=%d rotor_coef=%d",
+                   base_thrust_decreasing_rate, yaw_decreasing_rate, sat_check_max_thrust,
+                   thrust_limit, sat_check_max_thrust_index, sat_check_max_thrust_index, denom,
+                   base0, base1, rp0, rp1, v_factor_, motor_ref_index_, rotor_coef_);
+          nh_->logwarn(log_msg);
+        }
+#endif
+    }
+
   for(int i = 0; i < motor_number_; i++)
     {
       float candidate = roll_pitch_term_[i] + (1 + base_thrust_decreasing_rate) * base_thrust_term_[i] + (1 + yaw_decreasing_rate) * yaw_term_[i];

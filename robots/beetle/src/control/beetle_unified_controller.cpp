@@ -63,11 +63,6 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_interface_torque_limit_(0.0),
 	    alloc_priority_enabled_(false),
 	    alloc_priority_tolerances_(Eigen::VectorXd::Zero(6)),
-	    alloc_power_guard_enabled_(false),
-	    alloc_power_guard_thrust_margin_(1.0),
-	    alloc_power_guard_component_margin_(0.6),
-	    alloc_power_guard_lateral_scale_(0.7),
-	    alloc_power_guard_yaw_scale_(0.5),
 	    qp_n_vars_(-1),
 	    qp_n_constraints_(-1),
 	    qp_hessian_nnz_(-1),
@@ -131,11 +126,6 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_interface_force_limit", alloc_interface_force_limit_, 0.0);
   control_nh.param<double>("alloc_interface_torque_limit", alloc_interface_torque_limit_, 0.0);
   control_nh.param<bool>("alloc_priority_enabled", alloc_priority_enabled_, false);
-  control_nh.param<bool>("alloc_power_guard_enabled", alloc_power_guard_enabled_, false);
-  control_nh.param<double>("alloc_power_guard_thrust_margin", alloc_power_guard_thrust_margin_, 1.0);
-  control_nh.param<double>("alloc_power_guard_component_margin", alloc_power_guard_component_margin_, 0.6);
-  control_nh.param<double>("alloc_power_guard_lateral_scale", alloc_power_guard_lateral_scale_, 0.7);
-  control_nh.param<double>("alloc_power_guard_yaw_scale", alloc_power_guard_yaw_scale_, 0.5);
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
   alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
@@ -150,12 +140,6 @@ void BeetleUnifiedController::rosParamInit()
   alloc_interface_torque_weight_ = std::max(0.0, alloc_interface_torque_weight_);
   alloc_interface_force_limit_ = std::max(0.0, alloc_interface_force_limit_);
   alloc_interface_torque_limit_ = std::max(0.0, alloc_interface_torque_limit_);
-  alloc_power_guard_thrust_margin_ = std::max(0.0, alloc_power_guard_thrust_margin_);
-  alloc_power_guard_component_margin_ = std::max(0.0, alloc_power_guard_component_margin_);
-  alloc_power_guard_lateral_scale_ =
-      std::min(1.0, std::max(0.0, alloc_power_guard_lateral_scale_));
-  alloc_power_guard_yaw_scale_ =
-      std::min(1.0, std::max(0.0, alloc_power_guard_yaw_scale_));
 
   alloc_priority_tolerances_ = Eigen::VectorXd::Zero(6);
   XmlRpc::XmlRpcValue priority_tolerances;
@@ -252,57 +236,6 @@ void BeetleUnifiedController::clearInternalWrenchSecondaryReference()
 {
   module_internal_wrench_comp_.clear();
   internal_wrench_secondary_gain_ = 0.0;
-}
-
-void BeetleUnifiedController::applyActuatorMarginGuard(Eigen::VectorXd& control_wrench_acc) const
-{
-  if (!alloc_power_guard_enabled_ ||
-      control_wrench_acc.size() != 6 ||
-      rotor_coef_ != 2 ||
-      alloc_t_max_ <= 0.0 ||
-      prev_vectoring_f_.size() == 0 ||
-      prev_vectoring_f_.size() % rotor_coef_ != 0 ||
-      (alloc_power_guard_lateral_scale_ >= 0.999 &&
-       alloc_power_guard_yaw_scale_ >= 0.999)) {
-    return;
-  }
-
-  const int n_rotors = prev_vectoring_f_.size() / rotor_coef_;
-  double max_t = 0.0;
-  double min_component_margin = std::numeric_limits<double>::infinity();
-  for (int i = 0; i < n_rotors; i++) {
-    const double fx = prev_vectoring_f_(rotor_coef_ * i);
-    const double fz = prev_vectoring_f_(rotor_coef_ * i + 1);
-    if (!std::isfinite(fx) || !std::isfinite(fz)) return;
-
-    max_t = std::max(max_t, std::sqrt(fx * fx + fz * fz));
-    min_component_margin =
-        std::min(min_component_margin,
-                 std::min(alloc_t_max_ - std::abs(fx), alloc_t_max_ - fz));
-  }
-
-  const double thrust_trigger =
-      std::max(0.0, alloc_t_max_ - alloc_power_guard_thrust_margin_);
-  const bool high_thrust = max_t >= thrust_trigger;
-  const bool low_component_margin =
-      min_component_margin <= alloc_power_guard_component_margin_;
-  if (!high_thrust && !low_component_margin) return;
-
-  const Eigen::VectorXd before = control_wrench_acc;
-  control_wrench_acc(0) *= alloc_power_guard_lateral_scale_;
-  control_wrench_acc(1) *= alloc_power_guard_lateral_scale_;
-  control_wrench_acc(5) *= alloc_power_guard_yaw_scale_;
-
-  ROS_WARN_THROTTLE(
-      0.5,
-      "[UnifiedCtrl PowerGuard] shed XY/yaw feedback: prev_max_t=%.2f trigger_t=%.2f "
-      "prev_comp_margin=%.2f trigger_margin=%.2f scale_xy=%.2f scale_yaw=%.2f "
-      "control=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f)->(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f)",
-      max_t, thrust_trigger, min_component_margin, alloc_power_guard_component_margin_,
-      alloc_power_guard_lateral_scale_, alloc_power_guard_yaw_scale_,
-      before(0), before(1), before(2), before(3), before(4), before(5),
-      control_wrench_acc(0), control_wrench_acc(1), control_wrench_acc(2),
-      control_wrench_acc(3), control_wrench_acc(4), control_wrench_acc(5));
 }
 
 void BeetleUnifiedController::setModuleModelDescriptor(
@@ -571,8 +504,6 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         alloc_rate_weight_, alloc_lateral_rate_weight_, alloc_rate_limit_,
         alloc_direction_rate_limit_rad_ * 180.0 / M_PI);
   }
-  applyActuatorMarginGuard(control_wrench_acc);
-
   Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
   Eigen::MatrixXd interface_load_matrix;
   std::vector<std::pair<int, int>> interface_cuts;

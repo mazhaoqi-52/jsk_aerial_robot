@@ -1,5 +1,6 @@
 #include <beetle/control/beetle_controller.h>
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <sstream>
@@ -32,10 +33,10 @@ namespace aerial_robot_control
     unified_torque_alloc_inv_pub_interval_(0.05),
     last_unified_torque_alloc_inv_pub_time_(-1.0),
     last_unified_command_pub_time_(-1.0),
-    unified_internal_wrench_diag_(true),
-    unified_internal_wrench_log_(true),
+    unified_internal_wrench_diag_(false),
+    unified_internal_wrench_log_(false),
     unified_internal_wrench_detail_log_(false),
-    unified_internal_wrench_log_period_(1.0),
+    unified_internal_wrench_log_period_(5.0),
     unified_internal_wrench_secondary_gain_(0.0),
     unified_towing_debug_log_(true),
     unified_towing_debug_log_period_(1.0),
@@ -1018,7 +1019,7 @@ namespace aerial_robot_control
       max_pair_norm = std::max(max_pair_norm, std::sqrt(fx * fx + fz * fz));
     }
     ROS_INFO_THROTTLE(
-        0.5,
+        5.0,
         "[TEMP_UNIFIED_CMD] id=%d stage=publish nav=%d module_state=%d "
         "dt_prev=%.3f elems=%zu max_pair=%.2f max_abs_comp=%.2f "
         "angles=(%.3f,%.3f,%.3f)",
@@ -1121,7 +1122,7 @@ namespace aerial_robot_control
     unified_reference_pub_.publish(msg);
 
     ROS_INFO_THROTTLE(
-        1.0,
+        5.0,
         "[TEMP_UNIFIED_CMD] id=%d stage=ref_pub stamp=%.4f mass=%.3f "
         "wrench_z=%.3f pitch_alloc=%.3f yaw_raw=%.3f",
         beetle_navigator_->getMyID(),
@@ -1276,7 +1277,7 @@ namespace aerial_robot_control
     unified_cmd_stamp_ = now;
 
     ROS_INFO_THROTTLE(
-        1.0,
+        5.0,
         "[TEMP_UNIFIED_CMD] id=%d stage=ref_rx leader_id=%d age=%.4f "
         "wrench_z=%.3f pitch_alloc=%.3f yaw_raw=%.3f",
         beetle_navigator_->getMyID(),
@@ -2044,12 +2045,12 @@ namespace aerial_robot_control
                      unified_torque_alloc_inv_pub_interval_, 0.05);
     unified_torque_alloc_inv_pub_interval_ =
         std::max(0.0, unified_torque_alloc_inv_pub_interval_);
-    getParam<bool>(control_nh, "unified_internal_wrench_diag", unified_internal_wrench_diag_, true);
-    getParam<bool>(control_nh, "unified_internal_wrench_log", unified_internal_wrench_log_, true);
+    getParam<bool>(control_nh, "unified_internal_wrench_diag", unified_internal_wrench_diag_, false);
+    getParam<bool>(control_nh, "unified_internal_wrench_log", unified_internal_wrench_log_, false);
     getParam<bool>(control_nh, "unified_internal_wrench_detail_log",
                    unified_internal_wrench_detail_log_, false);
     getParam<double>(control_nh, "unified_internal_wrench_log_period",
-                     unified_internal_wrench_log_period_, 1.0);
+                     unified_internal_wrench_log_period_, 5.0);
     unified_internal_wrench_log_period_ =
         std::max(0.1, unified_internal_wrench_log_period_);
     getParam<double>(control_nh, "unified_internal_wrench_secondary_gain",
@@ -2376,6 +2377,113 @@ namespace aerial_robot_control
   void BeetleController::formationDesiredWrenchWeightsCallback(const std_msgs::Float32MultiArray& msg)
   {
     desiredExternalWrenchWeightsCallback(msg);
+  }
+
+  void BeetleController::logFollowerAllocationImbalance(
+      const Eigen::VectorXd& target_wrench_acc,
+      double alloc_ms,
+      double since_pub,
+      bool alloc_ok)
+  {
+    if (!alloc_ok ||
+        beetle_navigator_->getModuleState() != FOLLOWER ||
+        navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE) {
+      return;
+    }
+
+    const std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
+    const std::map<int, BeetleUnifiedController::ModuleCommand>& module_commands =
+        unified_controller_->getModuleCommands();
+    const int module_num = static_cast<int>(assembled_ids.size());
+    if (module_num <= 1 || module_commands.empty()) return;
+
+    int local_index = -1;
+    std::vector<double> module_means(module_num, 0.0);
+    std::vector<double> module_min(module_num, 0.0);
+    std::vector<double> module_max(module_num, 0.0);
+    double sum_means = 0.0;
+    double min_mean = 0.0;
+    double max_mean = 0.0;
+    for (int m = 0; m < module_num; m++) {
+      if (assembled_ids[m] == beetle_navigator_->getMyID()) local_index = m;
+
+      const auto cmd_it = module_commands.find(assembled_ids[m]);
+      if (cmd_it == module_commands.end() || cmd_it->second.full_thrusts.empty()) return;
+
+      double thrust_sum = 0.0;
+      double local_min = 0.0;
+      double local_max = 0.0;
+      const std::vector<float>& full_thrusts = cmd_it->second.full_thrusts;
+      for (size_t r = 0; r < full_thrusts.size(); r++) {
+        const double thrust = full_thrusts[r];
+        thrust_sum += thrust;
+        if (r == 0) {
+          local_min = thrust;
+          local_max = thrust;
+        } else {
+          local_min = std::min(local_min, thrust);
+          local_max = std::max(local_max, thrust);
+        }
+      }
+
+      module_means[m] = thrust_sum / full_thrusts.size();
+      module_min[m] = local_min;
+      module_max[m] = local_max;
+      sum_means += module_means[m];
+      if (m == 0) {
+        min_mean = module_means[m];
+        max_mean = module_means[m];
+      } else {
+        min_mean = std::min(min_mean, module_means[m]);
+        max_mean = std::max(max_mean, module_means[m]);
+      }
+    }
+    if (local_index < 0) return;
+
+    const double local_mean = module_means[local_index];
+    const double other_mean = (module_num > 1) ? (sum_means - local_mean) / (module_num - 1) : local_mean;
+    const double local_minus_other = local_mean - other_mean;
+    const double spread = max_mean - min_mean;
+    const double pitch_i = pid_controllers_.at(PITCH).getITerm();
+    const double pitch_err = target_rpy_.y() - rpy_.y();
+    const double pitch_err_i = pid_controllers_.at(PITCH).getErrI();
+    const double leader_pitch_i =
+        (unified_reference_wrench_acc_.size() >= 6) ? unified_reference_wrench_acc_(4) : 0.0;
+    const double ref_age =
+        unified_cmd_stamp_.isZero() ? -1.0 : (ros::Time::now() - unified_cmd_stamp_).toSec();
+
+    const bool suspicious =
+        std::abs(local_minus_other) > 2.0 ||
+        spread > 4.0 ||
+        std::abs(pitch_i) > 3.0 ||
+        std::abs(pitch_i - leader_pitch_i) > 3.0;
+    if (!suspicious) return;
+
+    std::ostringstream means_ss;
+    means_ss << std::fixed << std::setprecision(2);
+    for (int m = 0; m < module_num; m++) {
+      if (m > 0) means_ss << ",";
+      means_ss << assembled_ids[m] << ":" << module_means[m];
+    }
+    const std::string module_means_str = means_ss.str();
+
+    ROS_WARN_THROTTLE(
+        2.0,
+        "[UnifiedCtrl FollowerImbalance] id=%d thrust_mean(local/other/diff/spread)=%.2f/%.2f/%+.2f/%.2f "
+        "local_minmax=%.2f/%.2f module_means=[%s] "
+        "pitch(err/err_i/p/i/d)=%.4f/%.4f/%.3f/%.3f/%.3f "
+        "pitch_target/current=%.4f/%.4f leader_pitch_i=%.3f ref_age=%.3f "
+        "wrench_z_pitch=%.3f/%.3f alloc_ms=%.2f since_pub=%.3f",
+        beetle_navigator_->getMyID(),
+        local_mean, other_mean, local_minus_other, spread,
+        module_min[local_index], module_max[local_index],
+        module_means_str.c_str(),
+        pitch_err, pitch_err_i,
+        pid_controllers_.at(PITCH).getPTerm(), pitch_i,
+        pid_controllers_.at(PITCH).getDTerm(),
+        target_rpy_.y(), rpy_.y(), leader_pitch_i, ref_age,
+        target_wrench_acc(2), target_wrench_acc(4),
+        alloc_ms, since_pub);
   }
 
   void BeetleController::publishAssembleDebug(
@@ -2869,7 +2977,7 @@ namespace aerial_robot_control
       tf::Vector3 gravity_cog = uav_rot.inverse() * gravity_w;
       double gravity_ramp = 1.0;
       if (navigator_->getNaviState() == aerial_robot_navigation::TAKEOFF_STATE) {
-        constexpr int GRAVITY_RAMP_FRAMES = 20;
+        constexpr int GRAVITY_RAMP_FRAMES = 40;
         gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
       }
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
@@ -2893,7 +3001,7 @@ namespace aerial_robot_control
     const double alloc_end = ros::Time::now().toSec();
     const int local_module_state = beetle_navigator_->getModuleState();
     ROS_INFO_THROTTLE(
-        0.5,
+        5.0,
         "[TEMP_UNIFIED_CMD] id=%d role=%s stage=after_alloc ok=%d nav=%d "
         "module_state=%d alloc_ms=%.2f since_pub=%.3f "
         "wrench_acc=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) yaw_raw=%.3f",
@@ -2903,6 +3011,10 @@ namespace aerial_robot_control
         target_wrench_acc(0), target_wrench_acc(1), target_wrench_acc(2),
         target_wrench_acc(3), target_wrench_acc(4), target_wrench_acc(5),
         yaw_pid_raw);
+    logFollowerAllocationImbalance(target_wrench_acc,
+                                   1000.0 * (alloc_end - alloc_start),
+                                   since_pub_before_alloc,
+                                   ok);
     if (!ok) {
       ROS_WARN_THROTTLE(
           0.2,

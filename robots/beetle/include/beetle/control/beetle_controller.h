@@ -287,6 +287,10 @@ namespace aerial_robot_control
                               const Eigen::VectorXd& target_wrench_acc,
                               const Eigen::VectorXd& formation_wrench_cmd,
                               double yaw_pid_raw);
+    void logFollowerAllocationImbalance(const Eigen::VectorXd& target_wrench_acc,
+                                        double alloc_ms,
+                                        double since_pub,
+                                        bool alloc_ok);
     void controlCore() override;
     bool update() override;
     

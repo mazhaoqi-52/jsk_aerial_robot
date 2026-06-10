@@ -36,10 +36,10 @@ controller:
 
   # Unified internal wrench management: keep diagnostic-only until residual logs
   # are validated, then try a small secondary gain such as 0.02.
-  unified_internal_wrench_diag: true
-  unified_internal_wrench_log: true
+  unified_internal_wrench_diag: false
+  unified_internal_wrench_log: false
   unified_internal_wrench_detail_log: false
-  unified_internal_wrench_log_period: 1.0
+  unified_internal_wrench_log_period: 5.0
   unified_internal_wrench_secondary_gain: 0.0
 
   # Leader-only compact log for aerial towing validation. Prints only while a

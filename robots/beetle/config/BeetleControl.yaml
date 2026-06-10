@@ -39,10 +39,10 @@ controller:
   # diag=true reuses the legacy LF residual/inter-wrench calculation for logging.
   # secondary_gain=0 keeps it diagnostic-only. Set a small value (e.g. 0.02)
   # only after the est/task/res/comp logs look physically consistent in flight.
-  unified_internal_wrench_diag: true
-  unified_internal_wrench_log: true
+  unified_internal_wrench_diag: false
+  unified_internal_wrench_log: false
   unified_internal_wrench_detail_log: false
-  unified_internal_wrench_log_period: 1.0
+  unified_internal_wrench_log_period: 5.0
   unified_internal_wrench_secondary_gain: 0.0
 
   # Leader-only compact log for aerial towing validation. Prints only while a

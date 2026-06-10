@@ -612,7 +612,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
   publishInterfaceLoadDiagnostics(interface_load_matrix, interface_cuts, target_vectoring_f_);
 
-  ROS_INFO_THROTTLE(1.0, "[UnifiedCtrl] N=%d mass=%.3f cog_offset=(%.4f,%.4f,%.4f) "
+  ROS_INFO_THROTTLE(5.0, "[UnifiedCtrl] N=%d mass=%.3f cog_offset=(%.4f,%.4f,%.4f) "
                     "control_plus_task_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f)",
                     N, formation_mass_,
                     formation_cog_offset_.x(), formation_cog_offset_.y(), formation_cog_offset_.z(),
@@ -823,10 +823,17 @@ void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
       static_cast<int>(interface_cuts.size()) * 6 != interface_load_matrix.rows()) {
     return;
   }
+  const bool interface_diag_enabled =
+      alloc_interface_force_weight_ > 0.0 ||
+      alloc_interface_torque_weight_ > 0.0 ||
+      alloc_interface_force_limit_ > 0.0 ||
+      alloc_interface_torque_limit_ > 0.0;
+  const bool has_subscriber = interface_load_pub_.getNumSubscribers() > 0;
+  if (!interface_diag_enabled && !has_subscriber) return;
 
   Eigen::VectorXd load = interface_load_matrix * vectoring_f;
   std_msgs::Float32MultiArray msg;
-  msg.data.reserve(interface_cuts.size() * 10);
+  if (has_subscriber) msg.data.reserve(interface_cuts.size() * 10);
 
   double max_force = 0.0;
   double max_torque = 0.0;
@@ -841,28 +848,34 @@ void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
     max_force = std::max(max_force, fn);
     max_torque = std::max(max_torque, tn);
 
-    msg.data.push_back(static_cast<float>(interface_cuts[i].first));
-    msg.data.push_back(static_cast<float>(interface_cuts[i].second));
-    msg.data.push_back(static_cast<float>(force.x()));
-    msg.data.push_back(static_cast<float>(force.y()));
-    msg.data.push_back(static_cast<float>(force.z()));
-    msg.data.push_back(static_cast<float>(torque.x()));
-    msg.data.push_back(static_cast<float>(torque.y()));
-    msg.data.push_back(static_cast<float>(torque.z()));
-    msg.data.push_back(static_cast<float>(fn));
-    msg.data.push_back(static_cast<float>(tn));
+    if (has_subscriber) {
+      msg.data.push_back(static_cast<float>(interface_cuts[i].first));
+      msg.data.push_back(static_cast<float>(interface_cuts[i].second));
+      msg.data.push_back(static_cast<float>(force.x()));
+      msg.data.push_back(static_cast<float>(force.y()));
+      msg.data.push_back(static_cast<float>(force.z()));
+      msg.data.push_back(static_cast<float>(torque.x()));
+      msg.data.push_back(static_cast<float>(torque.y()));
+      msg.data.push_back(static_cast<float>(torque.z()));
+      msg.data.push_back(static_cast<float>(fn));
+      msg.data.push_back(static_cast<float>(tn));
+    }
 
-    if (i > 0) ss << " ";
-    ss << interface_cuts[i].first << "-" << interface_cuts[i].second
-       << ":F=(" << force.x() << "," << force.y() << "," << force.z()
-       << ")|F|=" << fn
-       << " T=(" << torque.x() << "," << torque.y() << "," << torque.z()
-       << ")|T|=" << tn;
+    if (interface_diag_enabled) {
+      if (i > 0) ss << " ";
+      ss << interface_cuts[i].first << "-" << interface_cuts[i].second
+         << ":F=(" << force.x() << "," << force.y() << "," << force.z()
+         << ")|F|=" << fn
+         << " T=(" << torque.x() << "," << torque.y() << "," << torque.z()
+         << ")|T|=" << tn;
+    }
   }
 
-  interface_load_pub_.publish(msg);
+  if (has_subscriber) interface_load_pub_.publish(msg);
+  if (!interface_diag_enabled) return;
+
   ROS_INFO_THROTTLE(
-      1.0,
+      5.0,
       "[UnifiedCtrl InterfaceLoad] actuator_cut_proxy max|F|=%.2fN max|T|=%.2fNm "
       "limits(F/T)=%.2f/%.2f weights(F/T)=%.3g/%.3g cuts=[%s]",
       max_force, max_torque,
@@ -1441,7 +1454,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
           "over_t(17.2/18.44/alloc/model)=%d/%d/%d/%d "
           "alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
       if (suspicious) {
-        ROS_WARN_THROTTLE(1.0, fmt,
+        ROS_WARN_THROTTLE(2.0, fmt,
                           control_residual.norm(), task_residual.norm(),
                           max_t, max_abs_angle_deg,
                           max_abs_fx, max_fz, min_component_margin,
@@ -1449,7 +1462,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
                           alloc_t_max_, model_limit,
                           thrust_stream.str().c_str(), angle_stream.str().c_str());
       } else {
-        ROS_INFO_THROTTLE(1.0, fmt,
+        ROS_INFO_THROTTLE(5.0, fmt,
                           control_residual.norm(), task_residual.norm(),
                           max_t, max_abs_angle_deg,
                           max_abs_fx, max_fz, min_component_margin,

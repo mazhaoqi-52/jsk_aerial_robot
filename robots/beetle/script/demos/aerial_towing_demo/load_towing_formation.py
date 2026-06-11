@@ -520,7 +520,9 @@ class TowingStateBase(FormationSingleUAVStateBase):
         if TowingStateBase._shared_load_interface is None:
             TowingStateBase._shared_load_interface = LoadInterface()
         self.load_interface = TowingStateBase._shared_load_interface
-        self._init_module_debug_monitors()
+        self.debug_monitors_enabled = rospy.get_param("~enable_command_debug_monitors", False)
+        if self.debug_monitors_enabled:
+            self._init_module_debug_monitors()
 
     def _init_module_debug_monitors(self):
         """Track command and force-landing heartbeat during insertion debug."""
@@ -583,6 +585,8 @@ class TowingStateBase(FormationSingleUAVStateBase):
         return " module_debug=[" + "; ".join(parts) + "]"
 
     def log_module_debug_status(self, prefix):
+        if not getattr(self, "debug_monitors_enabled", False):
+            return
         rospy.loginfo(f"{prefix}{self.format_module_debug_status()}")
 
     def get_load_position(self):
@@ -1131,9 +1135,7 @@ class TowingWithFeedforwardState(TowingStateBase):
             state_info = trajectory_gen.update_state(
                 current_pos, load_pos, rpy_result, z_err_for_guard)
 
-            # Debug: log actual vs target position every 0.5s
-            if int(elapsed * 2) != int((elapsed - 0.04) * 2):
-                rospy.loginfo(f"[Towing Pos] actual={current_pos}, start={start_pos}")
+            rospy.logdebug_throttle(2.0, f"[Towing Pos] actual={current_pos}, start={start_pos}")
 
             if trajectory_gen.is_complete() and completion_started_at is None:
                 done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
@@ -1207,10 +1209,8 @@ class TowingWithFeedforwardState(TowingStateBase):
                     f"[Towing] completion settling: t={settle_elapsed:.1f}s, "
                     f"max_rp={math.degrees(max_rp):.1f}deg, z_err={raw_z_err*1000:.0f}mm")
 
-            # Debug: log position and pitch every 0.5s
-            if int(elapsed * 2) != int((elapsed - 0.04) * 2):
-                rospy.loginfo(f"[Towing Debug] target_pos={target_state['position']}, "
-                             f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f} deg")
+            rospy.logdebug_throttle(2.0, f"[Towing Debug] target_pos={target_state['position']}, "
+                                    f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f} deg")
 
             self.send_assembly_command_from_end_effector(
                 target_state['position'],
@@ -1227,22 +1227,22 @@ class TowingWithFeedforwardState(TowingStateBase):
                                           frame_id=ff_frame,
                                           task_weights=task_weights)
 
-            # Debug: log ff force and progress every 0.5s
-            if int(elapsed * 2) != int((elapsed - 0.04) * 2):
-                rospy.loginfo(f"[Towing FF] ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N, "
-                             f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%, "
-                             f"guard={state_info['force_guard']}, task_scale={state_info['task_weight_scale']:.2f}, "
-                             f"mode={'unified' if unified_mode else 'LF'}, "
-                             f"cmd_frame={ff_frame}, tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm")
+            rospy.loginfo_throttle(
+                2.0,
+                f"[Towing FF] ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N, "
+                f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%, "
+                f"guard={state_info['force_guard']}, task_scale={state_info['task_weight_scale']:.2f}, "
+                f"mode={'unified' if unified_mode else 'LF'}, "
+                f"cmd_frame={ff_frame}, tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm")
 
-            # Log progress every 5s
-            if int(elapsed) % 5 == 0 and int(elapsed * 10) % 50 == 0:
-                dist_source = 'load' if state_info['using_load_tracking'] else 'ee'
-                dist_value = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
-                rospy.loginfo(f"Towing: {state_info['progress']*100:.1f}%, "
-                             f"dist={dist_value*1000:.0f}mm({dist_source}), "
-                             f"ff={state_info['current_force']:.1f}N, "
-                             f"guard={state_info['force_guard']}, time={elapsed:.1f}s")
+            dist_source = 'load' if state_info['using_load_tracking'] else 'ee'
+            dist_value = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+            rospy.loginfo_throttle(
+                5.0,
+                f"Towing: {state_info['progress']*100:.1f}%, "
+                f"dist={dist_value*1000:.0f}mm({dist_source}), "
+                f"ff={state_info['current_force']:.1f}N, "
+                f"guard={state_info['force_guard']}, time={elapsed:.1f}s")
 
             control_rate.sleep()
 

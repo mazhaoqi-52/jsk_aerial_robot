@@ -230,7 +230,7 @@ void BeetleNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & 
 
         if(target_delta.length() > vel_nav_threshold_)
           {
-            ROS_WARN("start vel nav control for waypoint");
+            ROS_WARN_THROTTLE(1.0, "start vel nav control for waypoint");
             vel_based_waypoint_ = true;
             xy_control_mode_ = VEL_CONTROL_MODE;
           }
@@ -610,33 +610,9 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
      * R/P PID has no actuator to track it in this mode and its I-term would
      * wind up unboundedly (verified failure: pitch=0.4 -> pitch_i +11.6 Nm in
      * 10 s, eating Z thrust until auto-land). */
-    if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
+    if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE ||
+       msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
       setFinalTargetBaselinkRPY(final_target_baselink_rpy);
-      const tf::Vector3 final_rpy = getFinalTargetBaselinkRPY();
-      const tf::Vector3 curr_rpy = getCurrTargetBaselinkRPY();
-      const tf::Vector3 target_rpy = getTargetRPY();
-      ROS_INFO("[UnifiedNav id=%d] pitch_cmd=%.3f final_baselink_rpy=(%.3f,%.3f) "
-               "curr_baselink_rpy=(%.3f,%.3f) target_rpy=(%.3f,%.3f) "
-               "prev_offset_z=%.3f new_offset_z=%.3f",
-               my_id_, msg->target_pitch,
-               final_rpy.x(), final_rpy.y(),
-               curr_rpy.x(), curr_rpy.y(),
-               target_rpy.x(), target_rpy.y(),
-               prev_com_offset.z(), com_offset.z());
-    }
-    if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
-      setFinalTargetBaselinkRPY(final_target_baselink_rpy);
-      const tf::Vector3 final_rpy = getFinalTargetBaselinkRPY();
-      const tf::Vector3 curr_rpy = getCurrTargetBaselinkRPY();
-      const tf::Vector3 target_rpy = getTargetRPY();
-      ROS_INFO("[UnifiedNav id=%d] roll_cmd=%.3f final_baselink_rpy=(%.3f,%.3f) "
-               "curr_baselink_rpy=(%.3f,%.3f) target_rpy=(%.3f,%.3f) "
-               "prev_offset_z=%.3f new_offset_z=%.3f",
-               my_id_, msg->target_roll,
-               final_rpy.x(), final_rpy.y(),
-               curr_rpy.x(), curr_rpy.y(),
-               target_rpy.x(), target_rpy.y(),
-               prev_com_offset.z(), com_offset.z());
     }
 
     {
@@ -707,7 +683,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
 
         if(target_delta.length() > vel_nav_threshold_)
           {
-            ROS_WARN("start vel nav control for waypoint");
+            ROS_WARN_THROTTLE(1.0, "start vel nav control for waypoint");
             vel_based_waypoint_ = true;
             xy_control_mode_ = VEL_CONTROL_MODE;
           }

@@ -560,9 +560,10 @@ class FormationSingleUAVStateBase(smach.State):
                 )
 
                 elapsed = rospy.get_time() - start_time
-                if int(elapsed * 2.0) % 10 == 0:
-                    rospy.loginfo(f"[Converging] pos_err={pos_error*1000:.1f}mm, "
-                                f"yaw_err={math.degrees(yaw_error):.1f} deg, t={elapsed:.1f}s")
+                rospy.loginfo_throttle(
+                    1.0,
+                    f"[Converging] pos_err={pos_error*1000:.1f}mm, "
+                    f"yaw_err={math.degrees(yaw_error):.1f} deg, t={elapsed:.1f}s")
 
             rospy.sleep(0.04)
 
@@ -770,14 +771,13 @@ class FormationSingleUAVStateBase(smach.State):
 
             prev_actual_z = actual_z
 
-            # Periodic logging
-            elapsed_int = int(wall_t)
-            if elapsed_int % 3 == 0 and abs(wall_t - round(wall_t)) < 0.025:
-                descended = start_z - actual_z
-                status = " [PAUSED]" if paused else ""
-                rospy.loginfo(f"[Z Descent] t={traj_time:.1f}/{duration:.1f}s Z={actual_z:.3f}m "
-                              f"descended={descended*1000:.0f}mm XY_err={xy_error*1000:.0f}mm"
-                              f" thresh={xy_pause_thresh*1000:.0f}mm{status}{debug_suffix()}")
+            descended = start_z - actual_z
+            status = " [PAUSED]" if paused else ""
+            rospy.loginfo_throttle(
+                3.0,
+                f"[Z Descent] t={traj_time:.1f}/{duration:.1f}s Z={actual_z:.3f}m "
+                f"descended={descended*1000:.0f}mm XY_err={xy_error*1000:.0f}mm"
+                f" thresh={xy_pause_thresh*1000:.0f}mm{status}{debug_suffix()}")
 
             rate.sleep()
 

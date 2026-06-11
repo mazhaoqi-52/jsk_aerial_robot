@@ -65,8 +65,9 @@ public:
    *                               [acc_x, acc_y, acc_z, ang_acc_roll, ang_acc_pitch, ang_acc_yaw]
    *                               In CoG frame, referenced to formation CoG.
    * @param desired_ext_wrench     6D external wrench demand at formation CoG in body frame
-   *                               [Fx,Fy,Fz,Tx,Ty,Tz] (N, Nm). This is tracked as a
-   *                               weighted soft task objective.
+   *                               [Fx,Fy,Fz,Tx,Ty,Tz] (N, Nm). Active task axes can be
+   *                               tracked as narrow hard bands, with soft weights used
+   *                               for remaining axes and secondary shaping.
    * @param priority_wrench_acc_cog Optional 6D reference for hard priority bands. When empty,
    *                                hard bands use target_wrench_acc_cog. Rows whose priority
    *                                center is approximately zero are kept soft-only.
@@ -341,6 +342,8 @@ private:
   double alloc_interface_torque_limit_;   // optional component-wise interface torque proxy limit [Nm]
   bool alloc_priority_enabled_;       // hard-prioritize selected 6D wrench tracking rows
   Eigen::VectorXd alloc_priority_tolerances_;  // [Fx,Fy,Fz,Tx,Ty,Tz] acc-space bands; <=0 disables row
+  bool alloc_task_priority_enabled_;  // hard-band active task rows before secondary objectives
+  double alloc_task_priority_min_weight_;  // task weight threshold for hard task rows
   int qp_n_vars_;                     // number of QP variables (= rotor_coef * n_rotors), -1 = uninit
   int qp_n_constraints_;              // number of linear constraints, -1 = uninit
   int qp_hessian_nnz_;                // sparse pattern guard for safe OsqpEigen updates
@@ -356,13 +359,15 @@ private:
    * @brief Full-vector constrained QP allocation.
    *
    * Formulation:
-   *   min_{f} ||Wc^(1/2)(A*f - w_control)||^2
+   *   min_{f} ||Wc_eff^(1/2)(A*f - w_control)||^2
    *           + ||Wt^(1/2)(A*f - (w_control + w_task))||^2
    *           + ρ||f||^2
    *           + λ||f - f_ref||^2 + smoothness terms
+   *   where Wc_eff clears active task-priority rows so task bands are not
+   *   softened by a competing control-only target.
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
-   *         optional 6D wrench priority bands
+   *         optional task/6D wrench priority bands
    *
    * @param alloc_matrix  Formation allocation matrix A (6 x n_cols)
    * @param w_control     Desired 6D control/stabilization wrench-acceleration vector

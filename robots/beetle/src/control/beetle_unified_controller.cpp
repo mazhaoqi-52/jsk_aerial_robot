@@ -63,6 +63,8 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_interface_torque_limit_(0.0),
 	    alloc_priority_enabled_(false),
 	    alloc_priority_tolerances_(Eigen::VectorXd::Zero(6)),
+	    alloc_task_priority_enabled_(true),
+	    alloc_task_priority_min_weight_(0.5),
 	    qp_n_vars_(-1),
 	    qp_n_constraints_(-1),
 	    qp_hessian_nnz_(-1),
@@ -126,6 +128,8 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_interface_force_limit", alloc_interface_force_limit_, 0.0);
   control_nh.param<double>("alloc_interface_torque_limit", alloc_interface_torque_limit_, 0.0);
   control_nh.param<bool>("alloc_priority_enabled", alloc_priority_enabled_, false);
+  control_nh.param<bool>("alloc_task_priority_enabled", alloc_task_priority_enabled_, true);
+  control_nh.param<double>("alloc_task_priority_min_weight", alloc_task_priority_min_weight_, 0.5);
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
   alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
@@ -140,6 +144,7 @@ void BeetleUnifiedController::rosParamInit()
   alloc_interface_torque_weight_ = std::max(0.0, alloc_interface_torque_weight_);
   alloc_interface_force_limit_ = std::max(0.0, alloc_interface_force_limit_);
   alloc_interface_torque_limit_ = std::max(0.0, alloc_interface_torque_limit_);
+  alloc_task_priority_min_weight_ = std::max(0.0, alloc_task_priority_min_weight_);
 
   alloc_priority_tolerances_ = Eigen::VectorXd::Zero(6);
   XmlRpc::XmlRpcValue priority_tolerances;
@@ -467,9 +472,9 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Split: rotational part (last 3 cols) for torque_allocation_matrix_inv
   integrated_map_inv_rot_ = integrated_map_inv_.rightCols(3);
 
-  // Convert external task wrench from force/torque to acceleration space. The
-  // task remains a weighted soft objective; it is not inserted into hard
-  // priority rows, so attitude/position stabilization keeps its own residual.
+  // Convert external task wrench from force/torque to acceleration space. High
+  // task-weight axes are tracked as narrow bands inside the QP; lower-weight
+  // axes remain soft so stabilization keeps residual authority.
   Eigen::VectorXd control_wrench_acc = target_wrench_acc_cog;
   Eigen::VectorXd task_wrench_acc = Eigen::VectorXd::Zero(6);
   Eigen::VectorXd priority_wrench_acc =
@@ -493,6 +498,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         "[UnifiedCtrl QPRef] id=%d control=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
         "task_acc=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
         "task_w=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
+        "task_prio=(enabled=%d,min_w=%.2f,tol_xy=%.2f/%.2f) "
         "rate=(w=%.1e,fx=%.1e,lim=%.2f,dir=%.1fdeg)",
         navigator_ ? navigator_->getMyID() : 0,
         control_wrench_acc(0), control_wrench_acc(1), control_wrench_acc(2),
@@ -501,6 +507,9 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         task_wrench_acc(3), task_wrench_acc(4), task_wrench_acc(5),
         effective_task_weights(0), effective_task_weights(1), effective_task_weights(2),
         effective_task_weights(3), effective_task_weights(4), effective_task_weights(5),
+        alloc_task_priority_enabled_ ? 1 : 0, alloc_task_priority_min_weight_,
+        alloc_priority_tolerances_.size() > 0 ? alloc_priority_tolerances_(0) : 0.0,
+        alloc_priority_tolerances_.size() > 1 ? alloc_priority_tolerances_(1) : 0.0,
         alloc_rate_weight_, alloc_lateral_rate_weight_, alloc_rate_limit_,
         alloc_direction_rate_limit_rad_ * 180.0 / M_PI);
   }
@@ -509,8 +518,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   std::vector<std::pair<int, int>> interface_cuts;
   buildInterfaceLoadMatrix(assembled_ids, interface_load_matrix, interface_cuts);
 
-  // Allocate: vectoring_f = control stabilization residual + weighted task
-  // residual + optional hard priority bands + secondary balanced-load objective.
+  // Allocate: active task axes are narrow hard bands; effort/rate/balancing
+  // terms then choose the actuator-side solution inside that feasible set.
   if (use_constrained_alloc_) {
     bool qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                    task_wrench_acc, effective_task_weights,
@@ -899,8 +908,9 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
   //
   // Objective:  min_f  0.5 * f' * P * f + q' * f
-  //   where P = A'(Wc+Wt)A + effort + R + optional rate/lateral-rate/interface terms,
-  //         q = -A'(Wc*w_control + Wt*w_task_target) - R*f_ref - smoothness refs
+  //   where P = A'(Wc_eff+Wt)A + effort + R + optional rate/lateral-rate/interface terms,
+  //         q = -A'(Wc_eff*w_control + Wt*w_task_target) - R*f_ref - smoothness refs
+  //         and Wc_eff is cleared on active task-priority rows.
   //
   // This separates stabilization/control tracking from task feedforward
   // tracking. Optional
@@ -917,7 +927,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   //     (d) Optional component rate bounds: |f - f_prev| ≤ Δf_max
   //     (e) Optional gimbal direction bounds: θ ∈ [θ_prev - Δθ, θ_prev + Δθ]
   //     (f) Interface cut-load component bounds: |D*f| ≤ load_max
-  //     (g) Priority bands: selected 6D wrench rows must remain near target
+  //     (g) Task-priority bands: active task rows must remain near w_control+w_task
+  //     (h) Priority bands: selected 6D wrench rows must remain near target
 
   const int n_cols = alloc_matrix.cols();
   if (n_cols == 0 || rotor_coef_ == 0 || n_cols % rotor_coef_ != 0) {
@@ -1005,11 +1016,28 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (w_task.size() == alloc_matrix.rows()) {
     task_target += w_task;
   }
+
+  std::vector<int> task_priority_rows;
+  std::vector<bool> task_priority_selected(alloc_matrix.rows(), false);
+  if (alloc_task_priority_enabled_ &&
+      w_task.size() == alloc_matrix.rows() &&
+      alloc_priority_tolerances_.size() == alloc_matrix.rows()) {
+    for (int r = 0; r < alloc_matrix.rows(); r++) {
+      if (alloc_priority_tolerances_(r) > 0.0 &&
+          effective_task_weights(r) >= alloc_task_priority_min_weight_ &&
+          std::abs(w_task(r)) > 1e-6) {
+        task_priority_rows.push_back(r);
+        task_priority_selected[r] = true;
+      }
+    }
+  }
+
   const Eigen::VectorXd& priority_target =
       (w_priority.size() == alloc_matrix.rows()) ? w_priority : w_control;
   std::vector<int> priority_rows;
   if (alloc_priority_enabled_ && alloc_priority_tolerances_.size() == alloc_matrix.rows()) {
     for (int r = 0; r < alloc_matrix.rows(); r++) {
+      if (task_priority_selected[r]) continue;
       // A zero priority center means "do not make this local feedback axis hard".
       if (alloc_priority_tolerances_(r) > 0.0 &&
           std::abs(priority_target(r)) > 1e-6) {
@@ -1017,10 +1045,17 @@ bool BeetleUnifiedController::solveFullVectorQP(
       }
     }
   }
+  const int n_task_priority_rows = static_cast<int>(task_priority_rows.size());
   const int n_priority_rows = static_cast<int>(priority_rows.size());
   int n_constraints = n_gimbal_rows + n_thrust_rows + n_bound_rows + n_rate_rows +
-                      n_direction_rate_rows + n_interface_rows + n_priority_rows;
-  Eigen::MatrixXd wrench_weight_diag = wrench_weights.asDiagonal();
+                      n_direction_rate_rows + n_interface_rows +
+                      n_task_priority_rows + n_priority_rows;
+
+  Eigen::VectorXd control_tracking_weights = wrench_weights;
+  for (int row_idx : task_priority_rows) {
+    control_tracking_weights(row_idx) = 0.0;
+  }
+  Eigen::MatrixXd wrench_weight_diag = control_tracking_weights.asDiagonal();
   Eigen::MatrixXd task_weight_diag = effective_task_weights.asDiagonal();
   Eigen::MatrixXd P_dense =
       alloc_matrix.transpose() * (wrench_weight_diag + task_weight_diag) * alloc_matrix;
@@ -1074,7 +1109,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   std::vector<Eigen::Triplet<double>> C_trips;
   C_trips.reserve(n_gimbal_rows * 2 + n_thrust_rows * 2 + n_bound_rows +
                   n_rate_rows + n_direction_rate_rows * 2 +
-                  n_interface_rows * n_cols + n_priority_rows * n_cols);
+                  n_interface_rows * n_cols +
+                  (n_task_priority_rows + n_priority_rows) * n_cols);
   Eigen::VectorXd lb(n_constraints), ub(n_constraints);
 
   int row = 0;
@@ -1201,7 +1237,23 @@ bool BeetleUnifiedController::solveFullVectorQP(
     }
   }
 
-  // (g) Hard priority bands for task-level high-output allocation.
+  // (g) Task hard bands: satisfy active feedforward wrench axes first, then let
+  // effort/rate/balancing costs choose the actuator distribution.
+  if (n_task_priority_rows > 0) {
+    for (int i = 0; i < n_task_priority_rows; i++) {
+      const int task_row = task_priority_rows[i];
+      const double tol = alloc_priority_tolerances_(task_row);
+      for (int c = 0; c < n_cols; c++) {
+        const double v = alloc_matrix(task_row, c);
+        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
+      }
+      lb(row) = task_target(task_row) - tol;
+      ub(row) = task_target(task_row) + tol;
+      row++;
+    }
+  }
+
+  // (h) Optional hard priority bands for non-task high-output allocation.
   // The band center can differ from the soft target so fast feedback artifacts
   // do not become hard constraints.
   if (n_priority_rows > 0) {
@@ -1371,9 +1423,9 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (!qp_solver_->solve()) {
     ROS_WARN_THROTTLE(
         1.0,
-        "[TEMP_UNIFIED_CMD] stage=qp_solve_fail rows(priority=%d,rate=%d,dir=%d) "
+        "[TEMP_UNIFIED_CMD] stage=qp_solve_fail rows(task_priority=%d,priority=%d,rate=%d,dir=%d) "
         "wz=(soft=%.3f,priority=%.3f) rate=(w=%.1e,fx=%.1e,lim=%.2f,dir=%.1fdeg)",
-        n_priority_rows, n_rate_rows, n_direction_rate_rows,
+        n_task_priority_rows, n_priority_rows, n_rate_rows, n_direction_rate_rows,
         w_control.size() > 2 ? w_control(2) : 0.0,
         priority_target.size() > 2 ? priority_target(2) : 0.0,
         alloc_rate_weight_, alloc_lateral_rate_weight_, alloc_rate_limit_,
@@ -1402,6 +1454,11 @@ bool BeetleUnifiedController::solveFullVectorQP(
     Eigen::VectorXd realized_acc = alloc_matrix * vectoring_f_out;
     Eigen::VectorXd control_residual = realized_acc - w_control;
     Eigen::VectorXd task_residual = realized_acc - task_target;
+    double task_priority_residual_norm = 0.0;
+    for (int task_row : task_priority_rows) {
+      task_priority_residual_norm += task_residual(task_row) * task_residual(task_row);
+    }
+    task_priority_residual_norm = std::sqrt(task_priority_residual_norm);
     if (rotor_coef_ == 2) {
       const double low_voltage_limit = 17.2;   // MotorInfo ref4 (21.2V)
       const double mid_voltage_limit = 18.44;  // MotorInfo ref3 (22.2V)
@@ -1449,13 +1506,15 @@ bool BeetleUnifiedController::solveFullVectorQP(
       const bool suspicious = over_low > 0 || over_alloc > 0 || over_model > 0 ||
                               near_component_bound > 0 || control_residual.norm() > 1.0;
       const char* fmt =
-          "[UnifiedCtrl QPDiag] ctrl_res=%.3f task_res=%.3f max_t=%.2f max_angle=%.1fdeg "
+          "[UnifiedCtrl QPDiag] ctrl_res=%.3f task_res=%.3f task_prio_res=%.3f rows=%d "
+          "max_t=%.2f max_angle=%.1fdeg "
           "max|fx|=%.2f max_fz=%.2f comp_margin_min=%.2f "
           "over_t(17.2/18.44/alloc/model)=%d/%d/%d/%d "
           "alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
       if (suspicious) {
         ROS_WARN_THROTTLE(2.0, fmt,
                           control_residual.norm(), task_residual.norm(),
+                          task_priority_residual_norm, n_task_priority_rows,
                           max_t, max_abs_angle_deg,
                           max_abs_fx, max_fz, min_component_margin,
                           over_low, over_mid, over_alloc, over_model,
@@ -1464,6 +1523,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
       } else {
         ROS_INFO_THROTTLE(5.0, fmt,
                           control_residual.norm(), task_residual.norm(),
+                          task_priority_residual_norm, n_task_priority_rows,
                           max_t, max_abs_angle_deg,
                           max_abs_fx, max_fz, min_component_margin,
                           over_low, over_mid, over_alloc, over_model,

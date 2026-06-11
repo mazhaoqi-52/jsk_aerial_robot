@@ -77,8 +77,12 @@ controller:
   alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
   alloc_priority_enabled: false
-  # Optional hard 6D wrench tracking bands [Fx,Fy,Fz,Tx,Ty,Tz] in acceleration
-  # space. Task wrench tracking is soft-only by default.
+  # Spidar-style task tracking: axes with nonzero desired wrench and task weight
+  # >= min_weight are narrow hard bands; effort/rate/balance stay secondary.
+  alloc_task_priority_enabled: true
+  alloc_task_priority_min_weight: 0.5
+  # Hard 6D wrench tracking bands [Fx,Fy,Fz,Tx,Ty,Tz] in acceleration space.
+  # Reused by task-priority rows; <=0 disables that row.
   alloc_priority_wrench_tolerances: [0.35, 0.35, 0.30, 0.40, 0.35, 0.40]
 
   pd_wrench_comp_mode: true

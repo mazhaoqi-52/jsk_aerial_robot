@@ -134,6 +134,7 @@ public:
     qp_constraint_outer_.clear();
     qp_constraint_inner_.clear();
     prev_vectoring_f_.resize(0);
+    last_qp_diag_log_time_ = -1.0;
   }
 
   void setFormationModelOverride(double formation_mass,
@@ -354,6 +355,7 @@ private:
   std::vector<int> qp_constraint_inner_;
   std::unique_ptr<OsqpEigen::Solver> qp_solver_;
   Eigen::VectorXd prev_vectoring_f_;   // previous successful allocation, used by rate terms
+  double last_qp_diag_log_time_;       // wall time of last QPDiag log emission
 
   /**
    * @brief Full-vector constrained QP allocation.

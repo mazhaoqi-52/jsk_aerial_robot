@@ -101,7 +101,7 @@ TOWING_FORCE_RELIEF_ATTITUDE = math.radians(18.0)
 TOWING_FORCE_HOLD_Z_ERROR = 0.15
 TOWING_FORCE_RELIEF_Z_ERROR = 0.22
 TOWING_BREAKAWAY_RECOVERY_DELAY = 2.5
-TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.50
+TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.25
 TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
 TOWING_BREAKAWAY_STABLE_Z_ERROR = 0.05
 TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.85
@@ -170,11 +170,14 @@ class LinearTowingTrajectoryGenerator:
         self.breakaway_time = None
         self.breakaway_reason = None
         self.breakaway_force_ratio = 0.80
-        self.overspeed_breakaway_force_ratio = 0.50
-        self.continue_force_floor_ratio = 0.60
-        self.overspeed_force_floor_ratio = 0.25
+        self.overspeed_breakaway_force_ratio = 0.35
+        self.continue_force_floor_ratio = 0.35
+        self.overspeed_force_floor_ratio = 0.10
         self.force_recover_rate = self.max_force / 15.0
         self.instability_force_relief_rate = self.max_force / 8.0
+        self.overspeed_force_relief_rate = self.max_force / 4.0
+        self.velocity_force_gain = self.max_force / max(self.target_velocity * 8.0, 1e-3)
+        self.severe_overspeed_ratio = 2.0
         self.breakaway_distance = 0.05  # 50mm load motion confirms contact release
         self.breakaway_velocity = self.target_velocity * 0.2
         self.early_breakaway_distance = 0.008
@@ -285,6 +288,13 @@ class LinearTowingTrajectoryGenerator:
         low_speed = self.target_velocity * 0.6
         high_speed = self.target_velocity * 1.3
         overspeed = self.motion_velocity > high_speed
+        severe_overspeed = self.motion_velocity > self.target_velocity * self.severe_overspeed_ratio
+        overspeed_relief_rate = 0.0
+        if overspeed:
+            speed_error = max(0.0, self.motion_velocity - self.target_velocity)
+            overspeed_relief_rate = min(
+                self.overspeed_force_relief_rate,
+                self.velocity_force_gain * speed_error)
 
         if not self.breakaway_detected and self.load_start_pos is not None:
             confirmed_motion = (
@@ -379,6 +389,9 @@ class LinearTowingTrajectoryGenerator:
             if guard_state == "relief":
                 self.current_force = max(
                     0.0, self.current_force - self.instability_force_relief_rate * safe_dt)
+            elif guard_state == "hold":
+                self.current_force = max(
+                    0.0, self.current_force - self.force_recover_rate * safe_dt)
             elif guard_state == "nominal":
                 ramp_time = 3.0 * self.stall_window_time  # 15s
                 self.force_ramp_progress = min(
@@ -391,14 +404,16 @@ class LinearTowingTrajectoryGenerator:
                     self.current_force = ramp_force
         else:
             if guard_state == "relief":
-                self.current_force -= self.instability_force_relief_rate * safe_dt
+                rate = (overspeed_relief_rate if overspeed
+                        else self.instability_force_relief_rate)
+                self.current_force -= rate * safe_dt
             elif guard_state != "nominal":
                 if overspeed:
-                    self.current_force -= self.instability_force_relief_rate * safe_dt
+                    self.current_force -= overspeed_relief_rate * safe_dt
             elif self.motion_velocity < low_speed:
                 self.current_force += self.force_recover_rate * safe_dt
             elif overspeed:
-                self.current_force -= self.instability_force_relief_rate * safe_dt
+                self.current_force -= overspeed_relief_rate * safe_dt
             floor_ratio = (self.overspeed_force_floor_ratio if overspeed
                            else (TOWING_FORCE_RELIEF_FLOOR_RATIO
                                  if guard_state in ("relief", "cooldown")
@@ -424,6 +439,7 @@ class LinearTowingTrajectoryGenerator:
             'motion_velocity': self.motion_velocity,
             'breakaway_detected': self.breakaway_detected,
             'overspeed': overspeed,
+            'severe_overspeed': severe_overspeed,
             'force_guard': self.force_guard_state,
             'task_weight_scale': self.task_weight_scale,
             'progress': motion_distance / self.target_distance,
@@ -1259,6 +1275,7 @@ class TowingWithFeedforwardState(TowingStateBase):
                 f"guard={state_info['force_guard']}, task_scale={state_info['task_weight_scale']:.2f}, "
                 f"vel={state_info['motion_velocity']*1000:.0f}mm/s, "
                 f"breakaway={state_info['breakaway_detected']}, overspeed={state_info['overspeed']}, "
+                f"severe={state_info['severe_overspeed']}, "
                 f"mode={'unified' if unified_mode else 'LF'}, "
                 f"cmd_frame={ff_frame}, tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm")
 

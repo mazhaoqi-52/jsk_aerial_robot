@@ -14,6 +14,10 @@ controller:
   unified_control_mode: false
   unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
   unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
+  unified_torque_allocation_matrix_inv_pub_interval: 0.05  # keep spinal P/D allocation mapping fresh
+  unified_command_stall_warn_gap: 0.30   # warn only when command gap is close to FC 500ms watchdog
+  unified_command_stall_trace_gap: 0.20  # keep DEBUG stage trace for smaller gaps
+  unified_command_stall_trace_duration: 0.25
 
   # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
   # handles LF↔unified switching directly in initUnifiedMode().

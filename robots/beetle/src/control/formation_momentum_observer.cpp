@@ -219,7 +219,7 @@ void FormationMomentumObserver::update(
     // 7. Equation diagnostic. In unloaded hover, finite_diff_ext_w should stay
     //    small; a persistent offset means the allocation/thrust model and the
     //    measured momentum are not self-consistent.
-    ROS_INFO_THROTTLE(
+    ROS_DEBUG_THROTTLE(
         2.0,
         "[FormObsEq_F] f_real_w=(%.2f,%.2f,%.2f) Mg=(%.2f,%.2f,%.2f) "
         "model_net=(%.2f,%.2f,%.2f) p_dot=(%.2f,%.2f,%.2f) "

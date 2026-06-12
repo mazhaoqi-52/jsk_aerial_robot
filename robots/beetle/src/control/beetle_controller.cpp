@@ -41,8 +41,8 @@ namespace aerial_robot_control
     unified_towing_debug_log_(true),
     unified_towing_debug_log_period_(1.0),
     unified_command_stall_debug_(true),
-    unified_command_stall_warn_gap_(0.12),
-    unified_command_stall_trace_gap_(0.12),
+    unified_command_stall_warn_gap_(0.30),
+    unified_command_stall_trace_gap_(0.20),
     unified_command_stall_trace_duration_(0.25),
     unified_debug_stage_("init"),
     unified_debug_stage_time_(-1.0),
@@ -433,12 +433,12 @@ namespace aerial_robot_control
       iz_new = boost::algorithm::clamp(iz_new, -iz_limit, iz_limit);
       pid_controllers_.at(Z).setErrI(iz_new);
 
-      ROS_WARN("[UnifiedCtrl] Z bumpless transfer (hover→unified): "
+      ROS_INFO("[UnifiedCtrl] Z bumpless transfer (hover→unified): "
                "i_old=%.4f, gravity_ff=%.4f, i_degrav=%.4f, err_i=%.4f (limit=±%.1f)",
                i_output_old, gravity_ff_z, i_output_degrav, iz_new, iz_limit);
     } else {
       pid_controllers_.at(Z).setErrI(0);
-      ROS_WARN("[UnifiedCtrl] Ground start: Z/RP/XY I-terms zeroed (naviState=%d)",
+      ROS_INFO("[UnifiedCtrl] Ground start: Z/RP/XY I-terms zeroed (naviState=%d)",
                navigator_->getNaviState());
     }
 
@@ -474,7 +474,7 @@ namespace aerial_robot_control
     init_sum_momentum_ = Eigen::VectorXd::Zero(6);
     ROS_INFO("[UnifiedCtrl] Single-module observer reset for unified residual diagnostics");
 
-    ROS_WARN("[UnifiedCtrl] %s id=%d mode switch: reset targets, %s, "
+    ROS_INFO("[UnifiedCtrl] %s id=%d mode switch: reset targets, %s, "
              "applied unified PID gains, starting local warmup window (%d frames), t=%.4f",
              is_leader ? "LEADER" : "FOLLOWER",
              beetle_navigator_->getMyID(),
@@ -776,7 +776,7 @@ namespace aerial_robot_control
       int navi_state = navigator_->getNaviState();
       if (navi_state == aerial_robot_navigation::TAKEOFF_STATE &&
           prev_navi_state_for_diag_ != aerial_robot_navigation::TAKEOFF_STATE) {
-        ROS_WARN("[UnifiedCtrl] takeoff snapshot: id=%d module_state=%d unified_mode=%s prev_unified=%s",
+        ROS_INFO("[UnifiedCtrl] takeoff snapshot: id=%d module_state=%d unified_mode=%s prev_unified=%s",
                  beetle_navigator_->getMyID(),
                  beetle_navigator_->getModuleState(),
                  unified_control_mode_ ? "ON" : "OFF",
@@ -894,7 +894,7 @@ namespace aerial_robot_control
         const double since_pub =
             (last_unified_command_pub_time_ >= 0.0)
                 ? now - last_unified_command_pub_time_ : -1.0;
-        ROS_WARN_THROTTLE(
+        ROS_DEBUG_THROTTLE(
             0.5,
             "[TEMP_UNIFIED_CMD] id=%d role=%s stage=base_gated nav=%d "
             "module_state=%d since_pub=%.3f control_timestamp=%.4f unified=%s",
@@ -908,7 +908,7 @@ namespace aerial_robot_control
 
       if (module_state != LEADER && module_state != FOLLOWER) {
         markUnifiedDebugStage("role_gated");
-        ROS_WARN_THROTTLE(
+        ROS_DEBUG_THROTTLE(
             0.5,
             "[TEMP_UNIFIED_CMD] id=%d role=OTHER stage=role_gated nav=%d "
             "module_state=%d unified=ON suppressing_LF_command=1",
@@ -1058,7 +1058,7 @@ namespace aerial_robot_control
 
     sendFollowerCascadeGains();
     local_unified_cascade_setup_sent_ = true;
-    ROS_WARN("[UnifiedCtrl] FOLLOWER id=%d one-shot local cascade setup: "
+    ROS_INFO("[UnifiedCtrl] FOLLOWER id=%d one-shot local cascade setup: "
              "gimbal_dof + alloc_inv + gains sent to own spinal",
              beetle_navigator_->getMyID());
     return true;
@@ -1360,7 +1360,7 @@ namespace aerial_robot_control
       unified_controller_->sendCascadeGains(roll_p, roll_i, roll_d,
                                             pitch_p, pitch_i, pitch_d, yaw_d);
     } else {
-      ROS_WARN("[UnifiedCtrl] Cascade setup: matrix not ready, deferring gains to one-shot");
+      ROS_INFO("[UnifiedCtrl] Cascade setup: matrix not ready, deferring gains to one-shot");
     }
 
     // Publish gimbal_dof=1 to own spinal (LEADER).
@@ -1494,7 +1494,7 @@ namespace aerial_robot_control
     yaw_pid.setLimitD(unified_yaw_gains_.limit_d);
 
     gains_switched_ = true;
-    ROS_WARN("[UnifiedCtrl] Applied unified gains: roll P=%.1f I=%.1f D=%.1f, pitch P=%.1f I=%.1f D=%.1f, "
+    ROS_INFO("[UnifiedCtrl] Applied unified gains: roll P=%.1f I=%.1f D=%.1f, pitch P=%.1f I=%.1f D=%.1f, "
              "xy P=%.1f I=%.1f D=%.1f, z P=%.1f I=%.1f D=%.1f, yaw P=%.1f I=%.1f D=%.1f",
              unified_roll_gains_.p, unified_roll_gains_.i, unified_roll_gains_.d,
              unified_pitch_gains_.p, unified_pitch_gains_.i, unified_pitch_gains_.d,
@@ -1555,7 +1555,7 @@ namespace aerial_robot_control
     yaw_pid.setLimitD(saved_yaw_gains_.limit_d);
 
     gains_switched_ = false;
-    ROS_WARN("[UnifiedCtrl] Restored independent gains: pitch P=%.1f D=%.1f, xy P=%.1f D=%.1f, z P=%.1f D=%.1f, yaw P=%.1f D=%.1f",
+    ROS_INFO("[UnifiedCtrl] Restored independent gains: pitch P=%.1f D=%.1f, xy P=%.1f D=%.1f, z P=%.1f D=%.1f, yaw P=%.1f D=%.1f",
              saved_pitch_gains_.p, saved_pitch_gains_.d,
              saved_xy_gains_.p, saved_xy_gains_.d,
              saved_z_gains_.p, saved_z_gains_.d,
@@ -2041,7 +2041,7 @@ namespace aerial_robot_control
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
     getParam<double>(control_nh, "unified_reference_timeout", unified_reference_timeout_, 0.8);
     unified_reference_timeout_ = std::max(0.0, unified_reference_timeout_);
-    getParam<double>(control_nh, "torque_allocation_matrix_inv_pub_interval",
+    getParam<double>(control_nh, "unified_torque_allocation_matrix_inv_pub_interval",
                      unified_torque_alloc_inv_pub_interval_, 0.05);
     unified_torque_alloc_inv_pub_interval_ =
         std::max(0.0, unified_torque_alloc_inv_pub_interval_);
@@ -2066,11 +2066,11 @@ namespace aerial_robot_control
     getParam<bool>(control_nh, "unified_command_stall_debug",
                    unified_command_stall_debug_, true);
     getParam<double>(control_nh, "unified_command_stall_warn_gap",
-                     unified_command_stall_warn_gap_, 0.12);
+                     unified_command_stall_warn_gap_, 0.30);
     unified_command_stall_warn_gap_ =
         std::max(0.03, unified_command_stall_warn_gap_);
     getParam<double>(control_nh, "unified_command_stall_trace_gap",
-                     unified_command_stall_trace_gap_, 0.12);
+                     unified_command_stall_trace_gap_, 0.20);
     unified_command_stall_trace_gap_ =
         std::max(0.03, unified_command_stall_trace_gap_);
     getParam<double>(control_nh, "unified_command_stall_trace_duration",
@@ -2913,7 +2913,7 @@ namespace aerial_robot_control
         spinal::FlightConfigCmd flight_config_cmd;
         flight_config_cmd.cmd = spinal::FlightConfigCmd::INTEGRATION_CONTROL_ON_CMD;
         navigator_->getFlightConfigPublisher().publish(flight_config_cmd);
-        ROS_WARN("[UnifiedCtrl] id=%d start roll/pitch I control (height threshold passed)", my_id);
+        ROS_INFO("[UnifiedCtrl] id=%d start roll/pitch I control (height threshold passed)", my_id);
       }
     }
     double du_rp = du;

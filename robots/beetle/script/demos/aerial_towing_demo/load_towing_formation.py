@@ -977,14 +977,22 @@ class DescendAndInsertState(TowingStateBase):
                 f"(target={HOOK_CONTACT_INSERT_CLEARANCE*1000:.1f}mm, positive=above box top)"
             )
 
-        # Stabilize at insertion position
-        rospy.loginfo("Stabilizing at insertion position...")
-        self.active_stabilization_wait(insertion_pos, insertion_yaw, duration=2.0)
+        contact_pos = np.array(achieved_pos) if achieved_pos is not None else insertion_pos
+
+        # Stabilize at the actually reached insertion height. This mirrors the
+        # valve-rotation flow: once contact locks the Z depth, later phases
+        # should use that physical height instead of the theoretical target.
+        rospy.loginfo("Stabilizing at insertion contact position...")
+        self.active_stabilization_wait(contact_pos, insertion_yaw, duration=2.0)
+        settled_contact_pos = self.get_end_effector_position()
+        if settled_contact_pos is not None:
+            contact_pos = np.array(settled_contact_pos)
+            rospy.loginfo(f"Insertion contact pose locked at {FormationUtils.format_vec(contact_pos)}")
 
         # Calculate hook position (retract to hook edge)
         approach_dir = userdata.approach_direction
-        hook_pos = insertion_pos.copy()
-        hook_pos[:2] = insertion_pos[:2] + approach_dir[:2] * RETRACT_DISTANCE
+        hook_pos = contact_pos.copy()
+        hook_pos[:2] = contact_pos[:2] + approach_dir[:2] * RETRACT_DISTANCE
 
         userdata.hook_position = hook_pos
         userdata.hook_yaw = insertion_yaw
@@ -1033,6 +1041,11 @@ class RetractAndHookState(TowingStateBase):
 
         # Stabilize
         self.active_stabilization_wait(hook_pos, hook_yaw, duration=2.0)
+        settled_hook_pos = self.get_end_effector_position()
+        if settled_hook_pos is None:
+            settled_hook_pos = hook_pos
+        else:
+            rospy.loginfo(f"Hook pose locked at {FormationUtils.format_vec(settled_hook_pos)}")
 
         # Towing direction is same as approach direction (pulling outward)
         towing_direction = approach_dir.copy()
@@ -1046,7 +1059,7 @@ class RetractAndHookState(TowingStateBase):
         # Theoretical pitch effect on EE position is only ~2mm, much less than the 7mm drift.
         self.formation_adapter.set_pitch_compensation(False)
 
-        userdata.towing_start_position = self.get_end_effector_position()
+        userdata.towing_start_position = settled_hook_pos
         userdata.towing_direction = towing_direction
 
         rospy.loginfo(f"Hook complete. Towing direction: {towing_direction}")
@@ -1060,7 +1073,8 @@ class TowingWithFeedforwardState(TowingStateBase):
         TowingStateBase.__init__(self,
             outcomes=['succeeded', 'failed', 'timeout'],
             input_keys=['towing_start_position', 'towing_direction', 'hook_yaw'],
-            output_keys=['towing_end_position'])
+            output_keys=['towing_end_position', 'towing_exit_reason',
+                         'towing_breakaway_detected'])
 
     def _clear_external_wrench(self, hold_pos=None, hold_yaw=None, duration=1.0):
         """Clear external wrench feedforward via BeetleInterface.
@@ -1096,6 +1110,23 @@ class TowingWithFeedforwardState(TowingStateBase):
         self.beetle.clearExternalWrench()
         # Disable internal-wrench auto-publish (also broadcasts a final zero).
         self.beetle.setAttachModule(None)
+
+    def _finish_towing_exit(self, userdata, reason, hold_pos, hold_yaw,
+                            breakaway_detected, clear_duration=1.0):
+        self._clear_external_wrench(hold_pos=hold_pos, hold_yaw=hold_yaw,
+                                    duration=clear_duration)
+        # Return/disengage needs pitch-aware EE geometry. Towing disables it to
+        # avoid wrench-comp Z drift, so every exit path must restore it.
+        self.formation_adapter.set_pitch_compensation(True)
+        final_pos = self.get_end_effector_position()
+        if final_pos is None:
+            final_pos = hold_pos
+        userdata.towing_end_position = final_pos
+        userdata.towing_exit_reason = reason
+        userdata.towing_breakaway_detected = bool(breakaway_detected)
+        pos_text = FormationUtils.format_vec(final_pos) if final_pos is not None else "None"
+        rospy.loginfo(f"Towing exit: reason={reason}, breakaway={breakaway_detected}, "
+                      f"pos={pos_text}")
 
     def _build_towing_wrench_command(self, force_world, unified_mode):
         """Return (force, torque, frame_id) for BeetleInterface.addExternalWrench()."""
@@ -1217,15 +1248,19 @@ class TowingWithFeedforwardState(TowingStateBase):
             if state_info['stall_counter'] >= STALL_TIMEOUT_COUNT:
                 rospy.logwarn(f"Towing aborted: stalled for {state_info['stall_counter']} "
                              f"consecutive windows ({state_info['stall_counter']*5}s no progress)")
-                self._clear_external_wrench(hold_pos=current_pos, hold_yaw=current_yaw)
-                userdata.towing_end_position = current_pos
-                self.formation_adapter.set_pitch_compensation(False)
+                reason = ('stalled_after_breakaway' if state_info['breakaway_detected']
+                          else 'stalled_no_breakaway')
+                self._finish_towing_exit(
+                    userdata, reason, current_pos, current_yaw,
+                    state_info['breakaway_detected'])
                 return 'timeout'
             if elapsed > ABSOLUTE_MAX_TIME:
                 rospy.logwarn(f"Towing absolute timeout after {elapsed:.1f}s")
-                self._clear_external_wrench(hold_pos=current_pos, hold_yaw=current_yaw)
-                userdata.towing_end_position = current_pos
-                self.formation_adapter.set_pitch_compensation(False)
+                reason = ('absolute_timeout_after_breakaway' if state_info['breakaway_detected']
+                          else 'absolute_timeout_no_breakaway')
+                self._finish_towing_exit(
+                    userdata, reason, current_pos, current_yaw,
+                    state_info['breakaway_detected'])
                 return 'timeout'
 
             # Stall warning (throttled to avoid log spam)
@@ -1243,9 +1278,11 @@ class TowingWithFeedforwardState(TowingStateBase):
 
             if unified_mode_seen and not unified_mode:
                 rospy.logwarn("Towing safety abort: unified mode exited during towing")
-                self._clear_external_wrench(hold_pos=current_pos, hold_yaw=current_yaw)
-                userdata.towing_end_position = current_pos
-                self.formation_adapter.set_pitch_compensation(False)
+                reason = ('unified_exit_after_breakaway' if state_info['breakaway_detected']
+                          else 'unified_exit_no_breakaway')
+                self._finish_towing_exit(
+                    userdata, reason, current_pos, current_yaw,
+                    state_info['breakaway_detected'])
                 return 'timeout'
 
             if completion_started_at is not None:
@@ -1321,23 +1358,21 @@ class TowingWithFeedforwardState(TowingStateBase):
 
         # If loop ends due to ROS shutdown/Ctrl-C, this is not a successful towing completion.
         if rospy.is_shutdown():
-            self._clear_external_wrench(hold_pos=self.get_end_effector_position(), hold_yaw=maintain_yaw)
-            userdata.towing_end_position = self.get_end_effector_position()
-            self.formation_adapter.set_pitch_compensation(False)
+            hold_pos = self.get_end_effector_position()
+            self._finish_towing_exit(
+                userdata, 'ros_shutdown', hold_pos, maintain_yaw,
+                trajectory_gen.breakaway_detected)
             return 'timeout'
 
         # ---- Clear feedforward after towing completes while holding pose ----
         unload_hold_pos = self.get_end_effector_position()
-        self._clear_external_wrench(hold_pos=unload_hold_pos, hold_yaw=maintain_yaw,
-                                    duration=2.0)
+        self._finish_towing_exit(
+            userdata, 'succeeded', unload_hold_pos, maintain_yaw,
+            trajectory_gen.breakaway_detected, clear_duration=2.0)
+        final_pos = userdata.towing_end_position
 
-        # With the task wrench cleared, use pitch-aware EE geometry for disengage/return.
-        self.formation_adapter.set_pitch_compensation(True)
-
-        final_pos = self.get_end_effector_position()
-        userdata.towing_end_position = final_pos
-
-        rospy.loginfo(f"Towing phase complete at {FormationUtils.format_vec(final_pos)}")
+        pos_text = FormationUtils.format_vec(final_pos) if final_pos is not None else "None"
+        rospy.loginfo(f"Towing phase complete at {pos_text}")
         return 'succeeded'
 
 
@@ -1348,7 +1383,8 @@ class DisengageAndReturnState(TowingStateBase):
         TowingStateBase.__init__(self,
             outcomes=['succeeded', 'failed'],
             input_keys=['start_position', 'start_yaw', 'towing_end_position',
-                        'towing_direction', 'load_position'])
+                        'towing_direction', 'load_position',
+                        'towing_exit_reason', 'towing_breakaway_detected'])
 
     def _return_attitude_safe(self, context):
         rpy = self.beetle.getAssemblyRPY()
@@ -1376,11 +1412,58 @@ class DisengageAndReturnState(TowingStateBase):
                      f"({pos_error*1000:.0f}mm > {tolerance*1000:.0f}mm)")
         return False
 
+    def _return_target_height(self, start_pos, load_position):
+        load_top_z = float(load_position[2]) + LOAD_BOX_HEIGHT / 2
+        return max(start_pos[2], load_top_z + TRANSIT_CLEARANCE_OFFSET), load_top_z
+
+    def _ascend_to_return_height(self, userdata, start_pos, current_yaw, context,
+                                 max_linear_vel=0.05):
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable before ascent")
+            return False
+
+        target_height, load_top_z = self._return_target_height(start_pos, userdata.load_position)
+        z_gap = target_height - current_pos[2]
+        rospy.loginfo(f"{context}: returning to height {target_height:.3f}m "
+                      f"(start_pos[2]={start_pos[2]:.3f}m, "
+                      f"floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m={load_top_z+TRANSIT_CLEARANCE_OFFSET:.3f}m, "
+                      f"current {current_pos[2]:.3f}m, delta {z_gap*1000:.0f}mm)")
+        if z_gap <= 0.03:
+            return self._return_attitude_safe(context)
+
+        ascent_target = (current_pos[0], current_pos[1], target_height)
+        success = self.active_position_convergence(
+            ascent_target, target_yaw=current_yaw,
+            pos_thresh=0.05, yaw_thresh=0.1, timeout=20.0,
+            max_linear_vel=max_linear_vel
+        )
+        if success:
+            return True
+
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable after ascent")
+            return False
+        z_gap = target_height - current_pos[2]
+        if z_gap > RETURN_LOOSE_ASCENT_Z_TOLERANCE or not self._return_attitude_safe(context):
+            rospy.logerr(f"{context}: ascent failed with large Z gap ({z_gap*1000:.0f}mm)")
+            return False
+        rospy.logwarn(f"{context}: ascent incomplete but close enough "
+                      f"(z_gap={z_gap*1000:.0f}mm)")
+        return True
+
     def execute(self, userdata):
         rospy.loginfo("=== Disengage and Return State ===")
 
         start_pos = userdata.start_position
         start_yaw = userdata.start_yaw
+        exit_reason = getattr(userdata, 'towing_exit_reason', 'unknown')
+        breakaway_detected = bool(getattr(userdata, 'towing_breakaway_detected', False))
+        no_breakaway_timeout = (
+            exit_reason != 'succeeded' and not breakaway_detected)
+        rospy.loginfo(f"[Return] towing_exit_reason={exit_reason}, "
+                      f"breakaway={breakaway_detected}")
 
         current_pos = self.get_end_effector_position()
         current_yaw = self.get_end_effector_yaw()
@@ -1413,11 +1496,25 @@ class DisengageAndReturnState(TowingStateBase):
         if not self._return_attitude_safe("[Phase 0]"):
             return 'failed'
 
+        if no_breakaway_timeout:
+            rospy.logwarn("[Phase 0.5-pre] No load breakaway detected; "
+                          "ascending before horizontal retract")
+            if not self._ascend_to_return_height(
+                    userdata, start_pos, current_yaw, "[Phase 0.5-pre]",
+                    max_linear_vel=0.03):
+                return 'failed'
+            updated_yaw = self.get_end_effector_yaw()
+            if updated_yaw is not None:
+                current_yaw = updated_yaw
+
         # Phase 0.5: Retract along towing reverse direction to disengage hook
         towing_dir = np.array(userdata.towing_direction)
         retract_dir = -towing_dir  # reverse of towing = back into box, then past wall
         retract_distance = 0.13  # 130mm
         current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr("[Phase 0.5] Current position unavailable before retract")
+            return 'failed'
         retract_target = np.array(current_pos) + retract_dir * retract_distance
         rospy.loginfo(f"[Phase 0.5] Retracting {retract_distance*1000:.0f}mm along "
                       f"{retract_dir} to disengage hook")
@@ -1436,33 +1533,12 @@ class DisengageAndReturnState(TowingStateBase):
         rospy.sleep(0.5)
 
         # Phase 1: Return to start height (hook is already disengaged in Phase 0.5).
-        # Apply box-anchored safety floor - same convention as ApproachLoadState
-        # Phase 1 - so transit Z above the box is consistent across the whole task.
-        current_pos = self.get_end_effector_position()
-        load_top_z = float(userdata.load_position[2]) + LOAD_BOX_HEIGHT / 2
-        target_height = max(start_pos[2], load_top_z + TRANSIT_CLEARANCE_OFFSET)
-        rospy.loginfo(f"[Phase 1] Returning to start height {target_height:.3f}m "
-                      f"(start_pos[2]={start_pos[2]:.3f}m, "
-                      f"floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m={load_top_z+TRANSIT_CLEARANCE_OFFSET:.3f}m, "
-                      f"current {current_pos[2]:.3f}m, delta {(target_height - current_pos[2])*1000:.0f}mm)")
-        ascent_target = (current_pos[0], current_pos[1], target_height)
-
-        success = self.active_position_convergence(
-            ascent_target, target_yaw=current_yaw,
-            pos_thresh=0.05, yaw_thresh=0.1, timeout=20.0,
-            max_linear_vel=0.05
-        )
-        if not success:
-            current_pos = self.get_end_effector_position()
-            if current_pos is None:
-                rospy.logerr("[Phase 1] Current position unavailable after ascent")
-                return 'failed'
-            z_gap = target_height - current_pos[2]
-            if z_gap > RETURN_LOOSE_ASCENT_Z_TOLERANCE or not self._return_attitude_safe("[Phase 1]"):
-                rospy.logerr(f"[Phase 1] Ascent failed with large Z gap ({z_gap*1000:.0f}mm)")
-                return 'failed'
-            rospy.logwarn(f"[Phase 1] Ascent incomplete but close enough "
-                          f"(z_gap={z_gap*1000:.0f}mm)")
+        # The no-breakaway timeout path may have already climbed before retract;
+        # this call then only verifies/finishes the height recovery.
+        if not self._ascend_to_return_height(
+                userdata, start_pos, current_yaw, "[Phase 1]",
+                max_linear_vel=0.05):
+            return 'failed'
 
         rospy.sleep(1.0)
 

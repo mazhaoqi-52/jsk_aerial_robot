@@ -100,13 +100,14 @@ TOWING_FORCE_HOLD_ATTITUDE = math.radians(12.0)
 TOWING_FORCE_RELIEF_ATTITUDE = math.radians(18.0)
 TOWING_FORCE_HOLD_Z_ERROR = 0.15
 TOWING_FORCE_RELIEF_Z_ERROR = 0.22
-TOWING_BREAKAWAY_RECOVERY_DELAY = 2.5
+TOWING_BREAKAWAY_RECOVERY_DELAY = 5.0
 TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.25
 TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
 TOWING_BREAKAWAY_STABLE_Z_ERROR = 0.05
-TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.85
+TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.40
 TOWING_TASK_HOLD_SCALE = 0.40
 TOWING_TASK_RELIEF_SCALE = 0.15
+TOWING_TASK_SCALE_RECOVER_RATE = 0.10  # 0.4 -> 1.0 takes about 6s
 
 
 class LinearTowingTrajectoryGenerator:
@@ -159,6 +160,7 @@ class LinearTowingTrajectoryGenerator:
         self.max_lead_distance = 0.17  # 170mm
         self.max_lag_distance = 0.08   # 80mm
         self.max_load_lead_distance = 0.12  # 120mm ahead of load progress
+        self.breakaway_load_lead_distance = 0.06  # keep target close after the load starts moving
         self.high_force_load_lead_distance = 0.05
         self.high_force_lead_force_ratio = 0.50
 
@@ -169,7 +171,7 @@ class LinearTowingTrajectoryGenerator:
         self.breakaway_relief_applied = False
         self.breakaway_time = None
         self.breakaway_reason = None
-        self.breakaway_force_ratio = 0.80
+        self.breakaway_force_ratio = 0.65
         self.overspeed_breakaway_force_ratio = 0.35
         self.continue_force_floor_ratio = 0.35
         self.overspeed_force_floor_ratio = 0.10
@@ -200,7 +202,8 @@ class LinearTowingTrajectoryGenerator:
         rospy.loginfo(f"LinearTowingTrajectory: dir={self.towing_direction}, "
                      f"dist={target_distance}m, vel={target_velocity}m/s, max_force={max_force}N")
 
-    def _update_force_guard(self, attitude_rp=None, z_error=0.0, current_time=None):
+    def _update_force_guard(self, attitude_rp=None, z_error=0.0, current_time=None,
+                            overspeed=False, severe_overspeed=False, dt=0.0):
         max_rp = 0.0
         if attitude_rp is not None:
             max_rp = max(abs(float(attitude_rp[0])), abs(float(attitude_rp[1])))
@@ -214,32 +217,46 @@ class LinearTowingTrajectoryGenerator:
             self.breakaway_time is not None and
             current_time is not None and
             current_time - self.breakaway_time < TOWING_BREAKAWAY_RECOVERY_DELAY)
+        speed_guard = self.breakaway_detected and overspeed
 
-        if max_rp > TOWING_FORCE_RELIEF_ATTITUDE or abs_z > TOWING_FORCE_RELIEF_Z_ERROR:
+        if (severe_overspeed or
+                max_rp > TOWING_FORCE_RELIEF_ATTITUDE or
+                abs_z > TOWING_FORCE_RELIEF_Z_ERROR):
             guard_state = "relief"
-            task_scale = TOWING_TASK_RELIEF_SCALE
+            target_task_scale = TOWING_TASK_RELIEF_SCALE
+        elif speed_guard:
+            guard_state = "cooldown"
+            target_task_scale = TOWING_TASK_HOLD_SCALE
         elif cooldown:
             guard_state = "cooldown"
             if (max_rp < TOWING_BREAKAWAY_STABLE_ATTITUDE and
                     abs_z < TOWING_BREAKAWAY_STABLE_Z_ERROR):
-                task_scale = TOWING_TASK_STABLE_COOLDOWN_SCALE
+                target_task_scale = TOWING_TASK_STABLE_COOLDOWN_SCALE
             else:
-                task_scale = TOWING_TASK_HOLD_SCALE
+                target_task_scale = TOWING_TASK_HOLD_SCALE
         elif max_rp > TOWING_FORCE_HOLD_ATTITUDE or abs_z > TOWING_FORCE_HOLD_Z_ERROR:
             guard_state = "hold"
-            task_scale = TOWING_TASK_HOLD_SCALE
+            target_task_scale = TOWING_TASK_HOLD_SCALE
         else:
             guard_state = "nominal"
-            task_scale = 1.0
+            target_task_scale = 1.0
+
+        prev_task_scale = self.task_weight_scale
+        if target_task_scale > self.task_weight_scale:
+            self.task_weight_scale = min(
+                target_task_scale,
+                self.task_weight_scale + TOWING_TASK_SCALE_RECOVER_RATE * max(0.0, dt))
+        else:
+            self.task_weight_scale = target_task_scale
 
         if guard_state != self.force_guard_state:
             log_fn = rospy.loginfo if guard_state == "nominal" else rospy.logwarn
             log_fn(f"[Towing Guard] {self.force_guard_state} -> {guard_state}: "
                    f"max_rp={math.degrees(max_rp):.1f}deg, z_err={z_error*1000:.0f}mm, "
-                   f"task_scale={task_scale:.2f}")
+                   f"task_scale={prev_task_scale:.2f}->{self.task_weight_scale:.2f} "
+                   f"(target={target_task_scale:.2f})")
 
         self.force_guard_state = guard_state
-        self.task_weight_scale = task_scale
         return guard_state
 
     def get_task_wrench_weights(self):
@@ -346,6 +363,8 @@ class LinearTowingTrajectoryGenerator:
             if (not self.breakaway_detected and
                     self.current_force >= self.max_force * self.high_force_lead_force_ratio):
                 load_lead_distance = self.high_force_load_lead_distance
+            if self.breakaway_detected:
+                load_lead_distance = min(load_lead_distance, self.breakaway_load_lead_distance)
             new_target_distance = min(
                 new_target_distance,
                 self.current_load_distance + load_lead_distance)
@@ -367,7 +386,9 @@ class LinearTowingTrajectoryGenerator:
             else:
                 self.stall_counter = max(0, self.stall_counter - 1)
 
-        guard_state = self._update_force_guard(attitude_rp, z_error, current_time)
+        guard_state = self._update_force_guard(
+            attitude_rp, z_error, current_time,
+            overspeed=overspeed, severe_overspeed=severe_overspeed, dt=safe_dt)
 
         if self.breakaway_detected and not self.breakaway_relief_applied:
             prev_force = self.current_force
@@ -418,9 +439,16 @@ class LinearTowingTrajectoryGenerator:
                            else (TOWING_FORCE_RELIEF_FLOOR_RATIO
                                  if guard_state in ("relief", "cooldown")
                                  else self.continue_force_floor_ratio))
-            self.current_force = min(
-                self.max_force,
-                max(self.max_force * floor_ratio, self.current_force))
+            if overspeed:
+                cap_ratio = (self.overspeed_force_floor_ratio if severe_overspeed
+                             else self.continue_force_floor_ratio)
+                self.current_force = min(self.current_force, self.max_force * cap_ratio)
+            elif guard_state == "nominal" and self.motion_velocity < low_speed:
+                force_floor = self.max_force * floor_ratio
+                if self.current_force < force_floor:
+                    self.current_force = min(
+                        force_floor, self.current_force + self.force_recover_rate * safe_dt)
+            self.current_force = min(self.max_force, max(0.0, self.current_force))
 
         progress_ratio = motion_distance / max(self.target_distance, 1e-6)
         if progress_ratio > TOWING_GOAL_TAPER_START_RATIO:

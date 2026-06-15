@@ -48,6 +48,8 @@ namespace aerial_robot_control
     unified_debug_stage_time_(-1.0),
     unified_debug_cycle_start_time_(-1.0),
     unified_debug_trace_until_time_(-1.0),
+    unified_heartbeat_pub_interval_(0.2),
+    last_unified_heartbeat_pub_time_(-1.0),
     unified_residual_bias_ready_(false),
     unified_residual_bias_samples_(0),
     unified_residual_bias_module_num_(0),
@@ -189,6 +191,7 @@ namespace aerial_robot_control
     // Publishers to this module's own spinal (same topic names as GimbalrotorController)
     follower_thrust_pub_ = nh_.advertise<spinal::FourAxisCommand>("four_axes/command", 1);
     follower_gimbal_pub_ = nh_.advertise<sensor_msgs::JointState>("gimbals_ctrl", 1);
+    unified_heartbeat_pub_ = nh_.advertise<diagnostic_msgs::KeyValue>("unified_control/heartbeat", 1);
 
     // Service for toggling unified control mode
     ros::NodeHandle srv_nh(nh_, "controller");
@@ -205,6 +208,7 @@ namespace aerial_robot_control
 
     unified_debug_stage_ = stage;
     unified_debug_stage_time_ = now;
+    publishUnifiedHeartbeat("stage", now);
 
     if (!unified_command_stall_debug_ || !unified_control_mode_) return;
 
@@ -235,6 +239,7 @@ namespace aerial_robot_control
   void BeetleController::reportUnifiedCommandGap(const char* event, double gap, double now)
   {
     if (!unified_command_stall_debug_ || gap < unified_command_stall_warn_gap_) return;
+    publishUnifiedHeartbeat(event, now, true);
 
     const double trace_until = now + unified_command_stall_trace_duration_;
     if (trace_until > unified_debug_trace_until_time_) {
@@ -255,6 +260,51 @@ namespace aerial_robot_control
         my_id, event, gap, unified_debug_stage_ ? unified_debug_stage_ : "unset",
         stage_age, nav_state, module_state, cycle_age,
         last_unified_command_pub_time_, control_timestamp_);
+  }
+
+  void BeetleController::publishUnifiedHeartbeat(const char* event, double now, bool force)
+  {
+    if (!unified_control_mode_ || unified_heartbeat_pub_interval_ <= 0.0) return;
+    if (!force && last_unified_heartbeat_pub_time_ >= 0.0 &&
+        now - last_unified_heartbeat_pub_time_ < unified_heartbeat_pub_interval_) {
+      return;
+    }
+    last_unified_heartbeat_pub_time_ = now;
+
+    const int my_id = beetle_navigator_ ? beetle_navigator_->getMyID() : -1;
+    const int module_state = beetle_navigator_ ? beetle_navigator_->getModuleState() : -1;
+    const int nav_state = navigator_ ? navigator_->getNaviState() : -1;
+    const bool force_landing = navigator_ ? navigator_->getForceLandingFlag() : false;
+    const double since_pub =
+        (last_unified_command_pub_time_ >= 0.0)
+            ? now - last_unified_command_pub_time_ : -1.0;
+    const double stage_age =
+        (unified_debug_stage_time_ >= 0.0) ? now - unified_debug_stage_time_ : -1.0;
+    const double cycle_age =
+        (unified_debug_cycle_start_time_ >= 0.0)
+            ? now - unified_debug_cycle_start_time_ : -1.0;
+    const double reference_age =
+        (unified_cmd_received_ && !unified_cmd_stamp_.isZero())
+            ? now - unified_cmd_stamp_.toSec() : -1.0;
+
+    diagnostic_msgs::KeyValue msg;
+    msg.key = unified_debug_stage_ ? unified_debug_stage_ : "unset";
+
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(4)
+       << "event=" << (event ? event : "periodic")
+       << " id=" << my_id
+       << " nav=" << nav_state
+       << " module_state=" << module_state
+       << " force_landing=" << (force_landing ? 1 : 0)
+       << " since_pub=" << since_pub
+       << " stage_age=" << stage_age
+       << " cycle_age=" << cycle_age
+       << " ref_age=" << reference_age
+       << " last_pub=" << last_unified_command_pub_time_
+       << " control_ts=" << control_timestamp_;
+    msg.value = ss.str();
+    unified_heartbeat_pub_.publish(msg);
   }
 
   void BeetleController::resetToIndependentHover()
@@ -456,6 +506,7 @@ namespace aerial_robot_control
     unified_reference_warmup_count_ = 0;
     last_unified_torque_alloc_inv_pub_time_ = ros::Time::now().toSec();
     last_unified_command_pub_time_ = -1.0;
+    last_unified_heartbeat_pub_time_ = -1.0;
 
     // Phase U2: activate formation observer on entering unified LEADER mode.
     // Follower does NOT run observer (leader is the observation point).
@@ -551,6 +602,7 @@ namespace aerial_robot_control
       local_unified_cascade_setup_sent_ = false;
       last_unified_torque_alloc_inv_pub_time_ = -1.0;
       last_unified_command_pub_time_ = -1.0;
+      last_unified_heartbeat_pub_time_ = -1.0;
       beetle_navigator_->setUnifiedControlMode(false);
 
       ros::NodeHandle control_nh(nh_, "controller");
@@ -894,6 +946,7 @@ namespace aerial_robot_control
         const double since_pub =
             (last_unified_command_pub_time_ >= 0.0)
                 ? now - last_unified_command_pub_time_ : -1.0;
+        publishUnifiedHeartbeat("base_gated", now, true);
         ROS_DEBUG_THROTTLE(
             0.5,
             "[TEMP_UNIFIED_CMD] id=%d role=%s stage=base_gated nav=%d "
@@ -908,6 +961,7 @@ namespace aerial_robot_control
 
       if (module_state != LEADER && module_state != FOLLOWER) {
         markUnifiedDebugStage("role_gated");
+        publishUnifiedHeartbeat("role_gated", ros::Time::now().toSec(), true);
         ROS_DEBUG_THROTTLE(
             0.5,
             "[TEMP_UNIFIED_CMD] id=%d role=OTHER stage=role_gated nav=%d "
@@ -2077,6 +2131,12 @@ namespace aerial_robot_control
                      unified_command_stall_trace_duration_, 0.25);
     unified_command_stall_trace_duration_ =
         std::max(0.0, unified_command_stall_trace_duration_);
+    getParam<double>(control_nh, "unified_heartbeat_pub_interval",
+                     unified_heartbeat_pub_interval_, 0.2);
+    if (unified_heartbeat_pub_interval_ > 0.0) {
+      unified_heartbeat_pub_interval_ =
+          std::max(0.05, unified_heartbeat_pub_interval_);
+    }
     // Load unified-mode PID gains for roll/pitch.
     // Full P/I/D: P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
     // I-term is retained on PC for slow formation-level bias correction.
@@ -3016,6 +3076,7 @@ namespace aerial_robot_control
                                    since_pub_before_alloc,
                                    ok);
     if (!ok) {
+      publishUnifiedHeartbeat("allocation_failed", alloc_end, true);
       ROS_WARN_THROTTLE(
           0.2,
           "[TEMP_UNIFIED_CMD] id=%d role=%s stage=allocation_failed nav=%d "

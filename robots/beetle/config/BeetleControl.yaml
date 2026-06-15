@@ -18,6 +18,7 @@ controller:
   unified_command_stall_warn_gap: 0.30   # warn only when command gap is close to FC 500ms watchdog
   unified_command_stall_trace_gap: 0.20  # keep DEBUG stage trace for smaller gaps
   unified_command_stall_trace_duration: 0.25
+  unified_heartbeat_pub_interval: 0.2    # rosbag-visible unified stage heartbeat [s], <=0 disables
 
   # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
   # handles LF↔unified switching directly in initUnifiedMode().

@@ -10,6 +10,7 @@
 #include <beetle/sensor/imu.h>
 #include <beetle/control/beetle_unified_controller.h>
 #include <beetle/control/formation_momentum_observer.h>
+#include <diagnostic_msgs/KeyValue.h>
 #include <std_srvs/SetBool.h>
 #include <std_msgs/Float32MultiArray.h>
 #include <mutex>
@@ -89,6 +90,8 @@ namespace aerial_robot_control
     double unified_debug_stage_time_;
     double unified_debug_cycle_start_time_;
     double unified_debug_trace_until_time_;
+    double unified_heartbeat_pub_interval_;
+    double last_unified_heartbeat_pub_time_;
     // Unified residual hover-bias diagnostic. This is log-only: it never feeds
     // wrench_comp_list_ or the allocation secondary.
     bool unified_residual_bias_ready_;
@@ -119,6 +122,7 @@ namespace aerial_robot_control
     void runUnifiedControlCommon(bool is_leader);
     void markUnifiedDebugStage(const char* stage);
     void reportUnifiedCommandGap(const char* event, double gap, double now);
+    void publishUnifiedHeartbeat(const char* event, double now, bool force = false);
 
     /** @brief Switch roll/pitch PID gains for unified (formation) mode. */
     void applyUnifiedGains();
@@ -153,6 +157,7 @@ namespace aerial_robot_control
     ros::Publisher follower_thrust_pub_;   // re-publish to own four_axes/command
     ros::Publisher follower_gimbal_pub_;   // re-publish to own gimbals_ctrl (only when !gimbal_calc_in_fc)
     ros::Publisher module_model_pub_;
+    ros::Publisher unified_heartbeat_pub_;
     map<string, ros::Subscriber> module_model_subs_;
     // Last formation revision seen in runUnifiedControlCommon. When the unified
     // controller's getFormationRevision() bumps (peer ModuleModel late-arrival

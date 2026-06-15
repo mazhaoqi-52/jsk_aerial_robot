@@ -72,6 +72,8 @@ TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
 # Positive clearance keeps the hook contact above the box top; negative means
 # intentionally inserting below the box top.
 HOOK_CONTACT_INSERT_CLEARANCE = 0.02
+# Reject "contact" detections that stop far above the intended hook height.
+HOOK_CONTACT_CLEARANCE_TOLERANCE = 0.06
 # Only split the descent when the final hook-insertion segment is long enough
 # to be meaningful. Shorter insertions are handled in one continuous descent.
 MIN_SPLIT_INSERTION_DROP = 0.10
@@ -914,7 +916,19 @@ class DescendAndInsertState(TowingStateBase):
             rospy.logerr("Cannot get current position")
             return 'failed'
 
-        if final_insert_drop < MIN_SPLIT_INSERTION_DROP:
+        approach_descent = max(0.0, current_pos[2] - approach_pos[2])
+        total_insert_descent = max(0.0, current_pos[2] - insertion_pos[2])
+        use_split_descent = (
+            final_insert_drop >= MIN_SPLIT_INSERTION_DROP or
+            approach_descent >= MIN_SPLIT_INSERTION_DROP or
+            total_insert_descent >= MIN_SPLIT_INSERTION_DROP
+        )
+        rospy.loginfo(
+            f"Insertion descent request: current_to_approach={approach_descent*1000:.1f}mm, "
+            f"current_to_insert={total_insert_descent*1000:.1f}mm, split={use_split_descent}"
+        )
+
+        if not use_split_descent:
             rospy.loginfo("[Insertion] Final insertion segment is short; using one continuous descent")
             self.log_module_debug_status("[Insertion Debug] before single insertion descent")
             success, achieved_pos = self.streaming_z_descent(
@@ -970,14 +984,26 @@ class DescendAndInsertState(TowingStateBase):
             return 'failed'
 
         # Verify achieved hook contact clearance relative to the load top.
-        if achieved_pos is not None:
-            achieved_clearance = achieved_pos[2] + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
-            rospy.loginfo(
-                f"Achieved hook contact clearance: {achieved_clearance*1000:.1f}mm "
-                f"(target={HOOK_CONTACT_INSERT_CLEARANCE*1000:.1f}mm, positive=above box top)"
+        if achieved_pos is None:
+            rospy.logerr("Cannot verify hook contact clearance")
+            return 'failed'
+        achieved_clearance = achieved_pos[2] + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
+        rospy.loginfo(
+            f"Achieved hook contact clearance: {achieved_clearance*1000:.1f}mm "
+            f"(target={HOOK_CONTACT_INSERT_CLEARANCE*1000:.1f}mm, positive=above box top)"
+        )
+        max_allowed_clearance = (
+            HOOK_CONTACT_INSERT_CLEARANCE + HOOK_CONTACT_CLEARANCE_TOLERANCE
+        )
+        if achieved_clearance > max_allowed_clearance:
+            rospy.logerr(
+                f"Hook insertion incomplete: clearance={achieved_clearance*1000:.1f}mm "
+                f"> allowed={max_allowed_clearance*1000:.1f}mm; refusing to enter hook/tow"
             )
+            self.log_module_debug_status("[Insertion Debug] hook clearance failed")
+            return 'failed'
 
-        contact_pos = np.array(achieved_pos) if achieved_pos is not None else insertion_pos
+        contact_pos = np.array(achieved_pos)
 
         # Stabilize at the actually reached insertion height. This mirrors the
         # valve-rotation flow: once contact locks the Z depth, later phases

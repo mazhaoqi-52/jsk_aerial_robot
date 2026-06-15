@@ -875,7 +875,6 @@ class ApproachLoadState(TowingStateBase):
 
         # Get current state
         current_pos = self.get_end_effector_position()
-        current_yaw = self.get_end_effector_yaw()
         if current_pos is None:
             rospy.logerr("Cannot get current end-effector position")
             return 'failed'
@@ -902,31 +901,29 @@ class ApproachLoadState(TowingStateBase):
         trajectory_points = self.generate_polynomial_trajectory(
             start_pos=current_pos,
             target_pos=phase1_target,
-            target_yaw=current_yaw,  # Keep current yaw during XY movement
-            lock_yaw=True
+            target_yaw=target_yaw,
+            lock_yaw=False
         )
 
         if trajectory_points:
             self.execute_polynomial_trajectory(trajectory_points)
 
         success = self.active_position_convergence(
-            phase1_target, target_yaw=current_yaw,
+            phase1_target, target_yaw=target_yaw,
             pos_thresh=0.06, yaw_thresh=0.1, timeout=4.0
         )
         if not success:
-            rospy.logwarn("Phase 1 loose XY settling incomplete, continuing...")
+            rospy.logwarn("Phase 1 loose XY/yaw settling incomplete, continuing...")
 
-        # Phase 2: Adjust yaw (keep position)
-        rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(target_yaw):.1f} deg")
-        current_pos = self.get_end_effector_position()
+        # Phase 2: Jointly settle XY and yaw before insertion
+        rospy.loginfo(f"[Phase 2] Settling XY/yaw to load-aligned target")
 
         success = self.active_position_convergence(
-            current_pos, target_yaw=target_yaw,
-            pos_thresh=0.05, yaw_thresh=0.05, timeout=15.0,
-            yaw_only=True
+            phase1_target, target_yaw=target_yaw,
+            pos_thresh=0.05, yaw_thresh=0.05, timeout=15.0
         )
         if not success:
-            rospy.logwarn("Phase 2 yaw adjustment incomplete, continuing...")
+            rospy.logwarn("Phase 2 XY/yaw settling incomplete, continuing...")
 
         # DESCEND_AND_INSERT conditionally splits at this approach height. If the
         # final hook insertion would be too short, it descends directly instead.
@@ -1165,6 +1162,9 @@ class RetractAndHookState(TowingStateBase):
         else:
             rospy.loginfo(f"Hook pose locked at {FormationUtils.format_vec(settled_hook_pos)}")
 
+        hook_alignment_ok = self.log_insertion_alignment(
+            "after hook stabilization", settled_hook_pos, hook_pos, approach_dir)
+
         # Towing direction is same as approach direction (pulling outward)
         towing_direction = approach_dir.copy()
 
@@ -1180,11 +1180,11 @@ class RetractAndHookState(TowingStateBase):
         userdata.towing_start_position = settled_hook_pos
         userdata.towing_direction = towing_direction
 
-        if success:
+        if success and hook_alignment_ok:
             rospy.loginfo(f"Hook complete. Towing direction: {towing_direction}")
         else:
             rospy.logwarn(
-                f"Hook complete with incomplete convergence. "
+                f"Hook complete with incomplete convergence/alignment. "
                 f"Towing direction: {towing_direction}"
             )
         return 'succeeded'

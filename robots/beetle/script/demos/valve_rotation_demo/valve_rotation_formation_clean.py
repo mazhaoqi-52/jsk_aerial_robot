@@ -728,7 +728,9 @@ class FormationSingleUAVStateBase(smach.State):
                 return False, actual_pos
 
             # Adaptive XY pause threshold (linearly narrows with descent progress)
-            progress = min((start_z - actual_z) / total_descent, 1.0) if total_descent > 0 else 0
+            progress = 0.0
+            if total_descent > 0:
+                progress = max(0.0, min((start_z - actual_z) / total_descent, 1.0))
             xy_pause_thresh = xy_pause_far + (xy_pause_near - xy_pause_far) * progress
             xy_resume_thresh = xy_pause_thresh * xy_resume_ratio
 

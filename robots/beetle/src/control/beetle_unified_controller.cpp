@@ -447,7 +447,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) {
     ROS_WARN_THROTTLE(1.0,
-                      "[TEMP_UNIFIED_CMD] stage=alloc_reject reason=no_assembled_ids");
+                      "[UnifiedCtrl QP] stage=alloc_reject reason=no_assembled_ids");
     return false;
   }
 
@@ -456,7 +456,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Update formation geometry
   if (!updateFormationGeometry()) {
     ROS_WARN_THROTTLE(1.0,
-                      "[TEMP_UNIFIED_CMD] stage=alloc_reject reason=geometry_update_failed N=%d",
+                      "[UnifiedCtrl QP] stage=alloc_reject reason=geometry_update_failed N=%d",
                       N);
     return false;
   }
@@ -1368,23 +1368,23 @@ bool BeetleUnifiedController::solveFullVectorQP(
     qp_solver_->data()->setNumberOfConstraints(n_constraints);
 
     if (!qp_solver_->data()->setHessianMatrix(P_sparse)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_init_fail op=hessian");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_init_fail op=hessian");
       return false;
     }
     if (!qp_solver_->data()->setGradient(q_vec)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_init_fail op=gradient");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_init_fail op=gradient");
       return false;
     }
     if (!qp_solver_->data()->setLinearConstraintsMatrix(C_sparse)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_init_fail op=constraint_matrix");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_init_fail op=constraint_matrix");
       return false;
     }
     if (!qp_solver_->data()->setLowerBound(lb)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_init_fail op=lower_bound");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_init_fail op=lower_bound");
       return false;
     }
     if (!qp_solver_->data()->setUpperBound(ub)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_init_fail op=upper_bound");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_init_fail op=upper_bound");
       return false;
     }
 
@@ -1399,22 +1399,22 @@ bool BeetleUnifiedController::solveFullVectorQP(
     storeSparsePattern(C_sparse, qp_constraint_outer_, qp_constraint_inner_, qp_constraint_nnz_);
   } else {
     if (!qp_solver_->updateHessianMatrix(P_sparse)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=hessian");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_update_fail op=hessian");
       resetQPState();
       return false;
     }
     if (!qp_solver_->updateGradient(q_vec)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=gradient");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_update_fail op=gradient");
       resetQPState();
       return false;
     }
     if (!qp_solver_->updateLinearConstraintsMatrix(C_sparse)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=constraint_matrix");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_update_fail op=constraint_matrix");
       resetQPState();
       return false;
     }
     if (!qp_solver_->updateBounds(lb, ub)) {
-      ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_update_fail op=bounds");
+      ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_update_fail op=bounds");
       resetQPState();
       return false;
     }
@@ -1424,7 +1424,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (!qp_solver_->solve()) {
     ROS_WARN_THROTTLE(
         1.0,
-        "[TEMP_UNIFIED_CMD] stage=qp_solve_fail rows(task_priority=%d,priority=%d,rate=%d,dir=%d) "
+        "[UnifiedCtrl QP] stage=qp_solve_fail rows(task_priority=%d,priority=%d,rate=%d,dir=%d) "
         "wz=(soft=%.3f,priority=%.3f) rate=(w=%.1e,fx=%.1e,lim=%.2f,dir=%.1fdeg)",
         n_task_priority_rows, n_priority_rows, n_rate_rows, n_direction_rate_rows,
         w_control.size() > 2 ? w_control(2) : 0.0,
@@ -1436,12 +1436,12 @@ bool BeetleUnifiedController::solveFullVectorQP(
   Eigen::VectorXd f_sol = qp_solver_->getSolution();
   if (f_sol.size() != n_cols) {
     ROS_WARN_THROTTLE(1.0,
-                      "[TEMP_UNIFIED_CMD] stage=qp_solution_reject size=%d expected=%d",
+                      "[UnifiedCtrl QP] stage=qp_solution_reject size=%d expected=%d",
                       static_cast<int>(f_sol.size()), n_cols);
     return false;
   }
   if (!f_sol.allFinite()) {
-    ROS_WARN_THROTTLE(1.0, "[TEMP_UNIFIED_CMD] stage=qp_solution_reject non_finite=1");
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] stage=qp_solution_reject non_finite=1");
     resetQPState();
     return false;
   }

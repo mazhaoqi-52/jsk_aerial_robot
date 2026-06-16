@@ -949,7 +949,7 @@ namespace aerial_robot_control
         publishUnifiedHeartbeat("base_gated", now, true);
         ROS_DEBUG_THROTTLE(
             0.5,
-            "[TEMP_UNIFIED_CMD] id=%d role=%s stage=base_gated nav=%d "
+            "[UnifiedCtrl Cmd] id=%d role=%s stage=base_gated nav=%d "
             "module_state=%d since_pub=%.3f control_timestamp=%.4f unified=%s",
             beetle_navigator_->getMyID(),
             module_state == LEADER ? "LEADER" :
@@ -964,7 +964,7 @@ namespace aerial_robot_control
         publishUnifiedHeartbeat("role_gated", ros::Time::now().toSec(), true);
         ROS_DEBUG_THROTTLE(
             0.5,
-            "[TEMP_UNIFIED_CMD] id=%d role=OTHER stage=role_gated nav=%d "
+            "[UnifiedCtrl Cmd] id=%d role=OTHER stage=role_gated nav=%d "
             "module_state=%d unified=ON suppressing_LF_command=1",
             beetle_navigator_->getMyID(), navigator_->getNaviState(),
             module_state);
@@ -1072,9 +1072,9 @@ namespace aerial_robot_control
       const double fz = unified_thrust_cmd_.base_thrust[i + 1];
       max_pair_norm = std::max(max_pair_norm, std::sqrt(fx * fx + fz * fz));
     }
-    ROS_INFO_THROTTLE(
+    ROS_DEBUG_THROTTLE(
         5.0,
-        "[TEMP_UNIFIED_CMD] id=%d stage=publish nav=%d module_state=%d "
+        "[UnifiedCtrl Cmd] id=%d stage=publish nav=%d module_state=%d "
         "dt_prev=%.3f elems=%zu max_pair=%.2f max_abs_comp=%.2f "
         "angles=(%.3f,%.3f,%.3f)",
         beetle_navigator_->getMyID(), navigator_->getNaviState(),
@@ -1175,9 +1175,9 @@ namespace aerial_robot_control
 
     unified_reference_pub_.publish(msg);
 
-    ROS_INFO_THROTTLE(
+    ROS_DEBUG_THROTTLE(
         5.0,
-        "[TEMP_UNIFIED_CMD] id=%d stage=ref_pub stamp=%.4f mass=%.3f "
+        "[UnifiedCtrl Cmd] id=%d stage=ref_pub stamp=%.4f mass=%.3f "
         "wrench_z=%.3f pitch_alloc=%.3f yaw_raw=%.3f",
         beetle_navigator_->getMyID(),
         msg.header.stamp.toSec(),
@@ -1330,9 +1330,9 @@ namespace aerial_robot_control
     unified_cmd_received_ = true;
     unified_cmd_stamp_ = now;
 
-    ROS_INFO_THROTTLE(
+    ROS_DEBUG_THROTTLE(
         5.0,
-        "[TEMP_UNIFIED_CMD] id=%d stage=ref_rx leader_id=%d age=%.4f "
+        "[UnifiedCtrl Cmd] id=%d stage=ref_rx leader_id=%d age=%.4f "
         "wrench_z=%.3f pitch_alloc=%.3f yaw_raw=%.3f",
         beetle_navigator_->getMyID(),
         beetle_navigator_->getLeaderID(),
@@ -3060,9 +3060,9 @@ namespace aerial_robot_control
     markUnifiedDebugStage(ok ? "allocation_solve_ok" : "allocation_solve_failed");
     const double alloc_end = ros::Time::now().toSec();
     const int local_module_state = beetle_navigator_->getModuleState();
-    ROS_INFO_THROTTLE(
+    ROS_DEBUG_THROTTLE(
         5.0,
-        "[TEMP_UNIFIED_CMD] id=%d role=%s stage=after_alloc ok=%d nav=%d "
+        "[UnifiedCtrl Cmd] id=%d role=%s stage=after_alloc ok=%d nav=%d "
         "module_state=%d alloc_ms=%.2f since_pub=%.3f "
         "wrench_acc=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) yaw_raw=%.3f",
         my_id, is_leader ? "LEADER" : "FOLLOWER", ok ? 1 : 0,
@@ -3079,7 +3079,7 @@ namespace aerial_robot_control
       publishUnifiedHeartbeat("allocation_failed", alloc_end, true);
       ROS_WARN_THROTTLE(
           0.2,
-          "[TEMP_UNIFIED_CMD] id=%d role=%s stage=allocation_failed nav=%d "
+          "[UnifiedCtrl Cmd] id=%d role=%s stage=allocation_failed nav=%d "
           "module_state=%d since_pub=%.3f",
           my_id, is_leader ? "LEADER" : "FOLLOWER",
           navigator_->getNaviState(), local_module_state, since_pub_before_alloc);

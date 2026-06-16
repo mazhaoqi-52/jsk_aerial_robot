@@ -463,6 +463,7 @@ class FormationSingleUAVStateBase(smach.State):
             yaw_only: If True, only check yaw convergence (ignore position error)
         """
         start_time = rospy.get_time()
+        self.last_convergence_failure_reason = None
 
         max_angular_vel_limit = max_angular_vel if max_angular_vel is not None else 0.05
         max_linear_vel_limit = max_linear_vel if max_linear_vel is not None else 0.16
@@ -493,6 +494,7 @@ class FormationSingleUAVStateBase(smach.State):
 
             # Safety abort: if position diverges beyond 300mm, stop immediately
             if not yaw_only and pos_error > 0.300:
+                self.last_convergence_failure_reason = "diverged"
                 rospy.logwarn(f"Position diverged to {pos_error*1000:.0f}mm, aborting convergence")
                 return False
 
@@ -567,6 +569,7 @@ class FormationSingleUAVStateBase(smach.State):
 
             rospy.sleep(0.04)
 
+        self.last_convergence_failure_reason = "timeout"
         rospy.logwarn(f"Formation active convergence timeout after {timeout:.1f}s: "
                      f"pos_err={pos_error*1000:.1f}mm, yaw_err={math.degrees(yaw_error):.1f} deg")
         return False

@@ -636,6 +636,9 @@ class TowingStateBase(FormationSingleUAVStateBase):
             TowingStateBase._last_config_ack_stamp[module_id] = rospy.Time.now().to_sec()
 
     def format_module_debug_status(self):
+        if not getattr(self, "debug_monitors_enabled", False):
+            return ""
+
         now = rospy.Time.now().to_sec()
 
         def age_text(stamp, stale_limit=0.5):
@@ -919,35 +922,36 @@ class ApproachLoadState(TowingStateBase):
 
         success = self.active_position_convergence(
             phase1_target, target_yaw=current_yaw,
-            pos_thresh=0.04, yaw_thresh=0.1, timeout=20.0
+            pos_thresh=0.03, yaw_thresh=0.1, timeout=20.0
         )
         if not success:
-            rospy.logwarn("Phase 1 XY settling incomplete, continuing...")
+            reason = getattr(self, "last_convergence_failure_reason", "unknown")
+            rospy.logwarn(f"Phase 1 XY settling incomplete ({reason}), continuing...")
 
-        # Phase 2: rotate to load-aligned yaw at the current position.
-        rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(target_yaw):.1f} deg")
-        current_pos = self.get_end_effector_position()
-        if current_pos is None:
-            rospy.logerr("Cannot get current end-effector position before yaw alignment")
-            return 'failed'
-
+        # Phase 2: rotate to load-aligned yaw while still holding the planned
+        # centerline. Do not accept an off-center Phase 1 position as the yaw
+        # target; otherwise lateral error can be carried into insertion.
+        rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(target_yaw):.1f} deg "
+                      "while holding planned XY")
         success = self.active_position_convergence(
-            current_pos, target_yaw=target_yaw,
+            phase1_target, target_yaw=target_yaw,
             pos_thresh=0.05, yaw_thresh=0.05, timeout=15.0,
-            max_yaw_step=0.05, yaw_only=True
+            max_yaw_step=0.05, max_linear_vel=0.04
         )
         if not success:
-            rospy.logwarn("Phase 2 yaw adjustment incomplete, continuing...")
+            reason = getattr(self, "last_convergence_failure_reason", "unknown")
+            rospy.logwarn(f"Phase 2 XY/yaw adjustment incomplete ({reason}), continuing...")
 
         # Phase 3: final XY/yaw settle on the load-aligned centerline.
         rospy.loginfo("[Phase 3] Final XY/yaw settle before insertion")
         success = self.active_position_convergence(
             phase1_target, target_yaw=target_yaw,
-            pos_thresh=0.05, yaw_thresh=0.05, timeout=10.0,
+            pos_thresh=0.035, yaw_thresh=0.05, timeout=10.0,
             max_linear_vel=0.03
         )
         if not success:
-            rospy.logwarn("Phase 3 XY/yaw settling incomplete, continuing...")
+            reason = getattr(self, "last_convergence_failure_reason", "unknown")
+            rospy.logwarn(f"Phase 3 XY/yaw settling incomplete ({reason}), continuing...")
 
         # DESCEND_AND_INSERT conditionally splits at this approach height. If the
         # final hook insertion would be too short, it descends directly instead.

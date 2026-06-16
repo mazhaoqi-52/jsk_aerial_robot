@@ -623,11 +623,14 @@ class FormationSingleUAVStateBase(smach.State):
         )
 
 
-    def streaming_z_descent(self, start_pos, final_target, final_yaw, descent_speed=0.05):
+    def streaming_z_descent(self, start_pos, final_target, final_yaw,
+                             descent_speed=0.05, contact_detection_remaining=None):
         """Streaming Z descent with inline contact detection at 25Hz.
 
         Uses polynomial trajectory for smooth continuous descent while monitoring
         actual Z motion each cycle. If Z stops moving (contact), locks height.
+        When contact_detection_remaining is set, contact is only accepted near
+        the target Z so command/plant lag at high clearance is ignored.
 
         Returns:
             (success, achieved_position)
@@ -758,7 +761,13 @@ class FormationSingleUAVStateBase(smach.State):
                 dz = abs(actual_z - prev_actual_z)
                 cmd_descended = start_z - cmd_z
                 cmd_actual_gap = actual_z - cmd_z
-                if (dz < small_motion_thresh
+                remaining_to_target = actual_z - target_z
+                contact_window_ok = (
+                    contact_detection_remaining is None or
+                    remaining_to_target <= contact_detection_remaining
+                )
+                if (contact_window_ok
+                        and dz < small_motion_thresh
                         and cmd_descended > 0.050
                         and cmd_actual_gap > 0.030):
                     consecutive_small += 1
@@ -769,6 +778,15 @@ class FormationSingleUAVStateBase(smach.State):
                                      f"dZ={dz*1000:.1f}mm, XY_err={xy_error*1000:.1f}mm)")
                         break
                 else:
+                    if (not contact_window_ok
+                            and dz < small_motion_thresh
+                            and cmd_descended > 0.050
+                            and cmd_actual_gap > 0.030):
+                        rospy.loginfo_throttle(
+                            3.0,
+                            f"[Z Descent] Ignoring contact candidate above target "
+                            f"(remaining={remaining_to_target*1000:.0f}mm > "
+                            f"gate={contact_detection_remaining*1000:.0f}mm)")
                     consecutive_small = 0
 
             prev_actual_z = actual_z

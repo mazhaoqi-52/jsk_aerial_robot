@@ -1007,14 +1007,11 @@ class DescendAndInsertState(TowingStateBase):
 
         approach_descent = max(0.0, current_pos[2] - approach_pos[2])
         total_insert_descent = max(0.0, current_pos[2] - insertion_pos[2])
-        use_split_descent = (
-            final_insert_drop >= MIN_SPLIT_INSERTION_DROP or
-            approach_descent >= MIN_SPLIT_INSERTION_DROP or
-            total_insert_descent >= MIN_SPLIT_INSERTION_DROP
-        )
+        use_split_descent = final_insert_drop >= MIN_SPLIT_INSERTION_DROP
         rospy.loginfo(
             f"Insertion descent request: current_to_approach={approach_descent*1000:.1f}mm, "
-            f"current_to_insert={total_insert_descent*1000:.1f}mm, split={use_split_descent}"
+            f"current_to_insert={total_insert_descent*1000:.1f}mm, "
+            f"split={use_split_descent} (final_drop_only)"
         )
 
         if not use_split_descent:
@@ -1030,7 +1027,8 @@ class DescendAndInsertState(TowingStateBase):
                 current_pos,
                 insertion_pos,
                 insertion_yaw,
-                descent_speed=0.05
+                descent_speed=0.05,
+                contact_detection_remaining=HOOK_CONTACT_CLEARANCE_TOLERANCE
             )
         else:
             self.log_module_debug_status("[Insertion Debug] before approach descent")
@@ -1040,7 +1038,8 @@ class DescendAndInsertState(TowingStateBase):
                 current_pos,
                 approach_pos,
                 insertion_yaw,
-                descent_speed=0.05
+                descent_speed=0.05,
+                contact_detection_remaining=HOOK_CONTACT_CLEARANCE_TOLERANCE
             )
 
             if not success:
@@ -1076,7 +1075,8 @@ class DescendAndInsertState(TowingStateBase):
                 current_pos,
                 insertion_pos,
                 insertion_yaw,
-                descent_speed=0.03
+                descent_speed=0.03,
+                contact_detection_remaining=HOOK_CONTACT_CLEARANCE_TOLERANCE
             )
 
         if not success:

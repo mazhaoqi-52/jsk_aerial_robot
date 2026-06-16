@@ -645,7 +645,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Order matters: matrix first, then gains, so thrustGainMapping() uses
   // the correct matrix when processing the new gains.
   if (!cascade_alloc_sent_ && integrated_map_inv_rot_.rows() > 0 && has_cascade_gain_cache_) {
-    bool matrix_sent = sendTorqueAllocationMatrixInv();
+    bool matrix_sent = sendTorqueAllocationMatrixInvLocked();
     if (matrix_sent) {
       sendCascadeGains(cached_cascade_roll_p_, cached_cascade_roll_i_, cached_cascade_roll_d_,
                        cached_cascade_pitch_p_, cached_cascade_pitch_i_, cached_cascade_pitch_d_,
@@ -1597,26 +1597,73 @@ int BeetleUnifiedController::getModuleIndex(int module_id) const
   return -1;
 }
 
+int BeetleUnifiedController::getModuleCount() const
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return static_cast<int>(module_commands_.size());
+}
+
+Eigen::MatrixXd BeetleUnifiedController::getFormationWrenchMatrix() const
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return integrated_map_;
+}
+
+Eigen::MatrixXd BeetleUnifiedController::getFormationWrenchMatrixInv() const
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return integrated_map_inv_;
+}
+
+Eigen::MatrixXd BeetleUnifiedController::getFormationWrenchMatrixInvRot() const
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return integrated_map_inv_rot_;
+}
+
+Eigen::VectorXd BeetleUnifiedController::getTargetVectoringForce() const
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return target_vectoring_f_;
+}
+
+std::map<int, BeetleUnifiedController::ModuleCommand> BeetleUnifiedController::getModuleCommands() const
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return module_commands_;
+}
+
+void BeetleUnifiedController::setCommandTargetRPY(const tf::Vector3& rpy)
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  command_target_rpy_ = rpy;
+}
+
 bool BeetleUnifiedController::buildModuleThrustCommand(
     int module_id,
     spinal::FourAxisCommand& thrust_msg) const
 {
-  int module_index = getModuleIndex(module_id);
-  if (module_index < 0) return false;
+  tf::Vector3 target_rpy;
+  {
+    std::lock_guard<std::mutex> lock(allocation_mutex_);
 
-  int elems_per_module = motor_num_per_module_ * rotor_coef_;
-  int col_start = module_index * elems_per_module;
-  if (target_vectoring_f_.size() < col_start + elems_per_module) return false;
+    int module_index = getModuleIndex(module_id);
+    if (module_index < 0) return false;
 
-  thrust_msg.base_thrust.resize(elems_per_module);
-  for (int i = 0; i < elems_per_module; i++) {
-    thrust_msg.base_thrust[i] = static_cast<float>(target_vectoring_f_(col_start + i));
+    int elems_per_module = motor_num_per_module_ * rotor_coef_;
+    int col_start = module_index * elems_per_module;
+    if (target_vectoring_f_.size() < col_start + elems_per_module) return false;
+
+    thrust_msg.base_thrust.resize(elems_per_module);
+    for (int i = 0; i < elems_per_module; i++) {
+      thrust_msg.base_thrust[i] = static_cast<float>(target_vectoring_f_(col_start + i));
+    }
+    thrust_msg.angles[0] = static_cast<float>(command_target_rpy_.x());
+    thrust_msg.angles[1] = static_cast<float>(command_target_rpy_.y());
+    thrust_msg.angles[2] = candidate_yaw_term_;
+    target_rpy = command_target_rpy_;
   }
-  thrust_msg.angles[0] = static_cast<float>(command_target_rpy_.x());
-  thrust_msg.angles[1] = static_cast<float>(command_target_rpy_.y());
-  thrust_msg.angles[2] = candidate_yaw_term_;
 
-  const tf::Vector3 target_rpy = command_target_rpy_;
   const tf::Vector3 final_baselink_rpy = navigator_->getFinalTargetBaselinkRPY();
   const tf::Vector3 curr_baselink_rpy = navigator_->getCurrTargetBaselinkRPY();
   ROS_DEBUG_THROTTLE(
@@ -1667,6 +1714,14 @@ bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInv(
     int module_id,
     spinal::TorqueAllocationMatrixInv& msg) const
 {
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return buildModuleTorqueAllocationMatrixInvLocked(module_id, msg);
+}
+
+bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInvLocked(
+    int module_id,
+    spinal::TorqueAllocationMatrixInv& msg) const
+{
   if (integrated_map_inv_rot_.rows() == 0) return false;
 
   int module_index = getModuleIndex(module_id);
@@ -1687,6 +1742,7 @@ bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInv(
 
 bool BeetleUnifiedController::isAllocationSaturated() const
 {
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
   if (module_commands_.empty()) return false;
   const double t_max = robot_model_->getThrustUpperLimit();
   const double t_min = robot_model_->getThrustLowerLimit();
@@ -1742,6 +1798,12 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
 
 bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 {
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return sendTorqueAllocationMatrixInvLocked();
+}
+
+bool BeetleUnifiedController::sendTorqueAllocationMatrixInvLocked()
+{
   // Send this module's rotational sub-block of the formation-level allocation
   // pseudoinverse to its spinal:
   // rows [m*motor_per_module*rotor_coef .. (m+1)*motor_per_module*rotor_coef) × 3 cols.
@@ -1764,13 +1826,12 @@ bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
   }
 
   spinal::TorqueAllocationMatrixInv msg;
-  msg.rows.resize(rows_per_module);
 
   if (integrated_map_inv_rot_.cwiseAbs().maxCoeff() > INT16_MAX * 0.001f) {
     ROS_ERROR_THROTTLE(1.0, "[UnifiedCtrl] Torque Allocation Matrix overflow for module %d", module_id);
   }
 
-  if (!buildModuleTorqueAllocationMatrixInv(module_id, msg)) {
+  if (!buildModuleTorqueAllocationMatrixInvLocked(module_id, msg)) {
     return false;
   }
 

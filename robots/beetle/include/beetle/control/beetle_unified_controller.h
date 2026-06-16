@@ -194,16 +194,16 @@ public:
   const Eigen::Vector3d& getFormationCogOffset() const { return formation_cog_offset_; }
   const Eigen::Matrix3d& getFormationInertia() const { return formation_inertia_; }
   double getFormationMass() const { return formation_mass_; }
-  int getModuleCount() const { return static_cast<int>(module_commands_.size()); }
+  int getModuleCount() const;
   int getMotorNumPerModule() const { return motor_num_per_module_; }
   double getSingleModuleMass() const { return robot_model_ ? robot_model_->getMass() : 0.0; }
-  const Eigen::MatrixXd& getFormationWrenchMatrix() const { return integrated_map_; }
-  const Eigen::MatrixXd& getFormationWrenchMatrixInv() const { return integrated_map_inv_; }
-  const Eigen::MatrixXd& getFormationWrenchMatrixInvRot() const { return integrated_map_inv_rot_; }
+  Eigen::MatrixXd getFormationWrenchMatrix() const;
+  Eigen::MatrixXd getFormationWrenchMatrixInv() const;
+  Eigen::MatrixXd getFormationWrenchMatrixInvRot() const;
   double getCandidateYawTerm() const { return candidate_yaw_term_; }
-  const Eigen::VectorXd& getTargetVectoringForce() const { return target_vectoring_f_; }
-  const std::map<int, ModuleCommand>& getModuleCommands() const { return module_commands_; }
-  void setCommandTargetRPY(const tf::Vector3& rpy) { command_target_rpy_ = rpy; }
+  Eigen::VectorXd getTargetVectoringForce() const;
+  std::map<int, ModuleCommand> getModuleCommands() const;
+  void setCommandTargetRPY(const tf::Vector3& rpy);
   int getModuleIndex(int module_id) const;
   bool buildModuleThrustCommand(int module_id, spinal::FourAxisCommand& thrust_msg) const;
   bool buildModuleTorqueAllocationMatrixInv(int module_id, spinal::TorqueAllocationMatrixInv& msg) const;
@@ -316,6 +316,9 @@ private:
   bool lookupModuleOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;
   bool getCachedModuleOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;
   std::vector<Eigen::MatrixXd> buildRotorMask() const;
+  bool buildModuleTorqueAllocationMatrixInvLocked(
+      int module_id, spinal::TorqueAllocationMatrixInv& msg) const;
+  bool sendTorqueAllocationMatrixInvLocked();
 
   void extractThrustAndGimbal(const Eigen::VectorXd& vectoring_f,
                               const std::vector<int>& assembled_ids);

@@ -2452,7 +2452,7 @@ namespace aerial_robot_control
     }
 
     const std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
-    const std::map<int, BeetleUnifiedController::ModuleCommand>& module_commands =
+    const std::map<int, BeetleUnifiedController::ModuleCommand> module_commands =
         unified_controller_->getModuleCommands();
     const int module_num = static_cast<int>(assembled_ids.size());
     if (module_num <= 1 || module_commands.empty()) return;
@@ -2620,7 +2620,7 @@ namespace aerial_robot_control
 
     // 2. Vectoring force
     if (alloc_ok) {
-      const Eigen::VectorXd& vf = unified_controller_->getTargetVectoringForce();
+      const Eigen::VectorXd vf = unified_controller_->getTargetVectoringForce();
       std_msgs::Float32MultiArray vf_msg;
       vf_msg.data.resize(vf.size());
       for (int i = 0; i < vf.size(); i++)

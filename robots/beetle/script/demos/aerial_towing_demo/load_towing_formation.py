@@ -17,7 +17,7 @@ import numpy as np
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav
-from std_msgs.msg import UInt8
+from std_msgs.msg import String, UInt8
 from tf.transformations import euler_from_quaternion
 
 # Add parent paths for imports
@@ -113,6 +113,8 @@ TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.40
 TOWING_TASK_HOLD_SCALE = 0.40
 TOWING_TASK_RELIEF_SCALE = 0.15
 TOWING_TASK_SCALE_RECOVER_RATE = 0.10  # 0.4 -> 1.0 takes about 6s
+TOWING_UNLOAD_FORCE_RATE = 4.0  # N/s; 20N feedforward unloads in about 5s
+TOWING_UNLOAD_MAX_DURATION = 8.0
 
 
 class LinearTowingTrajectoryGenerator:
@@ -892,38 +894,60 @@ class ApproachLoadState(TowingStateBase):
         )
         rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f} deg")
 
-        # Phase 1: XY movement (Z = box-anchored safety floor or current Z, whichever higher)
+        current_yaw = self.get_end_effector_yaw()
+        if current_yaw is None:
+            rospy.logerr("Cannot get current end-effector yaw")
+            return 'failed'
+
+        # Phase 1: XY movement with current yaw held. This keeps the EE from
+        # sweeping around the load edge while translating to the centerline.
         transit_z = max(current_pos[2], load_top_z + TRANSIT_CLEARANCE_OFFSET)
         rospy.loginfo(f"[Phase 1] Moving to XY position above box "
-                      f"(transit_z={transit_z:.3f}m, floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m)")
+                      f"(transit_z={transit_z:.3f}m, floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m, "
+                      f"yaw_hold={math.degrees(current_yaw):.1f} deg)")
         phase1_target = np.array([approach_xy[0], approach_xy[1], transit_z])
 
         trajectory_points = self.generate_polynomial_trajectory(
             start_pos=current_pos,
             target_pos=phase1_target,
-            target_yaw=target_yaw,
-            lock_yaw=False
+            target_yaw=current_yaw,
+            lock_yaw=True
         )
 
         if trajectory_points:
             self.execute_polynomial_trajectory(trajectory_points)
 
         success = self.active_position_convergence(
-            phase1_target, target_yaw=target_yaw,
-            pos_thresh=0.06, yaw_thresh=0.1, timeout=4.0
+            phase1_target, target_yaw=current_yaw,
+            pos_thresh=0.04, yaw_thresh=0.1, timeout=20.0
         )
         if not success:
-            rospy.logwarn("Phase 1 loose XY/yaw settling incomplete, continuing...")
+            rospy.logwarn("Phase 1 XY settling incomplete, continuing...")
 
-        # Phase 2: Jointly settle XY and yaw before insertion
-        rospy.loginfo(f"[Phase 2] Settling XY/yaw to load-aligned target")
+        # Phase 2: rotate to load-aligned yaw at the current position.
+        rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(target_yaw):.1f} deg")
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr("Cannot get current end-effector position before yaw alignment")
+            return 'failed'
 
         success = self.active_position_convergence(
-            phase1_target, target_yaw=target_yaw,
-            pos_thresh=0.05, yaw_thresh=0.05, timeout=15.0
+            current_pos, target_yaw=target_yaw,
+            pos_thresh=0.05, yaw_thresh=0.05, timeout=15.0,
+            max_yaw_step=0.05, yaw_only=True
         )
         if not success:
-            rospy.logwarn("Phase 2 XY/yaw settling incomplete, continuing...")
+            rospy.logwarn("Phase 2 yaw adjustment incomplete, continuing...")
+
+        # Phase 3: final XY/yaw settle on the load-aligned centerline.
+        rospy.loginfo("[Phase 3] Final XY/yaw settle before insertion")
+        success = self.active_position_convergence(
+            phase1_target, target_yaw=target_yaw,
+            pos_thresh=0.05, yaw_thresh=0.05, timeout=10.0,
+            max_linear_vel=0.03
+        )
+        if not success:
+            rospy.logwarn("Phase 3 XY/yaw settling incomplete, continuing...")
 
         # DESCEND_AND_INSERT conditionally splits at this approach height. If the
         # final hook insertion would be too short, it descends directly instead.
@@ -1164,6 +1188,21 @@ class RetractAndHookState(TowingStateBase):
 
         hook_alignment_ok = self.log_insertion_alignment(
             "after hook stabilization", settled_hook_pos, hook_pos, approach_dir)
+        towing_start_pos = np.array(hook_pos, dtype=float)
+        towing_start_pos[2] = settled_hook_pos[2]
+        hook_xy_offset = np.linalg.norm(
+            np.array(settled_hook_pos[:2], dtype=float) - towing_start_pos[:2])
+        if hook_xy_offset > 0.01:
+            rospy.logwarn(
+                f"Measured hook XY differs from planned centerline by "
+                f"{hook_xy_offset*1000:.1f}mm; towing start keeps planned XY "
+                f"and measured Z={towing_start_pos[2]:.3f}m"
+            )
+        else:
+            rospy.loginfo(
+                f"Towing start locked at planned hook centerline "
+                f"{FormationUtils.format_vec(towing_start_pos)}"
+            )
 
         # Towing direction is same as approach direction (pulling outward)
         towing_direction = approach_dir.copy()
@@ -1177,7 +1216,7 @@ class RetractAndHookState(TowingStateBase):
         # Theoretical pitch effect on EE position is only ~2mm, much less than the 7mm drift.
         self.formation_adapter.set_pitch_compensation(False)
 
-        userdata.towing_start_position = settled_hook_pos
+        userdata.towing_start_position = towing_start_pos
         userdata.towing_direction = towing_direction
 
         if success and hook_alignment_ok:
@@ -1199,6 +1238,24 @@ class TowingWithFeedforwardState(TowingStateBase):
             input_keys=['towing_start_position', 'towing_direction', 'hook_yaw'],
             output_keys=['towing_end_position', 'towing_exit_reason',
                          'towing_breakaway_detected'])
+        self.towing_alignment_diag_pub = rospy.Publisher(
+            '~towing_alignment_diag', String, queue_size=1)
+        self.last_towing_alignment_diag_time = 0.0
+
+    def _scaled_unload_duration(self, min_duration):
+        start_force = np.asarray(self.beetle.current_ff_force, dtype=float)
+        force_norm = float(np.linalg.norm(start_force))
+        if not math.isfinite(force_norm):
+            force_norm = 0.0
+        scaled_duration = force_norm / TOWING_UNLOAD_FORCE_RATE
+        duration = max(float(min_duration), scaled_duration)
+        duration = min(TOWING_UNLOAD_MAX_DURATION, duration)
+        rospy.loginfo(
+            f"[Towing Unload] ff_mag={force_norm:.2f}N, "
+            f"rate={TOWING_UNLOAD_FORCE_RATE:.1f}N/s, "
+            f"duration={duration:.1f}s"
+        )
+        return duration
 
     def _clear_external_wrench(self, hold_pos=None, hold_yaw=None, duration=1.0):
         """Clear external wrench feedforward via BeetleInterface.
@@ -1206,6 +1263,7 @@ class TowingWithFeedforwardState(TowingStateBase):
         Smoothly unloads the last command, then sends a few zero-wrench
         messages for reliability. Topic routing is handled by BeetleInterface.
         """
+        duration = self._scaled_unload_duration(duration)
         rospy.loginfo("Clearing external wrench feedforward")
         zero = [0.0, 0.0, 0.0]
         if hold_pos is None:
@@ -1268,6 +1326,44 @@ class TowingWithFeedforwardState(TowingStateBase):
             force_world, application_offset_body=contact_offset_body,
             yaw_only=True)
         return force_body, torque_body, "fc"
+
+    def _log_towing_alignment_diag(self, current_pos, target_pos, start_pos,
+                                   towing_dir, load_pos, load_start_pos,
+                                   state_info, ff_world):
+        ee_error = self._approach_frame_xy_error(current_pos, start_pos, towing_dir)
+        target_error = self._approach_frame_xy_error(current_pos, target_pos, towing_dir)
+        if ee_error is None or target_error is None:
+            return
+
+        ee_along, ee_lateral, _ = ee_error
+        target_along, target_lateral, target_xy_error = target_error
+        load_text = "load=NA"
+        if load_pos is not None and load_start_pos is not None:
+            load_error = self._approach_frame_xy_error(load_pos, load_start_pos, towing_dir)
+            if load_error is not None:
+                load_along, load_lateral, _ = load_error
+                load_text = (
+                    f"load_along={load_along*1000:.0f}mm, "
+                    f"load_lat={load_lateral*1000:.0f}mm"
+                )
+
+        now = rospy.Time.now().to_sec()
+        if now - self.last_towing_alignment_diag_time < 0.5:
+            return
+        self.last_towing_alignment_diag_time = now
+
+        diag_text = (
+            f"[Towing Align] ee_along={ee_along*1000:.0f}mm, "
+            f"ee_lat={ee_lateral*1000:.0f}mm, "
+            f"target_err_along={target_along*1000:.0f}mm, "
+            f"target_err_lat={target_lateral*1000:.0f}mm, "
+            f"target_xy_err={target_xy_error*1000:.0f}mm, "
+            f"{load_text}, ff={np.linalg.norm(ff_world):.1f}N, "
+            f"guard={state_info['force_guard']}, "
+            f"breakaway={state_info['breakaway_detected']}"
+        )
+        rospy.loginfo(diag_text)
+        self.towing_alignment_diag_pub.publish(String(data=diag_text))
 
     def execute(self, userdata):
         rospy.loginfo("=== Towing With Feedforward State ===")
@@ -1456,6 +1552,16 @@ class TowingWithFeedforwardState(TowingStateBase):
             self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,
                                           frame_id=ff_frame,
                                           task_weights=task_weights)
+            self._log_towing_alignment_diag(
+                current_pos=current_pos,
+                target_pos=target_state['position'],
+                start_pos=start_pos,
+                towing_dir=towing_dir,
+                load_pos=load_pos,
+                load_start_pos=trajectory_gen.load_start_pos,
+                state_info=state_info,
+                ff_world=ff_world
+            )
 
             rospy.loginfo_throttle(
                 2.0,

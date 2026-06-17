@@ -36,6 +36,7 @@ void GimbalrotorNavigator::update()
 
 void GimbalrotorNavigator::setFinalTargetBaselinkRotCallback(const spinal::DesireCoordConstPtr & msg)
 {
+  std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
   final_target_baselink_rot_.setValue(msg->roll, msg->pitch, msg->yaw);  
 }
 
@@ -44,37 +45,50 @@ void GimbalrotorNavigator::reset()
   BaseNavigator::reset();
 
   // reset SO3
-  eq_cog_world_ = false;
-  curr_target_baselink_rot_.setRPY(0, 0, 0);
-  final_target_baselink_rot_.setRPY(0, 0, 0);
+  tf::Quaternion curr_target_baselink_rot;
+  {
+    std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
+    eq_cog_world_ = false;
+    curr_target_baselink_rot_.setRPY(0, 0, 0);
+    final_target_baselink_rot_.setRPY(0, 0, 0);
+    curr_target_baselink_rot = curr_target_baselink_rot_;
+  }
   KDL::Rotation rot;
-  tf::quaternionTFToKDL(curr_target_baselink_rot_, rot);
+  tf::quaternionTFToKDL(curr_target_baselink_rot, rot);
   robot_model_->setCogDesireOrientation(rot);
 }
 
 void GimbalrotorNavigator::targetBaselinkRotCallback(const geometry_msgs::QuaternionStampedConstPtr & msg)
 {
-  tf::quaternionMsgToTF(msg->quaternion, final_target_baselink_rot_);
-  target_omega_.setValue(0,0,0); // for sure to reset the target angular velocity
+  const tf::Vector3 target_rpy = getTargetRPY();
+  {
+    std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
+    tf::quaternionMsgToTF(msg->quaternion, final_target_baselink_rot_);
 
-  // special process
-  if(getTargetRPY().z() != 0)
-    {
-      curr_target_baselink_rot_.setRPY(0, 0, getTargetRPY().z());
-      eq_cog_world_ = true;
-    }
+    // special process
+    if(target_rpy.z() != 0)
+      {
+        curr_target_baselink_rot_.setRPY(0, 0, target_rpy.z());
+        eq_cog_world_ = true;
+      }
+  }
+  setTargetZeroOmega(); // for sure to reset the target angular velocity
 }
 
 void GimbalrotorNavigator::targetBaselinkRPYCallback(const geometry_msgs::Vector3StampedConstPtr & msg)
 {
-  final_target_baselink_rot_.setRPY(msg->vector.x, msg->vector.y, msg->vector.z);
-  target_omega_.setValue(0,0,0); // for sure to reset the target angular velocity
+  {
+    std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
+    final_target_baselink_rot_.setRPY(msg->vector.x, msg->vector.y, msg->vector.z);
+  }
+  setTargetZeroOmega(); // for sure to reset the target angular velocity
 }
 
 
 
 void GimbalrotorNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & msg)
 {
+  std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
   BaseNavigator::naviCallback(msg);
   if(msg->roll_nav_mode == 2) setTargetRoll(msg->target_roll);
   if(msg->pitch_nav_mode == 2) setTargetPitch(msg->target_pitch);
@@ -82,56 +96,66 @@ void GimbalrotorNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstP
 
 void GimbalrotorNavigator::baselinkRotationProcess()
 {
-  if(curr_target_baselink_rot_ == final_target_baselink_rot_) return;
+  const double now = ros::Time::now().toSec();
+  tf::Quaternion curr_target_baselink_rot;
+  {
+    std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
+    if(curr_target_baselink_rot_ == final_target_baselink_rot_) return;
+    if(now - prev_rotation_stamp_ <= baselink_rot_pub_interval_) return;
 
-  if(ros::Time::now().toSec() - prev_rotation_stamp_ > baselink_rot_pub_interval_)
-    {
-      tf::Quaternion delta_q = curr_target_baselink_rot_.inverse() * final_target_baselink_rot_;
-      double angle = delta_q.getAngle();
-      if (angle > M_PI) angle -= 2 * M_PI;
+    tf::Quaternion delta_q = curr_target_baselink_rot_.inverse() * final_target_baselink_rot_;
+    double angle = delta_q.getAngle();
+    if (angle > M_PI) angle -= 2 * M_PI;
 
-      if(fabs(angle) > baselink_rot_change_thresh_)
-        {
-          curr_target_baselink_rot_ *= tf::Quaternion(delta_q.getAxis(), fabs(angle) / angle * baselink_rot_change_thresh_);
-        }
-      else
-        curr_target_baselink_rot_ = final_target_baselink_rot_;
+    if(fabs(angle) > baselink_rot_change_thresh_)
+      {
+        curr_target_baselink_rot_ *= tf::Quaternion(delta_q.getAxis(), fabs(angle) / angle * baselink_rot_change_thresh_);
+      }
+    else
+      curr_target_baselink_rot_ = final_target_baselink_rot_;
 
-      KDL::Rotation rot;
-      tf::quaternionTFToKDL(curr_target_baselink_rot_, rot);
-      robot_model_->setCogDesireOrientation(rot);
+    curr_target_baselink_rot = curr_target_baselink_rot_;
+    prev_rotation_stamp_ = now;
+  }
 
-      // send to spinal
-      spinal::DesireCoord msg;
-      double r,p,y;
-      tf::Matrix3x3(curr_target_baselink_rot_).getRPY(r, p, y);
-      msg.roll = r;
-      msg.pitch = p;
-      msg.yaw = y;
-      target_baselink_rpy_pub_.publish(msg);
+  KDL::Rotation rot;
+  tf::quaternionTFToKDL(curr_target_baselink_rot, rot);
+  robot_model_->setCogDesireOrientation(rot);
 
-      prev_rotation_stamp_ = ros::Time::now().toSec();
-    }
+  // send to spinal
+  spinal::DesireCoord msg;
+  double r,p,y;
+  tf::Matrix3x3(curr_target_baselink_rot).getRPY(r, p, y);
+  msg.roll = r;
+  msg.pitch = p;
+  msg.yaw = y;
+  target_baselink_rpy_pub_.publish(msg);
 }
 
 void GimbalrotorNavigator::setFinalTargetBaselinkRPY(tf::Vector3 final_target_baselink_rpy)
 {
+  std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
   final_target_baselink_rot_.setRPY(final_target_baselink_rpy.x(), final_target_baselink_rpy.y(), final_target_baselink_rpy.z());
 }
 
 void GimbalrotorNavigator::forceSetTargetBaselinkRPY(tf::Vector3 target_baselink_rpy)
 {
-  final_target_baselink_rot_.setRPY(target_baselink_rpy.x(), target_baselink_rpy.y(), target_baselink_rpy.z());
-  curr_target_baselink_rot_.setRPY(target_baselink_rpy.x(), target_baselink_rpy.y(), target_baselink_rpy.z());
+  tf::Quaternion curr_target_baselink_rot;
+  {
+    std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
+    final_target_baselink_rot_.setRPY(target_baselink_rpy.x(), target_baselink_rpy.y(), target_baselink_rpy.z());
+    curr_target_baselink_rot_.setRPY(target_baselink_rpy.x(), target_baselink_rpy.y(), target_baselink_rpy.z());
+    curr_target_baselink_rot = curr_target_baselink_rot_;
+  }
 
   KDL::Rotation rot;
-  tf::quaternionTFToKDL(curr_target_baselink_rot_, rot);
+  tf::quaternionTFToKDL(curr_target_baselink_rot, rot);
   robot_model_->setCogDesireOrientation(rot);
 
   //send to spinal
   spinal::DesireCoord msg;
   double r,p,y;
-  tf::Matrix3x3(curr_target_baselink_rot_).getRPY(r, p, y);
+  tf::Matrix3x3(curr_target_baselink_rot).getRPY(r, p, y);
   msg.roll = r;
   msg.pitch = p;
   msg.yaw = y;
@@ -140,6 +164,7 @@ void GimbalrotorNavigator::forceSetTargetBaselinkRPY(tf::Vector3 target_baselink
 
 tf::Vector3 GimbalrotorNavigator::getCurrTargetBaselinkRPY()
 {
+  std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
   double r,p,y;
   tf::Matrix3x3(curr_target_baselink_rot_).getRPY(r, p, y);
   tf::Vector3 curr_target_baselink_rpy(r,p,y);
@@ -148,6 +173,7 @@ tf::Vector3 GimbalrotorNavigator::getCurrTargetBaselinkRPY()
 
 tf::Vector3 GimbalrotorNavigator::getFinalTargetBaselinkRPY()
 {
+  std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
   double r,p,y;
   tf::Matrix3x3(final_target_baselink_rot_).getRPY(r, p, y);
   tf::Vector3 final_target_baselink_rpy(r,p,y);

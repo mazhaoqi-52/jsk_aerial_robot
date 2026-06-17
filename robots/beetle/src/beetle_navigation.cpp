@@ -182,6 +182,8 @@ void BeetleNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & 
 
   if(force_att_control_flag_) return;
 
+  std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
+
   /* yaw */
   if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
     {
@@ -462,6 +464,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
   if (unified_control_mode_ &&
       (getModuleState() == LEADER || getModuleState() == FOLLOWER)) {
 
+    std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
     const tf::Vector3 prev_final_target_baselink_rpy = getFinalTargetBaselinkRPY();
     tf::Vector3 final_target_baselink_rpy = prev_final_target_baselink_rpy;
     const double prev_target_yaw = getTargetRPY().z();
@@ -632,6 +635,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
   }
 
   // ======== Leader-Follower Mode Navigation (original path) ========
+  std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
 
   /* yaw */
   if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
@@ -754,7 +758,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
           {
           case WORLD_FRAME:
             {
-              target_acc_.setValue(msg->target_acc_x, msg->target_acc_y, 0);
+              setTargetAcc(msg->target_acc_x, msg->target_acc_y, 0);
               break;
             }
           case LOCAL_FRAME:
@@ -787,7 +791,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
         break;
       }
     }
-  if(msg->pos_xy_nav_mode != aerial_robot_msgs::FlightNav::ACC_MODE) target_acc_.setValue(0,0,0);
+  if(msg->pos_xy_nav_mode != aerial_robot_msgs::FlightNav::ACC_MODE) setTargetZeroAcc();
 
   /* z */
   if(msg->pos_z_nav_mode == aerial_robot_msgs::FlightNav::VEL_MODE)

@@ -17,6 +17,7 @@
 #include <nav_msgs/Path.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <aerial_robot_control/trajectory/trajectory_reference/polynomial_trajectory.hpp>
+#include <mutex>
 
 namespace aerial_robot_navigation
 {
@@ -83,52 +84,75 @@ namespace aerial_robot_navigation
       ROS_INFO("Force Landing state");
     }
 
-    inline tf::Vector3 getTargetPos() {return target_pos_;}
-    inline tf::Vector3 getTargetVel() {return target_vel_;}
-    inline tf::Vector3 getTargetAcc() {return target_acc_;}
-    inline tf::Vector3 getTargetRPY() {return target_rpy_;}
-    inline tf::Vector3 getTargetOmega() {return target_omega_;}
-    inline tf::Vector3 getTargetAngAcc() {return target_ang_acc_;}
+    struct TargetSnapshot
+    {
+      tf::Vector3 pos;
+      tf::Vector3 vel;
+      tf::Vector3 acc;
+      tf::Vector3 rpy;
+      tf::Vector3 omega;
+      tf::Vector3 ang_acc;
+    };
 
-    inline void setTargetPos(tf::Vector3 pos) { target_pos_ = pos; }
+    inline TargetSnapshot getTargetSnapshot()
+    {
+      std::lock_guard<std::recursive_mutex> lock(target_mutex_);
+      TargetSnapshot snapshot;
+      snapshot.pos = target_pos_;
+      snapshot.vel = target_vel_;
+      snapshot.acc = target_acc_;
+      snapshot.rpy = target_rpy_;
+      snapshot.omega = target_omega_;
+      snapshot.ang_acc = target_ang_acc_;
+      return snapshot;
+    }
+
+    inline tf::Vector3 getTargetPos() {std::lock_guard<std::recursive_mutex> lock(target_mutex_); return target_pos_;}
+    inline tf::Vector3 getTargetVel() {std::lock_guard<std::recursive_mutex> lock(target_mutex_); return target_vel_;}
+    inline tf::Vector3 getTargetAcc() {std::lock_guard<std::recursive_mutex> lock(target_mutex_); return target_acc_;}
+    inline tf::Vector3 getTargetRPY() {std::lock_guard<std::recursive_mutex> lock(target_mutex_); return target_rpy_;}
+    inline tf::Vector3 getTargetOmega() {std::lock_guard<std::recursive_mutex> lock(target_mutex_); return target_omega_;}
+    inline tf::Vector3 getTargetAngAcc() {std::lock_guard<std::recursive_mutex> lock(target_mutex_); return target_ang_acc_;}
+
+    inline void setTargetPos(tf::Vector3 pos) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_pos_ = pos;}
     inline void setTargetPos(double x, double y, double z) { setTargetPos(tf::Vector3(x, y, z)); }
-    inline void addTargetPos(tf::Vector3 diff_pos) { target_pos_ += diff_pos; }
+    inline void addTargetPos(tf::Vector3 diff_pos) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_pos_ += diff_pos;}
     inline void addTargetPos(double x, double y, double z) { addTargetPos(tf::Vector3(x, y, z)); }
-    inline void setTargetVel(tf::Vector3 vel) { target_vel_ = vel; }
+    inline void setTargetVel(tf::Vector3 vel) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_vel_ = vel;}
     inline void setTargetVel(double x, double y, double z) { setTargetVel(tf::Vector3(x, y, z)); }
     inline void setTargetZeroVel() { setTargetVel(0,0,0); }
-    inline void setTargetAcc(tf::Vector3 vel) { target_acc_ = vel; }
+    inline void setTargetAcc(tf::Vector3 vel) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_acc_ = vel;}
     inline void setTargetAcc(double x, double y, double z) { setTargetAcc(tf::Vector3(x, y, z)); }
     inline void setTargetZeroAcc() { setTargetAcc(tf::Vector3(0,0,0)); }
 
-    inline void setTargetRoll(float value) { target_rpy_.setX(clampTiltAngle(value)); }
-    inline void setTargetOmega(tf::Vector3 omega) { target_omega_ = omega; }
+    inline void setTargetRoll(float value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_rpy_.setX(clampTiltAngle(value));}
+    inline void setTargetOmega(tf::Vector3 omega) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_omega_ = omega;}
     inline void setTargetOmega(double x, double y, double z) { setTargetOmega(tf::Vector3(x, y, z)); }
     inline void setTargetZeroOmega() { setTargetOmega(0,0,0); }
-    inline void setTargetOmegaX(float value) { target_omega_.setX(value); }
-    inline void setTargetPitch(float value) { target_rpy_.setY(clampTiltAngle(value)); }
-    inline void setTargetOmegaY(float value) { target_omega_.setY(value); }
-    inline void setTargetYaw(float value) { target_rpy_.setZ(value); }
-    inline void addTargetYaw(float value) { setTargetYaw(angles::normalize_angle(target_rpy_.z() + value)); }
-    inline void setTargetOmegaZ(float value) { target_omega_.setZ(value); }
-    inline void setTargetRPY(tf::Vector3 value) { target_rpy_ = value; }
-    inline void setTargetAngAcc(tf::Vector3 acc) { target_ang_acc_ = acc; }
+    inline void setTargetOmegaX(float value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_omega_.setX(value);}
+    inline void setTargetPitch(float value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_rpy_.setY(clampTiltAngle(value));}
+    inline void setTargetOmegaY(float value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_omega_.setY(value);}
+    inline void setTargetYaw(float value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_rpy_.setZ(value);}
+    inline void addTargetYaw(float value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_rpy_.setZ(angles::normalize_angle(target_rpy_.z() + value));}
+    inline void setTargetOmegaZ(float value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_omega_.setZ(value);}
+    inline void setTargetRPY(tf::Vector3 value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_rpy_ = value;}
+    inline void setTargetAngAcc(tf::Vector3 acc) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_ang_acc_ = acc;}
     inline void setTargetAngAcc(double x, double y, double z) { setTargetAngAcc(tf::Vector3(x, y, z)); }
     inline void setTargetZeroAngAcc() { setTargetAngAcc(tf::Vector3(0,0,0)); }
-    inline void setTargetAngAccX(double value) { target_ang_acc_.setX(value); }
-    inline void setTargetAngAccY(double value) { target_ang_acc_.setY(value); }
-    inline void setTargetAngAccZ(double value) { target_ang_acc_.setZ(value); }
+    inline void setTargetAngAccX(double value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_ang_acc_.setX(value);}
+    inline void setTargetAngAccY(double value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_ang_acc_.setY(value);}
+    inline void setTargetAngAccZ(double value) {std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_ang_acc_.setZ(value);}
 
-    inline void setTargetPosX( float value){  target_pos_.setX(value);}
-    inline void setTargetVelX( float value){  target_vel_.setX(value);}
-    inline void setTargetAccX( float value){  target_acc_.setX(value);}
-    inline void setTargetPosY( float value){  target_pos_.setY(value);}
-    inline void setTargetVelY( float value){  target_vel_.setY(value);}
-    inline void setTargetAccY( float value){  target_acc_.setY(value);}
-    inline void setTargetPosZ( float value){  target_pos_.setZ(value);}
-    inline void setTargetVelZ( float value){  target_vel_.setZ(value);}
-    inline void setTargetAccZ( float value){  target_acc_.setZ(value);}
-    inline void addTargetPosZ( float value){  target_pos_ += tf::Vector3(0, 0, value);}
+    inline void setTargetPosX( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_pos_.setX(value);}
+    inline void setTargetVelX( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_vel_.setX(value);}
+    inline void setTargetAccX( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_acc_.setX(value);}
+    inline void setTargetPosY( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_pos_.setY(value);}
+    inline void setTargetVelY( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_vel_.setY(value);}
+    inline void setTargetAccY( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_acc_.setY(value);}
+    inline void setTargetPosZ( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_pos_.setZ(value);}
+    inline void setTargetVelZ( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_vel_.setZ(value);}
+    inline void setTargetAccZ( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_acc_.setZ(value);}
+    inline void addTargetPosZ( float value){std::lock_guard<std::recursive_mutex> lock(target_mutex_); target_pos_ += tf::Vector3(0, 0, value);}
 
     inline void setTeleopFlag(bool teleop_flag) { teleop_flag_ = teleop_flag; }
     inline bool getTeleopFlag() { return teleop_flag_; }
@@ -306,6 +330,7 @@ namespace aerial_robot_navigation
     double land_vel_convergent_thresh_;
 
     /* target value */
+    mutable std::recursive_mutex target_mutex_;
     tf::Vector3 target_pos_, target_vel_, target_acc_;
     tf::Vector3 target_rpy_, target_omega_, target_ang_acc_;
 

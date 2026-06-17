@@ -72,7 +72,10 @@ namespace aerial_robot_navigation
     bool getControlFlag(){return control_flag_;}
     int getModuleNum(){return module_num_;}
 
-    void setCog2CoM(const KDL::Frame Cog2CoM){Cog2CoM_ = Cog2CoM;}
+    void setCog2CoM(const KDL::Frame Cog2CoM){
+      std::lock_guard<std::mutex> lock(mutex_cog2com_);
+      Cog2CoM_ = Cog2CoM;
+    }
     void setModuleNum(const int module_num){module_num_ = module_num;}
     void setAssemblyFlag(const int key, const bool value){
       assembly_flags_[key] = value;

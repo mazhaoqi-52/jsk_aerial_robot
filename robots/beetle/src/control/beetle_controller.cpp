@@ -2702,9 +2702,10 @@ namespace aerial_robot_control
     markUnifiedDebugStage("run_common_state_enter");
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
     vel_ = estimator_->getVel(Frame::COG, estimate_mode_);
-    target_pos_ = navigator_->getTargetPos();
-    target_vel_ = navigator_->getTargetVel();
-    target_acc_ = navigator_->getTargetAcc();
+    const auto target_snapshot = navigator_->getTargetSnapshot();
+    target_pos_ = target_snapshot.pos;
+    target_vel_ = target_snapshot.vel;
+    target_acc_ = target_snapshot.acc;
 
     tf::Quaternion cog2baselink_rot;
     tf::quaternionKDLToTF(robot_model_->getCogDesireOrientation<KDL::Rotation>(), cog2baselink_rot);
@@ -2722,7 +2723,7 @@ namespace aerial_robot_control
     // causing pitch_i wind-up and a cascading Z drop. Removing the override restores
     // the same single-source-of-truth used by PoseLinearController (see
     // pose_linear_controller.cpp:244).
-    target_rpy_ = navigator_->getTargetRPY();
+    target_rpy_ = target_snapshot.rpy;
     tf::Matrix3x3 target_rot; target_rot.setRPY(target_rpy_.x(), target_rpy_.y(), target_rpy_.z());
     tf::Vector3 target_baselink_rpy = beetle_navigator_->getFinalTargetBaselinkRPY();
     target_baselink_rpy.setZ(target_rpy_.z());
@@ -2730,9 +2731,9 @@ namespace aerial_robot_control
     target_baselink_rot.setRPY(target_baselink_rpy.x(),
                                target_baselink_rpy.y(),
                                target_baselink_rpy.z());
-    tf::Vector3 target_omega = navigator_->getTargetOmega();
+    tf::Vector3 target_omega = target_snapshot.omega;
     target_omega_ = cog_rot.inverse() * target_rot * target_omega;
-    target_ang_acc_ = navigator_->getTargetAngAcc();
+    target_ang_acc_ = target_snapshot.ang_acc;
     markUnifiedDebugStage("run_common_state_ready");
 
     // --- Formation geometry: each module computes locally ---

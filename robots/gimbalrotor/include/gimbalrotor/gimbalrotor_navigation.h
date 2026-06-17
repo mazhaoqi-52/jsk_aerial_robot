@@ -6,6 +6,7 @@
 #include <geometry_msgs/Vector3Stamped.h>
 #include <geometry_msgs/QuaternionStamped.h>
 #include <spinal/DesireCoord.h>
+#include <mutex>
 
 namespace aerial_robot_navigation
 {
@@ -22,8 +23,16 @@ namespace aerial_robot_navigation
 
     void update() override;
 
-    tf::Quaternion getCurrTargetBaselinkRot(){return curr_target_baselink_rot_;}
-    tf::Quaternion getFinalTargetBaselinkRot(){return final_target_baselink_rot_;}
+    tf::Quaternion getCurrTargetBaselinkRot()
+    {
+      std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
+      return curr_target_baselink_rot_;
+    }
+    tf::Quaternion getFinalTargetBaselinkRot()
+    {
+      std::lock_guard<std::recursive_mutex> lock(baselink_target_mutex_);
+      return final_target_baselink_rot_;
+    }
     tf::Vector3 getCurrTargetBaselinkRPY();
     tf::Vector3 getFinalTargetBaselinkRPY();
  
@@ -45,6 +54,7 @@ namespace aerial_robot_navigation
     void reset() override;
 
     /* target baselink rotation */
+    mutable std::recursive_mutex baselink_target_mutex_;
     double prev_rotation_stamp_;
     tf::Quaternion curr_target_baselink_rot_, final_target_baselink_rot_;
     bool eq_cog_world_;

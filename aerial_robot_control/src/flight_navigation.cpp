@@ -199,6 +199,8 @@ void BaseNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & ms
 
   if(force_att_control_flag_) return;
 
+  std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
+
   /* yaw */
   if(msg->yaw_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
     {
@@ -701,7 +703,7 @@ void BaseNavigator::update()
 
   tf::Vector3 curr_pos = estimator_->getPos(Frame::COG, estimate_mode_);
   tf::Vector3 curr_vel = estimator_->getVel(Frame::COG, estimate_mode_);
-  tf::Vector3 delta = target_pos_ - curr_pos;
+  tf::Vector3 delta = getTargetPos() - curr_pos;
 
   /* check the hard landing in force_landing model */
   if(force_landing_flag_)
@@ -1035,11 +1037,14 @@ void BaseNavigator::updatePoseFromTrajectory()
     {
       if (ros::Time::now().toSec() > trajectory_reset_time_)
         {
-          setTargetZeroVel();
-          setTargetZeroAcc();
+          {
+            std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
+            setTargetZeroVel();
+            setTargetZeroAcc();
 
-          setTargetZeroOmega();
-          setTargetZeroAngAcc();
+            setTargetZeroOmega();
+            setTargetZeroAngAcc();
+          }
 
           trajectory_mode_ = false;
 
@@ -1067,11 +1072,14 @@ void BaseNavigator::updatePoseFromTrajectory()
     {
       ROS_INFO("[Nav] reach the end of trajectory");
 
-      setTargetZeroVel();
-      setTargetZeroAcc();
+      {
+        std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
+        setTargetZeroVel();
+        setTargetZeroAcc();
 
-      setTargetZeroOmega();
-      setTargetZeroAngAcc();
+        setTargetZeroOmega();
+        setTargetZeroAngAcc();
+      }
 
       trajectory_mode_ = false;
 
@@ -1090,16 +1098,18 @@ void BaseNavigator::updatePoseFromTrajectory()
 
   // find the target pose at t from trajectory
   agi::QuadState target_state = traj_generator_ptr_->getState(t);
-  setTargetPos(tf::Vector3(target_state.p(0), target_state.p(1), target_state.p(2)));
-  setTargetVel(tf::Vector3(target_state.v(0), target_state.v(1), target_state.v(2)));
-  setTargetAcc(tf::Vector3(target_state.a(0), target_state.a(1), target_state.a(2)));
-
   double target_yaw = target_state.getYaw();
   double target_omega_z = target_state.w(2);
   double target_ang_acc_z = target_state.tau(2);
-  setTargetYaw(target_yaw);
-  setTargetOmegaZ(target_omega_z);
-  setTargetAngAccZ(target_ang_acc_z);
+  {
+    std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
+    setTargetPos(tf::Vector3(target_state.p(0), target_state.p(1), target_state.p(2)));
+    setTargetVel(tf::Vector3(target_state.v(0), target_state.v(1), target_state.v(2)));
+    setTargetAcc(tf::Vector3(target_state.a(0), target_state.a(1), target_state.a(2)));
+    setTargetYaw(target_yaw);
+    setTargetOmegaZ(target_omega_z);
+    setTargetAngAccZ(target_ang_acc_z);
+  }
 
   tf::Vector3 curr_pos = estimator_->getPos(Frame::COG, estimate_mode_);
   double yaw_angle = estimator_->getEuler(Frame::COG, estimate_mode_).z();
@@ -1176,4 +1186,3 @@ void BaseNavigator::rosParamInit()
   getParam<double>(bat_nh, "bat_resistance_voltage_rate", bat_resistance_voltage_rate_, 0.0); //Battery internal resistance_voltage_rate
   getParam<double>(bat_nh, "hovering_current", hovering_current_, 0.0); // current at hovering state
 }
-

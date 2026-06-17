@@ -77,6 +77,10 @@ HOOK_CONTACT_CLEARANCE_TOLERANCE = 0.06
 # Soft lateral alignment guard in the load/approach frame. Exceeding this does
 # not abort the state machine, but it must not redefine the planned hook XY.
 HOOK_ALIGNMENT_LATERAL_TOLERANCE = 0.05
+# Tighter one-shot alignment before a direct insertion descent. The descent
+# itself already streams the same XY target, so do not recenter inside it.
+SINGLE_DESCENT_ALIGNMENT_LATERAL_TOLERANCE = 0.03
+HOOK_ATTEMPT_MAX_SOFT_FAIL_XY_ERROR = 0.30
 # Only split the descent when the final hook-insertion segment is long enough
 # to be meaningful. Shorter insertions are handled in one continuous descent.
 MIN_SPLIT_INSERTION_DROP = 0.10
@@ -700,46 +704,53 @@ class TowingStateBase(FormationSingleUAVStateBase):
         xy_error = float(np.linalg.norm(delta_xy))
         return longitudinal, lateral, xy_error
 
-    def log_insertion_alignment(self, label, current_pos, target_pos, approach_direction):
+    def log_insertion_alignment(self, label, current_pos, target_pos, approach_direction,
+                                lateral_tolerance=HOOK_ALIGNMENT_LATERAL_TOLERANCE):
         error = self._approach_frame_xy_error(current_pos, target_pos, approach_direction)
         if error is None:
             rospy.logwarn(f"[Insertion Align] {label}: cannot compute approach-frame error")
             return True
 
         longitudinal, lateral, xy_error = error
-        ok = abs(lateral) <= HOOK_ALIGNMENT_LATERAL_TOLERANCE
+        ok = abs(lateral) <= lateral_tolerance
         log_fn = rospy.loginfo if ok else rospy.logwarn
         log_fn(
             f"[Insertion Align] {label}: xy_err={xy_error*1000:.1f}mm, "
             f"along={longitudinal*1000:.1f}mm, lateral={lateral*1000:.1f}mm "
-            f"(limit={HOOK_ALIGNMENT_LATERAL_TOLERANCE*1000:.0f}mm)"
+            f"(limit={lateral_tolerance*1000:.0f}mm)"
         )
         return ok
 
-    def soft_recenter_insertion_alignment(self, label, target_pos, target_yaw, approach_direction):
+    def soft_recenter_insertion_alignment(
+            self, label, target_pos, target_yaw, approach_direction,
+            lateral_tolerance=HOOK_ALIGNMENT_LATERAL_TOLERANCE,
+            timeout=5.0, max_linear_vel=0.03):
         current_pos = self.get_end_effector_position()
         if current_pos is None:
             rospy.logwarn(f"[Insertion Align] {label}: position unavailable; continuing")
             return False
 
-        if self.log_insertion_alignment(label, current_pos, target_pos, approach_direction):
+        if self.log_insertion_alignment(
+                label, current_pos, target_pos, approach_direction,
+                lateral_tolerance=lateral_tolerance):
             return True
 
         recenter_target = np.array(target_pos, dtype=float)
         recenter_target[2] = current_pos[2]
         rospy.logwarn(
             f"[Insertion Align] {label}: lateral error exceeds "
-            f"{HOOK_ALIGNMENT_LATERAL_TOLERANCE*1000:.0f}mm; trying soft XY recenter"
+            f"{lateral_tolerance*1000:.0f}mm; trying soft XY recenter"
         )
         self.active_position_convergence(
             recenter_target, target_yaw=target_yaw,
-            pos_thresh=HOOK_ALIGNMENT_LATERAL_TOLERANCE, yaw_thresh=0.05,
-            timeout=5.0, max_linear_vel=0.03
+            pos_thresh=lateral_tolerance, yaw_thresh=0.05,
+            timeout=timeout, max_linear_vel=max_linear_vel
         )
 
         current_pos = self.get_end_effector_position()
         ok = self.log_insertion_alignment(
-            f"{label} after recenter", current_pos, target_pos, approach_direction)
+            f"{label} after recenter", current_pos, target_pos, approach_direction,
+            lateral_tolerance=lateral_tolerance)
         if not ok:
             rospy.logwarn(
                 f"[Insertion Align] {label}: still outside lateral tolerance; "
@@ -1037,7 +1048,8 @@ class DescendAndInsertState(TowingStateBase):
             rospy.loginfo("[Insertion] Final insertion segment is short; using one continuous descent")
             self.log_module_debug_status("[Insertion Debug] before single insertion descent")
             self.soft_recenter_insertion_alignment(
-                "before single insertion", insertion_pos, insertion_yaw, approach_dir)
+                "before single insertion", insertion_pos, insertion_yaw, approach_dir,
+                lateral_tolerance=SINGLE_DESCENT_ALIGNMENT_LATERAL_TOLERANCE)
             current_pos = self.get_end_effector_position()
             if current_pos is None:
                 rospy.logerr("Cannot get current position before single insertion")
@@ -1098,11 +1110,27 @@ class DescendAndInsertState(TowingStateBase):
                 contact_detection_remaining=HOOK_CONTACT_CLEARANCE_TOLERANCE
             )
 
-        if not success:
-            # If descent aborted (e.g., retry limit hit), don't continue with hook/tow.
-            rospy.logerr("Z descent failed (aborted). Exiting state machine.")
-            self.log_module_debug_status("[Insertion Debug] insertion descent failed")
-            return 'failed'
+        insertion_descent_soft_failed = not success
+        if insertion_descent_soft_failed:
+            if achieved_pos is None:
+                rospy.logerr("Z descent failed without a valid achieved position")
+                self.log_module_debug_status("[Insertion Debug] insertion descent failed")
+                return 'failed'
+            error = self._approach_frame_xy_error(
+                achieved_pos, insertion_pos, approach_dir)
+            if error is not None and error[2] > HOOK_ATTEMPT_MAX_SOFT_FAIL_XY_ERROR:
+                rospy.logerr(
+                    f"Z descent failed with XY error {error[2]*1000:.0f}mm "
+                    f"> {HOOK_ATTEMPT_MAX_SOFT_FAIL_XY_ERROR*1000:.0f}mm; "
+                    "refusing hook/tow attempt"
+                )
+                self.log_module_debug_status("[Insertion Debug] insertion descent failed")
+                return 'failed'
+            rospy.logwarn(
+                "Z descent soft-failed; continuing to hook attempt with planned "
+                "insertion centerline"
+            )
+            self.log_module_debug_status("[Insertion Debug] insertion descent soft-failed")
 
         # Verify achieved hook contact clearance relative to the load top.
         if achieved_pos is None:
@@ -1116,22 +1144,28 @@ class DescendAndInsertState(TowingStateBase):
         max_allowed_clearance = (
             HOOK_CONTACT_INSERT_CLEARANCE + HOOK_CONTACT_CLEARANCE_TOLERANCE
         )
-        if achieved_clearance > max_allowed_clearance:
-            rospy.logerr(
+        insertion_clearance_ok = achieved_clearance <= max_allowed_clearance
+        if not insertion_clearance_ok:
+            rospy.logwarn(
                 f"Hook insertion incomplete: clearance={achieved_clearance*1000:.1f}mm "
-                f"> allowed={max_allowed_clearance*1000:.1f}mm; refusing to enter hook/tow"
+                f"> allowed={max_allowed_clearance*1000:.1f}mm; continuing to hook/tow attempt"
             )
             self.log_module_debug_status("[Insertion Debug] hook clearance failed")
-            return 'failed'
 
         self.log_insertion_alignment(
             "after final insertion", achieved_pos, insertion_pos, approach_dir)
 
         contact_pos = np.array(insertion_pos, dtype=float)
-        contact_pos[2] = achieved_pos[2]
+        if insertion_clearance_ok:
+            contact_pos[2] = achieved_pos[2]
+        else:
+            rospy.logwarn(
+                f"Using planned insertion Z={contact_pos[2]:.3f}m for hook attempt "
+                f"(achieved_Z={achieved_pos[2]:.3f}m)"
+            )
 
-        # Stabilize at the planned insertion XY and the actually reached height.
-        # The contact Z is physical; lateral drift must not redefine hook center.
+        # Stabilize at the planned insertion XY. If insertion was incomplete,
+        # keep the planned Z so the next hook phase can still attempt engagement.
         rospy.loginfo("Stabilizing at insertion contact position...")
         self.active_stabilization_wait(contact_pos, insertion_yaw, duration=2.0)
         settled_contact_pos = self.get_end_effector_position()
@@ -1152,7 +1186,10 @@ class DescendAndInsertState(TowingStateBase):
         userdata.hook_position = hook_pos
         userdata.hook_yaw = insertion_yaw
 
-        rospy.loginfo("Insertion complete")
+        if insertion_descent_soft_failed or not insertion_clearance_ok:
+            rospy.logwarn("Insertion incomplete; proceeding to hook/tow attempt")
+        else:
+            rospy.loginfo("Insertion complete")
         return 'succeeded'
 
 

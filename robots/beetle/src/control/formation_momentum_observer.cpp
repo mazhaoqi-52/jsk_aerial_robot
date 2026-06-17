@@ -1,7 +1,7 @@
 // -*- mode: c++ -*-
 // Formation-level momentum observer — implementation.
 //
-// Version 1: 3D external force estimation only (debug-only, no control feedback).
+// Version 1: 3D external force estimation only.
 //
 // Observer equation (3D force channel):
 //
@@ -109,7 +109,7 @@ void FormationMomentumObserver::reset()
 
   last_cog_rot_ = Eigen::Matrix3d::Identity();
 
-  // No bias state to reset. Just clear the future FF arming gate.
+  // No bias state to reset. Just clear the downstream feedback arming gate.
   ff_armed_ = false;
   ff_armed_time_ = -1.0;
 

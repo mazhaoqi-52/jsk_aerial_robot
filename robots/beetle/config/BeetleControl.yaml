@@ -31,19 +31,18 @@ controller:
 
   # ========== Formation Momentum Observer ==========
   # Formation-level external wrench estimation using realized wrench from allocation.
-  # Controller consumes the filtered 6D estimate only through the conservative
+  # Controller consumes the filtered 6D estimate through the LF-like
   # unified_external_wrench_feedback path above.
   formation_observer:
     force_observer_gain: 3.0
     torque_observer_gain: 2.5
     enable_force_observer: true
     enable_torque_observer: true
-    # Output LPF cutoff. No bias subtraction is applied; the observer is
-    # diagnostic until its allocation/momentum equation is validated on hardware.
+    # Output LPF cutoff. Feedback still has norm clamps and a short ramp.
     est_force_lpf_cutoff_freq: 1.0
     est_torque_lpf_cutoff_freq: 1.0
-    # Gate ramp for the downstream low-gain observer feedback.
-    ff_ramp_seconds: 5.0
+    # Short gate ramp: close to LF's quick observer engagement, without a hard step.
+    ff_ramp_seconds: 1.0
 
   yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
 

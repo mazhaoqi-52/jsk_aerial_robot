@@ -3092,13 +3092,18 @@ namespace aerial_robot_control
       }
     }
 
+    const int observer_feedback_nav_state = navigator_->getNaviState();
+    const bool observer_feedback_nav_ready =
+        observer_feedback_nav_state == aerial_robot_navigation::TAKEOFF_STATE ||
+        observer_feedback_nav_state == aerial_robot_navigation::HOVER_STATE ||
+        observer_feedback_nav_state == aerial_robot_navigation::LAND_STATE;
     if (is_leader &&
         unified_external_wrench_feedback_ &&
         unified_external_wrench_feedback_gain_ > 0.0 &&
         formation_observer_ &&
         formation_observer_->isActive() &&
         formation_observer_->isFfReady() &&
-        navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
+        observer_feedback_nav_ready &&
         !navigator_->getForceLandingFlag()) {
       const Eigen::VectorXd est_external_wrench =
           formation_observer_->getEstExternalWrench6D();
@@ -3125,10 +3130,11 @@ namespace aerial_robot_control
         formation_wrench_cmd += feedback_wrench;
         ROS_INFO_THROTTLE(
             1.0,
-            "[UnifiedCtrl ExtWrenchFB] id=%d gain=%.3f ramp=%.3f "
+            "[UnifiedCtrl ExtWrenchFB] id=%d nav=%d gain=%.3f ramp=%.3f "
             "est=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
             "fb=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f)",
-            my_id, unified_external_wrench_feedback_gain_,
+            my_id, observer_feedback_nav_state,
+            unified_external_wrench_feedback_gain_,
             formation_observer_->getFfRampFactor(),
             est_external_wrench(0), est_external_wrench(1),
             est_external_wrench(2), est_external_wrench(3),
@@ -3353,15 +3359,19 @@ namespace aerial_robot_control
             Eigen::Vector3d vel_formation_w = vel_leader_w + omega_w.cross(offset_w);
             Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
 
-            // Arm the future observer-FF gate only while the formation is in hover.
-            const bool in_hover =
-                (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE);
-            formation_observer_->setFfArmed(in_hover);
-            formation_observer_->update(
-                unified_controller_->getFormationMass(),
-                unified_controller_->getFormationInertia(),
-                cog_rot_eigen, vel_formation_w, omega_body,
-                realized_wrench, du);
+            const int observer_nav_state = navigator_->getNaviState();
+            const bool observer_nav_ready =
+                observer_nav_state == aerial_robot_navigation::TAKEOFF_STATE ||
+                observer_nav_state == aerial_robot_navigation::HOVER_STATE ||
+                observer_nav_state == aerial_robot_navigation::LAND_STATE;
+            formation_observer_->setFfArmed(observer_nav_ready);
+            if (observer_nav_ready) {
+              formation_observer_->update(
+                  unified_controller_->getFormationMass(),
+                  unified_controller_->getFormationInertia(),
+                  cog_rot_eigen, vel_formation_w, omega_body,
+                  realized_wrench, du);
+            }
           }
           markUnifiedDebugStage("formation_observer_exit");
         }

@@ -27,7 +27,7 @@ controller:
 
   # ========== Formation Momentum Observer ==========
   # Formation-level external wrench estimation using realized wrench from allocation.
-  # Controller consumes the filtered 6D estimate only through the conservative
+  # Controller consumes the filtered 6D estimate through the LF-like
   # unified_external_wrench_feedback path above.
   # Observer gain = bandwidth: higher → faster but noisier. Start conservative.
   formation_observer:
@@ -35,9 +35,9 @@ controller:
     torque_observer_gain: 2.5      # K_t: observer gain for torque channel
     enable_force_observer: true    # V1: enable 3D force estimation
     enable_torque_observer: true   # V2: enable torque estimation
-    est_force_lpf_cutoff_freq: 0.05 # preserve previous code default
-    est_torque_lpf_cutoff_freq: 0.05
-    ff_ramp_seconds: 5.0           # gate ramp for downstream low-gain observer feedback
+    est_force_lpf_cutoff_freq: 1.0
+    est_torque_lpf_cutoff_freq: 1.0
+    ff_ramp_seconds: 1.0           # short LF-like gate ramp without a hard step
 
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
 

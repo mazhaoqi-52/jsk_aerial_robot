@@ -1,0 +1,86 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="wall">
+
+  <xacro:arg name="wall_thickness" default="0.1" />
+  <xacro:arg name="wall_width" default="2.0" />
+  <xacro:arg name="wall_height" default="2.0" />
+  <xacro:arg name="wall_mass" default="20.0" />
+
+  <xacro:property name="wall_thickness" value="$(arg wall_thickness)" />
+  <xacro:property name="wall_width" value="$(arg wall_width)" />
+  <xacro:property name="wall_height" value="$(arg wall_height)" />
+  <xacro:property name="wall_mass" value="$(arg wall_mass)" />
+
+  <xacro:property name="ixx" value="${(1.0/12.0) * wall_mass * (wall_width*wall_width + wall_height*wall_height)}" />
+  <xacro:property name="iyy" value="${(1.0/12.0) * wall_mass * (wall_thickness*wall_thickness + wall_height*wall_height)}" />
+  <xacro:property name="izz" value="${(1.0/12.0) * wall_mass * (wall_thickness*wall_thickness + wall_width*wall_width)}" />
+
+  <material name="wall_blue">
+    <color rgba="0.2 0.45 0.95 1.0" />
+  </material>
+
+  <link name="world" />
+
+  <joint name="wall_joint" type="fixed">
+    <parent link="world" />
+    <child link="wall_panel" />
+    <origin xyz="0 0 ${wall_height/2}" rpy="0 0 0" />
+    <axis xyz="1 0 0" />
+  </joint>
+
+  <link name="wall_panel">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="${wall_thickness} ${wall_width} ${wall_height}" />
+      </geometry>
+      <material name="wall_blue" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="${wall_thickness} ${wall_width} ${wall_height}" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="${wall_mass}" />
+      <inertia ixx="${ixx}" ixy="0" ixz="0" iyy="${iyy}" iyz="0" izz="${izz}" />
+    </inertial>
+  </link>
+
+  <gazebo reference="wall_panel">
+    <material>Gazebo/Blue</material>
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+    <kp>1000000.0</kp>
+    <kd>100.0</kd>
+    <minDepth>0.001</minDepth>
+    <maxVel>0.5</maxVel>
+  </gazebo>
+
+  <gazebo>
+    <plugin name="p3d_wall_controller" filename="libgazebo_ros_p3d.so">
+      <alwaysOn>true</alwaysOn>
+      <updateRate>50.0</updateRate>
+      <bodyName>wall_panel</bodyName>
+      <topicName>/wall/odom</topicName>
+      <gaussianNoise>0</gaussianNoise>
+      <frameName>world</frameName>
+      <xyzOffsets>0 0 0</xyzOffsets>
+      <rpyOffsets>0 0 0</rpyOffsets>
+    </plugin>
+  </gazebo>
+
+  <gazebo reference="wall_joint">
+    <provideFeedback>true</provideFeedback>
+  </gazebo>
+  <gazebo>
+    <plugin name="ft_sensor" filename="libgazebo_ros_ft_sensor.so">
+      <updateRate>100.0</updateRate>
+      <topicName>/wall/wrench</topicName>
+      <jointName>wall_joint</jointName>
+    </plugin>
+  </gazebo>
+
+</robot>

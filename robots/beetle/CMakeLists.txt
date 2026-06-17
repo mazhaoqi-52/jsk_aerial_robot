@@ -64,7 +64,7 @@ install(TARGETS beetle_sensor_pluginlib beetle_robot_model beetle_controller bee
   DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
 )
 
-install(DIRECTORY config plugins launch
+install(DIRECTORY config plugins launch urdf
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
   USE_SOURCE_PERMISSIONS
   )
@@ -95,5 +95,9 @@ catkin_install_python(PROGRAMS
 )
 catkin_install_python(PROGRAMS
   script/demos/aerial_towing_demo/load_towing_formation.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+catkin_install_python(PROGRAMS
+  script/demos/aerial_pushing_demo/wall_pushing_formation.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

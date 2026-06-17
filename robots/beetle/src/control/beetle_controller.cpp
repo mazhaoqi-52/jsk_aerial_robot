@@ -29,7 +29,6 @@ namespace aerial_robot_control
     unified_reference_warmup_count_(0),
     unified_reference_warmup_frames_(20),
     unified_reference_timeout_(0.8),
-    unified_attitude_i_local_ratio_(0.25),
     local_unified_cascade_setup_sent_(false),
     unified_torque_alloc_inv_pub_interval_(0.05),
     last_unified_torque_alloc_inv_pub_time_(-1.0),
@@ -2096,10 +2095,6 @@ namespace aerial_robot_control
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
     getParam<double>(control_nh, "unified_reference_timeout", unified_reference_timeout_, 0.8);
     unified_reference_timeout_ = std::max(0.0, unified_reference_timeout_);
-    getParam<double>(control_nh, "unified_attitude_i_local_ratio",
-                     unified_attitude_i_local_ratio_, 0.25);
-    unified_attitude_i_local_ratio_ =
-        std::min(1.0, std::max(0.0, unified_attitude_i_local_ratio_));
     getParam<double>(control_nh, "unified_torque_allocation_matrix_inv_pub_interval",
                      unified_torque_alloc_inv_pub_interval_, 0.05);
     unified_torque_alloc_inv_pub_interval_ =
@@ -3031,28 +3026,8 @@ namespace aerial_robot_control
     // Keep local PID/gravity feedback out of hard-priority rows. The control
     // target carries position PID, gravity FF, and slow roll/pitch I correction;
     // desired task wrench is added as a separate weighted soft objective.
-    double roll_i_for_alloc = pid_controllers_.at(ROLL).getITerm();
-    double pitch_i_for_alloc = pid_controllers_.at(PITCH).getITerm();
-    if (!is_leader && unified_cmd_received_ &&
-        unified_reference_wrench_acc_.size() >= 6 &&
-        unified_attitude_i_local_ratio_ < 1.0) {
-      const double local_ratio = unified_attitude_i_local_ratio_;
-      const double leader_roll_i = unified_reference_wrench_acc_(3);
-      const double leader_pitch_i = unified_reference_wrench_acc_(4);
-      roll_i_for_alloc = local_ratio * roll_i_for_alloc
-                         + (1.0 - local_ratio) * leader_roll_i;
-      pitch_i_for_alloc = local_ratio * pitch_i_for_alloc
-                          + (1.0 - local_ratio) * leader_pitch_i;
-      ROS_DEBUG_THROTTLE(
-          2.0,
-          "[UnifiedCtrl IConsensus] id=%d local_ratio=%.2f roll(local/leader/use)=%.3f/%.3f/%.3f "
-          "pitch(local/leader/use)=%.3f/%.3f/%.3f",
-          my_id, local_ratio,
-          pid_controllers_.at(ROLL).getITerm(), leader_roll_i, roll_i_for_alloc,
-          pid_controllers_.at(PITCH).getITerm(), leader_pitch_i, pitch_i_for_alloc);
-    }
-    target_wrench_acc(3) = roll_i_for_alloc;
-    target_wrench_acc(4) = pitch_i_for_alloc;
+    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
+    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 

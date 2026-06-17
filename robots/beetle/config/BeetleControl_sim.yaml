@@ -15,7 +15,6 @@ controller:
   unified_control_mode: false
   unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
   unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
-  unified_attitude_i_local_ratio: 0.25 # follower roll/pitch I allocation blend: 0=leader, 1=local
 
   # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
   # handles LF↔unified switching directly in initUnifiedMode().

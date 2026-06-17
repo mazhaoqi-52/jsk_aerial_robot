@@ -58,10 +58,13 @@ namespace aerial_robot_control
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
 
-    // Formation-level momentum observer (Phase U2)
+    // Formation-level momentum observer.
     // Runs only in unified LEADER mode; uses realized wrench from allocation.
-    // V1: 3D force estimation, debug-only (no control feedback).
     std::shared_ptr<FormationMomentumObserver> formation_observer_;
+    bool unified_external_wrench_feedback_;
+    double unified_external_wrench_feedback_gain_;
+    double unified_external_wrench_feedback_max_force_;
+    double unified_external_wrench_feedback_max_torque_;
 
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;
@@ -159,6 +162,11 @@ namespace aerial_robot_control
     ros::Publisher module_model_pub_;
     ros::Publisher unified_heartbeat_pub_;
     map<string, ros::Subscriber> module_model_subs_;
+    map<int, ros::Subscriber> unified_peer_heartbeat_subs_;
+    std::map<int, double> unified_peer_heartbeat_stamp_;
+    std::mutex unified_peer_heartbeat_mutex_;
+    bool unified_peer_stall_guard_;
+    double unified_peer_heartbeat_timeout_;
     // Last formation revision seen in runUnifiedControlCommon. When the unified
     // controller's getFormationRevision() bumps (peer ModuleModel late-arrival
     // or assembled-id change), the follower local cascade one-shot is re-armed
@@ -170,10 +178,12 @@ namespace aerial_robot_control
 
     // Edge-detector for one-shot takeoff diagnostic in update().
     int prev_navi_state_for_diag_;
-    // Reference msg fields cached on the follower side.
+    // Reference msg fields cached on the follower side. Guarded by
+    // unified_reference_mutex_ so callbacks and the control loop see a
+    // physically consistent reference snapshot.
     // wrench_acc / desired_wrench / yaw_pid_raw : leader low-frequency
-    //   reference and diagnostics. Followers still solve QP locally, but blend
-    //   roll/pitch I terms with the leader reference before allocation.
+    //   reference and diagnostics. Followers still solve QP locally; they use
+    //   desired_wrench as the shared formation-level task, not leader allocation.
     // leader_target_* / final_target_baselink  : Phase B — drives the
     //   follower's target_pos/_vel/_acc/_rpy/_omega/_ang_acc via rigid-formation
     //   kinematics inside runUnifiedControlCommon() while keeping PID attitude
@@ -196,8 +206,10 @@ namespace aerial_robot_control
     tf::Vector3 leader_final_target_baselink_rpy_;
     tf::Vector3 leader_target_omega_;
     tf::Vector3 leader_target_ang_acc_;
+    std::mutex unified_reference_mutex_;
 
     void unifiedReferenceCallback(const beetle::UnifiedControlReference& msg);
+    void unifiedPeerHeartbeatCallback(const diagnostic_msgs::KeyValue::ConstPtr& msg, int module_id);
     void ensureUnifiedReferenceSubscription();
     bool publishLocalUnifiedCommand();
     bool sendLocalUnifiedCascadeSetupOnce();

@@ -11,14 +11,13 @@
 //
 // Version 1 (Phase U2):
 //   - 3D external force estimation only (no torque)
-//   - Debug-only: publishes topic, no feedback to control
+//   - Publishes estimator diagnostics
 //
 // Version 2 (Phase U3):
 //   - Full 6D wrench estimation (force + torque)
-//   - Still debug-only
+//   - BeetleController may optionally apply low-gain downstream feedback
 //
-// Version 3 (future):
-//   - Low-frequency feedforward compensation (Z, then pitch, then full 6D)
+// The observer itself remains estimator-only.
 
 #pragma once
 
@@ -79,7 +78,7 @@ public:
               const Eigen::VectorXd& realized_wrench_body,
               double dt);
 
-  // ---- Accessors (debug / future compensation) ----
+  // ---- Accessors (debug / optional controller feedback) ----
 
   /** @brief Get estimated external force in world frame [N] (LPF-filtered).
    *  No bias subtraction is applied. Treat this as a diagnostic model residual
@@ -111,16 +110,16 @@ public:
   /** @brief Set the observer to active/inactive. When inactive, update() is a no-op. */
   void setActive(bool active) { active_ = active; }
 
-  /** @brief Gate downstream FF compensation. Called by the controller when the
+  /** @brief Gate downstream FF/feedback compensation. Called by the controller when the
    *  formation is judged to be in stable hover. When the gate flips OFF→ON, the
    *  ff_armed_time_ is recorded and getFfRampFactor() ramps 0→1 over
    *  ff_ramp_seconds_. */
   void setFfArmed(bool armed);
 
-  /** @brief Is the future FF gate currently armed? */
+  /** @brief Is the downstream FF/feedback gate currently armed? */
   bool isFfReady() const { return ff_armed_ && initialized_; }
 
-  /** @brief Soft-ramp factor [0,1] used by downstream FF compensation.
+  /** @brief Soft-ramp factor [0,1] used by downstream FF/feedback compensation.
    *  0 until ff is armed, then linearly ramps 0→1 over ff_ramp_seconds_, then 1.0. */
   double getFfRampFactor() const;
 
@@ -144,8 +143,7 @@ private:
   Eigen::Vector3d est_ext_torque_body_;      // estimated external torque in body frame
 
   // ---- FF arming (no bias subtraction) ----
-  // Kept only as a future feedforward gate; current unified control does not
-  // consume the observer output. The observer estimate remains diagnostic.
+  // Used only as a downstream gate/ramp; the observer itself stays estimator-only.
   bool   ff_armed_;                          // FF gate state (controlled by setFfArmed)
   double ff_armed_time_;                     // ros::Time::now().toSec() when armed (<0 = unarmed)
   double ff_ramp_seconds_;                   // duration of the 0→1 soft ramp [s]

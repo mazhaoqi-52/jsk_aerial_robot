@@ -15,13 +15,20 @@ controller:
   unified_control_mode: false
   unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
   unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
+  unified_peer_stall_guard: true       # leader force-lands if an assembled peer heartbeat is stale
+  unified_peer_heartbeat_timeout: 0.8
+  unified_external_wrench_feedback: true
+  unified_external_wrench_feedback_gain: 0.3
+  unified_external_wrench_feedback_max_force: 3.0     # [N], norm clamp on observer feedback
+  unified_external_wrench_feedback_max_torque: 0.25   # [Nm], norm clamp on observer feedback
 
   # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
   # handles LF↔unified switching directly in initUnifiedMode().
 
-  # ========== Formation Momentum Observer (Phase U2) ==========
+  # ========== Formation Momentum Observer ==========
   # Formation-level external wrench estimation using realized wrench from allocation.
-  # V1: 3D force only, debug-only output (no control feedback).
+  # Controller consumes the filtered 6D estimate only through the conservative
+  # unified_external_wrench_feedback path above.
   # Observer gain = bandwidth: higher → faster but noisier. Start conservative.
   formation_observer:
     force_observer_gain: 3.0       # K_f: observer gain for force channel [1/s]
@@ -30,7 +37,7 @@ controller:
     enable_torque_observer: true   # V2: enable torque estimation
     est_force_lpf_cutoff_freq: 0.05 # preserve previous code default
     est_torque_lpf_cutoff_freq: 0.05
-    ff_ramp_seconds: 5.0           # future FF gate only; current unified control does not consume FormObs
+    ff_ramp_seconds: 5.0           # gate ramp for downstream low-gain observer feedback
 
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
 

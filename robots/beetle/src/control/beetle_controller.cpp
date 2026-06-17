@@ -20,7 +20,13 @@ namespace aerial_robot_control
     desired_wrench_timeout_(0.5),
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
+    unified_external_wrench_feedback_(false),
+    unified_external_wrench_feedback_gain_(0.3),
+    unified_external_wrench_feedback_max_force_(3.0),
+    unified_external_wrench_feedback_max_torque_(0.25),
     unified_cmd_received_(false),
+    unified_peer_stall_guard_(true),
+    unified_peer_heartbeat_timeout_(0.8),
     prev_navi_state_for_diag_(-1),
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
@@ -134,6 +140,13 @@ namespace aerial_robot_control
       desired_ext_wrench_weights_pubs_[i+1] = nh_.advertise<std_msgs::Float32MultiArray>(module_name + string("/desired_external_wrench_weights"), 1);
       module_model_subs_.insert(make_pair(module_name, nh_.subscribe(module_name + string("/unified_control/module_model"), 1,
                                                                      &BeetleController::moduleModelCallback, this)));
+      if (i + 1 != beetle_navigator_->getMyID()) {
+        unified_peer_heartbeat_subs_[i+1] =
+            nh_.subscribe<diagnostic_msgs::KeyValue>(
+                module_name + string("/unified_control/heartbeat"), 1,
+                boost::bind(&BeetleController::unifiedPeerHeartbeatCallback,
+                            this, _1, i + 1));
+      }
     }
     pid_controllers_.push_back(PID("f_x", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
     pid_controllers_.push_back(PID("f_y", wrench_comp_p_gain_, wrench_comp_i_gain_, wrench_comp_d_gain_));
@@ -283,9 +296,16 @@ namespace aerial_robot_control
     const double cycle_age =
         (unified_debug_cycle_start_time_ >= 0.0)
             ? now - unified_debug_cycle_start_time_ : -1.0;
+    bool unified_cmd_received_snapshot = false;
+    ros::Time unified_cmd_stamp_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+      unified_cmd_received_snapshot = unified_cmd_received_;
+      unified_cmd_stamp_snapshot = unified_cmd_stamp_;
+    }
     const double reference_age =
-        (unified_cmd_received_ && !unified_cmd_stamp_.isZero())
-            ? now - unified_cmd_stamp_.toSec() : -1.0;
+        (unified_cmd_received_snapshot && !unified_cmd_stamp_snapshot.isZero())
+            ? now - unified_cmd_stamp_snapshot.toSec() : -1.0;
 
     diagnostic_msgs::KeyValue msg;
     msg.key = unified_debug_stage_ ? unified_debug_stage_ : "unset";
@@ -305,6 +325,15 @@ namespace aerial_robot_control
        << " control_ts=" << control_timestamp_;
     msg.value = ss.str();
     unified_heartbeat_pub_.publish(msg);
+  }
+
+  void BeetleController::unifiedPeerHeartbeatCallback(
+      const diagnostic_msgs::KeyValue::ConstPtr& msg,
+      int module_id)
+  {
+    (void)msg;
+    std::lock_guard<std::mutex> lock(unified_peer_heartbeat_mutex_);
+    unified_peer_heartbeat_stamp_[module_id] = ros::Time::now().toSec();
   }
 
   void BeetleController::resetToIndependentHover()
@@ -454,9 +483,9 @@ namespace aerial_robot_control
     navigator_->setTargetOmegaZ(0);
     beetle_navigator_->setUnifiedControlMode(true);
 
-    // v4 architecture — outer ROLL/PITCH PID is inert in unified mode
-    // (target_wrench_acc(3,4) ≡ 0; spinal owns full P+I+D), so just zero them.
-    // XY I-terms are reset (target_pos = cur_pos above → fresh PID starts at 0 err).
+    // Unified roll/pitch uses local PC-side slow I in target_wrench_acc(3,4)
+    // while spinal owns the high-bandwidth P+D inner loop. Reset RP/XY I on
+    // entry so each module starts from its own measured hover state.
     pid_controllers_.at(ROLL).setErrI(0);
     pid_controllers_.at(PITCH).setErrI(0);
     pid_controllers_.at(X).setErrI(0);
@@ -499,7 +528,7 @@ namespace aerial_robot_control
       local_unified_cascade_setup_sent_ = false;
       // follower: gimbal_dof + alloc_inv + gains are sent together by the
       // local one-shot after the first successful allocation.
-      ensureUnifiedReferenceSubscription();  // still subscribe for debug/monitoring
+      ensureUnifiedReferenceSubscription();
     }
     applyUnifiedGains();      // set unified PID gains into pid_controllers_ for PC loop
     unified_transition_count_ = 0;
@@ -507,8 +536,12 @@ namespace aerial_robot_control
     last_unified_torque_alloc_inv_pub_time_ = ros::Time::now().toSec();
     last_unified_command_pub_time_ = -1.0;
     last_unified_heartbeat_pub_time_ = -1.0;
+    if (is_leader) {
+      std::lock_guard<std::mutex> lock(unified_peer_heartbeat_mutex_);
+      unified_peer_heartbeat_stamp_.clear();
+    }
 
-    // Phase U2: activate formation observer on entering unified LEADER mode.
+    // Activate formation observer on entering unified LEADER mode.
     // Follower does NOT run observer (leader is the observation point).
     if (is_leader && formation_observer_) {
       formation_observer_->reset();
@@ -819,6 +852,13 @@ namespace aerial_robot_control
     // would let any external setParam (config reload / other tools / our own
     // T4.4 cleanup writing back) silently flip the controller mode mid-flight.
     // The setParam writes elsewhere are now broadcast-only (for rqt/Python).
+    bool unified_cmd_received_snapshot = false;
+    ros::Time unified_cmd_stamp_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+      unified_cmd_received_snapshot = unified_cmd_received_;
+      unified_cmd_stamp_snapshot = unified_cmd_stamp_;
+    }
 
     // ======== One-shot takeoff diagnostic ========
     // On the rising edge into TAKEOFF_STATE, snapshot the unified-mode wiring
@@ -842,10 +882,10 @@ namespace aerial_robot_control
     // from the LEADER, but unified_control_mode_ is false (e.g. rosparam was
     // overwritten by config reload, node restart, or race condition), force it on.
     // This is a secondary check complementing the callback-level auto-latch.
-    if (!unified_control_mode_ && unified_cmd_received_ &&
+    if (!unified_control_mode_ && unified_cmd_received_snapshot &&
         beetle_navigator_->getModuleState() == FOLLOWER)
     {
-      double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
+      double age = (ros::Time::now() - unified_cmd_stamp_snapshot).toSec();
       const int latch_navi_state = navigator_->getNaviState();
       const bool latch_allowed =
           !navigator_->getForceLandingFlag() &&
@@ -874,10 +914,10 @@ namespace aerial_robot_control
     // the existing force-landing path instead of continuing with a stale target.
     if (unified_control_mode_ &&
         beetle_navigator_->getModuleState() == FOLLOWER &&
-        unified_cmd_received_ &&
+        unified_cmd_received_snapshot &&
         unified_reference_timeout_ > 0.0 &&
         !navigator_->getForceLandingFlag()) {
-      const double age = (ros::Time::now() - unified_cmd_stamp_).toSec();
+      const double age = (ros::Time::now() - unified_cmd_stamp_snapshot).toSec();
       const int navi_state = navigator_->getNaviState();
       const bool in_flight =
           (navi_state == aerial_robot_navigation::TAKEOFF_STATE ||
@@ -890,6 +930,48 @@ namespace aerial_robot_control
             "> timeout=%.3fs, requesting force landing",
             beetle_navigator_->getMyID(), age, unified_reference_timeout_);
         navigator_->requestForceLanding();
+      }
+    }
+
+    // ======== LEADER peer-heartbeat stale guard ========
+    // FOLLOWERs already force-land when the leader reference disappears. The
+    // symmetric guard on the LEADER catches a crashed/stalled FOLLOWER so the
+    // formation does not keep solving unified allocation with a missing peer.
+    if (unified_control_mode_ &&
+        unified_peer_stall_guard_ &&
+        beetle_navigator_->getModuleState() == LEADER &&
+        unified_peer_heartbeat_timeout_ > 0.0 &&
+        unified_transition_count_ > unified_reference_warmup_frames_ &&
+        !navigator_->getForceLandingFlag()) {
+      const int navi_state = navigator_->getNaviState();
+      const bool in_flight =
+          (navi_state == aerial_robot_navigation::TAKEOFF_STATE ||
+           navi_state == aerial_robot_navigation::HOVER_STATE ||
+           navi_state == aerial_robot_navigation::LAND_STATE);
+      if (in_flight) {
+        const double now = ros::Time::now().toSec();
+        const std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
+        std::map<int, double> peer_stamp_snapshot;
+        {
+          std::lock_guard<std::mutex> lock(unified_peer_heartbeat_mutex_);
+          peer_stamp_snapshot = unified_peer_heartbeat_stamp_;
+        }
+        for (const int peer_id : assembled_ids) {
+          if (peer_id == beetle_navigator_->getMyID()) continue;
+          const auto it = peer_stamp_snapshot.find(peer_id);
+          const double age = (it == peer_stamp_snapshot.end()) ? -1.0 : now - it->second;
+          if (it == peer_stamp_snapshot.end() ||
+              age > unified_peer_heartbeat_timeout_) {
+            ROS_ERROR_THROTTLE(
+                0.5,
+                "[UnifiedCtrl] LEADER id=%d peer heartbeat stale: peer=%d age=%.3fs "
+                "timeout=%.3fs, requesting force landing",
+                beetle_navigator_->getMyID(), peer_id, age,
+                unified_peer_heartbeat_timeout_);
+            navigator_->requestForceLanding();
+            break;
+          }
+        }
       }
     }
 
@@ -908,8 +990,11 @@ namespace aerial_robot_control
         ROS_ERROR("[T4.3] Auto-exit unified mode: %s detected — clearing unified_control_mode for all modules",
                   force_landing ? "FORCE_LANDING" : "HALT");
         unified_control_mode_ = false;
-        unified_cmd_received_ = false;
-        unified_cmd_stamp_ = ros::Time(0);
+        {
+          std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+          unified_cmd_received_ = false;
+          unified_cmd_stamp_ = ros::Time(0);
+        }
         // Write to rosparam so FOLLOWERs also pick up the change on next cycle
         ros::NodeHandle control_nh(nh_, "controller");
         control_nh.setParam("unified_control_mode", false);
@@ -1006,7 +1091,11 @@ namespace aerial_robot_control
 
     // Clear unified mode FOLLOWER state so that stale commands are not
     // forwarded when switching back to unified mode.
-    unified_cmd_received_ = false;
+    {
+      std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+      unified_cmd_received_ = false;
+      unified_cmd_stamp_ = ros::Time(0);
+    }
     unified_reference_sub_.shutdown();
     unified_reference_leader_id_ = -1;
     unified_reference_warmup_count_ = 0;
@@ -1028,7 +1117,11 @@ namespace aerial_robot_control
     unified_reference_sub_ = nh_.subscribe(leader_ns + "/unified_control/reference", 1,
                                            &BeetleController::unifiedReferenceCallback, this);
     unified_reference_leader_id_ = leader_id;
-    unified_cmd_received_ = false;
+    {
+      std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+      unified_cmd_received_ = false;
+      unified_cmd_stamp_ = ros::Time(0);
+    }
 
     ROS_INFO("[UnifiedCtrl] FOLLOWER id=%d subscribed to unified reference: %s",
              beetle_navigator_->getMyID(),
@@ -1286,49 +1379,65 @@ namespace aerial_robot_control
 
   void BeetleController::unifiedReferenceCallback(const beetle::UnifiedControlReference& msg)
   {
-    unified_reference_wrench_acc_(0) = msg.wrench_acc.force.x;
-    unified_reference_wrench_acc_(1) = msg.wrench_acc.force.y;
-    unified_reference_wrench_acc_(2) = msg.wrench_acc.force.z;
-    unified_reference_wrench_acc_(3) = msg.wrench_acc.torque.x;
-    unified_reference_wrench_acc_(4) = msg.wrench_acc.torque.y;
-    unified_reference_wrench_acc_(5) = msg.wrench_acc.torque.z;
+    Eigen::VectorXd wrench_acc = Eigen::VectorXd::Zero(6);
+    wrench_acc(0) = msg.wrench_acc.force.x;
+    wrench_acc(1) = msg.wrench_acc.force.y;
+    wrench_acc(2) = msg.wrench_acc.force.z;
+    wrench_acc(3) = msg.wrench_acc.torque.x;
+    wrench_acc(4) = msg.wrench_acc.torque.y;
+    wrench_acc(5) = msg.wrench_acc.torque.z;
 
-    unified_reference_desired_wrench_(0) = msg.desired_wrench.force.x;
-    unified_reference_desired_wrench_(1) = msg.desired_wrench.force.y;
-    unified_reference_desired_wrench_(2) = msg.desired_wrench.force.z;
-    unified_reference_desired_wrench_(3) = msg.desired_wrench.torque.x;
-    unified_reference_desired_wrench_(4) = msg.desired_wrench.torque.y;
-    unified_reference_desired_wrench_(5) = msg.desired_wrench.torque.z;
-    unified_reference_yaw_pid_raw_ = msg.yaw_pid_raw;
+    Eigen::VectorXd desired_wrench = Eigen::VectorXd::Zero(6);
+    desired_wrench(0) = msg.desired_wrench.force.x;
+    desired_wrench(1) = msg.desired_wrench.force.y;
+    desired_wrench(2) = msg.desired_wrench.force.z;
+    desired_wrench(3) = msg.desired_wrench.torque.x;
+    desired_wrench(4) = msg.desired_wrench.torque.y;
+    desired_wrench(5) = msg.desired_wrench.torque.z;
+    const double yaw_pid_raw = msg.yaw_pid_raw;
 
     // Phase B: cache leader's navigator setpoints for follower target derivation.
-    leader_target_pos_.setValue(msg.leader_target_pos.x,
-                                msg.leader_target_pos.y,
-                                msg.leader_target_pos.z);
-    leader_target_vel_.setValue(msg.leader_target_vel.x,
-                                msg.leader_target_vel.y,
-                                msg.leader_target_vel.z);
-    leader_target_acc_.setValue(msg.leader_target_acc.x,
-                                msg.leader_target_acc.y,
-                                msg.leader_target_acc.z);
-    leader_target_rpy_.setValue(msg.leader_target_rpy.x,
-                                msg.leader_target_rpy.y,
-                                msg.leader_target_rpy.z);
-    leader_final_target_baselink_rpy_.setValue(msg.leader_final_target_baselink_rpy.x,
-                                               msg.leader_final_target_baselink_rpy.y,
-                                               msg.leader_final_target_baselink_rpy.z);
-    leader_target_omega_.setValue(msg.leader_target_omega.x,
-                                  msg.leader_target_omega.y,
-                                  msg.leader_target_omega.z);
-    leader_target_ang_acc_.setValue(msg.leader_target_ang_acc.x,
-                                    msg.leader_target_ang_acc.y,
-                                    msg.leader_target_ang_acc.z);
+    tf::Vector3 leader_target_pos(msg.leader_target_pos.x,
+                                  msg.leader_target_pos.y,
+                                  msg.leader_target_pos.z);
+    tf::Vector3 leader_target_vel(msg.leader_target_vel.x,
+                                  msg.leader_target_vel.y,
+                                  msg.leader_target_vel.z);
+    tf::Vector3 leader_target_acc(msg.leader_target_acc.x,
+                                  msg.leader_target_acc.y,
+                                  msg.leader_target_acc.z);
+    tf::Vector3 leader_target_rpy(msg.leader_target_rpy.x,
+                                  msg.leader_target_rpy.y,
+                                  msg.leader_target_rpy.z);
+    tf::Vector3 leader_final_target_baselink_rpy(
+        msg.leader_final_target_baselink_rpy.x,
+        msg.leader_final_target_baselink_rpy.y,
+        msg.leader_final_target_baselink_rpy.z);
+    tf::Vector3 leader_target_omega(msg.leader_target_omega.x,
+                                    msg.leader_target_omega.y,
+                                    msg.leader_target_omega.z);
+    tf::Vector3 leader_target_ang_acc(msg.leader_target_ang_acc.x,
+                                      msg.leader_target_ang_acc.y,
+                                      msg.leader_target_ang_acc.z);
 
     const ros::Time now = ros::Time::now();
     const double transport_age =
         msg.header.stamp.isZero() ? 0.0 : (now - msg.header.stamp).toSec();
-    unified_cmd_received_ = true;
-    unified_cmd_stamp_ = now;
+    {
+      std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+      unified_reference_wrench_acc_ = wrench_acc;
+      unified_reference_desired_wrench_ = desired_wrench;
+      unified_reference_yaw_pid_raw_ = yaw_pid_raw;
+      leader_target_pos_ = leader_target_pos;
+      leader_target_vel_ = leader_target_vel;
+      leader_target_acc_ = leader_target_acc;
+      leader_target_rpy_ = leader_target_rpy;
+      leader_final_target_baselink_rpy_ = leader_final_target_baselink_rpy;
+      leader_target_omega_ = leader_target_omega;
+      leader_target_ang_acc_ = leader_target_ang_acc;
+      unified_cmd_received_ = true;
+      unified_cmd_stamp_ = now;
+    }
 
     ROS_DEBUG_THROTTLE(
         5.0,
@@ -1337,9 +1446,9 @@ namespace aerial_robot_control
         beetle_navigator_->getMyID(),
         beetle_navigator_->getLeaderID(),
         transport_age,
-        unified_reference_wrench_acc_(2),
-        unified_reference_wrench_acc_(4),
-        unified_reference_yaw_pid_raw_);
+        wrench_acc(2),
+        wrench_acc(4),
+        yaw_pid_raw);
 
     // Auto-latch: if this FOLLOWER receives a unified reference from the LEADER
     // but unified_control_mode_ is false (e.g. rosparam was overwritten by a
@@ -2095,6 +2204,26 @@ namespace aerial_robot_control
     unified_reference_warmup_frames_ = std::max(0, unified_reference_warmup_frames_);
     getParam<double>(control_nh, "unified_reference_timeout", unified_reference_timeout_, 0.8);
     unified_reference_timeout_ = std::max(0.0, unified_reference_timeout_);
+    getParam<bool>(control_nh, "unified_peer_stall_guard",
+                   unified_peer_stall_guard_, true);
+    getParam<double>(control_nh, "unified_peer_heartbeat_timeout",
+                     unified_peer_heartbeat_timeout_, 0.8);
+    unified_peer_heartbeat_timeout_ =
+        std::max(0.0, unified_peer_heartbeat_timeout_);
+    getParam<bool>(control_nh, "unified_external_wrench_feedback",
+                   unified_external_wrench_feedback_, false);
+    getParam<double>(control_nh, "unified_external_wrench_feedback_gain",
+                     unified_external_wrench_feedback_gain_, 0.3);
+    unified_external_wrench_feedback_gain_ =
+        std::min(1.0, std::max(0.0, unified_external_wrench_feedback_gain_));
+    getParam<double>(control_nh, "unified_external_wrench_feedback_max_force",
+                     unified_external_wrench_feedback_max_force_, 3.0);
+    unified_external_wrench_feedback_max_force_ =
+        std::max(0.0, unified_external_wrench_feedback_max_force_);
+    getParam<double>(control_nh, "unified_external_wrench_feedback_max_torque",
+                     unified_external_wrench_feedback_max_torque_, 0.25);
+    unified_external_wrench_feedback_max_torque_ =
+        std::max(0.0, unified_external_wrench_feedback_max_torque_);
     getParam<double>(control_nh, "unified_torque_allocation_matrix_inv_pub_interval",
                      unified_torque_alloc_inv_pub_interval_, 0.05);
     unified_torque_alloc_inv_pub_interval_ =
@@ -2507,10 +2636,17 @@ namespace aerial_robot_control
     const double pitch_i = pid_controllers_.at(PITCH).getITerm();
     const double pitch_err = target_rpy_.y() - rpy_.y();
     const double pitch_err_i = pid_controllers_.at(PITCH).getErrI();
+    Eigen::VectorXd unified_reference_wrench_acc_snapshot;
+    ros::Time unified_cmd_stamp_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+      unified_reference_wrench_acc_snapshot = unified_reference_wrench_acc_;
+      unified_cmd_stamp_snapshot = unified_cmd_stamp_;
+    }
     const double leader_pitch_i =
-        (unified_reference_wrench_acc_.size() >= 6) ? unified_reference_wrench_acc_(4) : 0.0;
+        (unified_reference_wrench_acc_snapshot.size() >= 6) ? unified_reference_wrench_acc_snapshot(4) : 0.0;
     const double ref_age =
-        unified_cmd_stamp_.isZero() ? -1.0 : (ros::Time::now() - unified_cmd_stamp_).toSec();
+        unified_cmd_stamp_snapshot.isZero() ? -1.0 : (ros::Time::now() - unified_cmd_stamp_snapshot).toSec();
 
     const bool suspicious =
         std::abs(local_minus_other) > 2.0 ||
@@ -2698,6 +2834,35 @@ namespace aerial_robot_control
   {
     int my_id = beetle_navigator_->getMyID();
     int leader_id = beetle_navigator_->getLeaderID();
+    bool unified_cmd_received_snapshot = false;
+    ros::Time unified_cmd_stamp_snapshot;
+    Eigen::VectorXd unified_reference_desired_wrench_snapshot = Eigen::VectorXd::Zero(6);
+    tf::Vector3 leader_target_pos_snapshot;
+    tf::Vector3 leader_target_vel_snapshot;
+    tf::Vector3 leader_target_acc_snapshot;
+    tf::Vector3 leader_target_rpy_snapshot;
+    tf::Vector3 leader_final_target_baselink_rpy_snapshot;
+    tf::Vector3 leader_target_omega_snapshot;
+    tf::Vector3 leader_target_ang_acc_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(unified_reference_mutex_);
+      unified_cmd_received_snapshot = unified_cmd_received_;
+      unified_cmd_stamp_snapshot = unified_cmd_stamp_;
+      unified_reference_desired_wrench_snapshot = unified_reference_desired_wrench_;
+      leader_target_pos_snapshot = leader_target_pos_;
+      leader_target_vel_snapshot = leader_target_vel_;
+      leader_target_acc_snapshot = leader_target_acc_;
+      leader_target_rpy_snapshot = leader_target_rpy_;
+      leader_final_target_baselink_rpy_snapshot = leader_final_target_baselink_rpy_;
+      leader_target_omega_snapshot = leader_target_omega_;
+      leader_target_ang_acc_snapshot = leader_target_ang_acc_;
+    }
+    const double reference_snapshot_now = ros::Time::now().toSec();
+    const bool unified_reference_snapshot_fresh =
+        unified_cmd_received_snapshot &&
+        !unified_cmd_stamp_snapshot.isZero() &&
+        (unified_reference_timeout_ <= 0.0 ||
+         reference_snapshot_now - unified_cmd_stamp_snapshot.toSec() <= unified_reference_timeout_);
     // --- Gather local state ---
     markUnifiedDebugStage("run_common_state_enter");
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
@@ -2799,15 +2964,15 @@ namespace aerial_robot_control
     // For the leader itself this branch is skipped (its own navigator already
     // holds the correct setpoint). If no leader message has arrived yet, we
     // fall back to the navigator value (bounded transient at first frame).
-    if (!is_leader && unified_cmd_received_) {
+    if (!is_leader && unified_reference_snapshot_fresh) {
       markUnifiedDebugStage("follower_reference_enter");
-      const tf::Vector3& lt_pos     = leader_target_pos_;
-      const tf::Vector3& lt_vel     = leader_target_vel_;
-      const tf::Vector3& lt_acc     = leader_target_acc_;
-      const tf::Vector3& lt_rpy     = leader_target_rpy_;
-      const tf::Vector3& lt_final_baselink_rpy = leader_final_target_baselink_rpy_;
-      const tf::Vector3& lt_omega   = leader_target_omega_;
-      const tf::Vector3& lt_ang_acc = leader_target_ang_acc_;
+      const tf::Vector3& lt_pos     = leader_target_pos_snapshot;
+      const tf::Vector3& lt_vel     = leader_target_vel_snapshot;
+      const tf::Vector3& lt_acc     = leader_target_acc_snapshot;
+      const tf::Vector3& lt_rpy     = leader_target_rpy_snapshot;
+      const tf::Vector3& lt_final_baselink_rpy = leader_final_target_baselink_rpy_snapshot;
+      const tf::Vector3& lt_omega   = leader_target_omega_snapshot;
+      const tf::Vector3& lt_ang_acc = leader_target_ang_acc_snapshot;
 
       // Recompute target_rot with leader's RPY (rigid assembly ⇒ shared orientation).
       target_rpy_ = lt_rpy;
@@ -2903,19 +3068,75 @@ namespace aerial_robot_control
       formation_wrench_weights_stamp = formation_desired_wrench_weights_timestamp_;
     }
     markUnifiedDebugStage("task_wrench_lock_exit");
+    const double task_now = ros::Time::now().toSec();
     const bool formation_wrench_fresh =
         formation_wrench_stamp > 0.0 &&
         (desired_wrench_timeout_ <= 0.0 ||
-         ros::Time::now().toSec() - formation_wrench_stamp <= desired_wrench_timeout_);
+         task_now - formation_wrench_stamp <= desired_wrench_timeout_);
     const bool formation_wrench_weights_fresh =
         formation_wrench_weights_stamp > 0.0 &&
         (desired_wrench_timeout_ <= 0.0 ||
-         ros::Time::now().toSec() - formation_wrench_weights_stamp <= desired_wrench_timeout_);
+         task_now - formation_wrench_weights_stamp <= desired_wrench_timeout_);
     if (navigator_->getForceLandingFlag() || !formation_wrench_fresh) {
       formation_wrench_cmd.setZero();
       formation_wrench_weights_cmd = Eigen::VectorXd();
     } else if (!formation_wrench_weights_fresh || formation_wrench_weights_cmd.size() != 6) {
       formation_wrench_weights_cmd = Eigen::VectorXd();
+    }
+    if (!is_leader && unified_reference_snapshot_fresh &&
+        unified_reference_desired_wrench_snapshot.size() == 6 &&
+        !navigator_->getForceLandingFlag()) {
+      formation_wrench_cmd = unified_reference_desired_wrench_snapshot;
+      if (!formation_wrench_weights_fresh || formation_wrench_weights_cmd.size() != 6) {
+        formation_wrench_weights_cmd = Eigen::VectorXd();
+      }
+    }
+
+    if (is_leader &&
+        unified_external_wrench_feedback_ &&
+        unified_external_wrench_feedback_gain_ > 0.0 &&
+        formation_observer_ &&
+        formation_observer_->isActive() &&
+        formation_observer_->isFfReady() &&
+        navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
+        !navigator_->getForceLandingFlag()) {
+      const Eigen::VectorXd est_external_wrench =
+          formation_observer_->getEstExternalWrench6D();
+      if (est_external_wrench.size() == 6 && est_external_wrench.allFinite()) {
+        Eigen::VectorXd feedback_wrench =
+            -unified_external_wrench_feedback_gain_ *
+            formation_observer_->getFfRampFactor() *
+            est_external_wrench;
+        const double force_norm = feedback_wrench.head(3).norm();
+        if (unified_external_wrench_feedback_max_force_ > 0.0 &&
+            force_norm > unified_external_wrench_feedback_max_force_) {
+          feedback_wrench.head(3) *=
+              unified_external_wrench_feedback_max_force_ / force_norm;
+        }
+        const double torque_norm = feedback_wrench.tail(3).norm();
+        if (unified_external_wrench_feedback_max_torque_ > 0.0 &&
+            torque_norm > unified_external_wrench_feedback_max_torque_) {
+          feedback_wrench.tail(3) *=
+              unified_external_wrench_feedback_max_torque_ / torque_norm;
+        }
+        if (formation_wrench_cmd.size() != 6) {
+          formation_wrench_cmd = Eigen::VectorXd::Zero(6);
+        }
+        formation_wrench_cmd += feedback_wrench;
+        ROS_INFO_THROTTLE(
+            1.0,
+            "[UnifiedCtrl ExtWrenchFB] id=%d gain=%.3f ramp=%.3f "
+            "est=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
+            "fb=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f)",
+            my_id, unified_external_wrench_feedback_gain_,
+            formation_observer_->getFfRampFactor(),
+            est_external_wrench(0), est_external_wrench(1),
+            est_external_wrench(2), est_external_wrench(3),
+            est_external_wrench(4), est_external_wrench(5),
+            feedback_wrench(0), feedback_wrench(1),
+            feedback_wrench(2), feedback_wrench(3),
+            feedback_wrench(4), feedback_wrench(5));
+      }
     }
 
     markUnifiedDebugStage("position_pid_enter");

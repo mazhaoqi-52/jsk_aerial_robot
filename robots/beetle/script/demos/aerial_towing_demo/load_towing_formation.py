@@ -81,9 +81,11 @@ HOOK_ALIGNMENT_LATERAL_TOLERANCE = 0.05
 # to be meaningful. Shorter insertions are handled in one continuous descent.
 MIN_SPLIT_INSERTION_DROP = 0.10
 
-# Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Towing still prefers horizontal
-# pull force, but leaves more residual authority for stabilization/control.
-TOWING_TASK_WRENCH_WEIGHTS = [1.0, 1.0, 0.0, 0.08, 0.08, 0.01]
+# Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Horizontal force weights are
+# rebuilt from the actual body-frame towing direction before publishing.
+TOWING_TASK_WRENCH_WEIGHTS = [1.0, 0.10, 0.0, 0.08, 0.08, 0.01]
+TOWING_PRIMARY_FORCE_TASK_WEIGHT = 1.0
+TOWING_SECONDARY_FORCE_TASK_WEIGHT = 0.10
 
 # Loose guards for real-machine towing. These are not precision convergence
 # checks; they only prevent obvious high-force/high-attitude transitions.
@@ -115,6 +117,19 @@ TOWING_TASK_RELIEF_SCALE = 0.15
 TOWING_TASK_SCALE_RECOVER_RATE = 0.10  # 0.4 -> 1.0 takes about 6s
 TOWING_UNLOAD_FORCE_RATE = 4.0  # N/s; 20N feedforward unloads in about 5s
 TOWING_UNLOAD_MAX_DURATION = 8.0
+
+
+def build_towing_task_wrench_weights(force_body=None, task_scale=1.0):
+    weights = list(TOWING_TASK_WRENCH_WEIGHTS)
+    if force_body is not None:
+        force_xy = np.asarray(force_body[:2], dtype=float)
+        norm_xy = np.linalg.norm(force_xy)
+        if norm_xy > 1e-6:
+            direction_xy = force_xy / norm_xy
+            span = TOWING_PRIMARY_FORCE_TASK_WEIGHT - TOWING_SECONDARY_FORCE_TASK_WEIGHT
+            weights[0] = TOWING_SECONDARY_FORCE_TASK_WEIGHT + span * direction_xy[0] ** 2
+            weights[1] = TOWING_SECONDARY_FORCE_TASK_WEIGHT + span * direction_xy[1] ** 2
+    return [float(w) * task_scale for w in weights]
 
 
 class LinearTowingTrajectoryGenerator:
@@ -266,8 +281,8 @@ class LinearTowingTrajectoryGenerator:
         self.force_guard_state = guard_state
         return guard_state
 
-    def get_task_wrench_weights(self):
-        return [w * self.task_weight_scale for w in TOWING_TASK_WRENCH_WEIGHTS]
+    def get_task_wrench_weights(self, force_body=None):
+        return build_towing_task_wrench_weights(force_body, self.task_weight_scale)
 
     def update_state(self, current_pos, load_pos=None, attitude_rp=None, z_error=0.0):
         """
@@ -1282,9 +1297,11 @@ class TowingWithFeedforwardState(TowingStateBase):
                 blend = smoothstep01(float(step) / steps)
                 force = ((1.0 - blend) * start_force).tolist()
                 torque = ((1.0 - blend) * start_torque).tolist()
+                task_weights = (build_towing_task_wrench_weights(force)
+                                if self.beetle.isUnifiedMode() else None)
                 self.beetle.addExternalWrench(
                     force, torque, frame_id="fc",
-                    task_weights=TOWING_TASK_WRENCH_WEIGHTS if self.beetle.isUnifiedMode() else None)
+                    task_weights=task_weights)
                 if rospy.is_shutdown():
                     break
                 rate.sleep()
@@ -1552,7 +1569,8 @@ class TowingWithFeedforwardState(TowingStateBase):
             ff_world = target_state['force']
             ff_force, ff_torque, ff_frame = self._build_towing_wrench_command(
                 ff_world, unified_mode)
-            task_weights = trajectory_gen.get_task_wrench_weights() if unified_mode else None
+            task_weights = (trajectory_gen.get_task_wrench_weights(ff_force)
+                            if unified_mode else None)
             self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,
                                           frame_id=ff_frame,
                                           task_weights=task_weights)
@@ -1567,11 +1585,15 @@ class TowingWithFeedforwardState(TowingStateBase):
                 ff_world=ff_world
             )
 
+            task_weight_text = ""
+            if task_weights is not None:
+                task_weight_text = f"task_w_xy=({task_weights[0]:.2f},{task_weights[1]:.2f}), "
             rospy.loginfo_throttle(
                 2.0,
                 f"[Towing FF] ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N, "
                 f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%, "
                 f"guard={state_info['force_guard']}, task_scale={state_info['task_weight_scale']:.2f}, "
+                f"{task_weight_text}"
                 f"vel={state_info['motion_velocity']*1000:.0f}mm/s, "
                 f"breakaway={state_info['breakaway_detected']}, overspeed={state_info['overspeed']}, "
                 f"severe={state_info['severe_overspeed']}, "

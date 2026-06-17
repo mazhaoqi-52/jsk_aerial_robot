@@ -70,6 +70,10 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    qp_hessian_nnz_(-1),
 	    qp_constraint_nnz_(-1),
 	    last_qp_diag_log_time_(-1.0),
+	    pinv_pwm_pred_pub_interval_(0.1),
+	    last_pinv_pwm_pred_pub_time_(-1.0),
+	    pinv_pwm_min_(0.5),
+	    pinv_pwm_max_(0.85),
 	    qp_solver_(std::make_unique<OsqpEigen::Solver>())
 {
 }
@@ -104,6 +108,7 @@ void BeetleUnifiedController::initialize(
   formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("unified_control/formation_wrench", 1);
   formation_vectoring_f_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/vectoring_force", 1);
   interface_load_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/interface_load", 1);
+  pinv_pwm_pred_pub_ = nh_.advertise<spinal::Pwms>("unified_control/pinv_pwm_pred", 1);
 
   ROS_INFO("[UnifiedCtrl] Initialized: motor_per_module=%d, gimbal_dof=%d, rotor_coef=%d, gimbal_calc_in_fc=%d",
            motor_num_per_module_, gimbal_dof_, rotor_coef_, gimbal_calc_in_fc_);
@@ -131,6 +136,7 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<bool>("alloc_priority_enabled", alloc_priority_enabled_, false);
   control_nh.param<bool>("alloc_task_priority_enabled", alloc_task_priority_enabled_, true);
   control_nh.param<double>("alloc_task_priority_min_weight", alloc_task_priority_min_weight_, 0.5);
+  control_nh.param<double>("pinv_pwm_pred_pub_interval", pinv_pwm_pred_pub_interval_, 0.1);
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
   alloc_gimbal_limit_rad_ = gimbal_limit_deg * M_PI / 180.0;
@@ -146,6 +152,11 @@ void BeetleUnifiedController::rosParamInit()
   alloc_interface_force_limit_ = std::max(0.0, alloc_interface_force_limit_);
   alloc_interface_torque_limit_ = std::max(0.0, alloc_interface_torque_limit_);
   alloc_task_priority_min_weight_ = std::max(0.0, alloc_task_priority_min_weight_);
+  pinv_pwm_pred_pub_interval_ = std::max(0.0, pinv_pwm_pred_pub_interval_);
+
+  ros::NodeHandle motor_nh(nh_, "motor_info");
+  motor_nh.param<double>("min_pwm", pinv_pwm_min_, 0.5);
+  motor_nh.param<double>("max_pwm", pinv_pwm_max_, 0.85);
 
   alloc_priority_tolerances_ = Eigen::VectorXd::Zero(6);
   XmlRpc::XmlRpcValue priority_tolerances;
@@ -514,6 +525,9 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         alloc_rate_weight_, alloc_lateral_rate_weight_, alloc_rate_limit_,
         alloc_direction_rate_limit_rad_ * 180.0 / M_PI);
   }
+  const Eigen::VectorXd pinv_vectoring_f =
+      integrated_map_inv_ * (control_wrench_acc + task_wrench_acc);
+  publishPseudoinversePwmPrediction(pinv_vectoring_f, assembled_ids);
   Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
   Eigen::MatrixXd interface_load_matrix;
   std::vector<std::pair<int, int>> interface_cuts;
@@ -586,7 +600,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
           + integrated_map_.transpose()
               * lhs.ldlt().solve(blended_wrench_acc - integrated_map_ * secondary_ref);
     } else {
-      target_vectoring_f_ = integrated_map_inv_ * (control_wrench_acc + task_wrench_acc);
+      target_vectoring_f_ = pinv_vectoring_f;
     }
   }
 
@@ -892,6 +906,55 @@ void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
       alloc_interface_force_limit_, alloc_interface_torque_limit_,
       alloc_interface_force_weight_, alloc_interface_torque_weight_,
       ss.str().c_str());
+}
+
+uint16_t BeetleUnifiedController::predictPwmFromThrust(double thrust) const
+{
+  if (!std::isfinite(thrust)) thrust = 0.0;
+  const double t_max = std::max(alloc_t_max_, 1e-6);
+  const double ratio = std::max(0.0, std::min(thrust / t_max, 1.0));
+  const double pwm_min = std::max(0.0, pinv_pwm_min_);
+  const double pwm_max = std::max(pwm_min, pinv_pwm_max_);
+  const double pwm_norm = pwm_min + (pwm_max - pwm_min) * std::sqrt(ratio);
+  const double pwm_us = std::max(0.0, std::min(2000.0 * pwm_norm, 65535.0));
+  return static_cast<uint16_t>(std::lround(pwm_us));
+}
+
+void BeetleUnifiedController::publishPseudoinversePwmPrediction(
+    const Eigen::VectorXd& pinv_vectoring_f,
+    const std::vector<int>& assembled_ids)
+{
+  if (pinv_pwm_pred_pub_interval_ <= 0.0 || !pinv_vectoring_f.allFinite()) return;
+
+  const double now = ros::Time::now().toSec();
+  if (last_pinv_pwm_pred_pub_time_ >= 0.0 &&
+      now - last_pinv_pwm_pred_pub_time_ < pinv_pwm_pred_pub_interval_) {
+    return;
+  }
+
+  const int my_id = navigator_ ? navigator_->getMyID() : 0;
+  int module_index = -1;
+  for (size_t i = 0; i < assembled_ids.size(); i++) {
+    if (assembled_ids[i] == my_id) {
+      module_index = static_cast<int>(i);
+      break;
+    }
+  }
+  if (module_index < 0) return;
+
+  const int elems_per_module = motor_num_per_module_ * rotor_coef_;
+  const int col_start = module_index * elems_per_module;
+  if (pinv_vectoring_f.size() < col_start + elems_per_module) return;
+
+  spinal::Pwms msg;
+  msg.motor_value.resize(motor_num_per_module_);
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    const int idx = col_start + r * rotor_coef_;
+    const double thrust = pinv_vectoring_f.segment(idx, rotor_coef_).norm();
+    msg.motor_value[r] = predictPwmFromThrust(thrust);
+  }
+  pinv_pwm_pred_pub_.publish(msg);
+  last_pinv_pwm_pred_pub_time_ = now;
 }
 
 bool BeetleUnifiedController::solveFullVectorQP(

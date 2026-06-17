@@ -21,6 +21,7 @@
 #include <ros/ros.h>
 #include <Eigen/Dense>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -31,6 +32,7 @@
 // header (e.g. ninja) do not need to link against OsqpEigen.
 namespace OsqpEigen { class Solver; }
 #include <spinal/FourAxisCommand.h>
+#include <spinal/Pwms.h>
 #include <spinal/TorqueAllocationMatrixInv.h>
 #include <spinal/RollPitchYawTerms.h>
 #include <sensor_msgs/JointState.h>
@@ -135,6 +137,7 @@ public:
     qp_constraint_inner_.clear();
     prev_vectoring_f_.resize(0);
     last_qp_diag_log_time_ = -1.0;
+    last_pinv_pwm_pred_pub_time_ = -1.0;
   }
 
   void setFormationModelOverride(double formation_mass,
@@ -299,6 +302,7 @@ private:
   ros::Publisher formation_wrench_pub_;
   ros::Publisher formation_vectoring_f_pub_;
   ros::Publisher interface_load_pub_;
+  ros::Publisher pinv_pwm_pred_pub_;
 
   // Internal methods
   Eigen::MatrixXd buildFormationAllocationMatrix(
@@ -411,8 +415,16 @@ private:
   void publishInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_load_matrix,
                                        const std::vector<std::pair<int, int>>& interface_cuts,
                                        const Eigen::VectorXd& vectoring_f);
+  void publishPseudoinversePwmPrediction(const Eigen::VectorXd& pinv_vectoring_f,
+                                         const std::vector<int>& assembled_ids);
+  uint16_t predictPwmFromThrust(double thrust) const;
 
   double getModuleAllocationWeight(int module_id) const;
+
+  double pinv_pwm_pred_pub_interval_;
+  double last_pinv_pwm_pred_pub_time_;
+  double pinv_pwm_min_;
+  double pinv_pwm_max_;
 
   void rosParamInit();
 };

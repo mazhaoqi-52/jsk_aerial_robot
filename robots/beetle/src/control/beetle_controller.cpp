@@ -22,8 +22,6 @@ namespace aerial_robot_control
     prev_unified_control_mode_(false),
     unified_external_wrench_feedback_(false),
     unified_external_wrench_feedback_gain_(0.3),
-    unified_external_wrench_feedback_max_force_(3.0),
-    unified_external_wrench_feedback_max_torque_(0.25),
     unified_external_wrench_feedback_task_weight_(0.05),
     unified_external_wrench_feedback_settle_pos_(0.08),
     unified_external_wrench_feedback_settle_vel_(0.12),
@@ -2330,14 +2328,6 @@ namespace aerial_robot_control
                      unified_external_wrench_feedback_gain_, 0.3);
     unified_external_wrench_feedback_gain_ =
         std::min(1.0, std::max(0.0, unified_external_wrench_feedback_gain_));
-    getParam<double>(control_nh, "unified_external_wrench_feedback_max_force",
-                     unified_external_wrench_feedback_max_force_, 3.0);
-    unified_external_wrench_feedback_max_force_ =
-        std::max(0.0, unified_external_wrench_feedback_max_force_);
-    getParam<double>(control_nh, "unified_external_wrench_feedback_max_torque",
-                     unified_external_wrench_feedback_max_torque_, 0.25);
-    unified_external_wrench_feedback_max_torque_ =
-        std::max(0.0, unified_external_wrench_feedback_max_torque_);
     getParam<double>(control_nh, "unified_external_wrench_feedback_task_weight",
                      unified_external_wrench_feedback_task_weight_, 0.05);
     unified_external_wrench_feedback_task_weight_ =
@@ -3314,18 +3304,6 @@ namespace aerial_robot_control
             -unified_external_wrench_feedback_gain_ *
             formation_observer_->getFfRampFactor() *
             feedback_est_wrench;
-        const double force_norm = feedback_wrench.head(3).norm();
-        if (unified_external_wrench_feedback_max_force_ > 0.0 &&
-            force_norm > unified_external_wrench_feedback_max_force_) {
-          feedback_wrench.head(3) *=
-              unified_external_wrench_feedback_max_force_ / force_norm;
-        }
-        const double torque_norm = feedback_wrench.tail(3).norm();
-        if (unified_external_wrench_feedback_max_torque_ > 0.0 &&
-            torque_norm > unified_external_wrench_feedback_max_torque_) {
-          feedback_wrench.tail(3) *=
-              unified_external_wrench_feedback_max_torque_ / torque_norm;
-        }
         if (formation_wrench_cmd.size() != 6) {
           formation_wrench_cmd = Eigen::VectorXd::Zero(6);
         }

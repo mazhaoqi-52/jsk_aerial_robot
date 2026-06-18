@@ -63,8 +63,6 @@ namespace aerial_robot_control
     std::shared_ptr<FormationMomentumObserver> formation_observer_;
     bool unified_external_wrench_feedback_;
     double unified_external_wrench_feedback_gain_;
-    double unified_external_wrench_feedback_max_force_;
-    double unified_external_wrench_feedback_max_torque_;
     double unified_external_wrench_feedback_task_weight_;
     double unified_external_wrench_feedback_settle_pos_;
     double unified_external_wrench_feedback_settle_vel_;

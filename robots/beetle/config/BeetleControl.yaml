@@ -18,9 +18,7 @@ controller:
   unified_peer_heartbeat_timeout: 0.8
   unified_external_wrench_feedback: true
   unified_external_wrench_feedback_gain: 0.3
-  unified_external_wrench_feedback_max_force: 3.0     # [N], norm clamp on observer feedback
-  unified_external_wrench_feedback_max_torque: 0.25   # [Nm], norm clamp on observer feedback
-  unified_external_wrench_feedback_task_weight: 0.05  # low-weight task-space disturbance rejection
+  unified_external_wrench_feedback_task_weight: 0.05  # LF-style soft task-space disturbance rejection
   unified_external_wrench_feedback_settle_pos: 0.08   # [m/rad], learn observer bias only near hover equilibrium
   unified_external_wrench_feedback_settle_vel: 0.12   # [m/s, rad/s], learn observer bias only when slow
   unified_torque_allocation_matrix_inv_pub_interval: 0.05  # keep spinal P/D allocation mapping fresh

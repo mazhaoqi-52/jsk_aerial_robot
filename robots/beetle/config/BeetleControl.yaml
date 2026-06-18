@@ -17,7 +17,7 @@ controller:
   unified_peer_stall_guard: true       # leader force-lands if an assembled peer heartbeat is stale
   unified_peer_heartbeat_timeout: 0.8
   unified_external_wrench_feedback: true
-  unified_external_wrench_feedback_gain: 0.3
+  unified_external_wrench_feedback_gain: 0.2
   unified_external_wrench_feedback_task_weight: 0.05  # LF-style soft task-space disturbance rejection
   unified_external_wrench_feedback_settle_pos: 0.08   # [m/rad], learn observer bias only near hover equilibrium
   unified_external_wrench_feedback_settle_vel: 0.12   # [m/s, rad/s], learn observer bias only when slow
@@ -39,9 +39,9 @@ controller:
     torque_observer_gain: 2.5
     enable_force_observer: true
     enable_torque_observer: true
-    # Output LPF cutoff. Feedback still has norm clamps and a short ramp.
-    est_force_lpf_cutoff_freq: 1.0
-    est_torque_lpf_cutoff_freq: 1.0
+    # Output LPF cutoff. Feedback is bias-corrected, settled-gated, and ramped.
+    est_force_lpf_cutoff_freq: 0.5
+    est_torque_lpf_cutoff_freq: 0.5
     # Short gate ramp: close to LF's quick observer engagement, without a hard step.
     ff_ramp_seconds: 1.0
 
@@ -73,10 +73,10 @@ controller:
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   # Spidar-style secondary costs: keep the allocation close to balanced hover
   # and penalize total thrust before using actuator margin.
-  alloc_rate_weight: 2.0e-3     # soft penalty on |f[k] - f[k-1]|
+  alloc_rate_weight: 4.0e-3     # soft penalty on |f[k] - f[k-1]|
   alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
   alloc_direction_rate_limit_deg: 0.0  # hard per-cycle gimbal direction band [deg]; soft fx-rate is preferred
-  alloc_lateral_rate_weight: 2.0e-3    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
+  alloc_lateral_rate_weight: 4.0e-3    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
   # Weighted control/stabilization residual [Fx,Fy,Fz,Tx,Ty,Tz].
   alloc_wrench_weights: [0.50, 0.50, 1.20, 0.25, 0.40, 0.50]
   # Fallback weighted task residual [Fx,Fy,Fz,Tx,Ty,Tz]. Demo layers may publish

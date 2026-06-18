@@ -47,8 +47,14 @@ namespace aerial_robot_navigation
 
     // Unified control mode flag — set by BeetleController, read by navigation
     // to skip leader-follower specific logic (e.g. CoG→CoM conversion).
-    void setUnifiedControlMode(bool mode) { unified_control_mode_ = mode; }
-    bool getUnifiedControlMode() const { return unified_control_mode_; }
+    void setUnifiedControlMode(bool mode) {
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      unified_control_mode_ = mode;
+    }
+    bool getUnifiedControlMode() {
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return unified_control_mode_;
+    }
 
     // Synchronize pre_target_pos_ tracking state with current target position.
     // Must be called when transitioning back from unified → leader-follower mode
@@ -61,37 +67,73 @@ namespace aerial_robot_navigation
       pre_target_pos_.setZ(cur_target.z());
     }
 
-    bool getCurrentAssembled(){return current_assembled_;}
-    int getModuleState(){return module_state_;}
-    int getReconfigFlag(){return reconfig_flag_;}
+    bool getCurrentAssembled(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return current_assembled_;
+    }
+    int getModuleState(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return module_state_;
+    }
+    int getReconfigFlag(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return reconfig_flag_;
+    }
     int getMyID(){return my_id_;}
     int getMyIndex(){return my_index_;}
     std::string getMyName(){return my_name_;}
-    int getLeaderID(){return leader_id_;}
-    std::vector<int> getModuleIDs(){return assembled_modules_ids_;}
-    bool getControlFlag(){return control_flag_;}
-    int getModuleNum(){return module_num_;}
+    int getLeaderID(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return leader_id_;
+    }
+    std::vector<int> getModuleIDs(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return assembled_modules_ids_;
+    }
+    bool getControlFlag(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return control_flag_;
+    }
+    int getModuleNum(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return module_num_;
+    }
 
     void setCog2CoM(const KDL::Frame Cog2CoM){
       std::lock_guard<std::mutex> lock(mutex_cog2com_);
       Cog2CoM_ = Cog2CoM;
     }
-    void setModuleNum(const int module_num){module_num_ = module_num;}
+    void setModuleNum(const int module_num){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      module_num_ = module_num;
+    }
     void setAssemblyFlag(const int key, const bool value){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
       assembly_flags_[key] = value;
     }
-    void setControlFlag(const bool control_flag){control_flag_ = control_flag;}
+    void setControlFlag(const bool control_flag){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      control_flag_ = control_flag;
+    }
     void setLeaderID(const int leader_id){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
       leader_id_ = leader_id;
       leader_fix_flag_ = true;
     }
 
     void setLeaderFixFlag(const bool leader_fix_flag){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
       leader_fix_flag_ = leader_fix_flag;
     }
 
-    std::map<int, bool> getAssemblyFlags(){return assembly_flags_;}
-    std::vector<int> getAssemblyIds(){return assembled_modules_ids_;}
+    std::map<int, bool> getAssemblyFlags(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return assembly_flags_;
+    }
+    std::vector<int> getAssemblyIds(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return assembled_modules_ids_;
+    }
     int getMaxModuleNum(){return max_modules_num_;}
     tf2_ros::Buffer& getTfBuffer(){return tfBuffer_;}
 
@@ -101,6 +143,7 @@ namespace aerial_robot_navigation
   protected:
     ros::Publisher cog_com_dist_pub_;
     std::mutex mutex_cog2com_;
+    std::mutex mutex_assembly_state_;
     KDL::Frame Cog2CoM_;
     tf2_ros::TransformListener tfListener_;
     tf2_ros::Buffer tfBuffer_;

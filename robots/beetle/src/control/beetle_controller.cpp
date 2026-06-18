@@ -1826,6 +1826,26 @@ namespace aerial_robot_control
      *    and the rest of the function reduces to the pre-existing behaviour.
      */
     std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
+    const int max_modules_num = beetle_navigator_->getMaxModuleNum();
+    const int my_id = beetle_navigator_->getMyID();
+    const int leader_id = beetle_navigator_->getLeaderID();
+    auto zeroWrench = []() -> Eigen::VectorXd {
+      return Eigen::VectorXd::Zero(6);
+    };
+    auto isAssembled = [&](int id) {
+      if (id <= 0 || id > max_modules_num) return false;
+      const auto it = assembly_flag.find(id);
+      return it != assembly_flag.end() && it->second;
+    };
+    auto getWrenchOrZero = [&](const std::map<int, Eigen::VectorXd>& wrench_map,
+                               int id) -> Eigen::VectorXd {
+      const auto it = wrench_map.find(id);
+      if (it != wrench_map.end() && it->second.size() == 6 &&
+          it->second.allFinite()) {
+        return it->second;
+      }
+      return zeroWrench();
+    };
     const double now = ros::Time::now().toSec();
     const bool task_prediction_active =
         formation_desired_wrench_timestamp_ > 0.0 &&
@@ -1833,19 +1853,16 @@ namespace aerial_robot_control
          now - formation_desired_wrench_timestamp_ <= desired_wrench_timeout_);
     int module_num = 0;
     Eigen::VectorXd W_sum = Eigen::VectorXd::Zero(6);
-    for(const auto & item : est_wrench_list_){
-      if(assembly_flag[item.first]){
-        Eigen::VectorXd y_task = est_wrench_task_list_.count(item.first)
-                                  ? est_wrench_task_list_[item.first]
-                                  : Eigen::VectorXd::Zero(6);
+    for(int i = 1; i <= max_modules_num; i++){
+      if(isAssembled(i)){
+        Eigen::VectorXd y_task = getWrenchOrZero(est_wrench_task_list_, i);
         if (!task_prediction_active) y_task = Eigen::VectorXd::Zero(6);
-        if(y_task.size() != 6) y_task = Eigen::VectorXd::Zero(6);
-        Eigen::VectorXd residual = item.second - y_task;
-        est_residual_list_[item.first] = residual;
+        Eigen::VectorXd residual = getWrenchOrZero(est_wrench_list_, i) - y_task;
+        est_residual_list_[i] = residual;
         W_sum += residual;
         module_num ++;
       }else{
-        est_residual_list_[item.first] = Eigen::VectorXd::Zero(6);
+        est_residual_list_[i] = Eigen::VectorXd::Zero(6);
       }
     }
 
@@ -1865,45 +1882,47 @@ namespace aerial_robot_control
      *    PARASITIC joint-cut wrench across the boundary between module i
      *    and module i+1 (along the leader→i traversal). */
     Eigen::VectorXd left_inter_wrench = Eigen::VectorXd::Zero(6);
-    for(const auto & item : est_residual_list_){
-      if(assembly_flag[item.first]){
-        Eigen::VectorXd right_inter_wrench = item.second - W_w + left_inter_wrench;
-        inter_wrench_list_[item.first] = right_inter_wrench;
+    for(int i = 1; i <= max_modules_num; i++){
+      if(isAssembled(i)){
+        Eigen::VectorXd right_inter_wrench =
+            getWrenchOrZero(est_residual_list_, i) - W_w + left_inter_wrench;
+        inter_wrench_list_[i] = right_inter_wrench;
         left_inter_wrench = right_inter_wrench;
       }else{
-        inter_wrench_list_[item.first] = Eigen::VectorXd::Zero(6);
+        inter_wrench_list_[i] = Eigen::VectorXd::Zero(6);
       }
     }
-    int my_id = beetle_navigator_->getMyID();
-    wrench_msg.wrench.force.x = inter_wrench_list_[my_id](0);
-    wrench_msg.wrench.force.y = inter_wrench_list_[my_id](1);
-    wrench_msg.wrench.force.z = inter_wrench_list_[my_id](2);
-    wrench_msg.wrench.torque.x = inter_wrench_list_[my_id](3);
-    wrench_msg.wrench.torque.y = inter_wrench_list_[my_id](4);
-    wrench_msg.wrench.torque.z = inter_wrench_list_[my_id](5);
+    const Eigen::VectorXd my_inter_wrench =
+        getWrenchOrZero(inter_wrench_list_, my_id);
+    wrench_msg.wrench.force.x = my_inter_wrench(0);
+    wrench_msg.wrench.force.y = my_inter_wrench(1);
+    wrench_msg.wrench.force.z = my_inter_wrench(2);
+    wrench_msg.wrench.torque.x = my_inter_wrench(3);
+    wrench_msg.wrench.torque.y = my_inter_wrench(4);
+    wrench_msg.wrench.torque.z = my_inter_wrench(5);
     internal_wrench_pub_.publish(wrench_msg);
 
     /* 2b. [Step D'] Leader-only diagnostic: pairwise disagreement of
      *     per-module inter wrenches. PURE OBSERVATION — does not affect
      *     control. Useful to detect divergent observer states between
      *     modules (model error, drift, comm dropout). */
-    int leader_id_diag = beetle_navigator_->getLeaderID();
-    bool is_diag_leader = (my_id == leader_id_diag);
+    bool is_diag_leader = (my_id == leader_id);
     double max_f = 0.0, max_t = 0.0;
     double rms_f = 0.0, rms_t = 0.0;
     int n_pairs = 0;
     if (is_diag_leader) {
       std::vector<int> active_ids;
-      for (const auto& kv : inter_wrench_list_) {
-        if (assembly_flag[kv.first] && kv.second.size() == 6) {
-          active_ids.push_back(kv.first);
+      for (int i = 1; i <= max_modules_num; i++) {
+        if (isAssembled(i) && getWrenchOrZero(inter_wrench_list_, i).size() == 6) {
+          active_ids.push_back(i);
         }
       }
       double sum_f2 = 0.0, sum_t2 = 0.0;
       for (size_t a = 0; a < active_ids.size(); ++a) {
         for (size_t b = a + 1; b < active_ids.size(); ++b) {
           Eigen::VectorXd diff =
-              inter_wrench_list_[active_ids[a]] - inter_wrench_list_[active_ids[b]];
+              getWrenchOrZero(inter_wrench_list_, active_ids[a]) -
+              getWrenchOrZero(inter_wrench_list_, active_ids[b]);
           double nf = diff.head(3).norm();
           double nt = diff.tail(3).norm();
           if (nf > max_f) max_f = nf;
@@ -1927,24 +1946,22 @@ namespace aerial_robot_control
      *    the PARASITIC joint-cut wrench (task already subtracted at step 1),
      *    wrench_comp_list_[i] is a simple cumulative sum of parasitic joint
      *    wrenches between the leader and module i. */
-    int leader_id = beetle_navigator_->getLeaderID();
     /* 3.1. process from leader to left*/
     Eigen::VectorXd wrench_comp_sum_left = Eigen::VectorXd::Zero(6);
     for(int i = leader_id-1; i > 0; i--){
-      if(assembly_flag[i]){
-        wrench_comp_sum_left += inter_wrench_list_[i];
+      if(isAssembled(i)){
+        wrench_comp_sum_left += getWrenchOrZero(inter_wrench_list_, i);
         wrench_comp_list_[i] = wrench_comp_sum_left;
       }else{
         wrench_comp_list_[i] = Eigen::VectorXd::Zero(6);
       }
     }
     /* 3.2. process from leader to right*/
-    int max_modules_num = beetle_navigator_->getMaxModuleNum();
     int left_module_id = leader_id;
     Eigen::VectorXd wrench_comp_sum_right = Eigen::VectorXd::Zero(6);
     for(int i = leader_id+1; i <= max_modules_num; i++){
-      if(assembly_flag[i]){
-        wrench_comp_sum_right += -inter_wrench_list_[left_module_id];
+      if(isAssembled(i)){
+        wrench_comp_sum_right += -getWrenchOrZero(inter_wrench_list_, left_module_id);
         wrench_comp_list_[i] = wrench_comp_sum_right;
         left_module_id = i;
       }else{
@@ -1958,11 +1975,8 @@ namespace aerial_robot_control
     bool task_quiet = true;
     double task_norm_sum = 0.0;
     for (int i = 1; i <= max_modules_num; ++i) {
-      if (!assembly_flag[i]) continue;
-      Eigen::VectorXd task = est_wrench_task_list_.count(i)
-                                 ? est_wrench_task_list_[i]
-                                 : Eigen::VectorXd::Zero(6);
-      if (task.size() != 6) task = Eigen::VectorXd::Zero(6);
+      if (!isAssembled(i)) continue;
+      Eigen::VectorXd task = getWrenchOrZero(est_wrench_task_list_, i);
       task_norm_sum += task.norm();
     }
     task_quiet = (task_norm_sum < kQuietWrenchNorm);
@@ -1992,21 +2006,19 @@ namespace aerial_robot_control
       if (unified_residual_bias_samples_ == 0) {
         unified_residual_common_bias_ = W_w;
         for (int i = 1; i <= max_modules_num; ++i) {
-          if (!assembly_flag[i]) continue;
-          unified_residual_bias_list_[i] = est_residual_list_[i];
+          if (!isAssembled(i)) continue;
+          unified_residual_bias_list_[i] = getWrenchOrZero(est_residual_list_, i);
         }
         unified_residual_bias_module_num_ = module_num;
       } else {
         unified_residual_common_bias_ =
             (1.0 - kBiasAlpha) * unified_residual_common_bias_ + kBiasAlpha * W_w;
         for (int i = 1; i <= max_modules_num; ++i) {
-          if (!assembly_flag[i]) continue;
-          if (unified_residual_bias_list_[i].size() != 6) {
-            unified_residual_bias_list_[i] = Eigen::VectorXd::Zero(6);
-          }
+          if (!isAssembled(i)) continue;
           unified_residual_bias_list_[i] =
-              (1.0 - kBiasAlpha) * unified_residual_bias_list_[i] +
-              kBiasAlpha * est_residual_list_[i];
+              (1.0 - kBiasAlpha) *
+              getWrenchOrZero(unified_residual_bias_list_, i) +
+              kBiasAlpha * getWrenchOrZero(est_residual_list_, i);
         }
       }
       unified_residual_bias_samples_++;
@@ -2031,11 +2043,8 @@ namespace aerial_robot_control
       bool all_model_ok = true;
 
       for (int i = 1; i <= max_modules_num; ++i) {
-        if (!assembly_flag[i]) continue;
-        Eigen::VectorXd residual = residuals.count(i)
-                                       ? residuals.at(i)
-                                       : Eigen::VectorXd::Zero(6);
-        if (residual.size() != 6) residual = Eigen::VectorXd::Zero(6);
+        if (!isAssembled(i)) continue;
+        Eigen::VectorXd residual = getWrenchOrZero(residuals, i);
 
         double mass = 1.0;
         Eigen::Matrix3d inertia = Eigen::Matrix3d::Identity();
@@ -2068,7 +2077,7 @@ namespace aerial_robot_control
         common.head(3) = force_sum / active_num;
         common.tail(3) = torque_sum / active_num;
         for (int i = 1; i <= max_modules_num; ++i) {
-          if (assembly_flag[i]) common_by_module[i] = common;
+          if (isAssembled(i)) common_by_module[i] = common;
         }
         common_avg = common;
         return false;
@@ -2083,7 +2092,7 @@ namespace aerial_robot_control
       if (!common_acc.allFinite() || !common_alpha.allFinite()) return useSimpleAverage();
 
       for (int i = 1; i <= max_modules_num; ++i) {
-        if (!assembly_flag[i]) continue;
+        if (!isAssembled(i)) continue;
         Eigen::VectorXd common = Eigen::VectorXd::Zero(6);
         common.head(3) = mass_by_module[i] * common_acc;
         common.tail(3) = inertia_by_module[i] * common_alpha;
@@ -2109,12 +2118,9 @@ namespace aerial_robot_control
     }
     if (unified_residual_bias_ready_) {
       for (int i = 1; i <= max_modules_num; ++i) {
-        if (!assembly_flag[i]) continue;
-        Eigen::VectorXd bias = unified_residual_bias_list_.count(i)
-                                   ? unified_residual_bias_list_[i]
-                                   : Eigen::VectorXd::Zero(6);
-        if (bias.size() != 6) bias = Eigen::VectorXd::Zero(6);
-        residual_biascorr_list[i] = est_residual_list_[i] - bias;
+        if (!isAssembled(i)) continue;
+        Eigen::VectorXd bias = getWrenchOrZero(unified_residual_bias_list_, i);
+        residual_biascorr_list[i] = getWrenchOrZero(est_residual_list_, i) - bias;
         max_res_biascorr_f =
             std::max(max_res_biascorr_f, residual_biascorr_list[i].head(3).norm());
         max_res_biascorr_t =
@@ -2127,7 +2133,7 @@ namespace aerial_robot_control
 
       Eigen::VectorXd left_inter_wrench_bc = Eigen::VectorXd::Zero(6);
       for (const auto& item : residual_biascorr_list) {
-        if (assembly_flag[item.first]) {
+        if (isAssembled(item.first)) {
           Eigen::VectorXd common = common_biascorr_list.count(item.first)
                                        ? common_biascorr_list[item.first]
                                        : W_w_biascorr;
@@ -2141,16 +2147,17 @@ namespace aerial_robot_control
 
       Eigen::VectorXd wrench_comp_sum_left_bc = Eigen::VectorXd::Zero(6);
       for (int i = leader_id - 1; i > 0; --i) {
-        if (assembly_flag[i]) {
-          wrench_comp_sum_left_bc += inter_biascorr_list[i];
+        if (isAssembled(i)) {
+          wrench_comp_sum_left_bc += getWrenchOrZero(inter_biascorr_list, i);
           comp_biascorr_list[i] = wrench_comp_sum_left_bc;
         }
       }
       int left_module_id_bc = leader_id;
       Eigen::VectorXd wrench_comp_sum_right_bc = Eigen::VectorXd::Zero(6);
       for (int i = leader_id + 1; i <= max_modules_num; ++i) {
-        if (assembly_flag[i]) {
-          wrench_comp_sum_right_bc += -inter_biascorr_list[left_module_id_bc];
+        if (isAssembled(i)) {
+          wrench_comp_sum_right_bc +=
+              -getWrenchOrZero(inter_biascorr_list, left_module_id_bc);
           comp_biascorr_list[i] = wrench_comp_sum_right_bc;
           left_module_id_bc = i;
         }
@@ -2158,11 +2165,12 @@ namespace aerial_robot_control
       comp_biascorr_list[leader_id] = Eigen::VectorXd::Zero(6);
 
       for (int i = 1; i <= max_modules_num; ++i) {
-        if (!assembly_flag[i] || comp_biascorr_list[i].size() < 6) continue;
+        if (!isAssembled(i)) continue;
+        Eigen::VectorXd comp_biascorr = getWrenchOrZero(comp_biascorr_list, i);
         max_comp_biascorr_f =
-            std::max(max_comp_biascorr_f, comp_biascorr_list[i].head(3).norm());
+            std::max(max_comp_biascorr_f, comp_biascorr.head(3).norm());
         max_comp_biascorr_t =
-            std::max(max_comp_biascorr_t, comp_biascorr_list[i].tail(3).norm());
+            std::max(max_comp_biascorr_t, comp_biascorr.tail(3).norm());
       }
     }
     wrench_comp_biascorr_list_ = comp_biascorr_list;
@@ -2191,15 +2199,13 @@ namespace aerial_robot_control
       std::map<int, Eigen::VectorXd> realized_wrench_list;
       Eigen::Vector3d realized_force_sum = Eigen::Vector3d::Zero();
       for (int i = 1; i <= max_modules_num; ++i) {
-        if (!assembly_flag[i]) continue;
-        if (est_residual_list_[i].size() >= 6) {
-          max_res_f = std::max(max_res_f, est_residual_list_[i].head(3).norm());
-          max_res_t = std::max(max_res_t, est_residual_list_[i].tail(3).norm());
-        }
-        if (wrench_comp_list_[i].size() >= 6) {
-          max_comp_f = std::max(max_comp_f, wrench_comp_list_[i].head(3).norm());
-          max_comp_t = std::max(max_comp_t, wrench_comp_list_[i].tail(3).norm());
-        }
+        if (!isAssembled(i)) continue;
+        Eigen::VectorXd residual = getWrenchOrZero(est_residual_list_, i);
+        Eigen::VectorXd comp = getWrenchOrZero(wrench_comp_list_, i);
+        max_res_f = std::max(max_res_f, residual.head(3).norm());
+        max_res_t = std::max(max_res_t, residual.tail(3).norm());
+        max_comp_f = std::max(max_comp_f, comp.head(3).norm());
+        max_comp_t = std::max(max_comp_t, comp.tail(3).norm());
         Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
         if (unified_controller_ &&
             unified_controller_->getRealizedModuleWrenchBody(i, realized)) {
@@ -2256,7 +2262,7 @@ namespace aerial_robot_control
         std::ostringstream detail_ss;
         detail_ss << ss.str() << " modules:";
         for (int i = 1; i <= max_modules_num; ++i) {
-          if (!assembly_flag[i]) continue;
+          if (!isAssembled(i)) continue;
           auto realized_it = realized_wrench_list.find(i);
           const Eigen::VectorXd realized =
               (realized_it != realized_wrench_list.end())
@@ -2264,18 +2270,18 @@ namespace aerial_robot_control
                   : Eigen::VectorXd::Zero(6);
           detail_ss << " m" << i
                     << "{real=" << fmtWrench(realized)
-                    << ",est=" << fmtWrench(est_wrench_list_[i])
-                    << ",task=" << fmtWrench(est_wrench_task_list_[i])
-                    << ",res=" << fmtWrench(est_residual_list_[i])
-                    << ",bias=" << fmtWrench(unified_residual_bias_list_[i]);
+                    << ",est=" << fmtWrench(getWrenchOrZero(est_wrench_list_, i))
+                    << ",task=" << fmtWrench(getWrenchOrZero(est_wrench_task_list_, i))
+                    << ",res=" << fmtWrench(getWrenchOrZero(est_residual_list_, i))
+                    << ",bias=" << fmtWrench(getWrenchOrZero(unified_residual_bias_list_, i));
           if (unified_residual_bias_ready_) {
-            detail_ss << ",res_bc=" << fmtWrench(residual_biascorr_list[i])
-                      << ",inter_bc=" << fmtWrench(inter_biascorr_list[i])
-                      << ",comp_bc=" << fmtWrench(comp_biascorr_list[i]);
+            detail_ss << ",res_bc=" << fmtWrench(getWrenchOrZero(residual_biascorr_list, i))
+                      << ",inter_bc=" << fmtWrench(getWrenchOrZero(inter_biascorr_list, i))
+                      << ",comp_bc=" << fmtWrench(getWrenchOrZero(comp_biascorr_list, i));
           }
           detail_ss
-                    << ",inter=" << fmtWrench(inter_wrench_list_[i])
-                    << ",comp=" << fmtWrench(wrench_comp_list_[i]) << "}";
+                    << ",inter=" << fmtWrench(getWrenchOrZero(inter_wrench_list_, i))
+                    << ",comp=" << fmtWrench(getWrenchOrZero(wrench_comp_list_, i)) << "}";
         }
         ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, detail_ss.str());
       }

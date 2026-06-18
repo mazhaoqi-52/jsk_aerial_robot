@@ -461,7 +461,7 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
   // equivalent module-CoG target internally so the unified controller can
   // reconstruct the same target formation CoG before solving one formation
   // allocation and slicing the result for this module.
-  if (unified_control_mode_ &&
+  if (getUnifiedControlMode() &&
       (getModuleState() == LEADER || getModuleState() == FOLLOWER)) {
 
     std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
@@ -877,7 +877,22 @@ void BeetleNavigator::rotateContactPointFrame()
 void BeetleNavigator::calcCenterOfMoving()
 {
   std::string cog_name = my_name_ + std::to_string(my_id_) + "/cog";
-  const bool use_module_model_masses = unified_control_mode_;
+  const bool use_module_model_masses = getUnifiedControlMode();
+  std::map<int, bool> assembly_flags_snapshot;
+  bool control_flag_snapshot = false;
+  bool leader_fix_flag_snapshot = false;
+  int leader_id_snapshot = leader_id_;
+  int module_state_snapshot = module_state_;
+  int pre_assembled_modules_snapshot = pre_assembled_modules_;
+  {
+    std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+    assembly_flags_snapshot = assembly_flags_;
+    control_flag_snapshot = control_flag_;
+    leader_fix_flag_snapshot = leader_fix_flag_;
+    leader_id_snapshot = leader_id_;
+    module_state_snapshot = module_state_;
+    pre_assembled_modules_snapshot = pre_assembled_modules_;
+  }
   // Mass-weighted center: matches BeetleUnifiedController::updateFormationGeometry().
   // Without weighting the navigator's Cog2CoM_ drifts ~5 mm from the controller's
   // formation_cog_offset_ under asymmetric per-module masses, opening a residual
@@ -887,9 +902,9 @@ void BeetleNavigator::calcCenterOfMoving()
   bool all_module_masses_ready = true;
   std::string missing_module_model_ids;
   std::vector<std::pair<int, Eigen::Vector3f>> module_offsets;
+  std::vector<int> assembled_modules_ids;
   geometry_msgs::Point cog_com_dist_msg;
-  assembled_modules_ids_.clear();
-  for(const auto & item : assembly_flags_){
+  for(const auto & item : assembly_flags_snapshot){
     geometry_msgs::TransformStamped transformStamped;
     int id = item.first;
     bool value = item.second;
@@ -910,7 +925,7 @@ void BeetleNavigator::calcCenterOfMoving()
         }
         module_offsets.push_back(std::make_pair(id, module_root));
         assembled_module ++;
-        assembled_modules_ids_.push_back(id);
+        assembled_modules_ids.push_back(id);
       }
     catch (tf2::TransformException& ex)
       {
@@ -933,30 +948,40 @@ void BeetleNavigator::calcCenterOfMoving()
     center_of_moving += static_cast<float>(m_i) * module.second;
     total_mass += m_i;
   }
-  setModuleNum(assembled_module);
-  if(!assembled_module || assembled_module == 1 || !assembly_flags_[my_id_]){
-    pre_assembled_modules_ = assembled_module;
+  const auto my_flag = assembly_flags_snapshot.find(my_id_);
+  const bool my_assembled =
+      my_flag != assembly_flags_snapshot.end() && my_flag->second;
+  if(!assembled_module || assembled_module == 1 || !my_assembled){
     KDL::Frame com_frame;
     setCog2CoM(com_frame);
-    current_assembled_ = false;
-    module_state_ = SEPARATED;
-    cog_com_dist_msg.x = Cog2CoM_.p.x();
-    cog_com_dist_msg.y = Cog2CoM_.p.y();
-    cog_com_dist_msg.z = Cog2CoM_.p.z();
+    {
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      assembled_modules_ids_ = assembled_modules_ids;
+      module_num_ = assembled_module;
+      pre_assembled_modules_ = assembled_module;
+      current_assembled_ = false;
+      module_state_ = SEPARATED;
+    }
+    const KDL::Frame cog2com = getCog2CoM<KDL::Frame>();
+    cog_com_dist_msg.x = cog2com.p.x();
+    cog_com_dist_msg.y = cog2com.p.y();
+    cog_com_dist_msg.z = cog2com.p.z();
     cog_com_dist_pub_.publish(cog_com_dist_msg);
     return;
   }
 
   //define a module closest to the center as leader
-  std::sort(assembled_modules_ids_.begin(), assembled_modules_ids_.end());
-  int leader_index = std::round((assembled_modules_ids_.size())/2.0) -1;
-  if(!leader_fix_flag_) leader_id_ = assembled_modules_ids_[leader_index];
+  std::sort(assembled_modules_ids.begin(), assembled_modules_ids.end());
+  int leader_index = std::round((assembled_modules_ids.size())/2.0) -1;
+  int leader_id = leader_id_snapshot;
+  if(!leader_fix_flag_snapshot) leader_id = assembled_modules_ids[leader_index];
   // Expose leader_id to rosparam so Python scripts can route wrench to the correct module
-  nh_.setParam("assembly_leader_id", leader_id_);
-  if(my_id_ == leader_id_ && control_flag_){
-    module_state_ = LEADER;
-  }else if(control_flag_){
-    module_state_ = FOLLOWER;
+  nh_.setParam("assembly_leader_id", leader_id);
+  int module_state = module_state_snapshot;
+  if(my_id_ == leader_id && control_flag_snapshot){
+    module_state = LEADER;
+  }else if(control_flag_snapshot){
+    module_state = FOLLOWER;
   }
 
   //define a module on the right edge as leader
@@ -986,18 +1011,18 @@ void BeetleNavigator::calcCenterOfMoving()
   br_.sendTransform(tf);
 
   //update com-cog distance only during hovering
-  if(control_flag_){
+  bool reconfig_flag = false;
+  if(control_flag_snapshot){
     Eigen::Vector3f cog_com_dist(center_of_moving.norm() * center_of_moving.x()/fabs(center_of_moving.x()),0,0);
     // ROS_INFO_STREAM("cog_com_dist is " << cog_com_dist.transpose());
     tf.transform.translation.x = cog_com_dist.x();
     tf.transform.translation.y = cog_com_dist.y();
     tf.transform.translation.z = cog_com_dist.z();
     setCog2CoM(tf2::transformToKDL(tf));
-    reconfig_flag_ =  (pre_assembled_modules_ != assembled_module) ? true : false;
-    if(reconfig_flag_){
-      pre_assembled_modules_ = assembled_module;
-      Eigen::VectorXi id_vector = Eigen::Map<Eigen::VectorXi>(assembled_modules_ids_.data(), assembled_modules_ids_.size());
-      for(const auto & item : assembly_flags_){
+    reconfig_flag =  (pre_assembled_modules_snapshot != assembled_module) ? true : false;
+    if(reconfig_flag){
+      Eigen::VectorXi id_vector = Eigen::Map<Eigen::VectorXi>(assembled_modules_ids.data(), assembled_modules_ids.size());
+      for(const auto & item : assembly_flags_snapshot){
         if(item.second)
           {
             std::cout << "id: " << item.first << " -> assembled"<< std::endl;
@@ -1006,14 +1031,24 @@ void BeetleNavigator::calcCenterOfMoving()
         }
       }
       ROS_INFO_STREAM(id_vector);
-      ROS_INFO_STREAM("Leader's ID is " <<leader_id_);
+      ROS_INFO_STREAM("Leader's ID is " <<leader_id);
     }
   }
-  cog_com_dist_msg.x = Cog2CoM_.p.x();
-  cog_com_dist_msg.y = Cog2CoM_.p.y();
-  cog_com_dist_msg.z = Cog2CoM_.p.z();
+  const KDL::Frame cog2com = getCog2CoM<KDL::Frame>();
+  cog_com_dist_msg.x = cog2com.p.x();
+  cog_com_dist_msg.y = cog2com.p.y();
+  cog_com_dist_msg.z = cog2com.p.z();
   cog_com_dist_pub_.publish(cog_com_dist_msg);
-  if(control_flag_) current_assembled_ = true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+    assembled_modules_ids_ = assembled_modules_ids;
+    module_num_ = assembled_module;
+    leader_id_ = leader_id;
+    module_state_ = module_state;
+    reconfig_flag_ = reconfig_flag;
+    if(reconfig_flag) pre_assembled_modules_ = assembled_module;
+    if(control_flag_snapshot) current_assembled_ = true;
+  }
 }
 
 
@@ -1023,7 +1058,8 @@ void BeetleNavigator::convertTargetPosFromCoG2CoM()
   // in formation CoG frame. The old CoG→CoM conversion is specific to the
   // leader-follower architecture and must be bypassed to avoid corrupting
   // the formation-level position reference.
-  if (unified_control_mode_) return;
+  const bool unified_control_mode = getUnifiedControlMode();
+  if (unified_control_mode) return;
 
   //TODO: considering correct rotaion axis
 
@@ -1035,10 +1071,10 @@ void BeetleNavigator::convertTargetPosFromCoG2CoM()
 
   // [EXIT_DIAG] Log CoG→CoM conversion details after exiting unified mode
   // This helps trace whether com_conversion is causing target position drift
-  if (was_unified_for_diag_ && !unified_control_mode_) {
+  if (was_unified_for_diag_ && !unified_control_mode) {
     cog2com_diag_count_ = 0;  // start logging on transition
   }
-  was_unified_for_diag_ = unified_control_mode_;
+  was_unified_for_diag_ = unified_control_mode;
   if (cog2com_diag_count_ >= 0 && cog2com_diag_count_ < 80) {
     if (cog2com_diag_count_ < 10 || cog2com_diag_count_ % 10 == 0) {
       double cdo_r, cdo_p, cdo_y;

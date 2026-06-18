@@ -68,7 +68,7 @@ controller:
   # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).
   # Constraints: gimbal angle limits (linearized), component bounds.
   use_constrained_alloc: true
-  alloc_lambda: 3.0e-2          # secondary objective weight toward balanced hover allocation
+  alloc_lambda: 1.0e-2          # secondary objective weight toward balanced hover allocation
   alloc_t_max: 19.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   # Spidar-style secondary costs: keep the allocation close to balanced hover
@@ -76,13 +76,13 @@ controller:
   alloc_rate_weight: 2.0e-3     # soft penalty on |f[k] - f[k-1]|
   alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
   alloc_direction_rate_limit_deg: 0.0  # hard per-cycle gimbal direction band [deg]; soft fx-rate is preferred
-  alloc_lateral_rate_weight: 1.0e-2    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
+  alloc_lateral_rate_weight: 2.0e-3    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
   # Weighted control/stabilization residual [Fx,Fy,Fz,Tx,Ty,Tz].
-  alloc_wrench_weights: [0.20, 0.20, 1.20, 0.15, 0.15, 0.50]
+  alloc_wrench_weights: [0.50, 0.50, 1.20, 0.25, 0.40, 0.50]
   # Fallback weighted task residual [Fx,Fy,Fz,Tx,Ty,Tz]. Demo layers may publish
   # task-specific weights with each wrench command.
   alloc_task_wrench_weights: [1.00, 1.00, 0.40, 0.40, 0.40, 0.40]
-  alloc_effort_weight: 1.0e-2   # secondary min-energy cost on sum_i ||f_i||^2
+  alloc_effort_weight: 3.0e-3   # secondary min-energy cost on sum_i ||f_i||^2
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
   alloc_interface_force_weight: 1.0e-4   # soft tracking of actuator-side cut force proxy [1/N^2]
   alloc_interface_torque_weight: 1.0e-3  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]

@@ -2750,6 +2750,8 @@ namespace aerial_robot_control
     const double local_minus_other = local_mean - other_mean;
     const double spread = max_mean - min_mean;
     const double pitch_i = pid_controllers_.at(PITCH).getITerm();
+    const double applied_pitch_i =
+        (target_wrench_acc.size() >= 6) ? target_wrench_acc(4) : pitch_i;
     const double pitch_err = target_rpy_.y() - rpy_.y();
     const double pitch_err_i = pid_controllers_.at(PITCH).getErrI();
     Eigen::VectorXd unified_reference_wrench_acc_snapshot;
@@ -2767,8 +2769,8 @@ namespace aerial_robot_control
     const bool suspicious =
         std::abs(local_minus_other) > 2.0 ||
         spread > 4.0 ||
-        std::abs(pitch_i) > 3.0 ||
-        std::abs(pitch_i - leader_pitch_i) > 3.0;
+        std::abs(applied_pitch_i) > 3.0 ||
+        std::abs(applied_pitch_i - leader_pitch_i) > 3.0;
     if (!suspicious) return;
 
     std::ostringstream means_ss;
@@ -2783,7 +2785,7 @@ namespace aerial_robot_control
         2.0,
         "[UnifiedCtrl FollowerImbalance] id=%d thrust_mean(local/other/diff/spread)=%.2f/%.2f/%+.2f/%.2f "
         "local_minmax=%.2f/%.2f module_means=[%s] "
-        "pitch(err/err_i/p/i/d)=%.4f/%.4f/%.3f/%.3f/%.3f "
+        "pitch(err/err_i/p/local_i/applied_i/d)=%.4f/%.4f/%.3f/%.3f/%.3f/%.3f "
         "pitch_target/current=%.4f/%.4f leader_pitch_i=%.3f ref_age=%.3f "
         "wrench_z_pitch=%.3f/%.3f alloc_ms=%.2f since_pub=%.3f",
         beetle_navigator_->getMyID(),
@@ -2791,7 +2793,7 @@ namespace aerial_robot_control
         module_min[local_index], module_max[local_index],
         module_means_str.c_str(),
         pitch_err, pitch_err_i,
-        pid_controllers_.at(PITCH).getPTerm(), pitch_i,
+        pid_controllers_.at(PITCH).getPTerm(), pitch_i, applied_pitch_i,
         pid_controllers_.at(PITCH).getDTerm(),
         target_rpy_.y(), rpy_.y(), leader_pitch_i, ref_age,
         target_wrench_acc(2), target_wrench_acc(4),
@@ -2952,6 +2954,7 @@ namespace aerial_robot_control
     int leader_id = beetle_navigator_->getLeaderID();
     bool unified_cmd_received_snapshot = false;
     ros::Time unified_cmd_stamp_snapshot;
+    Eigen::VectorXd unified_reference_wrench_acc_snapshot = Eigen::VectorXd::Zero(6);
     Eigen::VectorXd unified_reference_desired_wrench_snapshot = Eigen::VectorXd::Zero(6);
     Eigen::VectorXd unified_reference_desired_wrench_weights_snapshot = Eigen::VectorXd::Zero(6);
     tf::Vector3 leader_target_pos_snapshot;
@@ -2965,6 +2968,7 @@ namespace aerial_robot_control
       std::lock_guard<std::mutex> lock(unified_reference_mutex_);
       unified_cmd_received_snapshot = unified_cmd_received_;
       unified_cmd_stamp_snapshot = unified_cmd_stamp_;
+      unified_reference_wrench_acc_snapshot = unified_reference_wrench_acc_;
       unified_reference_desired_wrench_snapshot = unified_reference_desired_wrench_;
       unified_reference_desired_wrench_weights_snapshot =
           unified_reference_desired_wrench_weights_;
@@ -3291,6 +3295,7 @@ namespace aerial_robot_control
         formation_observer_->isFfReady() &&
         unified_external_wrench_feedback_task_weight_ > 0.0 &&
         observer_feedback_nav_ready &&
+        observer_feedback_settled &&
         !navigator_->getForceLandingFlag() &&
         !explicit_task_wrench_active &&
         unified_external_wrench_feedback_bias_ready_ &&
@@ -3404,8 +3409,16 @@ namespace aerial_robot_control
         ROS_INFO("[UnifiedCtrl] id=%d start roll/pitch I control (height threshold passed)", my_id);
       }
     }
+    // Rigid formation: roll/pitch integral torque is a formation-level slow
+    // state. Followers keep local P/D state fresh, but reuse the leader's
+    // broadcast I-term instead of integrating their own bias into the QP.
+    const bool use_formation_rp_i =
+        !is_leader &&
+        unified_reference_snapshot_fresh &&
+        unified_reference_wrench_acc_snapshot.size() == 6 &&
+        unified_reference_wrench_acc_snapshot.allFinite();
     double du_rp = du;
-    if (!start_rp_integration_) du_rp = 0;
+    if (!start_rp_integration_ || use_formation_rp_i) du_rp = 0;
 
     // v5: Restored outer R/P PID. Mirrors beetle independent-mode
     // (gimbal_calc_in_fc=true && i_term_rp_calc_in_pc=true): PC runs full
@@ -3453,8 +3466,13 @@ namespace aerial_robot_control
     // Keep local PID/gravity feedback out of hard-priority rows. The control
     // target carries position PID, gravity FF, and slow roll/pitch I correction;
     // desired task wrench is added as a separate weighted soft objective.
-    target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
-    target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
+    if (use_formation_rp_i) {
+      target_wrench_acc(3) = unified_reference_wrench_acc_snapshot(3);
+      target_wrench_acc(4) = unified_reference_wrench_acc_snapshot(4);
+    } else {
+      target_wrench_acc(3) = pid_controllers_.at(ROLL).getITerm();
+      target_wrench_acc(4) = pid_controllers_.at(PITCH).getITerm();
+    }
     double yaw_pid_raw = pid_controllers_.at(YAW).result();
     target_wrench_acc(5) = yaw_in_allocation_ ? yaw_pid_raw : 0.0;
 

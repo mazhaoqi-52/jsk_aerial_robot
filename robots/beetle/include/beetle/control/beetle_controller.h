@@ -65,6 +65,9 @@ namespace aerial_robot_control
     double unified_external_wrench_feedback_gain_;
     double unified_external_wrench_feedback_max_force_;
     double unified_external_wrench_feedback_max_torque_;
+    bool unified_external_wrench_feedback_bias_ready_;
+    int unified_external_wrench_feedback_bias_samples_;
+    Eigen::VectorXd unified_external_wrench_feedback_bias_;
 
     // Service for toggling unified control mode (replaces rosparam polling)
     ros::ServiceServer set_unified_mode_srv_;
@@ -184,12 +187,14 @@ namespace aerial_robot_control
     // wrench_acc / desired_wrench / yaw_pid_raw : leader low-frequency
     //   reference and diagnostics. Followers still solve QP locally; they use
     //   desired_wrench as the shared formation-level task, not leader allocation.
+    // desired_wrench_weights : QP task weights paired with desired_wrench.
     // leader_target_* / final_target_baselink  : Phase B — drives the
     //   follower's target_pos/_vel/_acc/_rpy/_omega/_ang_acc via rigid-formation
     //   kinematics inside runUnifiedControlCommon() while keeping PID attitude
     //   and physical baselink tilt separate.
     Eigen::VectorXd unified_reference_wrench_acc_;
     Eigen::VectorXd unified_reference_desired_wrench_;
+    Eigen::VectorXd unified_reference_desired_wrench_weights_;
     double unified_reference_yaw_pid_raw_;
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;
@@ -216,6 +221,7 @@ namespace aerial_robot_control
     bool publishLocalUnifiedTorqueAllocationMatrixInv();
     void publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                    const Eigen::VectorXd& desired_wrench,
+                   const Eigen::VectorXd& desired_wrench_weights,
                    double yaw_pid_raw);
     void publishModuleModel();
     void moduleModelCallback(const beetle::ModuleModel& msg);
@@ -248,6 +254,8 @@ namespace aerial_robot_control
     std::map<int, Eigen::VectorXd> est_residual_list_;
     std::map<int, Eigen::VectorXd> inter_wrench_list_;
     std::map<int, Eigen::VectorXd> wrench_comp_list_;
+    // Bias-subtracted zero-sum compensation used by unified allocation secondary.
+    std::map<int, Eigen::VectorXd> wrench_comp_biascorr_list_;
     std::mutex unified_wrench_state_mutex_;
 
     /* external wrench compensation */

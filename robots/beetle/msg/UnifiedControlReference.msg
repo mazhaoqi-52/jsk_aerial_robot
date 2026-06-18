@@ -1,6 +1,7 @@
 std_msgs/Header header
 geometry_msgs/Wrench wrench_acc
 geometry_msgs/Wrench desired_wrench
+float64[6] desired_wrench_weights
 float64 formation_mass
 geometry_msgs/Vector3 formation_cog_offset
 float64[9] formation_inertia

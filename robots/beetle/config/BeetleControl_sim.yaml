@@ -17,7 +17,7 @@ controller:
   unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
   unified_peer_stall_guard: true       # leader force-lands if an assembled peer heartbeat is stale
   unified_peer_heartbeat_timeout: 0.8
-  unified_external_wrench_feedback: false
+  unified_external_wrench_feedback: true
   unified_external_wrench_feedback_gain: 0.3
   unified_external_wrench_feedback_max_force: 3.0     # [N], norm clamp on observer feedback
   unified_external_wrench_feedback_max_torque: 0.25   # [Nm], norm clamp on observer feedback
@@ -41,13 +41,14 @@ controller:
 
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
 
-  # Unified internal wrench management: keep diagnostic-only until residual logs
-  # are validated, then try a small secondary gain such as 0.02.
-  unified_internal_wrench_diag: false
-  unified_internal_wrench_log: false
+  # Unified internal wrench management. In sim we enable a small secondary gain
+  # for validation; control uses bias-corrected residuals only after hover bias
+  # initialization is ready.
+  unified_internal_wrench_diag: true
+  unified_internal_wrench_log: true
   unified_internal_wrench_detail_log: false
   unified_internal_wrench_log_period: 5.0
-  unified_internal_wrench_secondary_gain: 0.0
+  unified_internal_wrench_secondary_gain: 0.02
 
   # Leader-only compact log for aerial towing validation. Prints only while a
   # nonzero formation_desired_wrench is active.

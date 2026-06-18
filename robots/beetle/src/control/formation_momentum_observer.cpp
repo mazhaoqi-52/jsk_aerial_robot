@@ -31,6 +31,8 @@ namespace aerial_robot_control
 
 FormationMomentumObserver::FormationMomentumObserver()
   : initialized_(false),
+    force_initialized_(false),
+    torque_initialized_(false),
     active_(false),
     init_linear_momentum_(Eigen::Vector3d::Zero()),
     prev_linear_momentum_(Eigen::Vector3d::Zero()),
@@ -93,6 +95,8 @@ void FormationMomentumObserver::loadParams()
 void FormationMomentumObserver::reset()
 {
   initialized_ = false;
+  force_initialized_ = false;
+  torque_initialized_ = false;
   init_linear_momentum_ = Eigen::Vector3d::Zero();
   prev_linear_momentum_ = Eigen::Vector3d::Zero();
   integrate_term_force_ = Eigen::Vector3d::Zero();
@@ -158,10 +162,10 @@ void FormationMomentumObserver::update(
     Eigen::Vector3d p_lin = formation_mass * vel_w;
 
     // 2. First-time initialization: record initial momentum
-    if (!initialized_)
+    if (!force_initialized_)
     {
       init_linear_momentum_ = p_lin;
-      initialized_ = true;
+      force_initialized_ = true;
       ROS_INFO("[FormationObserver] First update: p_lin_0 = (%.4f, %.4f, %.4f), "
                "mass = %.3f (no bias subtraction)",
                init_linear_momentum_.x(), init_linear_momentum_.y(),
@@ -251,15 +255,10 @@ void FormationMomentumObserver::update(
     Eigen::Vector3d p_ang = formation_inertia * omega_body;
 
     // 2. First-time initialization for angular channel
-    //    (shares initialized_ flag with force channel — if force is disabled,
-    //     torque still initializes on first call)
-    if (!initialized_)
+    if (!torque_initialized_)
     {
       init_angular_momentum_ = p_ang;
-      if (!enable_force_observer_)
-      {
-        initialized_ = true;
-      }
+      torque_initialized_ = true;
       ROS_INFO("[FormationObserver] Torque init: p_ang_0 = (%.4f, %.4f, %.4f)",
                init_angular_momentum_.x(), init_angular_momentum_.y(),
                init_angular_momentum_.z());
@@ -307,6 +306,11 @@ void FormationMomentumObserver::update(
                       tau_raw_filt_dev,
                       gyroscopic.x(), gyroscopic.y(), gyroscopic.z());
   }
+
+  const bool force_ready = !enable_force_observer_ || force_initialized_;
+  const bool torque_ready = !enable_torque_observer_ || torque_initialized_;
+  initialized_ = (enable_force_observer_ || enable_torque_observer_) &&
+                 force_ready && torque_ready;
 
   // ========== Publish all debug topics ==========
   publishDebug(ros::Time::now(), residual, residual_torque);

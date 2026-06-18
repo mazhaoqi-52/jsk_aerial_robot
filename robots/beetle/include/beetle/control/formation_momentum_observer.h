@@ -127,7 +127,9 @@ private:
   ros::NodeHandle nh_;
 
   // ---- Observer state ----
-  bool initialized_;        // true after first update() call
+  bool initialized_;        // true after all enabled channels have initialized
+  bool force_initialized_;
+  bool torque_initialized_;
   bool active_;             // external enable/disable
 
   // Momentum observer internal state

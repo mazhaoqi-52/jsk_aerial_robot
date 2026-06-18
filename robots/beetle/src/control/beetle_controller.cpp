@@ -24,12 +24,16 @@ namespace aerial_robot_control
     unified_external_wrench_feedback_gain_(0.3),
     unified_external_wrench_feedback_max_force_(3.0),
     unified_external_wrench_feedback_max_torque_(0.25),
+    unified_external_wrench_feedback_bias_ready_(false),
+    unified_external_wrench_feedback_bias_samples_(0),
+    unified_external_wrench_feedback_bias_(Eigen::VectorXd::Zero(6)),
     unified_cmd_received_(false),
     unified_peer_stall_guard_(true),
     unified_peer_heartbeat_timeout_(0.8),
     prev_navi_state_for_diag_(-1),
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
+    unified_reference_desired_wrench_weights_(Eigen::VectorXd::Zero(6)),
     unified_reference_yaw_pid_raw_(0.0),
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
@@ -131,6 +135,7 @@ namespace aerial_robot_control
       est_wrench_list_.insert(make_pair(i+1, wrench));
       inter_wrench_list_.insert(make_pair(i+1, wrench));
       wrench_comp_list_.insert(make_pair(i+1, wrench));
+      wrench_comp_biascorr_list_.insert(make_pair(i+1, wrench));
       est_wrench_task_list_.insert(make_pair(i+1, wrench));
       est_residual_list_.insert(make_pair(i+1, wrench));
       unified_residual_bias_list_.insert(make_pair(i+1, wrench));
@@ -432,6 +437,7 @@ namespace aerial_robot_control
       for (auto& kv : est_residual_list_) kv.second = Eigen::VectorXd::Zero(6);
       for (auto& kv : inter_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
       for (auto& kv : wrench_comp_list_) kv.second = Eigen::VectorXd::Zero(6);
+      for (auto& kv : wrench_comp_biascorr_list_) kv.second = Eigen::VectorXd::Zero(6);
       for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
       formation_desired_wrench_.setZero();
       formation_desired_wrench_weights_.setZero();
@@ -441,6 +447,9 @@ namespace aerial_robot_control
       unified_residual_bias_samples_ = 0;
       unified_residual_bias_module_num_ = 0;
       unified_residual_common_bias_ = Eigen::VectorXd::Zero(6);
+      unified_external_wrench_feedback_bias_ready_ = false;
+      unified_external_wrench_feedback_bias_samples_ = 0;
+      unified_external_wrench_feedback_bias_ = Eigen::VectorXd::Zero(6);
     }
     if (unified_controller_) {
       unified_controller_->clearInternalWrenchSecondaryReference();
@@ -1213,6 +1222,7 @@ namespace aerial_robot_control
 
   void BeetleController::publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                                                  const Eigen::VectorXd& desired_wrench,
+                                                 const Eigen::VectorXd& desired_wrench_weights,
                                                  double yaw_pid_raw)
   {
     beetle::UnifiedControlReference msg;
@@ -1229,6 +1239,10 @@ namespace aerial_robot_control
     msg.desired_wrench.torque.x = desired_wrench(3);
     msg.desired_wrench.torque.y = desired_wrench(4);
     msg.desired_wrench.torque.z = desired_wrench(5);
+    for (int i = 0; i < 6; ++i) {
+      msg.desired_wrench_weights[i] =
+          desired_wrench_weights.size() == 6 ? desired_wrench_weights(i) : 0.0;
+    }
     msg.formation_mass = unified_controller_->getFormationMass();
     const Eigen::Vector3d& formation_cog_offset = unified_controller_->getFormationCogOffset();
     msg.formation_cog_offset.x = formation_cog_offset.x();
@@ -1394,6 +1408,10 @@ namespace aerial_robot_control
     desired_wrench(3) = msg.desired_wrench.torque.x;
     desired_wrench(4) = msg.desired_wrench.torque.y;
     desired_wrench(5) = msg.desired_wrench.torque.z;
+    Eigen::VectorXd desired_wrench_weights = Eigen::VectorXd::Zero(6);
+    for (int i = 0; i < 6; ++i) {
+      desired_wrench_weights(i) = msg.desired_wrench_weights[i];
+    }
     const double yaw_pid_raw = msg.yaw_pid_raw;
 
     // Phase B: cache leader's navigator setpoints for follower target derivation.
@@ -1427,6 +1445,7 @@ namespace aerial_robot_control
       std::lock_guard<std::mutex> lock(unified_reference_mutex_);
       unified_reference_wrench_acc_ = wrench_acc;
       unified_reference_desired_wrench_ = desired_wrench;
+      unified_reference_desired_wrench_weights_ = desired_wrench_weights;
       unified_reference_yaw_pid_raw_ = yaw_pid_raw;
       leader_target_pos_ = leader_target_pos;
       leader_target_vel_ = leader_target_vel;
@@ -1932,6 +1951,135 @@ namespace aerial_robot_control
       }
     }
 
+    constexpr int kBiasReadySamples = 100;
+    constexpr double kBiasAlpha = 0.01;
+    constexpr double kQuietWrenchNorm = 1e-3;
+    bool task_quiet = true;
+    double task_norm_sum = 0.0;
+    for (int i = 1; i <= max_modules_num; ++i) {
+      if (!assembly_flag[i]) continue;
+      Eigen::VectorXd task = est_wrench_task_list_.count(i)
+                                 ? est_wrench_task_list_[i]
+                                 : Eigen::VectorXd::Zero(6);
+      if (task.size() != 6) task = Eigen::VectorXd::Zero(6);
+      task_norm_sum += task.norm();
+    }
+    task_quiet = (task_norm_sum < kQuietWrenchNorm);
+    const double desired_norm =
+        (formation_desired_wrench_.size() >= 6) ? formation_desired_wrench_.norm() : 0.0;
+    const bool desired_quiet = (desired_norm < kQuietWrenchNorm);
+    const bool hover_quiet_gate =
+        beetle_navigator_->getControlFlag() &&
+        navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
+        !navigator_->getForceLandingFlag() &&
+        task_quiet && desired_quiet;
+    const bool bias_gate =
+        hover_quiet_gate &&
+        (!unified_residual_bias_ready_ ||
+         unified_internal_wrench_secondary_gain_ <= 0.0);
+    const bool bias_module_changed =
+        unified_residual_bias_samples_ > 0 &&
+        unified_residual_bias_module_num_ != module_num;
+    if (bias_module_changed ||
+        (!hover_quiet_gate && !unified_residual_bias_ready_)) {
+      for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
+      unified_residual_common_bias_ = Eigen::VectorXd::Zero(6);
+      unified_residual_bias_samples_ = 0;
+      unified_residual_bias_ready_ = false;
+    }
+    if (bias_gate) {
+      if (unified_residual_bias_samples_ == 0) {
+        unified_residual_common_bias_ = W_w;
+        for (int i = 1; i <= max_modules_num; ++i) {
+          if (!assembly_flag[i]) continue;
+          unified_residual_bias_list_[i] = est_residual_list_[i];
+        }
+        unified_residual_bias_module_num_ = module_num;
+      } else {
+        unified_residual_common_bias_ =
+            (1.0 - kBiasAlpha) * unified_residual_common_bias_ + kBiasAlpha * W_w;
+        for (int i = 1; i <= max_modules_num; ++i) {
+          if (!assembly_flag[i]) continue;
+          if (unified_residual_bias_list_[i].size() != 6) {
+            unified_residual_bias_list_[i] = Eigen::VectorXd::Zero(6);
+          }
+          unified_residual_bias_list_[i] =
+              (1.0 - kBiasAlpha) * unified_residual_bias_list_[i] +
+              kBiasAlpha * est_residual_list_[i];
+        }
+      }
+      unified_residual_bias_samples_++;
+      unified_residual_bias_ready_ =
+          (unified_residual_bias_samples_ >= kBiasReadySamples);
+    }
+
+    std::map<int, Eigen::VectorXd> residual_biascorr_list;
+    std::map<int, Eigen::VectorXd> inter_biascorr_list;
+    std::map<int, Eigen::VectorXd> comp_biascorr_list;
+    Eigen::VectorXd W_w_biascorr = Eigen::VectorXd::Zero(6);
+    double max_res_biascorr_f = 0.0, max_res_biascorr_t = 0.0;
+    double max_comp_biascorr_f = 0.0, max_comp_biascorr_t = 0.0;
+    for (int i = 1; i <= max_modules_num; ++i) {
+      residual_biascorr_list[i] = Eigen::VectorXd::Zero(6);
+      inter_biascorr_list[i] = Eigen::VectorXd::Zero(6);
+      comp_biascorr_list[i] = Eigen::VectorXd::Zero(6);
+    }
+    if (unified_residual_bias_ready_) {
+      int biascorr_module_num = 0;
+      for (int i = 1; i <= max_modules_num; ++i) {
+        if (!assembly_flag[i]) continue;
+        Eigen::VectorXd bias = unified_residual_bias_list_.count(i)
+                                   ? unified_residual_bias_list_[i]
+                                   : Eigen::VectorXd::Zero(6);
+        if (bias.size() != 6) bias = Eigen::VectorXd::Zero(6);
+        residual_biascorr_list[i] = est_residual_list_[i] - bias;
+        W_w_biascorr += residual_biascorr_list[i];
+        biascorr_module_num++;
+        max_res_biascorr_f =
+            std::max(max_res_biascorr_f, residual_biascorr_list[i].head(3).norm());
+        max_res_biascorr_t =
+            std::max(max_res_biascorr_t, residual_biascorr_list[i].tail(3).norm());
+      }
+      if (biascorr_module_num > 0) W_w_biascorr /= biascorr_module_num;
+
+      Eigen::VectorXd left_inter_wrench_bc = Eigen::VectorXd::Zero(6);
+      for (const auto& item : residual_biascorr_list) {
+        if (assembly_flag[item.first]) {
+          Eigen::VectorXd right_inter_wrench_bc =
+              item.second - W_w_biascorr + left_inter_wrench_bc;
+          inter_biascorr_list[item.first] = right_inter_wrench_bc;
+          left_inter_wrench_bc = right_inter_wrench_bc;
+        }
+      }
+
+      Eigen::VectorXd wrench_comp_sum_left_bc = Eigen::VectorXd::Zero(6);
+      for (int i = leader_id - 1; i > 0; --i) {
+        if (assembly_flag[i]) {
+          wrench_comp_sum_left_bc += inter_biascorr_list[i];
+          comp_biascorr_list[i] = wrench_comp_sum_left_bc;
+        }
+      }
+      int left_module_id_bc = leader_id;
+      Eigen::VectorXd wrench_comp_sum_right_bc = Eigen::VectorXd::Zero(6);
+      for (int i = leader_id + 1; i <= max_modules_num; ++i) {
+        if (assembly_flag[i]) {
+          wrench_comp_sum_right_bc += -inter_biascorr_list[left_module_id_bc];
+          comp_biascorr_list[i] = wrench_comp_sum_right_bc;
+          left_module_id_bc = i;
+        }
+      }
+      comp_biascorr_list[leader_id] = Eigen::VectorXd::Zero(6);
+
+      for (int i = 1; i <= max_modules_num; ++i) {
+        if (!assembly_flag[i] || comp_biascorr_list[i].size() < 6) continue;
+        max_comp_biascorr_f =
+            std::max(max_comp_biascorr_f, comp_biascorr_list[i].head(3).norm());
+        max_comp_biascorr_t =
+            std::max(max_comp_biascorr_t, comp_biascorr_list[i].tail(3).norm());
+      }
+    }
+    wrench_comp_biascorr_list_ = comp_biascorr_list;
+
     if (unified_control_mode_ && unified_internal_wrench_log_) {
       auto fmtWrench = [](const Eigen::VectorXd& v) {
         std::ostringstream os;
@@ -1950,130 +2098,6 @@ namespace aerial_robot_control
            << "[" << v(0) << "," << v(1) << "," << v(2) << "]";
         return os.str();
       };
-
-      constexpr int kBiasReadySamples = 100;
-      constexpr double kBiasAlpha = 0.01;
-      constexpr double kQuietWrenchNorm = 1e-3;
-      bool task_quiet = true;
-      double task_norm_sum = 0.0;
-      for (int i = 1; i <= max_modules_num; ++i) {
-        if (!assembly_flag[i]) continue;
-        Eigen::VectorXd task = est_wrench_task_list_.count(i)
-                                   ? est_wrench_task_list_[i]
-                                   : Eigen::VectorXd::Zero(6);
-        if (task.size() != 6) task = Eigen::VectorXd::Zero(6);
-        task_norm_sum += task.norm();
-      }
-      task_quiet = (task_norm_sum < kQuietWrenchNorm);
-      const double desired_norm =
-          (formation_desired_wrench_.size() >= 6) ? formation_desired_wrench_.norm() : 0.0;
-      const bool desired_quiet = (desired_norm < kQuietWrenchNorm);
-      const bool bias_gate =
-          beetle_navigator_->getControlFlag() &&
-          navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
-          !navigator_->getForceLandingFlag() &&
-          unified_internal_wrench_secondary_gain_ <= 0.0 &&
-          task_quiet && desired_quiet;
-      if (bias_gate && unified_residual_bias_samples_ > 0 &&
-          unified_residual_bias_module_num_ != module_num) {
-        for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
-        unified_residual_common_bias_ = Eigen::VectorXd::Zero(6);
-        unified_residual_bias_samples_ = 0;
-        unified_residual_bias_ready_ = false;
-      }
-      if (bias_gate) {
-        if (unified_residual_bias_samples_ == 0) {
-          unified_residual_common_bias_ = W_w;
-          for (int i = 1; i <= max_modules_num; ++i) {
-            if (!assembly_flag[i]) continue;
-            unified_residual_bias_list_[i] = est_residual_list_[i];
-          }
-          unified_residual_bias_module_num_ = module_num;
-        } else {
-          unified_residual_common_bias_ =
-              (1.0 - kBiasAlpha) * unified_residual_common_bias_ + kBiasAlpha * W_w;
-          for (int i = 1; i <= max_modules_num; ++i) {
-            if (!assembly_flag[i]) continue;
-            if (unified_residual_bias_list_[i].size() != 6) {
-              unified_residual_bias_list_[i] = Eigen::VectorXd::Zero(6);
-            }
-            unified_residual_bias_list_[i] =
-                (1.0 - kBiasAlpha) * unified_residual_bias_list_[i] +
-                kBiasAlpha * est_residual_list_[i];
-          }
-        }
-        unified_residual_bias_samples_++;
-        unified_residual_bias_ready_ =
-            (unified_residual_bias_samples_ >= kBiasReadySamples);
-      }
-
-      std::map<int, Eigen::VectorXd> residual_biascorr_list;
-      std::map<int, Eigen::VectorXd> inter_biascorr_list;
-      std::map<int, Eigen::VectorXd> comp_biascorr_list;
-      Eigen::VectorXd W_w_biascorr = Eigen::VectorXd::Zero(6);
-      double max_res_biascorr_f = 0.0, max_res_biascorr_t = 0.0;
-      double max_comp_biascorr_f = 0.0, max_comp_biascorr_t = 0.0;
-      if (unified_residual_bias_ready_) {
-        int biascorr_module_num = 0;
-        for (int i = 1; i <= max_modules_num; ++i) {
-          residual_biascorr_list[i] = Eigen::VectorXd::Zero(6);
-          if (!assembly_flag[i]) continue;
-          Eigen::VectorXd bias = unified_residual_bias_list_.count(i)
-                                     ? unified_residual_bias_list_[i]
-                                     : Eigen::VectorXd::Zero(6);
-          if (bias.size() != 6) bias = Eigen::VectorXd::Zero(6);
-          residual_biascorr_list[i] = est_residual_list_[i] - bias;
-          W_w_biascorr += residual_biascorr_list[i];
-          biascorr_module_num++;
-          max_res_biascorr_f =
-              std::max(max_res_biascorr_f, residual_biascorr_list[i].head(3).norm());
-          max_res_biascorr_t =
-              std::max(max_res_biascorr_t, residual_biascorr_list[i].tail(3).norm());
-        }
-        if (biascorr_module_num > 0) W_w_biascorr /= biascorr_module_num;
-
-        Eigen::VectorXd left_inter_wrench_bc = Eigen::VectorXd::Zero(6);
-        for (const auto& item : residual_biascorr_list) {
-          if (assembly_flag[item.first]) {
-            Eigen::VectorXd right_inter_wrench_bc =
-                item.second - W_w_biascorr + left_inter_wrench_bc;
-            inter_biascorr_list[item.first] = right_inter_wrench_bc;
-            left_inter_wrench_bc = right_inter_wrench_bc;
-          } else {
-            inter_biascorr_list[item.first] = Eigen::VectorXd::Zero(6);
-          }
-        }
-
-        Eigen::VectorXd wrench_comp_sum_left_bc = Eigen::VectorXd::Zero(6);
-        for (int i = leader_id - 1; i > 0; --i) {
-          if (assembly_flag[i]) {
-            wrench_comp_sum_left_bc += inter_biascorr_list[i];
-            comp_biascorr_list[i] = wrench_comp_sum_left_bc;
-          } else {
-            comp_biascorr_list[i] = Eigen::VectorXd::Zero(6);
-          }
-        }
-        int left_module_id_bc = leader_id;
-        Eigen::VectorXd wrench_comp_sum_right_bc = Eigen::VectorXd::Zero(6);
-        for (int i = leader_id + 1; i <= max_modules_num; ++i) {
-          if (assembly_flag[i]) {
-            wrench_comp_sum_right_bc += -inter_biascorr_list[left_module_id_bc];
-            comp_biascorr_list[i] = wrench_comp_sum_right_bc;
-            left_module_id_bc = i;
-          } else {
-            comp_biascorr_list[i] = Eigen::VectorXd::Zero(6);
-          }
-        }
-        comp_biascorr_list[leader_id] = Eigen::VectorXd::Zero(6);
-
-        for (int i = 1; i <= max_modules_num; ++i) {
-          if (!assembly_flag[i] || comp_biascorr_list[i].size() < 6) continue;
-          max_comp_biascorr_f =
-              std::max(max_comp_biascorr_f, comp_biascorr_list[i].head(3).norm());
-          max_comp_biascorr_t =
-              std::max(max_comp_biascorr_t, comp_biascorr_list[i].tail(3).norm());
-        }
-      }
 
       double max_res_f = 0.0, max_res_t = 0.0;
       double max_comp_f = 0.0, max_comp_t = 0.0;
@@ -2837,6 +2861,7 @@ namespace aerial_robot_control
     bool unified_cmd_received_snapshot = false;
     ros::Time unified_cmd_stamp_snapshot;
     Eigen::VectorXd unified_reference_desired_wrench_snapshot = Eigen::VectorXd::Zero(6);
+    Eigen::VectorXd unified_reference_desired_wrench_weights_snapshot = Eigen::VectorXd::Zero(6);
     tf::Vector3 leader_target_pos_snapshot;
     tf::Vector3 leader_target_vel_snapshot;
     tf::Vector3 leader_target_acc_snapshot;
@@ -2849,6 +2874,8 @@ namespace aerial_robot_control
       unified_cmd_received_snapshot = unified_cmd_received_;
       unified_cmd_stamp_snapshot = unified_cmd_stamp_;
       unified_reference_desired_wrench_snapshot = unified_reference_desired_wrench_;
+      unified_reference_desired_wrench_weights_snapshot =
+          unified_reference_desired_wrench_weights_;
       leader_target_pos_snapshot = leader_target_pos_;
       leader_target_vel_snapshot = leader_target_vel_;
       leader_target_acc_snapshot = leader_target_acc_;
@@ -3017,28 +3044,35 @@ namespace aerial_robot_control
     // With gain=0 this is diagnostic only: it publishes the same residual /
     // inter-wrench signals as the legacy leader-follower path without feeding
     // them back into the allocator. A positive gain biases the QP secondary
-    // reference, not the primary formation wrench objective.
+    // reference after hover-bias initialization, not the primary formation
+    // wrench objective.
     const bool unified_secondary_ready =
         beetle_navigator_->getControlFlag() &&
         navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
         !navigator_->getForceLandingFlag();
-    const bool unified_secondary_active =
+    const bool unified_secondary_requested =
         unified_internal_wrench_secondary_gain_ > 0.0 && unified_secondary_ready;
 
     if (beetle_navigator_->getControlFlag() &&
-        (unified_internal_wrench_diag_ || unified_secondary_active)) {
+        (unified_internal_wrench_diag_ || unified_secondary_requested)) {
       markUnifiedDebugStage("internal_wrench_calc_enter");
       calcInteractionWrench();
       markUnifiedDebugStage("internal_wrench_calc_exit");
     }
-    if (unified_secondary_active) {
-      std::map<int, Eigen::VectorXd> wrench_comp_snapshot;
+    bool unified_secondary_active = false;
+    std::map<int, Eigen::VectorXd> wrench_comp_snapshot;
+    if (unified_secondary_requested) {
       markUnifiedDebugStage("internal_wrench_secondary_lock_enter");
       {
         std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
-        wrench_comp_snapshot = wrench_comp_list_;
+        if (unified_residual_bias_ready_) {
+          wrench_comp_snapshot = wrench_comp_biascorr_list_;
+          unified_secondary_active = true;
+        }
       }
       markUnifiedDebugStage("internal_wrench_secondary_lock_exit");
+    }
+    if (unified_secondary_active) {
       unified_controller_->setInternalWrenchSecondaryReference(
           wrench_comp_snapshot, unified_internal_wrench_secondary_gain_);
     } else {
@@ -3083,20 +3117,63 @@ namespace aerial_robot_control
     } else if (!formation_wrench_weights_fresh || formation_wrench_weights_cmd.size() != 6) {
       formation_wrench_weights_cmd = Eigen::VectorXd();
     }
+    constexpr int kExtWrenchFeedbackBiasReadySamples = 40;
+    constexpr double kExtWrenchFeedbackBiasAlpha = 0.05;
+    constexpr double kExtWrenchFeedbackSoftWeight = 0.25;
+    const bool explicit_task_wrench_active =
+        formation_wrench_cmd.size() == 6 && formation_wrench_cmd.norm() > 1e-3;
     if (!is_leader && unified_reference_snapshot_fresh &&
         unified_reference_desired_wrench_snapshot.size() == 6 &&
         !navigator_->getForceLandingFlag()) {
       formation_wrench_cmd = unified_reference_desired_wrench_snapshot;
-      if (!formation_wrench_weights_fresh || formation_wrench_weights_cmd.size() != 6) {
+      if (unified_reference_desired_wrench_weights_snapshot.size() == 6 &&
+          unified_reference_desired_wrench_weights_snapshot.maxCoeff() > 0.0) {
+        formation_wrench_weights_cmd =
+            unified_reference_desired_wrench_weights_snapshot;
+      } else if (!formation_wrench_weights_fresh ||
+                 formation_wrench_weights_cmd.size() != 6) {
         formation_wrench_weights_cmd = Eigen::VectorXd();
       }
     }
 
     const int observer_feedback_nav_state = navigator_->getNaviState();
     const bool observer_feedback_nav_ready =
-        observer_feedback_nav_state == aerial_robot_navigation::TAKEOFF_STATE ||
-        observer_feedback_nav_state == aerial_robot_navigation::HOVER_STATE ||
-        observer_feedback_nav_state == aerial_robot_navigation::LAND_STATE;
+        observer_feedback_nav_state == aerial_robot_navigation::HOVER_STATE;
+    const bool observer_feedback_base_ready =
+        is_leader &&
+        unified_external_wrench_feedback_ &&
+        unified_external_wrench_feedback_gain_ > 0.0 &&
+        formation_observer_ &&
+        formation_observer_->isActive() &&
+        formation_observer_->isInitialized() &&
+        observer_feedback_nav_ready &&
+        !navigator_->getForceLandingFlag();
+    if ((!observer_feedback_nav_ready || navigator_->getForceLandingFlag()) &&
+        unified_external_wrench_feedback_bias_samples_ > 0) {
+      unified_external_wrench_feedback_bias_ready_ = false;
+      unified_external_wrench_feedback_bias_samples_ = 0;
+      unified_external_wrench_feedback_bias_ = Eigen::VectorXd::Zero(6);
+    }
+    if (observer_feedback_base_ready && !explicit_task_wrench_active &&
+        !unified_external_wrench_feedback_bias_ready_) {
+      const Eigen::VectorXd est_external_wrench =
+          formation_observer_->getEstExternalWrench6D();
+      if (est_external_wrench.size() == 6 && est_external_wrench.allFinite()) {
+        if (unified_external_wrench_feedback_bias_samples_ == 0 ||
+            unified_external_wrench_feedback_bias_.size() != 6) {
+          unified_external_wrench_feedback_bias_ = est_external_wrench;
+        } else {
+          unified_external_wrench_feedback_bias_ =
+              (1.0 - kExtWrenchFeedbackBiasAlpha) *
+              unified_external_wrench_feedback_bias_ +
+              kExtWrenchFeedbackBiasAlpha * est_external_wrench;
+        }
+        unified_external_wrench_feedback_bias_samples_++;
+        unified_external_wrench_feedback_bias_ready_ =
+            unified_external_wrench_feedback_bias_samples_ >=
+            kExtWrenchFeedbackBiasReadySamples;
+      }
+    }
     if (is_leader &&
         unified_external_wrench_feedback_ &&
         unified_external_wrench_feedback_gain_ > 0.0 &&
@@ -3104,14 +3181,19 @@ namespace aerial_robot_control
         formation_observer_->isActive() &&
         formation_observer_->isFfReady() &&
         observer_feedback_nav_ready &&
-        !navigator_->getForceLandingFlag()) {
+        !navigator_->getForceLandingFlag() &&
+        !explicit_task_wrench_active &&
+        unified_external_wrench_feedback_bias_ready_ &&
+        unified_external_wrench_feedback_bias_.size() == 6) {
       const Eigen::VectorXd est_external_wrench =
           formation_observer_->getEstExternalWrench6D();
       if (est_external_wrench.size() == 6 && est_external_wrench.allFinite()) {
+        const Eigen::VectorXd feedback_est_wrench =
+            est_external_wrench - unified_external_wrench_feedback_bias_;
         Eigen::VectorXd feedback_wrench =
             -unified_external_wrench_feedback_gain_ *
             formation_observer_->getFfRampFactor() *
-            est_external_wrench;
+            feedback_est_wrench;
         const double force_norm = feedback_wrench.head(3).norm();
         if (unified_external_wrench_feedback_max_force_ > 0.0 &&
             force_norm > unified_external_wrench_feedback_max_force_) {
@@ -3127,18 +3209,31 @@ namespace aerial_robot_control
         if (formation_wrench_cmd.size() != 6) {
           formation_wrench_cmd = Eigen::VectorXd::Zero(6);
         }
+        if (!formation_wrench_weights_fresh ||
+            formation_wrench_weights_cmd.size() != 6) {
+          formation_wrench_weights_cmd =
+              Eigen::VectorXd::Constant(6, kExtWrenchFeedbackSoftWeight);
+        }
         formation_wrench_cmd += feedback_wrench;
         ROS_INFO_THROTTLE(
             1.0,
             "[UnifiedCtrl ExtWrenchFB] id=%d nav=%d gain=%.3f ramp=%.3f "
-            "est=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
+            "bias_samples=%d est=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
+            "bias=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
             "fb=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f)",
             my_id, observer_feedback_nav_state,
             unified_external_wrench_feedback_gain_,
             formation_observer_->getFfRampFactor(),
+            unified_external_wrench_feedback_bias_samples_,
             est_external_wrench(0), est_external_wrench(1),
             est_external_wrench(2), est_external_wrench(3),
             est_external_wrench(4), est_external_wrench(5),
+            unified_external_wrench_feedback_bias_(0),
+            unified_external_wrench_feedback_bias_(1),
+            unified_external_wrench_feedback_bias_(2),
+            unified_external_wrench_feedback_bias_(3),
+            unified_external_wrench_feedback_bias_(4),
+            unified_external_wrench_feedback_bias_(5),
             feedback_wrench(0), feedback_wrench(1),
             feedback_wrench(2), feedback_wrench(3),
             feedback_wrench(4), feedback_wrench(5));
@@ -3334,7 +3429,8 @@ namespace aerial_robot_control
       }
       if (is_leader) {
         markUnifiedDebugStage("reference_pub_enter");
-        publishUnifiedReference(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
+        publishUnifiedReference(target_wrench_acc, formation_wrench_cmd,
+                                formation_wrench_weights_cmd, yaw_pid_raw);
         markUnifiedDebugStage("reference_pub_exit");
         if (formation_observer_ && formation_observer_->isActive()) {
           markUnifiedDebugStage("formation_observer_enter");
@@ -3360,12 +3456,14 @@ namespace aerial_robot_control
             Eigen::VectorXd realized_wrench = unified_controller_->getRealizedWrenchBody();
 
             const int observer_nav_state = navigator_->getNaviState();
-            const bool observer_nav_ready =
+            const bool observer_update_nav_ready =
                 observer_nav_state == aerial_robot_navigation::TAKEOFF_STATE ||
                 observer_nav_state == aerial_robot_navigation::HOVER_STATE ||
                 observer_nav_state == aerial_robot_navigation::LAND_STATE;
-            formation_observer_->setFfArmed(observer_nav_ready);
-            if (observer_nav_ready) {
+            const bool observer_feedback_gate_ready =
+                observer_nav_state == aerial_robot_navigation::HOVER_STATE;
+            formation_observer_->setFfArmed(observer_feedback_gate_ready);
+            if (observer_update_nav_ready) {
               formation_observer_->update(
                   unified_controller_->getFormationMass(),
                   unified_controller_->getFormationInertia(),

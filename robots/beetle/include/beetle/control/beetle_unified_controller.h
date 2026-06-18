@@ -200,6 +200,7 @@ public:
   int getModuleCount() const;
   int getMotorNumPerModule() const { return motor_num_per_module_; }
   double getSingleModuleMass() const { return robot_model_ ? robot_model_->getMass() : 0.0; }
+  bool getModuleMassInertia(int module_id, double& mass, Eigen::Matrix3d& inertia) const;
   Eigen::MatrixXd getFormationWrenchMatrix() const;
   Eigen::MatrixXd getFormationWrenchMatrixInv() const;
   Eigen::MatrixXd getFormationWrenchMatrixInvRot() const;
@@ -371,7 +372,8 @@ private:
    *   min_{f} ||Wc_eff^(1/2)(A*f - w_control)||^2
    *           + ||Wt^(1/2)(A*f - (w_control + w_task))||^2
    *           + ρ||f||^2
-   *           + λ||f - f_ref||^2 + smoothness terms
+   *           + λ||f - f_ref||^2 + ||Wi^(1/2)(D*f - d_ref)||^2
+   *           + smoothness terms
    *   where Wc_eff clears active task-priority rows so task bands are not
    *   softened by a competing control-only target.
    *   s.t.  linear gimbal-angle constraints (per rotor)
@@ -384,6 +386,7 @@ private:
    * @param task_weights  6D task soft residual weights
    * @param w_priority    6D wrench-acceleration vector used as the center of hard priority bands
    * @param secondary_ref Preferred allocation in the nullspace / soft secondary objective
+   * @param interface_load_reference Preferred actuator-side cut-load proxy D*f.
    * @param vectoring_f_out  Output: full vectoring force vector (n_cols)
    * @return true on success, false on failure (caller falls back to pseudoinverse)
    */
@@ -395,6 +398,7 @@ private:
                          const Eigen::VectorXd& secondary_ref,
                          const std::vector<int>& assembled_ids,
                          const Eigen::MatrixXd& interface_load_matrix,
+                         const Eigen::VectorXd& interface_load_reference,
                          Eigen::VectorXd& vectoring_f_out);
 
   /** @brief Build the current secondary allocation reference.
@@ -414,7 +418,8 @@ private:
 
   void publishInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_load_matrix,
                                        const std::vector<std::pair<int, int>>& interface_cuts,
-                                       const Eigen::VectorXd& vectoring_f);
+                                       const Eigen::VectorXd& vectoring_f,
+                                       const Eigen::VectorXd& interface_load_reference);
   void publishPseudoinversePwmPrediction(const Eigen::VectorXd& pinv_vectoring_f,
                                          const std::vector<int>& assembled_ids);
   uint16_t predictPwmFromThrust(double thrust) const;

@@ -2013,19 +2013,100 @@ namespace aerial_robot_control
           (unified_residual_bias_samples_ >= kBiasReadySamples);
     }
 
+    auto computeCommonModeByModule =
+        [&](const std::map<int, Eigen::VectorXd>& residuals,
+            std::map<int, Eigen::VectorXd>& common_by_module,
+            Eigen::VectorXd& common_avg) {
+      common_by_module.clear();
+      common_avg = Eigen::VectorXd::Zero(6);
+
+      Eigen::Vector3d force_sum = Eigen::Vector3d::Zero();
+      Eigen::Vector3d torque_sum = Eigen::Vector3d::Zero();
+      Eigen::Matrix3d inertia_sum = Eigen::Matrix3d::Zero();
+      std::map<int, double> mass_by_module;
+      std::map<int, Eigen::Matrix3d> inertia_by_module;
+      double mass_sum = 0.0;
+      int active_num = 0;
+      bool all_model_ok = true;
+
+      for (int i = 1; i <= max_modules_num; ++i) {
+        if (!assembly_flag[i]) continue;
+        Eigen::VectorXd residual = residuals.count(i)
+                                       ? residuals.at(i)
+                                       : Eigen::VectorXd::Zero(6);
+        if (residual.size() != 6) residual = Eigen::VectorXd::Zero(6);
+
+        double mass = 1.0;
+        Eigen::Matrix3d inertia = Eigen::Matrix3d::Identity();
+        double model_mass = 0.0;
+        Eigen::Matrix3d model_inertia = Eigen::Matrix3d::Zero();
+        if (unified_controller_ &&
+            unified_controller_->getModuleMassInertia(i, model_mass, model_inertia) &&
+            std::isfinite(model_mass) && model_mass > 1e-6 &&
+            model_inertia.allFinite() &&
+            std::abs(model_inertia.trace()) > 1e-9) {
+          mass = model_mass;
+          inertia = model_inertia;
+        } else {
+          all_model_ok = false;
+        }
+
+        mass_by_module[i] = mass;
+        inertia_by_module[i] = inertia;
+        mass_sum += mass;
+        inertia_sum += inertia;
+        force_sum += residual.head(3);
+        torque_sum += residual.tail(3);
+        active_num++;
+      }
+
+      if (active_num <= 0) return false;
+
+      auto useSimpleAverage = [&]() {
+        Eigen::VectorXd common = Eigen::VectorXd::Zero(6);
+        common.head(3) = force_sum / active_num;
+        common.tail(3) = torque_sum / active_num;
+        for (int i = 1; i <= max_modules_num; ++i) {
+          if (assembly_flag[i]) common_by_module[i] = common;
+        }
+        common_avg = common;
+        return false;
+      };
+
+      if (mass_sum <= 1e-9 || !inertia_sum.allFinite()) return useSimpleAverage();
+
+      Eigen::LDLT<Eigen::Matrix3d> ldlt(inertia_sum);
+      if (ldlt.info() != Eigen::Success) return useSimpleAverage();
+      Eigen::Vector3d common_acc = force_sum / mass_sum;
+      Eigen::Vector3d common_alpha = ldlt.solve(torque_sum);
+      if (!common_acc.allFinite() || !common_alpha.allFinite()) return useSimpleAverage();
+
+      for (int i = 1; i <= max_modules_num; ++i) {
+        if (!assembly_flag[i]) continue;
+        Eigen::VectorXd common = Eigen::VectorXd::Zero(6);
+        common.head(3) = mass_by_module[i] * common_acc;
+        common.tail(3) = inertia_by_module[i] * common_alpha;
+        common_by_module[i] = common;
+        common_avg += common;
+      }
+      common_avg /= active_num;
+      return all_model_ok;
+    };
+
     std::map<int, Eigen::VectorXd> residual_biascorr_list;
     std::map<int, Eigen::VectorXd> inter_biascorr_list;
     std::map<int, Eigen::VectorXd> comp_biascorr_list;
+    std::map<int, Eigen::VectorXd> common_biascorr_list;
     Eigen::VectorXd W_w_biascorr = Eigen::VectorXd::Zero(6);
     double max_res_biascorr_f = 0.0, max_res_biascorr_t = 0.0;
     double max_comp_biascorr_f = 0.0, max_comp_biascorr_t = 0.0;
+    bool biascorr_model_projected = false;
     for (int i = 1; i <= max_modules_num; ++i) {
       residual_biascorr_list[i] = Eigen::VectorXd::Zero(6);
       inter_biascorr_list[i] = Eigen::VectorXd::Zero(6);
       comp_biascorr_list[i] = Eigen::VectorXd::Zero(6);
     }
     if (unified_residual_bias_ready_) {
-      int biascorr_module_num = 0;
       for (int i = 1; i <= max_modules_num; ++i) {
         if (!assembly_flag[i]) continue;
         Eigen::VectorXd bias = unified_residual_bias_list_.count(i)
@@ -2033,20 +2114,25 @@ namespace aerial_robot_control
                                    : Eigen::VectorXd::Zero(6);
         if (bias.size() != 6) bias = Eigen::VectorXd::Zero(6);
         residual_biascorr_list[i] = est_residual_list_[i] - bias;
-        W_w_biascorr += residual_biascorr_list[i];
-        biascorr_module_num++;
         max_res_biascorr_f =
             std::max(max_res_biascorr_f, residual_biascorr_list[i].head(3).norm());
         max_res_biascorr_t =
             std::max(max_res_biascorr_t, residual_biascorr_list[i].tail(3).norm());
       }
-      if (biascorr_module_num > 0) W_w_biascorr /= biascorr_module_num;
+      biascorr_model_projected =
+          computeCommonModeByModule(residual_biascorr_list,
+                                    common_biascorr_list,
+                                    W_w_biascorr);
 
       Eigen::VectorXd left_inter_wrench_bc = Eigen::VectorXd::Zero(6);
       for (const auto& item : residual_biascorr_list) {
         if (assembly_flag[item.first]) {
+          Eigen::VectorXd common = common_biascorr_list.count(item.first)
+                                       ? common_biascorr_list[item.first]
+                                       : W_w_biascorr;
+          if (common.size() != 6) common = W_w_biascorr;
           Eigen::VectorXd right_inter_wrench_bc =
-              item.second - W_w_biascorr + left_inter_wrench_bc;
+              item.second - common + left_inter_wrench_bc;
           inter_biascorr_list[item.first] = right_inter_wrench_bc;
           left_inter_wrench_bc = right_inter_wrench_bc;
         }
@@ -2136,6 +2222,7 @@ namespace aerial_robot_control
          << ",biasAvg=" << fmtWrench(unified_residual_common_bias_);
       if (unified_residual_bias_ready_) {
         ss << ",resAvgCorr=" << fmtWrench(W_w_biascorr)
+           << ",proj=" << (biascorr_model_projected ? "mass_inertia" : "average")
            << ",maxResCorr=[F=" << max_res_biascorr_f
            << ",T=" << max_res_biascorr_t << "]"
            << ",maxCompCorr=[F=" << max_comp_biascorr_f

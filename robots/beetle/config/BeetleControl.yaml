@@ -47,11 +47,11 @@ controller:
   yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
 
   # Unified internal wrench management.
-  # diag=true reuses the legacy LF residual/inter-wrench calculation for logging.
-  # secondary_gain=0 keeps it diagnostic-only. Set a small value (e.g. 0.02)
-  # only after the est/task/res/comp logs look physically consistent in flight.
-  unified_internal_wrench_diag: false
-  unified_internal_wrench_log: false
+  # diag/log=true is safe for first real-hardware hover: it only records the
+  # bias-corrected residual/interface signals. secondary_gain=0 keeps this path
+  # diagnostic-only until the real logs look physically consistent.
+  unified_internal_wrench_diag: true
+  unified_internal_wrench_log: true
   unified_internal_wrench_detail_log: false
   unified_internal_wrench_log_period: 5.0
   unified_internal_wrench_secondary_gain: 0.0
@@ -83,8 +83,8 @@ controller:
   alloc_task_wrench_weights: [1.00, 1.00, 0.40, 0.40, 0.40, 0.40]
   alloc_effort_weight: 1.0e-2   # secondary min-energy cost on sum_i ||f_i||^2
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
-  alloc_interface_force_weight: 0.0      # soft cost on actuator-side cut force proxy [1/N^2]
-  alloc_interface_torque_weight: 0.0     # soft cost on actuator-side cut torque proxy [1/(Nm)^2]
+  alloc_interface_force_weight: 0.0      # soft tracking of actuator-side cut force proxy [1/N^2]
+  alloc_interface_torque_weight: 0.0     # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
   alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
   alloc_priority_enabled: false

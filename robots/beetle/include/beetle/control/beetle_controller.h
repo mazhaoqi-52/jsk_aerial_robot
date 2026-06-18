@@ -65,6 +65,9 @@ namespace aerial_robot_control
     double unified_external_wrench_feedback_gain_;
     double unified_external_wrench_feedback_max_force_;
     double unified_external_wrench_feedback_max_torque_;
+    double unified_external_wrench_feedback_task_weight_;
+    double unified_external_wrench_feedback_settle_pos_;
+    double unified_external_wrench_feedback_settle_vel_;
     bool unified_external_wrench_feedback_bias_ready_;
     int unified_external_wrench_feedback_bias_samples_;
     Eigen::VectorXd unified_external_wrench_feedback_bias_;
@@ -98,8 +101,9 @@ namespace aerial_robot_control
     double unified_debug_trace_until_time_;
     double unified_heartbeat_pub_interval_;
     double last_unified_heartbeat_pub_time_;
-    // Unified residual hover-bias diagnostic. This is log-only: it never feeds
-    // wrench_comp_list_ or the allocation secondary.
+    // Unified residual hover-bias estimator. The bias-corrected internal
+    // component is diagnostic when secondary_gain=0 and becomes a QP secondary
+    // reference when secondary_gain>0.
     bool unified_residual_bias_ready_;
     int unified_residual_bias_samples_;
     int unified_residual_bias_module_num_;

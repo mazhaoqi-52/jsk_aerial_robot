@@ -16,10 +16,13 @@ controller:
   unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
   unified_peer_stall_guard: true       # leader force-lands if an assembled peer heartbeat is stale
   unified_peer_heartbeat_timeout: 0.8
-  unified_external_wrench_feedback: false
+  unified_external_wrench_feedback: true
   unified_external_wrench_feedback_gain: 0.3
   unified_external_wrench_feedback_max_force: 3.0     # [N], norm clamp on observer feedback
   unified_external_wrench_feedback_max_torque: 0.25   # [Nm], norm clamp on observer feedback
+  unified_external_wrench_feedback_task_weight: 0.05  # low-weight task-space disturbance rejection
+  unified_external_wrench_feedback_settle_pos: 0.08   # [m/rad], learn observer bias only near hover equilibrium
+  unified_external_wrench_feedback_settle_vel: 0.12   # [m/s, rad/s], learn observer bias only when slow
   unified_torque_allocation_matrix_inv_pub_interval: 0.05  # keep spinal P/D allocation mapping fresh
   unified_command_stall_warn_gap: 0.30   # warn only when command gap is close to FC 500ms watchdog
   unified_command_stall_trace_gap: 0.20  # keep DEBUG stage trace for smaller gaps
@@ -31,8 +34,8 @@ controller:
 
   # ========== Formation Momentum Observer ==========
   # Formation-level external wrench estimation using realized wrench from allocation.
-  # Controller consumes the filtered 6D estimate through the LF-like
-  # unified_external_wrench_feedback path above.
+  # Feedback is bias-corrected, hover-settled, and injected only as a low-weight
+  # task-space disturbance-rejection objective.
   formation_observer:
     force_observer_gain: 3.0
     torque_observer_gain: 2.5
@@ -48,13 +51,13 @@ controller:
 
   # Unified internal wrench management.
   # diag/log=true is safe for first real-hardware hover: it only records the
-  # bias-corrected residual/interface signals. secondary_gain=0 keeps this path
-  # diagnostic-only until the real logs look physically consistent.
+  # bias-corrected residual/interface signals. A small secondary gain uses the
+  # mass/inertia-projected internal residual as a QP nullspace preference.
   unified_internal_wrench_diag: true
   unified_internal_wrench_log: true
   unified_internal_wrench_detail_log: false
   unified_internal_wrench_log_period: 5.0
-  unified_internal_wrench_secondary_gain: 0.0
+  unified_internal_wrench_secondary_gain: 0.02
 
   # Leader-only compact log for aerial towing validation. Prints only while a
   # nonzero formation_desired_wrench is active.
@@ -83,8 +86,8 @@ controller:
   alloc_task_wrench_weights: [1.00, 1.00, 0.40, 0.40, 0.40, 0.40]
   alloc_effort_weight: 1.0e-2   # secondary min-energy cost on sum_i ||f_i||^2
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
-  alloc_interface_force_weight: 0.0      # soft tracking of actuator-side cut force proxy [1/N^2]
-  alloc_interface_torque_weight: 0.0     # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
+  alloc_interface_force_weight: 1.0e-4   # soft tracking of actuator-side cut force proxy [1/N^2]
+  alloc_interface_torque_weight: 1.0e-3  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
   alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
   alloc_priority_enabled: false

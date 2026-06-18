@@ -24,6 +24,9 @@ namespace aerial_robot_control
     unified_external_wrench_feedback_gain_(0.3),
     unified_external_wrench_feedback_max_force_(3.0),
     unified_external_wrench_feedback_max_torque_(0.25),
+    unified_external_wrench_feedback_task_weight_(0.05),
+    unified_external_wrench_feedback_settle_pos_(0.08),
+    unified_external_wrench_feedback_settle_vel_(0.12),
     unified_external_wrench_feedback_bias_ready_(false),
     unified_external_wrench_feedback_bias_samples_(0),
     unified_external_wrench_feedback_bias_(Eigen::VectorXd::Zero(6)),
@@ -2335,6 +2338,18 @@ namespace aerial_robot_control
                      unified_external_wrench_feedback_max_torque_, 0.25);
     unified_external_wrench_feedback_max_torque_ =
         std::max(0.0, unified_external_wrench_feedback_max_torque_);
+    getParam<double>(control_nh, "unified_external_wrench_feedback_task_weight",
+                     unified_external_wrench_feedback_task_weight_, 0.05);
+    unified_external_wrench_feedback_task_weight_ =
+        std::max(0.0, unified_external_wrench_feedback_task_weight_);
+    getParam<double>(control_nh, "unified_external_wrench_feedback_settle_pos",
+                     unified_external_wrench_feedback_settle_pos_, 0.08);
+    unified_external_wrench_feedback_settle_pos_ =
+        std::max(0.0, unified_external_wrench_feedback_settle_pos_);
+    getParam<double>(control_nh, "unified_external_wrench_feedback_settle_vel",
+                     unified_external_wrench_feedback_settle_vel_, 0.12);
+    unified_external_wrench_feedback_settle_vel_ =
+        std::max(0.0, unified_external_wrench_feedback_settle_vel_);
     getParam<double>(control_nh, "unified_torque_allocation_matrix_inv_pub_interval",
                      unified_torque_alloc_inv_pub_interval_, 0.05);
     unified_torque_alloc_inv_pub_interval_ =
@@ -3206,7 +3221,6 @@ namespace aerial_robot_control
     }
     constexpr int kExtWrenchFeedbackBiasReadySamples = 40;
     constexpr double kExtWrenchFeedbackBiasAlpha = 0.05;
-    constexpr double kExtWrenchFeedbackSoftWeight = 0.25;
     const bool explicit_task_wrench_active =
         formation_wrench_cmd.size() == 6 && formation_wrench_cmd.norm() > 1e-3;
     if (!is_leader && unified_reference_snapshot_fresh &&
@@ -3226,6 +3240,21 @@ namespace aerial_robot_control
     const int observer_feedback_nav_state = navigator_->getNaviState();
     const bool observer_feedback_nav_ready =
         observer_feedback_nav_state == aerial_robot_navigation::HOVER_STATE;
+    const tf::Vector3 observer_feedback_pos_err =
+        target_formation_pos - formation_pos;
+    const tf::Vector3 observer_feedback_vel_err =
+        target_vel_ - formation_vel;
+    const double observer_feedback_pos_xy =
+        std::hypot(observer_feedback_pos_err.x(), observer_feedback_pos_err.y());
+    const double observer_feedback_vel_xy =
+        std::hypot(observer_feedback_vel_err.x(), observer_feedback_vel_err.y());
+    const bool observer_feedback_settled =
+        observer_feedback_pos_xy <= unified_external_wrench_feedback_settle_pos_ &&
+        std::abs(observer_feedback_pos_err.z()) <=
+            unified_external_wrench_feedback_settle_pos_ &&
+        observer_feedback_vel_xy <= unified_external_wrench_feedback_settle_vel_ &&
+        std::abs(observer_feedback_vel_err.z()) <=
+            unified_external_wrench_feedback_settle_vel_;
     const bool observer_feedback_base_ready =
         is_leader &&
         unified_external_wrench_feedback_ &&
@@ -3245,7 +3274,10 @@ namespace aerial_robot_control
         !unified_external_wrench_feedback_bias_ready_) {
       const Eigen::VectorXd est_external_wrench =
           formation_observer_->getEstExternalWrench6D();
-      if (est_external_wrench.size() == 6 && est_external_wrench.allFinite()) {
+      if (!observer_feedback_settled) {
+        unified_external_wrench_feedback_bias_samples_ = 0;
+        unified_external_wrench_feedback_bias_ = Eigen::VectorXd::Zero(6);
+      } else if (est_external_wrench.size() == 6 && est_external_wrench.allFinite()) {
         if (unified_external_wrench_feedback_bias_samples_ == 0 ||
             unified_external_wrench_feedback_bias_.size() != 6) {
           unified_external_wrench_feedback_bias_ = est_external_wrench;
@@ -3267,6 +3299,7 @@ namespace aerial_robot_control
         formation_observer_ &&
         formation_observer_->isActive() &&
         formation_observer_->isFfReady() &&
+        unified_external_wrench_feedback_task_weight_ > 0.0 &&
         observer_feedback_nav_ready &&
         !navigator_->getForceLandingFlag() &&
         !explicit_task_wrench_active &&
@@ -3297,23 +3330,30 @@ namespace aerial_robot_control
           formation_wrench_cmd = Eigen::VectorXd::Zero(6);
         }
         if (!formation_wrench_weights_fresh ||
-            formation_wrench_weights_cmd.size() != 6) {
+            formation_wrench_weights_cmd.size() != 6 ||
+            formation_wrench_weights_cmd.maxCoeff() <= 0.0) {
           formation_wrench_weights_cmd =
-              Eigen::VectorXd::Constant(6, kExtWrenchFeedbackSoftWeight);
+              Eigen::VectorXd::Constant(
+                  6, unified_external_wrench_feedback_task_weight_);
         }
         formation_wrench_cmd += feedback_wrench;
         ROS_INFO_THROTTLE(
-            1.0,
-            "[UnifiedCtrl ExtWrenchFB] id=%d nav=%d gain=%.3f ramp=%.3f "
-            "bias_samples=%d est=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
+          1.0,
+          "[UnifiedCtrl ExtWrenchFB] id=%d nav=%d gain=%.3f ramp=%.3f "
+            "w=%.3f settled=%d pos_xy=%.3f vel_xy=%.3f bias_samples=%d "
+            "est=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
             "bias=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
             "fb=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f)",
-            my_id, observer_feedback_nav_state,
-            unified_external_wrench_feedback_gain_,
-            formation_observer_->getFfRampFactor(),
-            unified_external_wrench_feedback_bias_samples_,
-            est_external_wrench(0), est_external_wrench(1),
-            est_external_wrench(2), est_external_wrench(3),
+          my_id, observer_feedback_nav_state,
+          unified_external_wrench_feedback_gain_,
+          formation_observer_->getFfRampFactor(),
+          unified_external_wrench_feedback_task_weight_,
+          observer_feedback_settled ? 1 : 0,
+          observer_feedback_pos_xy,
+          observer_feedback_vel_xy,
+          unified_external_wrench_feedback_bias_samples_,
+          est_external_wrench(0), est_external_wrench(1),
+          est_external_wrench(2), est_external_wrench(3),
             est_external_wrench(4), est_external_wrench(5),
             unified_external_wrench_feedback_bias_(0),
             unified_external_wrench_feedback_bias_(1),

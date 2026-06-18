@@ -2690,6 +2690,106 @@ namespace aerial_robot_control
     desiredExternalWrenchWeightsCallback(msg);
   }
 
+  bool BeetleController::computeFormationRpError(
+      const tf::Vector3& target_rpy,
+      tf::Vector3& formation_rpy,
+      tf::Vector3& formation_rp_error,
+      Eigen::Vector2d& rp_weight_sum)
+  {
+    formation_rpy = rpy_;
+    formation_rp_error.setValue(target_rpy.x() - rpy_.x(),
+                                target_rpy.y() - rpy_.y(),
+                                0.0);
+    rp_weight_sum.setZero();
+
+    const std::vector<int> assembled_ids = beetle_navigator_->getAssemblyIds();
+    if (assembled_ids.empty() || !unified_controller_) return false;
+
+    const std::string robot_name = beetle_navigator_->getMyName();
+    const int leader_id = beetle_navigator_->getLeaderID();
+    const std::string leader_cog_frame =
+        robot_name + std::to_string(leader_id) + "/cog";
+    const Eigen::Vector3d formation_cog_offset =
+        unified_controller_->getFormationCogOffset();
+
+    double roll_err_sum = 0.0;
+    double pitch_err_sum = 0.0;
+    double roll_sum = 0.0;
+    double pitch_sum = 0.0;
+
+    for (int module_id : assembled_ids) {
+      double module_mass = 0.0;
+      Eigen::Matrix3d module_inertia = Eigen::Matrix3d::Zero();
+      if (!unified_controller_->getModuleMassInertia(
+              module_id, module_mass, module_inertia)) {
+        return false;
+      }
+
+      const std::string module_cog_frame =
+          robot_name + std::to_string(module_id) + "/cog";
+
+      geometry_msgs::TransformStamped world_tf;
+      geometry_msgs::TransformStamped leader_tf;
+      try {
+        world_tf = beetle_navigator_->getTfBuffer().lookupTransform(
+            "world", module_cog_frame, ros::Time(0));
+        leader_tf = beetle_navigator_->getTfBuffer().lookupTransform(
+            leader_cog_frame, module_cog_frame, ros::Time(0));
+      } catch (tf2::TransformException& ex) {
+        ROS_WARN_THROTTLE(
+            1.0,
+            "[UnifiedCtrl RP-I] formation attitude TF failed id=%d (%s); using local RP error",
+            module_id, ex.what());
+        return false;
+      }
+
+      Eigen::Vector3d module_offset(
+          leader_tf.transform.translation.x,
+          leader_tf.transform.translation.y,
+          leader_tf.transform.translation.z);
+      Eigen::Vector3d d = module_offset - formation_cog_offset;
+      Eigen::Matrix3d inertia_about_form =
+          module_inertia +
+          module_mass * (d.dot(d) * Eigen::Matrix3d::Identity() -
+                         d * d.transpose());
+
+      const double roll_weight = inertia_about_form(0, 0);
+      const double pitch_weight = inertia_about_form(1, 1);
+      if (!std::isfinite(roll_weight) || !std::isfinite(pitch_weight) ||
+          roll_weight <= 1e-9 || pitch_weight <= 1e-9) {
+        return false;
+      }
+
+      tf::Quaternion module_quat;
+      tf::quaternionMsgToTF(world_tf.transform.rotation, module_quat);
+      double module_roll, module_pitch, module_yaw;
+      tf::Matrix3x3(module_quat).getRPY(module_roll, module_pitch, module_yaw);
+
+      const double roll_err =
+          angles::shortest_angular_distance(module_roll, target_rpy.x());
+      const double pitch_err = target_rpy.y() - module_pitch;
+
+      roll_err_sum += roll_weight * roll_err;
+      pitch_err_sum += pitch_weight * pitch_err;
+      roll_sum += roll_weight * module_roll;
+      pitch_sum += pitch_weight * module_pitch;
+      rp_weight_sum.x() += roll_weight;
+      rp_weight_sum.y() += pitch_weight;
+    }
+
+    if (rp_weight_sum.x() <= 1e-9 || rp_weight_sum.y() <= 1e-9) {
+      return false;
+    }
+
+    formation_rp_error.setValue(roll_err_sum / rp_weight_sum.x(),
+                                pitch_err_sum / rp_weight_sum.y(),
+                                0.0);
+    formation_rpy.setValue(roll_sum / rp_weight_sum.x(),
+                           pitch_sum / rp_weight_sum.y(),
+                           rpy_.z());
+    return true;
+  }
+
   void BeetleController::logFollowerAllocationImbalance(
       const Eigen::VectorXd& target_wrench_acc,
       double alloc_ms,
@@ -2808,6 +2908,8 @@ namespace aerial_robot_control
 
   void BeetleController::publishAssembleDebug(
       const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
+      const tf::Vector3& formation_rpy,
+      const tf::Vector3& formation_rp_error,
       const tf::Vector3& target_formation_pos, bool alloc_ok,
       const Eigen::VectorXd& target_wrench_acc,
       const Eigen::VectorXd& formation_wrench_cmd,
@@ -2852,7 +2954,7 @@ namespace aerial_robot_control
     assemble_pid_msg_.roll.i_term.at(0) = pid_controllers_.at(ROLL).getITerm();
     assemble_pid_msg_.roll.d_term.at(0) = pid_controllers_.at(ROLL).getDTerm();
     assemble_pid_msg_.roll.target_p = target_rpy_.x();
-    assemble_pid_msg_.roll.err_p = target_rpy_.x() - rpy_.x();
+    assemble_pid_msg_.roll.err_p = formation_rp_error.x();
     assemble_pid_msg_.roll.target_d = target_omega_.x();
     assemble_pid_msg_.roll.err_d = target_omega_.x() - omega_.x();
 
@@ -2862,7 +2964,7 @@ namespace aerial_robot_control
     assemble_pid_msg_.pitch.i_term.at(0) = pid_controllers_.at(PITCH).getITerm();
     assemble_pid_msg_.pitch.d_term.at(0) = pid_controllers_.at(PITCH).getDTerm();
     assemble_pid_msg_.pitch.target_p = target_rpy_.y();
-    assemble_pid_msg_.pitch.err_p = target_rpy_.y() - rpy_.y();
+    assemble_pid_msg_.pitch.err_p = formation_rp_error.y();
     assemble_pid_msg_.pitch.target_d = target_omega_.y();
     assemble_pid_msg_.pitch.err_d = target_omega_.y() - omega_.y();
 
@@ -2934,12 +3036,12 @@ namespace aerial_robot_control
              << target_vel_.y() - formation_vel.y() << ","
              << target_vel_.z() - formation_vel.z() << "]"
              << " rpy=[cur="
-             << rpy_.x() << "," << rpy_.y() << "," << rpy_.z()
+             << formation_rpy.x() << "," << formation_rpy.y() << "," << rpy_.z()
              << ",target="
              << target_rpy_.x() << "," << target_rpy_.y() << "," << target_rpy_.z()
              << ",err="
-             << target_rpy_.x() - rpy_.x() << ","
-             << target_rpy_.y() - rpy_.y() << ","
+             << formation_rp_error.x() << ","
+             << formation_rp_error.y() << ","
              << angles::shortest_angular_distance(rpy_.z(), target_rpy_.z()) << "]"
              << " yaw_raw=" << yaw_pid_raw;
           ROS_INFO_STREAM_THROTTLE(unified_towing_debug_log_period_, ss.str());
@@ -3136,6 +3238,24 @@ namespace aerial_robot_control
     tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);
     tf::Vector3 target_formation_pos = target_pos_ + target_baselink_rot * offset_body;
     markUnifiedDebugStage("formation_kinematics_ready");
+
+    tf::Vector3 formation_rpy = rpy_;
+    tf::Vector3 formation_rp_error(target_rpy_.x() - rpy_.x(),
+                                   target_rpy_.y() - rpy_.y(),
+                                   0.0);
+    Eigen::Vector2d formation_rp_weight_sum = Eigen::Vector2d::Zero();
+    const bool formation_rp_error_ready =
+        is_leader && computeFormationRpError(target_rpy_, formation_rpy,
+                                             formation_rp_error,
+                                             formation_rp_weight_sum);
+    if (formation_rp_error_ready) {
+      ROS_DEBUG_THROTTLE(
+          2.0,
+          "[UnifiedCtrl RP-I] id=%d formation_err=(%.4f,%.4f) formation_rp=(%.4f,%.4f) weights=(%.4f,%.4f)",
+          my_id, formation_rp_error.x(), formation_rp_error.y(),
+          formation_rpy.x(), formation_rpy.y(),
+          formation_rp_weight_sum.x(), formation_rp_weight_sum.y());
+    }
 
     // --- Position PID (X/Y/Z) with formation CoG ---
     double du = ros::Time::now().toSec() - control_timestamp_;
@@ -3416,8 +3536,8 @@ namespace aerial_robot_control
       }
     }
     // Rigid formation: roll/pitch integral torque is a formation-level slow
-    // state. Followers keep local P/D state fresh, but reuse the leader's
-    // broadcast I-term instead of integrating their own bias into the QP.
+    // state. The leader integrates the inertia-weighted formation RP error;
+    // followers keep local P/D state fresh, but reuse only this slow I-term.
     const bool use_formation_rp_i =
         !is_leader &&
         unified_reference_snapshot_fresh &&
@@ -3425,6 +3545,12 @@ namespace aerial_robot_control
         unified_reference_wrench_acc_snapshot.allFinite();
     double du_rp = du;
     if (!start_rp_integration_ || use_formation_rp_i) du_rp = 0;
+    const double roll_err_for_pid =
+        formation_rp_error_ready ? formation_rp_error.x()
+                                 : target_rpy_.x() - rpy_.x();
+    const double pitch_err_for_pid =
+        formation_rp_error_ready ? formation_rp_error.y()
+                                 : target_rpy_.y() - rpy_.y();
 
     // v5: Restored outer R/P PID. Mirrors beetle independent-mode
     // (gimbal_calc_in_fc=true && i_term_rp_calc_in_pc=true): PC runs full
@@ -3432,9 +3558,9 @@ namespace aerial_robot_control
     // target_wrench_acc(3,4); spinal owns the high-bandwidth P+D inner loop.
     // The PC P-/D-term states are still maintained for clean exit to
     // independent hover (no discontinuity).
-    pid_controllers_.at(ROLL).update(target_rpy_.x() - rpy_.x(), du_rp,
+    pid_controllers_.at(ROLL).update(roll_err_for_pid, du_rp,
                                      target_omega_.x() - omega_.x(), target_ang_acc_.x());
-    pid_controllers_.at(PITCH).update(target_rpy_.y() - rpy_.y(), du_rp,
+    pid_controllers_.at(PITCH).update(pitch_err_for_pid, du_rp,
                                       target_omega_.y() - omega_.y(), target_ang_acc_.y());
     if (navigator_->getForceLandingFlag()) {
       pid_controllers_.at(ROLL).reset();
@@ -3616,7 +3742,9 @@ namespace aerial_robot_control
     // Only leader publishes assembly-debug topics (shared global namespace)
     if (is_leader) {
       markUnifiedDebugStage("assemble_debug_pub_enter");
-      publishAssembleDebug(formation_pos, formation_vel, target_formation_pos, ok,
+      publishAssembleDebug(formation_pos, formation_vel,
+                           formation_rpy, formation_rp_error,
+                           target_formation_pos, ok,
                            target_wrench_acc, formation_wrench_cmd, yaw_pid_raw);
       markUnifiedDebugStage("assemble_debug_pub_exit");
     }

@@ -128,6 +128,10 @@ namespace aerial_robot_control
     /** @brief Symmetric unified-mode control body. Both leader and follower run the full
      *  outer PID + formation allocation locally using their own estimator state. */
     void runUnifiedControlCommon(bool is_leader);
+    bool computeFormationRpError(const tf::Vector3& target_rpy,
+                                 tf::Vector3& formation_rpy,
+                                 tf::Vector3& formation_rp_error,
+                                 Eigen::Vector2d& rp_weight_sum);
     void markUnifiedDebugStage(const char* stage);
     void reportUnifiedCommandGap(const char* event, double gap, double now);
     void publishUnifiedHeartbeat(const char* event, double now, bool force = false);
@@ -311,6 +315,8 @@ namespace aerial_robot_control
     ros::Publisher assemble_formation_wrench_pub_;
     aerial_robot_msgs::PoseControlPid assemble_pid_msg_;
     void publishAssembleDebug(const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
+                              const tf::Vector3& formation_rpy,
+                              const tf::Vector3& formation_rp_error,
                               const tf::Vector3& target_formation_pos, bool alloc_ok,
                               const Eigen::VectorXd& target_wrench_acc,
                               const Eigen::VectorXd& formation_wrench_cmd,

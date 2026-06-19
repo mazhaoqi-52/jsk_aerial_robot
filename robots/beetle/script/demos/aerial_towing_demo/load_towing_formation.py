@@ -74,6 +74,9 @@ TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
 HOOK_CONTACT_INSERT_CLEARANCE = 0.02
 # Reject "contact" detections that stop far above the intended hook height.
 HOOK_CONTACT_CLEARANCE_TOLERANCE = 0.06
+# Final insertion is complete only when the hook is within this clearance band
+# above the intended hook contact height.
+HOOK_INSERTION_DEPTH_TOLERANCE = 0.02
 # Soft lateral alignment guard in the load/approach frame. Exceeding this does
 # not abort the state machine, but it must not redefine the planned hook XY.
 HOOK_ALIGNMENT_LATERAL_TOLERANCE = 0.05
@@ -1142,7 +1145,7 @@ class DescendAndInsertState(TowingStateBase):
             f"(target={HOOK_CONTACT_INSERT_CLEARANCE*1000:.1f}mm, positive=above box top)"
         )
         max_allowed_clearance = (
-            HOOK_CONTACT_INSERT_CLEARANCE + HOOK_CONTACT_CLEARANCE_TOLERANCE
+            HOOK_CONTACT_INSERT_CLEARANCE + HOOK_INSERTION_DEPTH_TOLERANCE
         )
         insertion_clearance_ok = achieved_clearance <= max_allowed_clearance
         if not insertion_clearance_ok:
@@ -1173,7 +1176,24 @@ class DescendAndInsertState(TowingStateBase):
             self.log_insertion_alignment(
                 "after contact stabilization", settled_contact_pos,
                 insertion_pos, approach_dir)
-            contact_pos[2] = settled_contact_pos[2]
+            settled_clearance = (
+                settled_contact_pos[2] + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
+            )
+            rospy.loginfo(
+                f"Settled hook contact clearance: {settled_clearance*1000:.1f}mm "
+                f"(allowed={max_allowed_clearance*1000:.1f}mm)"
+            )
+            if settled_clearance <= max_allowed_clearance:
+                contact_pos[2] = settled_contact_pos[2]
+                insertion_clearance_ok = True
+            else:
+                insertion_clearance_ok = False
+                contact_pos[2] = insertion_pos[2]
+                rospy.logwarn(
+                    f"Hook insertion still shallow after stabilization; keeping planned "
+                    f"insertion Z={contact_pos[2]:.3f}m for hook attempt "
+                    f"(measured_Z={settled_contact_pos[2]:.3f}m)"
+                )
             rospy.loginfo(
                 f"Insertion contact pose locked at {FormationUtils.format_vec(contact_pos)} "
                 f"(measured={FormationUtils.format_vec(settled_contact_pos)})"
@@ -1982,6 +2002,7 @@ def main():
     rospy.loginfo("=" * 60)
     rospy.loginfo(f"Load box: {LOAD_BOX_LENGTH}m x {LOAD_BOX_WIDTH}m x {LOAD_BOX_HEIGHT}m")
     rospy.loginfo(f"Hook contact insert clearance: {HOOK_CONTACT_INSERT_CLEARANCE*1000:.0f}mm above box top")
+    rospy.loginfo(f"Hook insertion depth tolerance: {HOOK_INSERTION_DEPTH_TOLERANCE*1000:.0f}mm")
     rospy.loginfo(f"Retract distance: {RETRACT_DISTANCE*1000:.0f}mm")
     rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
     rospy.loginfo(f"Max towing force: {TOWING_MAX_FORCE}N (adaptive from 0N)")

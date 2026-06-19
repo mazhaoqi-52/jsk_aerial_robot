@@ -190,9 +190,10 @@ namespace aerial_robot_control
     // Reference msg fields cached on the follower side. Guarded by
     // unified_reference_mutex_ so callbacks and the control loop see a
     // physically consistent reference snapshot.
-    // wrench_acc / desired_wrench / yaw_pid_raw : leader low-frequency
-    //   reference and diagnostics. Followers still solve QP locally; they use
-    //   desired_wrench as the shared formation-level task, not leader allocation.
+    // wrench_acc / desired_wrench / observer_feedback_wrench / yaw_pid_raw :
+    //   leader low-frequency reference and diagnostics. Followers still solve
+    //   QP locally; desired_wrench is the explicit formation-level task and
+    //   observer_feedback_wrench is a separate low-weight residual task.
     // desired_wrench_weights : QP task weights paired with desired_wrench.
     // leader_target_* / final_target_baselink  : Phase B — drives the
     //   follower's target_pos/_vel/_acc/_rpy/_omega/_ang_acc via rigid-formation
@@ -201,6 +202,8 @@ namespace aerial_robot_control
     Eigen::VectorXd unified_reference_wrench_acc_;
     Eigen::VectorXd unified_reference_desired_wrench_;
     Eigen::VectorXd unified_reference_desired_wrench_weights_;
+    Eigen::VectorXd unified_reference_observer_feedback_wrench_;
+    Eigen::VectorXd unified_reference_observer_feedback_wrench_weights_;
     double unified_reference_yaw_pid_raw_;
     int unified_reference_leader_id_;
     int unified_reference_warmup_count_;
@@ -228,6 +231,8 @@ namespace aerial_robot_control
     void publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                    const Eigen::VectorXd& desired_wrench,
                    const Eigen::VectorXd& desired_wrench_weights,
+                   const Eigen::VectorXd& observer_feedback_wrench,
+                   const Eigen::VectorXd& observer_feedback_wrench_weights,
                    double yaw_pid_raw);
     void publishModuleModel();
     void moduleModelCallback(const beetle::ModuleModel& msg);

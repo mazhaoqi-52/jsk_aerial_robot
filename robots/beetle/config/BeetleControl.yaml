@@ -55,7 +55,7 @@ controller:
   unified_internal_wrench_log: true
   unified_internal_wrench_detail_log: false
   unified_internal_wrench_log_period: 5.0
-  unified_internal_wrench_secondary_gain: 0.02
+  unified_internal_wrench_secondary_gain: 0.05
 
   # Leader-only compact log for aerial towing validation. Prints only while a
   # nonzero formation_desired_wrench is active.
@@ -73,10 +73,10 @@ controller:
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
   # Spidar-style secondary costs: keep the allocation close to balanced hover
   # and penalize total thrust before using actuator margin.
-  alloc_rate_weight: 4.0e-3     # soft penalty on |f[k] - f[k-1]|
+  alloc_rate_weight: 8.0e-3     # soft penalty on |f[k] - f[k-1]|
   alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
   alloc_direction_rate_limit_deg: 0.0  # hard per-cycle gimbal direction band [deg]; soft fx-rate is preferred
-  alloc_lateral_rate_weight: 4.0e-3    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
+  alloc_lateral_rate_weight: 8.0e-3    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
   # Weighted control/stabilization residual [Fx,Fy,Fz,Tx,Ty,Tz].
   alloc_wrench_weights: [0.50, 0.50, 1.20, 0.25, 0.40, 0.50]
   # Fallback weighted task residual [Fx,Fy,Fz,Tx,Ty,Tz]. Demo layers may publish
@@ -84,8 +84,8 @@ controller:
   alloc_task_wrench_weights: [1.00, 1.00, 0.40, 0.40, 0.40, 0.40]
   alloc_effort_weight: 3.0e-3   # secondary min-energy cost on sum_i ||f_i||^2
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
-  alloc_interface_force_weight: 1.0e-4   # soft tracking of actuator-side cut force proxy [1/N^2]
-  alloc_interface_torque_weight: 1.0e-3  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
+  alloc_interface_force_weight: 3.0e-4   # soft tracking of actuator-side cut force proxy [1/N^2]
+  alloc_interface_torque_weight: 3.0e-3  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
   alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
   alloc_priority_enabled: false

@@ -459,11 +459,13 @@ bool BeetleUnifiedController::updateFormationGeometry()
 }
 
 bool BeetleUnifiedController::computeUnifiedAllocation(
-    const Eigen::VectorXd& target_wrench_acc_cog,
+  const Eigen::VectorXd& target_wrench_acc_cog,
   const Eigen::VectorXd& desired_ext_wrench,
   double yaw_pid_raw,
   const Eigen::VectorXd& priority_wrench_acc_cog,
-  const Eigen::VectorXd& task_wrench_weights)
+  const Eigen::VectorXd& task_wrench_weights,
+  const Eigen::VectorXd& observer_feedback_wrench,
+  const Eigen::VectorXd& observer_feedback_wrench_weights)
 {
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) {
@@ -499,27 +501,45 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // axes remain soft so stabilization keeps residual authority.
   Eigen::VectorXd control_wrench_acc = target_wrench_acc_cog;
   Eigen::VectorXd task_wrench_acc = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd feedback_wrench_acc = Eigen::VectorXd::Zero(6);
   Eigen::VectorXd priority_wrench_acc =
       (priority_wrench_acc_cog.size() == target_wrench_acc_cog.size())
           ? priority_wrench_acc_cog : target_wrench_acc_cog;
   Eigen::VectorXd effective_task_weights =
       (task_wrench_weights.size() == 6) ? task_wrench_weights : alloc_task_wrench_weights_;
+  Eigen::VectorXd effective_feedback_weights =
+      (observer_feedback_wrench_weights.size() == 6)
+          ? observer_feedback_wrench_weights : Eigen::VectorXd::Zero(6);
   if (effective_task_weights.size() != 6) effective_task_weights = Eigen::VectorXd::Ones(6);
+  if (effective_feedback_weights.size() != 6) effective_feedback_weights = Eigen::VectorXd::Zero(6);
   for (int i = 0; i < effective_task_weights.size(); i++) {
     effective_task_weights(i) = std::max(0.0, effective_task_weights(i));
+    effective_feedback_weights(i) = std::max(0.0, effective_feedback_weights(i));
   }
   const bool has_desired_ext_wrench =
       (desired_ext_wrench.size() == 6 && desired_ext_wrench.norm() > 1e-6);
+  const bool has_feedback_ext_wrench =
+      (observer_feedback_wrench.size() == 6 &&
+       observer_feedback_wrench.norm() > 1e-6 &&
+       effective_feedback_weights.maxCoeff() > 0.0);
+  double mass_inv = 1.0 / formation_mass_;
+  Eigen::Matrix3d inertia_inv = formation_inertia_.inverse();
   if (has_desired_ext_wrench) {
-    double mass_inv = 1.0 / formation_mass_;
-    Eigen::Matrix3d inertia_inv = formation_inertia_.inverse();
     task_wrench_acc.head(3) = mass_inv * desired_ext_wrench.head(3);
     task_wrench_acc.tail(3) = inertia_inv * desired_ext_wrench.tail(3);
+  }
+  if (has_feedback_ext_wrench) {
+    feedback_wrench_acc.head(3) = mass_inv * observer_feedback_wrench.head(3);
+    feedback_wrench_acc.tail(3) = inertia_inv * observer_feedback_wrench.tail(3);
+  }
+  if (has_desired_ext_wrench || has_feedback_ext_wrench) {
     ROS_INFO_THROTTLE(
         1.0,
         "[UnifiedCtrl QPRef] id=%d control=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
         "task_acc=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
+        "fb_acc=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
         "task_w=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
+        "fb_w=(%.2f,%.2f,%.2f;%.2f,%.2f,%.2f) "
         "task_prio=(enabled=%d,min_w=%.2f,tol_xy=%.2f/%.2f) "
         "rate=(w=%.1e,fx=%.1e,lim=%.2f,dir=%.1fdeg)",
         navigator_ ? navigator_->getMyID() : 0,
@@ -527,8 +547,12 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         control_wrench_acc(3), control_wrench_acc(4), control_wrench_acc(5),
         task_wrench_acc(0), task_wrench_acc(1), task_wrench_acc(2),
         task_wrench_acc(3), task_wrench_acc(4), task_wrench_acc(5),
+        feedback_wrench_acc(0), feedback_wrench_acc(1), feedback_wrench_acc(2),
+        feedback_wrench_acc(3), feedback_wrench_acc(4), feedback_wrench_acc(5),
         effective_task_weights(0), effective_task_weights(1), effective_task_weights(2),
         effective_task_weights(3), effective_task_weights(4), effective_task_weights(5),
+        effective_feedback_weights(0), effective_feedback_weights(1), effective_feedback_weights(2),
+        effective_feedback_weights(3), effective_feedback_weights(4), effective_feedback_weights(5),
         alloc_task_priority_enabled_ ? 1 : 0, alloc_task_priority_min_weight_,
         alloc_priority_tolerances_.size() > 0 ? alloc_priority_tolerances_(0) : 0.0,
         alloc_priority_tolerances_.size() > 1 ? alloc_priority_tolerances_(1) : 0.0,
@@ -536,7 +560,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         alloc_direction_rate_limit_rad_ * 180.0 / M_PI);
   }
   const Eigen::VectorXd pinv_vectoring_f =
-      integrated_map_inv_ * (control_wrench_acc + task_wrench_acc);
+      integrated_map_inv_ * (control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
   publishPseudoinversePwmPrediction(pinv_vectoring_f, assembled_ids);
   Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
   Eigen::MatrixXd interface_load_matrix;
@@ -552,15 +576,18 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   if (use_constrained_alloc_) {
     bool qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                    task_wrench_acc, effective_task_weights,
+                                   feedback_wrench_acc, effective_feedback_weights,
                                    priority_wrench_acc,
                                    secondary_ref, assembled_ids,
                                    interface_load_matrix, interface_load_reference,
                                    target_vectoring_f_);
-    if (!qp_ok && has_desired_ext_wrench) {
+    if (!qp_ok && (has_desired_ext_wrench || has_feedback_ext_wrench)) {
       const double retry_task_scales[] = {0.7, 0.4, 0.0};
       for (double retry_scale : retry_task_scales) {
         Eigen::VectorXd retry_task_wrench_acc = retry_scale * task_wrench_acc;
         Eigen::VectorXd retry_task_weights = retry_scale * effective_task_weights;
+        Eigen::VectorXd retry_feedback_wrench_acc = retry_scale * feedback_wrench_acc;
+        Eigen::VectorXd retry_feedback_weights = retry_scale * effective_feedback_weights;
         Eigen::VectorXd retry_priority_acc = priority_wrench_acc_cog;
         if (retry_priority_acc.size() != target_wrench_acc_cog.size()) {
           retry_priority_acc = target_wrench_acc_cog;
@@ -568,6 +595,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
         qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                   retry_task_wrench_acc, retry_task_weights,
+                                  retry_feedback_wrench_acc, retry_feedback_weights,
                                   retry_priority_acc,
                                   secondary_ref, assembled_ids,
                                   interface_load_matrix, interface_load_reference,
@@ -576,10 +604,12 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
         task_wrench_acc = retry_task_wrench_acc;
         effective_task_weights = retry_task_weights;
+        feedback_wrench_acc = retry_feedback_wrench_acc;
+        effective_feedback_weights = retry_feedback_weights;
         if (retry_scale > 1e-6) {
           ROS_WARN_THROTTLE(
               1.0,
-              "[UnifiedCtrl QP] task wrench objective scaled to %.0f%% after constrained solve failed",
+              "[UnifiedCtrl QP] external wrench objectives scaled to %.0f%% after constrained solve failed",
               retry_scale * 100.0);
         } else {
           ROS_WARN_THROTTLE(
@@ -599,15 +629,22 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       Eigen::VectorXd blended_wrench_acc = control_wrench_acc;
       if (task_wrench_acc.size() == control_wrench_acc.size() &&
           effective_task_weights.size() == control_wrench_acc.size() &&
+          feedback_wrench_acc.size() == control_wrench_acc.size() &&
+          effective_feedback_weights.size() == control_wrench_acc.size() &&
           alloc_wrench_weights_.size() == control_wrench_acc.size()) {
         for (int i = 0; i < blended_wrench_acc.size(); i++) {
-          const double denom = alloc_wrench_weights_(i) + effective_task_weights(i);
+          const double denom = alloc_wrench_weights_(i) +
+                               effective_task_weights(i) +
+                               effective_feedback_weights(i);
           if (denom > 1e-9) {
-            blended_wrench_acc(i) += effective_task_weights(i) / denom * task_wrench_acc(i);
+            blended_wrench_acc(i) +=
+                (effective_task_weights(i) * task_wrench_acc(i) +
+                 effective_feedback_weights(i) *
+                     (task_wrench_acc(i) + feedback_wrench_acc(i))) / denom;
           }
         }
       } else {
-        blended_wrench_acc += task_wrench_acc;
+        blended_wrench_acc += task_wrench_acc + feedback_wrench_acc;
       }
       Eigen::MatrixXd lhs = integrated_map_ * integrated_map_.transpose()
                            + alloc_lambda_ * Eigen::MatrixXd::Identity(integrated_map_.rows(),
@@ -997,6 +1034,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
     const Eigen::VectorXd& w_control,
     const Eigen::VectorXd& w_task,
     const Eigen::VectorXd& task_weights,
+    const Eigen::VectorXd& w_feedback,
+    const Eigen::VectorXd& feedback_weights,
     const Eigen::VectorXd& w_priority,
     const Eigen::VectorXd& secondary_ref,
     const std::vector<int>& assembled_ids,
@@ -1008,15 +1047,15 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
   //
   // Objective:  min_f  0.5 * f' * P * f + q' * f
-  //   where P = A'(Wc_eff+Wt)A + effort + R + optional rate/lateral-rate/interface terms,
-  //         q = -A'(Wc_eff*w_control + Wt*w_task_target) - R*f_ref
+  //   where P = A'(Wc_eff+Wt+Wfb)A + effort + R + optional rate/lateral-rate/interface terms,
+  //         q = -A'(Wc_eff*w_control + Wt*w_task_target + Wfb*w_feedback_target) - R*f_ref
   //             - D'Wi*d_ref - smoothness refs
   //         and Wc_eff is cleared on active task-priority rows.
   //
-  // This separates stabilization/control tracking from task feedforward
-  // tracking. Optional
-  // interface terms are a model-based actuator-side cut-load proxy target,
-  // not a measured physical connector load.
+  // This separates stabilization/control tracking, explicit task feedforward,
+  // and low-weight observer residual feedback. Optional interface terms are a
+  // model-based actuator-side cut-load proxy target, not a measured physical
+  // connector load.
   //
   // Constraints (all linear, OSQP-compatible):
   //   Per rotor i (rotor_coef=2, gimbal_dof=1):
@@ -1042,6 +1081,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
       !w_control.allFinite() ||
       (w_task.size() > 0 && !w_task.allFinite()) ||
       (task_weights.size() > 0 && !task_weights.allFinite()) ||
+      (w_feedback.size() > 0 && !w_feedback.allFinite()) ||
+      (feedback_weights.size() > 0 && !feedback_weights.allFinite()) ||
       (w_priority.size() > 0 && !w_priority.allFinite()) ||
       (secondary_ref.size() > 0 && !secondary_ref.allFinite()) ||
       (interface_load_matrix.size() > 0 && !interface_load_matrix.allFinite()) ||
@@ -1051,12 +1092,14 @@ bool BeetleUnifiedController::solveFullVectorQP(
     ROS_WARN_THROTTLE(
         1.0,
         "[UnifiedCtrl QP] reject non-finite or mismatched input: A=%dx%d wc=%d "
-        "wt=%d tw=%d pr=%d sec=%d D=%dx%d dref=%d",
+        "wt=%d tw=%d wf=%d fw=%d pr=%d sec=%d D=%dx%d dref=%d",
         static_cast<int>(alloc_matrix.rows()),
         static_cast<int>(alloc_matrix.cols()),
         static_cast<int>(w_control.size()),
         static_cast<int>(w_task.size()),
         static_cast<int>(task_weights.size()),
+        static_cast<int>(w_feedback.size()),
+        static_cast<int>(feedback_weights.size()),
         static_cast<int>(w_priority.size()),
         static_cast<int>(secondary_ref.size()),
         static_cast<int>(interface_load_matrix.rows()),
@@ -1112,12 +1155,21 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (task_weights.size() == alloc_matrix.rows()) {
     effective_task_weights = task_weights;
   }
+  Eigen::VectorXd effective_feedback_weights = Eigen::VectorXd::Zero(alloc_matrix.rows());
+  if (feedback_weights.size() == alloc_matrix.rows()) {
+    effective_feedback_weights = feedback_weights;
+  }
   for (int r = 0; r < effective_task_weights.size(); r++) {
     effective_task_weights(r) = std::max(0.0, effective_task_weights(r));
+    effective_feedback_weights(r) = std::max(0.0, effective_feedback_weights(r));
   }
   Eigen::VectorXd task_target = w_control;
   if (w_task.size() == alloc_matrix.rows()) {
     task_target += w_task;
+  }
+  Eigen::VectorXd feedback_target = task_target;
+  if (w_feedback.size() == alloc_matrix.rows()) {
+    feedback_target += w_feedback;
   }
 
   std::vector<int> task_priority_rows;
@@ -1160,11 +1212,15 @@ bool BeetleUnifiedController::solveFullVectorQP(
   }
   Eigen::MatrixXd wrench_weight_diag = control_tracking_weights.asDiagonal();
   Eigen::MatrixXd task_weight_diag = effective_task_weights.asDiagonal();
+  Eigen::MatrixXd feedback_weight_diag = effective_feedback_weights.asDiagonal();
   Eigen::MatrixXd P_dense =
-      alloc_matrix.transpose() * (wrench_weight_diag + task_weight_diag) * alloc_matrix;
+      alloc_matrix.transpose() *
+      (wrench_weight_diag + task_weight_diag + feedback_weight_diag) *
+      alloc_matrix;
   Eigen::VectorXd q_vec =
       -alloc_matrix.transpose() * (wrench_weight_diag * w_control +
-                                   task_weight_diag * task_target);
+                                   task_weight_diag * task_target +
+                                   feedback_weight_diag * feedback_target);
 
   if (alloc_effort_weight_ > 0.0) {
     P_dense.diagonal().array() += alloc_effort_weight_;

@@ -35,6 +35,8 @@ namespace aerial_robot_control
     unified_reference_wrench_acc_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_(Eigen::VectorXd::Zero(6)),
     unified_reference_desired_wrench_weights_(Eigen::VectorXd::Zero(6)),
+    unified_reference_observer_feedback_wrench_(Eigen::VectorXd::Zero(6)),
+    unified_reference_observer_feedback_wrench_weights_(Eigen::VectorXd::Zero(6)),
     unified_reference_yaw_pid_raw_(0.0),
     unified_reference_leader_id_(-1),
     unified_reference_warmup_count_(0),
@@ -1224,6 +1226,8 @@ namespace aerial_robot_control
   void BeetleController::publishUnifiedReference(const Eigen::VectorXd& target_wrench_acc,
                                                  const Eigen::VectorXd& desired_wrench,
                                                  const Eigen::VectorXd& desired_wrench_weights,
+                                                 const Eigen::VectorXd& observer_feedback_wrench,
+                                                 const Eigen::VectorXd& observer_feedback_wrench_weights,
                                                  double yaw_pid_raw)
   {
     beetle::UnifiedControlReference msg;
@@ -1243,6 +1247,23 @@ namespace aerial_robot_control
     for (int i = 0; i < 6; ++i) {
       msg.desired_wrench_weights[i] =
           desired_wrench_weights.size() == 6 ? desired_wrench_weights(i) : 0.0;
+    }
+    msg.observer_feedback_wrench.force.x =
+        observer_feedback_wrench.size() == 6 ? observer_feedback_wrench(0) : 0.0;
+    msg.observer_feedback_wrench.force.y =
+        observer_feedback_wrench.size() == 6 ? observer_feedback_wrench(1) : 0.0;
+    msg.observer_feedback_wrench.force.z =
+        observer_feedback_wrench.size() == 6 ? observer_feedback_wrench(2) : 0.0;
+    msg.observer_feedback_wrench.torque.x =
+        observer_feedback_wrench.size() == 6 ? observer_feedback_wrench(3) : 0.0;
+    msg.observer_feedback_wrench.torque.y =
+        observer_feedback_wrench.size() == 6 ? observer_feedback_wrench(4) : 0.0;
+    msg.observer_feedback_wrench.torque.z =
+        observer_feedback_wrench.size() == 6 ? observer_feedback_wrench(5) : 0.0;
+    for (int i = 0; i < 6; ++i) {
+      msg.observer_feedback_wrench_weights[i] =
+          observer_feedback_wrench_weights.size() == 6
+              ? observer_feedback_wrench_weights(i) : 0.0;
     }
     msg.formation_mass = unified_controller_->getFormationMass();
     const Eigen::Vector3d& formation_cog_offset = unified_controller_->getFormationCogOffset();
@@ -1413,6 +1434,17 @@ namespace aerial_robot_control
     for (int i = 0; i < 6; ++i) {
       desired_wrench_weights(i) = msg.desired_wrench_weights[i];
     }
+    Eigen::VectorXd observer_feedback_wrench = Eigen::VectorXd::Zero(6);
+    observer_feedback_wrench(0) = msg.observer_feedback_wrench.force.x;
+    observer_feedback_wrench(1) = msg.observer_feedback_wrench.force.y;
+    observer_feedback_wrench(2) = msg.observer_feedback_wrench.force.z;
+    observer_feedback_wrench(3) = msg.observer_feedback_wrench.torque.x;
+    observer_feedback_wrench(4) = msg.observer_feedback_wrench.torque.y;
+    observer_feedback_wrench(5) = msg.observer_feedback_wrench.torque.z;
+    Eigen::VectorXd observer_feedback_wrench_weights = Eigen::VectorXd::Zero(6);
+    for (int i = 0; i < 6; ++i) {
+      observer_feedback_wrench_weights(i) = msg.observer_feedback_wrench_weights[i];
+    }
     const double yaw_pid_raw = msg.yaw_pid_raw;
 
     // Phase B: cache leader's navigator setpoints for follower target derivation.
@@ -1447,6 +1479,9 @@ namespace aerial_robot_control
       unified_reference_wrench_acc_ = wrench_acc;
       unified_reference_desired_wrench_ = desired_wrench;
       unified_reference_desired_wrench_weights_ = desired_wrench_weights;
+      unified_reference_observer_feedback_wrench_ = observer_feedback_wrench;
+      unified_reference_observer_feedback_wrench_weights_ =
+          observer_feedback_wrench_weights;
       unified_reference_yaw_pid_raw_ = yaw_pid_raw;
       leader_target_pos_ = leader_target_pos;
       leader_target_vel_ = leader_target_vel;
@@ -3065,6 +3100,8 @@ namespace aerial_robot_control
     Eigen::VectorXd unified_reference_wrench_acc_snapshot = Eigen::VectorXd::Zero(6);
     Eigen::VectorXd unified_reference_desired_wrench_snapshot = Eigen::VectorXd::Zero(6);
     Eigen::VectorXd unified_reference_desired_wrench_weights_snapshot = Eigen::VectorXd::Zero(6);
+    Eigen::VectorXd unified_reference_observer_feedback_wrench_snapshot = Eigen::VectorXd::Zero(6);
+    Eigen::VectorXd unified_reference_observer_feedback_wrench_weights_snapshot = Eigen::VectorXd::Zero(6);
     tf::Vector3 leader_target_pos_snapshot;
     tf::Vector3 leader_target_vel_snapshot;
     tf::Vector3 leader_target_acc_snapshot;
@@ -3080,6 +3117,10 @@ namespace aerial_robot_control
       unified_reference_desired_wrench_snapshot = unified_reference_desired_wrench_;
       unified_reference_desired_wrench_weights_snapshot =
           unified_reference_desired_wrench_weights_;
+      unified_reference_observer_feedback_wrench_snapshot =
+          unified_reference_observer_feedback_wrench_;
+      unified_reference_observer_feedback_wrench_weights_snapshot =
+          unified_reference_observer_feedback_wrench_weights_;
       leader_target_pos_snapshot = leader_target_pos_;
       leader_target_vel_snapshot = leader_target_vel_;
       leader_target_acc_snapshot = leader_target_acc_;
@@ -3313,6 +3354,8 @@ namespace aerial_robot_control
 
     Eigen::VectorXd formation_wrench_cmd;
     Eigen::VectorXd formation_wrench_weights_cmd;
+    Eigen::VectorXd observer_feedback_wrench_cmd = Eigen::VectorXd::Zero(6);
+    Eigen::VectorXd observer_feedback_wrench_weights_cmd = Eigen::VectorXd::Zero(6);
     double formation_wrench_stamp = -1.0;
     double formation_wrench_weights_stamp = -1.0;
     markUnifiedDebugStage("task_wrench_lock_enter");
@@ -3341,8 +3384,6 @@ namespace aerial_robot_control
     }
     constexpr int kExtWrenchFeedbackBiasReadySamples = 40;
     constexpr double kExtWrenchFeedbackBiasAlpha = 0.05;
-    const bool explicit_task_wrench_active =
-        formation_wrench_cmd.size() == 6 && formation_wrench_cmd.norm() > 1e-3;
     if (!is_leader && unified_reference_snapshot_fresh &&
         unified_reference_desired_wrench_snapshot.size() == 6 &&
         !navigator_->getForceLandingFlag()) {
@@ -3355,7 +3396,21 @@ namespace aerial_robot_control
                  formation_wrench_weights_cmd.size() != 6) {
         formation_wrench_weights_cmd = Eigen::VectorXd();
       }
+      if (unified_reference_observer_feedback_wrench_snapshot.size() == 6 &&
+          unified_reference_observer_feedback_wrench_snapshot.allFinite()) {
+        observer_feedback_wrench_cmd =
+            unified_reference_observer_feedback_wrench_snapshot;
+      }
+      if (unified_reference_observer_feedback_wrench_weights_snapshot.size() == 6 &&
+          unified_reference_observer_feedback_wrench_weights_snapshot.allFinite()) {
+        observer_feedback_wrench_weights_cmd =
+            unified_reference_observer_feedback_wrench_weights_snapshot;
+      }
     }
+    const bool explicit_task_wrench_active =
+        formation_wrench_cmd.size() == 6 &&
+        formation_wrench_cmd.allFinite() &&
+        formation_wrench_cmd.norm() > 1e-3;
 
     const int observer_feedback_nav_state = navigator_->getNaviState();
     const bool observer_feedback_nav_ready =
@@ -3423,41 +3478,38 @@ namespace aerial_robot_control
         observer_feedback_nav_ready &&
         observer_feedback_settled &&
         !navigator_->getForceLandingFlag() &&
-        !explicit_task_wrench_active &&
         unified_external_wrench_feedback_bias_ready_ &&
         unified_external_wrench_feedback_bias_.size() == 6) {
       const Eigen::VectorXd est_external_wrench =
           formation_observer_->getEstExternalWrench6D();
       if (est_external_wrench.size() == 6 && est_external_wrench.allFinite()) {
-        const Eigen::VectorXd feedback_est_wrench =
+        Eigen::VectorXd feedback_est_wrench =
             est_external_wrench - unified_external_wrench_feedback_bias_;
-        Eigen::VectorXd feedback_wrench =
+        if (explicit_task_wrench_active) {
+          feedback_est_wrench -= formation_wrench_cmd;
+        }
+        observer_feedback_wrench_cmd =
             -unified_external_wrench_feedback_gain_ *
             formation_observer_->getFfRampFactor() *
             feedback_est_wrench;
-        if (formation_wrench_cmd.size() != 6) {
-          formation_wrench_cmd = Eigen::VectorXd::Zero(6);
-        }
-        if (!formation_wrench_weights_fresh ||
-            formation_wrench_weights_cmd.size() != 6 ||
-            formation_wrench_weights_cmd.maxCoeff() <= 0.0) {
-          formation_wrench_weights_cmd =
-              Eigen::VectorXd::Constant(
-                  6, unified_external_wrench_feedback_task_weight_);
-        }
-        formation_wrench_cmd += feedback_wrench;
+        observer_feedback_wrench_weights_cmd =
+            Eigen::VectorXd::Constant(
+                6, unified_external_wrench_feedback_task_weight_);
         ROS_INFO_THROTTLE(
           1.0,
           "[UnifiedCtrl ExtWrenchFB] id=%d nav=%d gain=%.3f ramp=%.3f "
-            "w=%.3f settled=%d pos_xy=%.3f vel_xy=%.3f bias_samples=%d "
+            "w=%.3f settled=%d explicit=%d pos_xy=%.3f vel_xy=%.3f bias_samples=%d "
             "est=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
             "bias=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
+            "task=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
+            "res=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f) "
             "fb=(%.2f,%.2f,%.2f,%.3f,%.3f,%.3f)",
           my_id, observer_feedback_nav_state,
           unified_external_wrench_feedback_gain_,
           formation_observer_->getFfRampFactor(),
           unified_external_wrench_feedback_task_weight_,
           observer_feedback_settled ? 1 : 0,
+          explicit_task_wrench_active ? 1 : 0,
           observer_feedback_pos_xy,
           observer_feedback_vel_xy,
           unified_external_wrench_feedback_bias_samples_,
@@ -3470,9 +3522,18 @@ namespace aerial_robot_control
             unified_external_wrench_feedback_bias_(3),
             unified_external_wrench_feedback_bias_(4),
             unified_external_wrench_feedback_bias_(5),
-            feedback_wrench(0), feedback_wrench(1),
-            feedback_wrench(2), feedback_wrench(3),
-            feedback_wrench(4), feedback_wrench(5));
+            explicit_task_wrench_active ? formation_wrench_cmd(0) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd(1) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd(2) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd(3) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd(4) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd(5) : 0.0,
+            feedback_est_wrench(0), feedback_est_wrench(1),
+            feedback_est_wrench(2), feedback_est_wrench(3),
+            feedback_est_wrench(4), feedback_est_wrench(5),
+            observer_feedback_wrench_cmd(0), observer_feedback_wrench_cmd(1),
+            observer_feedback_wrench_cmd(2), observer_feedback_wrench_cmd(3),
+            observer_feedback_wrench_cmd(4), observer_feedback_wrench_cmd(5));
       }
     }
 
@@ -3633,8 +3694,10 @@ namespace aerial_robot_control
         (last_unified_command_pub_time_ >= 0.0)
             ? alloc_start - last_unified_command_pub_time_ : -1.0;
     markUnifiedDebugStage("allocation_solve_enter");
-    bool ok = unified_controller_->computeUnifiedAllocation(target_wrench_acc, formation_wrench_cmd, yaw_pid_raw,
-                                                            priority_wrench_acc, formation_wrench_weights_cmd);
+    bool ok = unified_controller_->computeUnifiedAllocation(
+        target_wrench_acc, formation_wrench_cmd, yaw_pid_raw,
+        priority_wrench_acc, formation_wrench_weights_cmd,
+        observer_feedback_wrench_cmd, observer_feedback_wrench_weights_cmd);
     markUnifiedDebugStage(ok ? "allocation_solve_ok" : "allocation_solve_failed");
     const double alloc_end = ros::Time::now().toSec();
     const int local_module_state = beetle_navigator_->getModuleState();
@@ -3685,7 +3748,10 @@ namespace aerial_robot_control
       if (is_leader) {
         markUnifiedDebugStage("reference_pub_enter");
         publishUnifiedReference(target_wrench_acc, formation_wrench_cmd,
-                                formation_wrench_weights_cmd, yaw_pid_raw);
+                                formation_wrench_weights_cmd,
+                                observer_feedback_wrench_cmd,
+                                observer_feedback_wrench_weights_cmd,
+                                yaw_pid_raw);
         markUnifiedDebugStage("reference_pub_exit");
         if (formation_observer_ && formation_observer_->isActive()) {
           markUnifiedDebugStage("formation_observer_enter");

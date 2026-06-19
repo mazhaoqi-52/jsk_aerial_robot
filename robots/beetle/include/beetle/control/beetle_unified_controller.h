@@ -75,13 +75,17 @@ public:
    *                                center is approximately zero are kept soft-only.
    * @param task_wrench_weights    Optional 6D task soft tracking weights. When empty, controller
    *                               parameters choose the task weighting.
+   * @param observer_feedback_wrench Optional 6D residual-feedback wrench at formation CoG.
+   * @param observer_feedback_wrench_weights Optional low weights paired with observer_feedback_wrench.
    * @return true if allocation succeeded, false otherwise.
    */
   bool computeUnifiedAllocation(const Eigen::VectorXd& target_wrench_acc_cog,
                                 const Eigen::VectorXd& desired_ext_wrench,
                                 double yaw_pid_raw,
                                 const Eigen::VectorXd& priority_wrench_acc_cog = Eigen::VectorXd(),
-                                const Eigen::VectorXd& task_wrench_weights = Eigen::VectorXd());
+                                const Eigen::VectorXd& task_wrench_weights = Eigen::VectorXd(),
+                                const Eigen::VectorXd& observer_feedback_wrench = Eigen::VectorXd(),
+                                const Eigen::VectorXd& observer_feedback_wrench_weights = Eigen::VectorXd());
 
   /** @brief Optional LF-style internal wrench compensation used only as a
    *  secondary allocation reference. Gain 0 disables the effect. The input map
@@ -384,6 +388,8 @@ private:
    * @param w_control     Desired 6D control/stabilization wrench-acceleration vector
    * @param w_task        6D task feedforward wrench-acceleration vector
    * @param task_weights  6D task soft residual weights
+   * @param w_feedback    6D observer residual-feedback wrench-acceleration vector
+   * @param feedback_weights 6D low feedback residual weights
    * @param w_priority    6D wrench-acceleration vector used as the center of hard priority bands
    * @param secondary_ref Preferred allocation in the nullspace / soft secondary objective
    * @param interface_load_reference Preferred actuator-side cut-load proxy D*f.
@@ -394,6 +400,8 @@ private:
                          const Eigen::VectorXd& w_control,
                          const Eigen::VectorXd& w_task,
                          const Eigen::VectorXd& task_weights,
+                         const Eigen::VectorXd& w_feedback,
+                         const Eigen::VectorXd& feedback_weights,
                          const Eigen::VectorXd& w_priority,
                          const Eigen::VectorXd& secondary_ref,
                          const std::vector<int>& assembled_ids,

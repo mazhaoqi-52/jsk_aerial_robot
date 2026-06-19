@@ -3656,9 +3656,6 @@ namespace aerial_robot_control
     Eigen::VectorXd target_wrench_acc = Eigen::VectorXd::Zero(6);
     target_wrench_acc.head(3) = Eigen::Vector3d(target_acc_cog.x(), target_acc_cog.y(), target_acc_cog.z());
     Eigen::VectorXd priority_wrench_acc = Eigen::VectorXd::Zero(6);
-    // Keep local PID/gravity feedback out of hard-priority rows. The control
-    // target carries position PID, gravity FF, and slow roll/pitch I correction;
-    // desired task wrench is added as a separate weighted soft objective.
     if (use_formation_rp_i) {
       target_wrench_acc(3) = unified_reference_wrench_acc_snapshot(3);
       target_wrench_acc(4) = unified_reference_wrench_acc_snapshot(4);
@@ -3680,6 +3677,17 @@ namespace aerial_robot_control
         gravity_ramp = std::min(static_cast<double>(unified_transition_count_) / GRAVITY_RAMP_FRAMES, 1.0);
       }
       target_wrench_acc.head(3) += gravity_ramp * Eigen::Vector3d(gravity_cog.x(), gravity_cog.y(), gravity_cog.z());
+    }
+
+    // Spidar-style hover band: stabilize lateral force and roll/pitch moment
+    // first, while leaving Fz/yaw and explicit task-priority axes to the normal
+    // tracking path. The QP skips any row already claimed by task priority.
+    if (navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
+        !navigator_->getForceLandingFlag()) {
+      priority_wrench_acc(0) = target_wrench_acc(0);
+      priority_wrench_acc(1) = target_wrench_acc(1);
+      priority_wrench_acc(3) = target_wrench_acc(3);
+      priority_wrench_acc(4) = target_wrench_acc(4);
     }
 
     setTargetWrenchAccCog(target_wrench_acc);

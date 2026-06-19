@@ -1665,6 +1665,12 @@ bool BeetleUnifiedController::solveFullVectorQP(
           task_priority_residual_norm += task_residual(task_row) * task_residual(task_row);
         }
         task_priority_residual_norm = std::sqrt(task_priority_residual_norm);
+        Eigen::VectorXd priority_residual = realized_acc - priority_target;
+        double priority_residual_norm = 0.0;
+        for (int priority_row : priority_rows) {
+          priority_residual_norm += priority_residual(priority_row) * priority_residual(priority_row);
+        }
+        priority_residual_norm = std::sqrt(priority_residual_norm);
 
         std::ostringstream thrust_stream;
         std::ostringstream angle_stream;
@@ -1682,7 +1688,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
         }
 
         const char* fmt =
-            "[UnifiedCtrl QPDiag] ctrl_res=%.3f task_res=%.3f task_prio_res=%.3f rows=%d "
+            "[UnifiedCtrl QPDiag] ctrl_res=%.3f task_res=%.3f "
+            "task_prio_res=%.3f task_rows=%d prio_res=%.3f prio_rows=%d "
             "max_t=%.2f max_angle=%.1fdeg "
             "max|fx|=%.2f max_fz=%.2f comp_margin_min=%.2f "
             "over_t(17.2/18.44/alloc/model)=%d/%d/%d/%d "
@@ -1691,6 +1698,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
           ROS_WARN(fmt,
                    control_residual.norm(), task_residual.norm(),
                    task_priority_residual_norm, n_task_priority_rows,
+                   priority_residual_norm, n_priority_rows,
                    max_t, max_abs_angle_deg,
                    max_abs_fx, max_fz, min_component_margin,
                    over_low, over_mid, over_alloc, over_model,
@@ -1700,6 +1708,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
           ROS_INFO(fmt,
                    control_residual.norm(), task_residual.norm(),
                    task_priority_residual_norm, n_task_priority_rows,
+                   priority_residual_norm, n_priority_rows,
                    max_t, max_abs_angle_deg,
                    max_abs_fx, max_fz, min_component_margin,
                    over_low, over_mid, over_alloc, over_model,

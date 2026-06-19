@@ -16,7 +16,7 @@ controller:
   unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
   unified_peer_stall_guard: true       # leader force-lands if an assembled peer heartbeat is stale
   unified_peer_heartbeat_timeout: 0.8
-  unified_external_wrench_feedback: false
+  unified_external_wrench_feedback: true
   unified_external_wrench_feedback_gain: 0.2
   unified_external_wrench_feedback_task_weight: 0.05  # LF-style soft task-space disturbance rejection
   unified_external_wrench_feedback_settle_pos: 0.08   # [m/rad], learn observer bias only near hover equilibrium
@@ -88,13 +88,14 @@ controller:
   alloc_interface_torque_weight: 3.0e-3  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
   alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
-  alloc_priority_enabled: false
+  alloc_priority_enabled: true
   # Spidar-style task tracking: axes with nonzero desired wrench and task weight
   # >= min_weight are narrow hard bands; effort/rate/balance stay secondary.
   alloc_task_priority_enabled: true
   alloc_task_priority_min_weight: 0.5
   # Hard 6D wrench tracking bands [Fx,Fy,Fz,Tx,Ty,Tz] in acceleration space.
-  # Reused by task-priority rows; <=0 disables that row.
+  # Reused by task-priority rows; hover priority currently fills only Fx/Fy/Tx/Ty.
+  # <=0 disables that row.
   alloc_priority_wrench_tolerances: [0.35, 0.35, 0.30, 0.40, 0.35, 0.40]
 
   pd_wrench_comp_mode: true

@@ -88,7 +88,7 @@ controller:
   alloc_interface_torque_weight: 3.0e-3  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
   alloc_interface_force_limit: 0.0       # component-wise cut force proxy bound [N]; 0 disables
   alloc_interface_torque_limit: 0.0      # component-wise cut torque proxy bound [Nm]; 0 disables
-  alloc_priority_enabled: true
+  alloc_priority_enabled: false
   # Spidar-style task tracking: axes with nonzero desired wrench and task weight
   # >= min_weight are narrow hard bands; effort/rate/balance stay secondary.
   alloc_task_priority_enabled: true

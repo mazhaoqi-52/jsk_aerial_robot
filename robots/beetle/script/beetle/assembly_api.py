@@ -192,10 +192,10 @@ class StandbyState(smach.State):
         target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])
 
         pos_error = np.array(self.target_offset - follower_from_leader[0])
-        # If follower has passed the target (moved too close to leader), ignore x error
-        # attach_dir = 1: follower at +X, moving toward -X, if pos_error[0] < 0 means passed
-        # attach_dir = -1: follower at -X, moving toward +X, if pos_error[0] > 0 means passed
-        if(pos_error[0] * self.attach_dir < 0):
+        # If follower is on the target side and already inside the standby offset,
+        # ignore x error and let ApproachState handle final docking.
+        if(follower_from_leader[0][0] * self.target_offset[0] > 0 and
+           abs(follower_from_leader[0][0]) <= abs(self.target_offset[0])):
             pos_error[0] = 0.0
         att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
 

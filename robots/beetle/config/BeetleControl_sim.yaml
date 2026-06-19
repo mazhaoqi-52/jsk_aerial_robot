@@ -17,7 +17,7 @@ controller:
   unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
   unified_peer_stall_guard: true       # leader force-lands if an assembled peer heartbeat is stale
   unified_peer_heartbeat_timeout: 0.8
-  unified_external_wrench_feedback: true
+  unified_external_wrench_feedback: false
   unified_external_wrench_feedback_gain: 0.2
   unified_external_wrench_feedback_task_weight: 0.05  # LF-style soft task-space disturbance rejection
   unified_external_wrench_feedback_settle_pos: 0.08   # [m/rad], learn observer bias only near hover equilibrium

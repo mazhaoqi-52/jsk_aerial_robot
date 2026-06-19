@@ -76,7 +76,7 @@ controller:
   alloc_rate_weight: 2.0e-2     # soft penalty on |f[k] - f[k-1]|
   alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
   alloc_direction_rate_limit_deg: 0.0  # hard per-cycle gimbal direction band [deg]; soft fx-rate is preferred
-  alloc_lateral_rate_weight: 1.0e-1    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
+  alloc_lateral_rate_weight: 1.5e-1    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
   # Weighted control/stabilization residual [Fx,Fy,Fz,Tx,Ty,Tz].
   alloc_wrench_weights: [0.50, 0.50, 1.20, 0.25, 0.40, 0.50]
   # Fallback weighted task residual [Fx,Fy,Fz,Tx,Ty,Tz]. Demo layers may publish

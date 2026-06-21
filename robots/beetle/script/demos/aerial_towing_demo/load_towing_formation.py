@@ -83,6 +83,7 @@ HOOK_ALIGNMENT_LATERAL_TOLERANCE = 0.05
 # Tighter one-shot alignment before a direct insertion descent. The descent
 # itself already streams the same XY target, so do not recenter inside it.
 SINGLE_DESCENT_ALIGNMENT_LATERAL_TOLERANCE = 0.03
+HOOK_RECENTER_BEFORE_TOWING_TOLERANCE = 0.04
 HOOK_ATTEMPT_MAX_SOFT_FAIL_XY_ERROR = 0.30
 # Only split the descent when the final hook-insertion segment is long enough
 # to be meaningful. Shorter insertions are handled in one continuous descent.
@@ -1296,6 +1297,36 @@ class RetractAndHookState(TowingStateBase):
 
         hook_alignment_ok = self.log_insertion_alignment(
             "after hook stabilization", settled_hook_pos, hook_pos, approach_dir)
+        hook_error = self._approach_frame_xy_error(
+            settled_hook_pos, hook_pos, approach_dir)
+        if hook_error is not None:
+            _, hook_lateral, hook_xy_error = hook_error
+            if (abs(hook_lateral) > HOOK_RECENTER_BEFORE_TOWING_TOLERANCE or
+                    hook_xy_error > HOOK_RECENTER_BEFORE_TOWING_TOLERANCE):
+                recenter_target = np.array(hook_pos, dtype=float)
+                recenter_target[2] = settled_hook_pos[2]
+                rospy.logwarn(
+                    f"[Insertion Align] hook offset before towing: "
+                    f"xy={hook_xy_error*1000:.1f}mm, "
+                    f"lateral={hook_lateral*1000:.1f}mm; "
+                    f"recentering below "
+                    f"{HOOK_RECENTER_BEFORE_TOWING_TOLERANCE*1000:.0f}mm"
+                )
+                self.active_position_convergence(
+                    recenter_target, target_yaw=hook_yaw,
+                    pos_thresh=HOOK_POSITION_TOLERANCE, yaw_thresh=0.05,
+                    timeout=8.0, max_linear_vel=0.02)
+                self.active_stabilization_wait(
+                    recenter_target, hook_yaw, duration=2.0)
+                recentered_hook_pos = self.get_end_effector_position()
+                if recentered_hook_pos is not None:
+                    settled_hook_pos = recentered_hook_pos
+                    rospy.loginfo(
+                        f"Hook pose re-locked at "
+                        f"{FormationUtils.format_vec(settled_hook_pos)}")
+                    hook_alignment_ok = self.log_insertion_alignment(
+                        "after hook recenter stabilization",
+                        settled_hook_pos, hook_pos, approach_dir)
         towing_start_pos = np.array(hook_pos, dtype=float)
         towing_start_pos[2] = settled_hook_pos[2]
         hook_xy_offset = np.linalg.norm(

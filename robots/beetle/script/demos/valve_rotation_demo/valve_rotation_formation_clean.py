@@ -467,6 +467,7 @@ class FormationSingleUAVStateBase(smach.State):
 
         max_angular_vel_limit = max_angular_vel if max_angular_vel is not None else 0.05
         max_linear_vel_limit = max_linear_vel if max_linear_vel is not None else 0.16
+        near_target_pos_only_radius = min(0.08, max(pos_thresh * 2.0, 0.06))
 
         consecutive_good_readings = 0
         required_consecutive = 8
@@ -540,7 +541,7 @@ class FormationSingleUAVStateBase(smach.State):
 
                 smooth_angular_vel = min(actual_yaw_error / angular_divisor, max_angular_vel_limit) if actual_yaw_error > 0.005 else 0.0
 
-                if pos_error > 0.02:
+                if pos_error > near_target_pos_only_radius:
                     speed_magnitude = min(pos_error / 4.0, max_linear_vel_limit)
                     direction = np.array(target_pos) - np.array(current_pos)
                     direction_norm = np.linalg.norm(direction)

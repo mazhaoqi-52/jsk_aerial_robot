@@ -115,10 +115,13 @@ TOWING_FORCE_RELIEF_ATTITUDE = math.radians(18.0)
 TOWING_FORCE_HOLD_Z_ERROR = 0.15
 TOWING_FORCE_RELIEF_Z_ERROR = 0.22
 TOWING_BREAKAWAY_RECOVERY_DELAY = 5.0
+TOWING_BREAKAWAY_FORCE_HOLD_TIME = 0.8
+TOWING_BREAKAWAY_FORCE_RELIEF_RATE = 4.0
 TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.25
 TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
 TOWING_BREAKAWAY_STABLE_Z_ERROR = 0.05
-TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.40
+TOWING_TASK_COOLDOWN_SCALE = 0.60
+TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.60
 TOWING_TASK_HOLD_SCALE = 0.40
 TOWING_TASK_RELIEF_SCALE = 0.15
 TOWING_TASK_SCALE_RECOVER_RATE = 0.10  # 0.4 -> 1.0 takes about 6s
@@ -198,6 +201,7 @@ class LinearTowingTrajectoryGenerator:
         self.force_ramp_progress = 0.0
         self.breakaway_detected = False
         self.breakaway_relief_applied = False
+        self.breakaway_relief_target = None
         self.breakaway_time = None
         self.breakaway_reason = None
         self.breakaway_force_ratio = 0.65
@@ -255,14 +259,14 @@ class LinearTowingTrajectoryGenerator:
             target_task_scale = TOWING_TASK_RELIEF_SCALE
         elif speed_guard:
             guard_state = "cooldown"
-            target_task_scale = TOWING_TASK_HOLD_SCALE
+            target_task_scale = TOWING_TASK_COOLDOWN_SCALE
         elif cooldown:
             guard_state = "cooldown"
             if (max_rp < TOWING_BREAKAWAY_STABLE_ATTITUDE and
                     abs_z < TOWING_BREAKAWAY_STABLE_Z_ERROR):
                 target_task_scale = TOWING_TASK_STABLE_COOLDOWN_SCALE
             else:
-                target_task_scale = TOWING_TASK_HOLD_SCALE
+                target_task_scale = TOWING_TASK_COOLDOWN_SCALE
         elif max_rp > TOWING_FORCE_HOLD_ATTITUDE or abs_z > TOWING_FORCE_HOLD_Z_ERROR:
             guard_state = "hold"
             target_task_scale = TOWING_TASK_HOLD_SCALE
@@ -428,13 +432,14 @@ class LinearTowingTrajectoryGenerator:
                                  if guard_state == "cooldown"
                                  else self.continue_force_floor_ratio))
             floor_force = min(prev_force, self.max_force * floor_ratio)
-            self.current_force = max(prev_force * relief_ratio,
-                                     floor_force)
+            self.breakaway_relief_target = max(prev_force * relief_ratio,
+                                               floor_force)
             self.breakaway_relief_applied = True
             rospy.loginfo(f"[Towing] Load breakaway detected ({self.breakaway_reason}): "
                          f"dist={motion_distance*1000:.0f}mm, "
                          f"vel={self.motion_velocity*1000:.0f}mm/s, "
-                         f"ff {prev_force:.1f}N -> {self.current_force:.1f}N")
+                         f"ff {prev_force:.1f}N -> {self.breakaway_relief_target:.1f}N "
+                         f"(smooth)")
         elif not self.breakaway_detected:
             if guard_state == "relief":
                 self.current_force = max(
@@ -453,10 +458,22 @@ class LinearTowingTrajectoryGenerator:
                 else:
                     self.current_force = ramp_force
         else:
-            if guard_state == "relief":
+            if (self.breakaway_relief_target is not None and
+                    current_time - self.breakaway_time >= TOWING_BREAKAWAY_FORCE_HOLD_TIME):
+                self.current_force = max(
+                    self.breakaway_relief_target,
+                    self.current_force - TOWING_BREAKAWAY_FORCE_RELIEF_RATE * safe_dt)
+                if self.current_force <= self.breakaway_relief_target + 1e-3:
+                    self.breakaway_relief_target = None
+            elif guard_state == "relief":
                 rate = (overspeed_relief_rate if overspeed
                         else self.instability_force_relief_rate)
                 self.current_force -= rate * safe_dt
+            elif guard_state == "cooldown":
+                if overspeed:
+                    self.current_force -= overspeed_relief_rate * safe_dt
+                elif self.motion_velocity < low_speed:
+                    self.current_force += self.force_recover_rate * safe_dt
             elif guard_state != "nominal":
                 if overspeed:
                     self.current_force -= overspeed_relief_rate * safe_dt

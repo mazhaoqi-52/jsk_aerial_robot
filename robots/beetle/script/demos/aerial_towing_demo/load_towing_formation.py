@@ -93,6 +93,8 @@ MIN_SPLIT_INSERTION_DROP = 0.10
 TOWING_TASK_WRENCH_WEIGHTS = [1.0, 0.10, 0.0, 0.08, 0.08, 0.01]
 TOWING_PRIMARY_FORCE_TASK_WEIGHT = 1.0
 TOWING_SECONDARY_FORCE_TASK_WEIGHT = 0.10
+TOWING_TASK_PRIORITY_WEIGHT_FLOOR = 0.55
+TOWING_FORCE_RAMP_TIME = 25.0
 
 # Loose guards for real-machine towing. These are not precision convergence
 # checks; they only prevent obvious high-force/high-attitude transitions.
@@ -116,7 +118,7 @@ TOWING_FORCE_HOLD_Z_ERROR = 0.15
 TOWING_FORCE_RELIEF_Z_ERROR = 0.22
 TOWING_BREAKAWAY_RECOVERY_DELAY = 5.0
 TOWING_BREAKAWAY_FORCE_HOLD_TIME = 0.8
-TOWING_BREAKAWAY_FORCE_RELIEF_RATE = 4.0
+TOWING_BREAKAWAY_FORCE_RELIEF_RATE = 3.0
 TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.25
 TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
 TOWING_BREAKAWAY_STABLE_Z_ERROR = 0.05
@@ -124,13 +126,14 @@ TOWING_TASK_COOLDOWN_SCALE = 0.60
 TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.60
 TOWING_TASK_HOLD_SCALE = 0.40
 TOWING_TASK_RELIEF_SCALE = 0.15
-TOWING_TASK_SCALE_RECOVER_RATE = 0.10  # 0.4 -> 1.0 takes about 6s
+TOWING_TASK_SCALE_RECOVER_RATE = 0.30  # 0.15 -> 0.60 takes about 1.5s
 TOWING_UNLOAD_FORCE_RATE = 4.0  # N/s; 20N feedforward unloads in about 5s
 TOWING_UNLOAD_MAX_DURATION = 8.0
 
 
 def build_towing_task_wrench_weights(force_body=None, task_scale=1.0):
     weights = list(TOWING_TASK_WRENCH_WEIGHTS)
+    primary_axis = None
     if force_body is not None:
         force_xy = np.asarray(force_body[:2], dtype=float)
         norm_xy = np.linalg.norm(force_xy)
@@ -139,7 +142,12 @@ def build_towing_task_wrench_weights(force_body=None, task_scale=1.0):
             span = TOWING_PRIMARY_FORCE_TASK_WEIGHT - TOWING_SECONDARY_FORCE_TASK_WEIGHT
             weights[0] = TOWING_SECONDARY_FORCE_TASK_WEIGHT + span * direction_xy[0] ** 2
             weights[1] = TOWING_SECONDARY_FORCE_TASK_WEIGHT + span * direction_xy[1] ** 2
-    return [float(w) * task_scale for w in weights]
+            primary_axis = 0 if abs(direction_xy[0]) >= abs(direction_xy[1]) else 1
+    scaled_weights = [float(w) * task_scale for w in weights]
+    if primary_axis is not None and task_scale > 0.0:
+        scaled_weights[primary_axis] = max(
+            scaled_weights[primary_axis], TOWING_TASK_PRIORITY_WEIGHT_FLOOR)
+    return scaled_weights
 
 
 class LinearTowingTrajectoryGenerator:
@@ -208,7 +216,7 @@ class LinearTowingTrajectoryGenerator:
         self.overspeed_breakaway_force_ratio = 0.35
         self.continue_force_floor_ratio = 0.35
         self.overspeed_force_floor_ratio = 0.10
-        self.force_recover_rate = self.max_force / 15.0
+        self.force_recover_rate = self.max_force / TOWING_FORCE_RAMP_TIME
         self.instability_force_relief_rate = self.max_force / 8.0
         self.overspeed_force_relief_rate = self.max_force / 4.0
         self.velocity_force_gain = self.max_force / max(self.target_velocity * 8.0, 1e-3)
@@ -448,7 +456,7 @@ class LinearTowingTrajectoryGenerator:
                 self.current_force = max(
                     0.0, self.current_force - self.force_recover_rate * safe_dt)
             elif guard_state == "nominal":
-                ramp_time = 3.0 * self.stall_window_time  # 15s
+                ramp_time = TOWING_FORCE_RAMP_TIME
                 self.force_ramp_progress = min(
                     1.0, self.force_ramp_progress + 1.0 / (ramp_time * self.control_rate))
                 ramp_force = self.max_force * smoothstep01(self.force_ramp_progress)
@@ -465,6 +473,13 @@ class LinearTowingTrajectoryGenerator:
                     self.current_force - TOWING_BREAKAWAY_FORCE_RELIEF_RATE * safe_dt)
                 if self.current_force <= self.breakaway_relief_target + 1e-3:
                     self.breakaway_relief_target = None
+            elif self.breakaway_relief_target is not None:
+                if guard_state == "relief":
+                    rate = (overspeed_relief_rate if overspeed
+                            else self.instability_force_relief_rate)
+                    self.current_force -= rate * safe_dt
+                elif overspeed:
+                    self.current_force -= overspeed_relief_rate * safe_dt
             elif guard_state == "relief":
                 rate = (overspeed_relief_rate if overspeed
                         else self.instability_force_relief_rate)

@@ -311,6 +311,8 @@ class ApproachState(smach.State):
         self.x_tol = x_tol
         self.y_tol = y_tol
         self.z_tol = z_tol
+        if self.real_machine:
+            self.z_tol = max(self.z_tol, 0.015)
         self.roll_tol = roll_tol
         self.pitch_tol = pitch_tol
         self.yaw_tol = yaw_tol
@@ -369,7 +371,8 @@ class ApproachState(smach.State):
         # set target odom in leader coordinate
         #TODO: determine leader namespace dynamically
         # Add small offset toward leader for final approach (negative direction relative to attach_dir)
-        self.br.sendTransform((self.target_offset[0] - 0.05 * self.attach_dir + self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
+        approach_offset = 0.05
+        self.br.sendTransform((self.target_offset[0] - approach_offset * self.attach_dir + self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
                               tf.transformations.quaternion_from_euler(0, 0, 0),
                               rospy.Time.now(),
                               "follower_target_odom",
@@ -385,6 +388,10 @@ class ApproachState(smach.State):
         target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])
 
         pos_error = np.array(self.target_offset - follower_from_leader[0])
+        if(follower_from_leader[0][0] * self.target_offset[0] > 0 and
+           abs(follower_from_leader[0][0]) <= abs(self.target_offset[0]) and
+           abs(pos_error[0]) <= approach_offset):
+            pos_error[0] = 0.0
         att_error = att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
 
         rospy.loginfo(pos_error)

@@ -34,6 +34,18 @@
        doc="Target towing distance (m)"/>
   <arg name="towing_force"    default="5.0"
        doc="Initial towing force (N), ramps adaptively"/>
+  <arg name="stall_window_time" default="5.0"
+       doc="Stall watchdog window duration (s)"/>
+  <arg name="stall_timeout_count" default="4"
+       doc="Consecutive armed stall windows before abort"/>
+  <arg name="stall_min_force_ratio" default="1.0"
+       doc="Arm no-breakaway stall detection after this fraction of towing_force"/>
+  <arg name="unload_contact_lead" default="0.03"
+       doc="EE lead along towing direction while unloading feedforward (m)"/>
+  <arg name="unload_force_rate" default="3.0"
+       doc="Feedforward unload rate (N/s); unload duration is current force divided by this"/>
+  <arg name="unload_max_duration" default="15.0"
+       doc="Maximum feedforward unload duration (s)"/>
   <arg name="debug" default="false"/>
 
   ###########  Demo  ###########
@@ -42,6 +54,12 @@
     <param name="module_ids"      value="$(arg module_ids)"/>
     <param name="towing_distance" value="$(arg towing_distance)"/>
     <param name="towing_force"    value="$(arg towing_force)"/>
+    <param name="stall_window_time" value="$(arg stall_window_time)"/>
+    <param name="stall_timeout_count" value="$(arg stall_timeout_count)"/>
+    <param name="stall_min_force_ratio" value="$(arg stall_min_force_ratio)"/>
+    <param name="unload_contact_lead" value="$(arg unload_contact_lead)"/>
+    <param name="unload_force_rate" value="$(arg unload_force_rate)"/>
+    <param name="unload_max_duration" value="$(arg unload_max_duration)"/>
     <param name="simulation"      value="$(arg simulation)"/>
     <param name="real_machine"    value="$(arg real_machine)"/>
     <param name="debug"           value="$(arg debug)"/>

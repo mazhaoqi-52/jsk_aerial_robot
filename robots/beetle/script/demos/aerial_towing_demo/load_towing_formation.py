@@ -96,6 +96,9 @@ TOWING_PRIMARY_FORCE_TASK_WEIGHT = 1.0
 TOWING_SECONDARY_FORCE_TASK_WEIGHT = 0.10
 TOWING_TASK_PRIORITY_WEIGHT_FLOOR = 0.55
 TOWING_FORCE_RAMP_TIME = 25.0
+TOWING_STALL_WINDOW_TIME = 5.0
+TOWING_STALL_TIMEOUT_COUNT = 4
+TOWING_STALL_MIN_FORCE_RATIO = 1.0
 
 # Loose guards for real-machine towing. These are not precision convergence
 # checks; they only prevent obvious high-force/high-attitude transitions.
@@ -128,8 +131,10 @@ TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.60
 TOWING_TASK_HOLD_SCALE = 0.40
 TOWING_TASK_RELIEF_SCALE = 0.15
 TOWING_TASK_SCALE_RECOVER_RATE = 0.30  # 0.15 -> 0.60 takes about 1.5s
-TOWING_UNLOAD_FORCE_RATE = 4.0  # N/s; 20N feedforward unloads in about 5s
-TOWING_UNLOAD_MAX_DURATION = 8.0
+TOWING_UNLOAD_FORCE_RATE = 3.0  # N/s; 40N feedforward unloads in about 13s
+TOWING_UNLOAD_MAX_DURATION = 15.0
+TOWING_UNLOAD_CONTACT_LEAD = 0.03
+RETURN_RETRACT_DISTANCE = 0.13
 
 
 def build_towing_task_wrench_weights(force_body=None, task_scale=1.0):
@@ -237,12 +242,23 @@ class LinearTowingTrajectoryGenerator:
         self.stall_counter = 0
 
         # Sliding window for stall-based abort detection
-        self.stall_window_time = 5.0    # seconds per window
+        self.stall_window_time = max(
+            0.5, float(rospy.get_param("~stall_window_time", TOWING_STALL_WINDOW_TIME)))
+        self.stall_timeout_count = max(
+            1, int(rospy.get_param("~stall_timeout_count", TOWING_STALL_TIMEOUT_COUNT)))
+        self.stall_min_force_ratio = max(
+            0.0, min(1.0, float(rospy.get_param(
+                "~stall_min_force_ratio", TOWING_STALL_MIN_FORCE_RATIO))))
+        self.stall_min_force = self.max_force * self.stall_min_force_ratio
+        self.stall_force_gate_active = False
         self.stall_last_check_time = self.start_time
         self.stall_last_check_distance = 0.0
 
         rospy.loginfo(f"LinearTowingTrajectory: dir={self.towing_direction}, "
-                     f"dist={target_distance}m, vel={target_velocity}m/s, max_force={max_force}N")
+                     f"dist={target_distance}m, vel={target_velocity}m/s, max_force={max_force}N, "
+                     f"stall_gate={self.stall_min_force:.1f}N "
+                     f"({self.stall_min_force_ratio:.2f}x), "
+                     f"stall={self.stall_timeout_count}x{self.stall_window_time:.1f}s")
 
     def _update_force_guard(self, attitude_rp=None, z_error=0.0, current_time=None,
                             overspeed=False, severe_overspeed=False, dt=0.0):
@@ -414,20 +430,6 @@ class LinearTowingTrajectoryGenerator:
 
         self.target_pos[:2] = self.start_pos[:2] + self.towing_direction[:2] * new_target_distance
 
-        # Stall detection using sliding window (for abort decision only)
-        window_elapsed = current_time - self.stall_last_check_time
-        if window_elapsed >= self.stall_window_time:
-            window_distance = motion_distance - self.stall_last_check_distance
-            recent_velocity = window_distance / window_elapsed
-            self._recent_velocity = recent_velocity
-            self.stall_last_check_time = current_time
-            self.stall_last_check_distance = motion_distance
-
-            if recent_velocity < self.target_velocity * 0.05:  # < 5% of target
-                self.stall_counter += 1  # increments once per window
-            else:
-                self.stall_counter = max(0, self.stall_counter - 1)
-
         guard_state = self._update_force_guard(
             attitude_rp, z_error, current_time,
             overspeed=overspeed, severe_overspeed=severe_overspeed, dt=safe_dt)
@@ -520,6 +522,33 @@ class LinearTowingTrajectoryGenerator:
                                (1.0 - TOWING_GOAL_FORCE_FLOOR_RATIO) * remaining_ratio)
             self.current_force = min(self.current_force, self.max_force * force_cap_ratio)
 
+        # Stall detection using sliding window (for abort decision only). Before
+        # breakaway, arm this watchdog only after the configured feedforward is
+        # reached; otherwise the ramp itself can create a false stall.
+        stall_force_gate_ready = (
+            self.breakaway_detected or
+            self.current_force >= self.stall_min_force)
+        if stall_force_gate_ready and not self.stall_force_gate_active:
+            rospy.loginfo(
+                f"[Towing] Stall watchdog armed at ff={self.current_force:.1f}N "
+                f"(gate={self.stall_min_force:.1f}N)")
+        self.stall_force_gate_active = stall_force_gate_ready
+
+        window_elapsed = current_time - self.stall_last_check_time
+        if window_elapsed >= self.stall_window_time:
+            window_distance = motion_distance - self.stall_last_check_distance
+            recent_velocity = window_distance / window_elapsed
+            self._recent_velocity = recent_velocity
+            self.stall_last_check_time = current_time
+            self.stall_last_check_distance = motion_distance
+
+            if not stall_force_gate_ready:
+                self.stall_counter = 0
+            elif recent_velocity < self.target_velocity * 0.05:  # < 5% of target
+                self.stall_counter += 1  # increments once per armed window
+            else:
+                self.stall_counter = max(0, self.stall_counter - 1)
+
         return {
             'current_distance': self.current_distance,
             'current_load_distance': self.current_load_distance,
@@ -534,6 +563,7 @@ class LinearTowingTrajectoryGenerator:
             'task_weight_scale': self.task_weight_scale,
             'progress': motion_distance / self.target_distance,
             'stall_counter': self.stall_counter,
+            'stall_force_gate_ready': stall_force_gate_ready,
             'using_load_tracking': self.load_start_pos is not None
         }
 
@@ -1386,13 +1416,18 @@ class TowingWithFeedforwardState(TowingStateBase):
         force_norm = float(np.linalg.norm(start_force))
         if not math.isfinite(force_norm):
             force_norm = 0.0
-        scaled_duration = force_norm / TOWING_UNLOAD_FORCE_RATE
+        unload_rate = max(
+            0.1, float(rospy.get_param("~unload_force_rate", TOWING_UNLOAD_FORCE_RATE)))
+        max_duration = max(
+            float(min_duration),
+            float(rospy.get_param("~unload_max_duration", TOWING_UNLOAD_MAX_DURATION)))
+        scaled_duration = force_norm / unload_rate
         duration = max(float(min_duration), scaled_duration)
-        duration = min(TOWING_UNLOAD_MAX_DURATION, duration)
+        duration = min(max_duration, duration)
         rospy.loginfo(
             f"[Towing Unload] ff_mag={force_norm:.2f}N, "
-            f"rate={TOWING_UNLOAD_FORCE_RATE:.1f}N/s, "
-            f"duration={duration:.1f}s"
+            f"rate={unload_rate:.1f}N/s, "
+            f"duration={duration:.1f}s, max={max_duration:.1f}s"
         )
         return duration
 
@@ -1433,6 +1468,26 @@ class TowingWithFeedforwardState(TowingStateBase):
         self.beetle.clearExternalWrench()
         # Disable internal-wrench auto-publish (also broadcasts a final zero).
         self.beetle.setAttachModule(None)
+
+    def _build_unload_hold_position(self, current_pos, towing_dir):
+        lead = max(0.0, float(rospy.get_param(
+            "~unload_contact_lead", TOWING_UNLOAD_CONTACT_LEAD)))
+        if current_pos is None or lead <= 1e-4:
+            return current_pos
+
+        direction = np.asarray(towing_dir, dtype=float)
+        norm_xy = np.linalg.norm(direction[:2])
+        if norm_xy < 1e-6:
+            return current_pos
+        direction = direction / norm_xy
+        direction[2] = 0.0
+
+        hold_pos = np.array(current_pos, dtype=float)
+        hold_pos[:2] += direction[:2] * lead
+        rospy.loginfo(
+            f"[Towing Unload] holding {lead*1000:.0f}mm contact lead "
+            f"along towing direction: {FormationUtils.format_vec(hold_pos)}")
+        return hold_pos
 
     def _finish_towing_exit(self, userdata, reason, hold_pos, hold_yaw,
                             breakaway_detected, clear_duration=1.0):
@@ -1561,15 +1616,17 @@ class TowingWithFeedforwardState(TowingStateBase):
 
         # Towing control loop
         towing_start_time = rospy.Time.now().to_sec()
-        # Stall-based timeout: abort only if truly stuck for STALL_TIMEOUT consecutive windows
-        STALL_TIMEOUT_COUNT = 4   # 4 consecutive stall windows (4x5s = 20s stuck) -> abort
         ABSOLUTE_MAX_TIME = 180.0 # safety net: 3 minutes absolute max
         control_rate = rospy.Rate(25)  # 25Hz
         unified_mode_seen = False
         completion_started_at = None
 
-        rospy.loginfo(f"Starting towing loop (stall abort after {STALL_TIMEOUT_COUNT} consecutive stalls, "
-                      f"absolute max: {ABSOLUTE_MAX_TIME:.0f}s)...")
+        rospy.loginfo(
+            f"Starting towing loop (stall abort after "
+            f"{trajectory_gen.stall_timeout_count} consecutive "
+            f"{trajectory_gen.stall_window_time:.1f}s windows armed at "
+            f"{trajectory_gen.stall_min_force:.1f}N, "
+            f"absolute max: {ABSOLUTE_MAX_TIME:.0f}s)...")
 
         # PI compensator REMOVED: testing showed it was counterproductive.
         # When EE is below target (z_err>0), integral saturates negative, pushes Z target UP,
@@ -1606,27 +1663,40 @@ class TowingWithFeedforwardState(TowingStateBase):
                               "settling briefly before unload")
 
             # Timeout: stall-based (consecutive stall windows) + absolute safety net
-            if state_info['stall_counter'] >= STALL_TIMEOUT_COUNT:
+            if state_info['stall_counter'] >= trajectory_gen.stall_timeout_count:
                 rospy.logwarn(f"Towing aborted: stalled for {state_info['stall_counter']} "
-                             f"consecutive windows ({state_info['stall_counter']*5}s no progress)")
+                             f"consecutive armed windows "
+                             f"({state_info['stall_counter']*trajectory_gen.stall_window_time:.0f}s no progress)")
                 reason = ('stalled_after_breakaway' if state_info['breakaway_detected']
                           else 'stalled_no_breakaway')
+                unload_hold_pos = self._build_unload_hold_position(current_pos, towing_dir)
                 self._finish_towing_exit(
-                    userdata, reason, current_pos, current_yaw,
+                    userdata, reason, unload_hold_pos, current_yaw,
                     state_info['breakaway_detected'])
                 return 'timeout'
             if elapsed > ABSOLUTE_MAX_TIME:
                 rospy.logwarn(f"Towing absolute timeout after {elapsed:.1f}s")
                 reason = ('absolute_timeout_after_breakaway' if state_info['breakaway_detected']
                           else 'absolute_timeout_no_breakaway')
+                unload_hold_pos = self._build_unload_hold_position(current_pos, towing_dir)
                 self._finish_towing_exit(
-                    userdata, reason, current_pos, current_yaw,
+                    userdata, reason, unload_hold_pos, current_yaw,
                     state_info['breakaway_detected'])
                 return 'timeout'
 
             # Stall warning (throttled to avoid log spam)
             if state_info['stall_counter'] > 0:
-                rospy.logwarn_throttle(5.0, f"Towing stalled (window {state_info['stall_counter']}/{STALL_TIMEOUT_COUNT})")
+                rospy.logwarn_throttle(
+                    5.0,
+                    f"Towing stalled (window {state_info['stall_counter']}/"
+                    f"{trajectory_gen.stall_timeout_count})")
+            elif (not state_info['breakaway_detected'] and
+                    not state_info['stall_force_gate_ready']):
+                rospy.loginfo_throttle(
+                    5.0,
+                    f"[Towing] stall watchdog waiting for ff "
+                    f"{trajectory_gen.stall_min_force:.1f}N "
+                    f"(current={state_info['current_force']:.1f}N)")
 
             # Generate and execute target
             target_state = trajectory_gen.generate_target_state(maintain_yaw)
@@ -1742,6 +1812,7 @@ class TowingWithFeedforwardState(TowingStateBase):
 
         # ---- Clear feedforward after towing completes while holding pose ----
         unload_hold_pos = self.get_end_effector_position()
+        unload_hold_pos = self._build_unload_hold_position(unload_hold_pos, towing_dir)
         self._finish_towing_exit(
             userdata, 'succeeded', unload_hold_pos, maintain_yaw,
             trajectory_gen.breakaway_detected, clear_duration=2.0)
@@ -1829,6 +1900,38 @@ class DisengageAndReturnState(TowingStateBase):
                       f"(z_gap={z_gap*1000:.0f}mm)")
         return True
 
+    def _retract_to_disengage(self, userdata, current_yaw, context):
+        towing_dir = np.array(userdata.towing_direction, dtype=float)
+        retract_dir = -towing_dir
+        retract_dir[2] = 0.0
+        norm_xy = np.linalg.norm(retract_dir[:2])
+        if norm_xy < 1e-6:
+            rospy.logerr(f"{context}: invalid towing direction for disengage")
+            return False
+        retract_dir = retract_dir / norm_xy
+
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable before retract")
+            return False
+        retract_target = np.array(current_pos) + retract_dir * RETURN_RETRACT_DISTANCE
+        rospy.loginfo(f"{context}: retracting {RETURN_RETRACT_DISTANCE*1000:.0f}mm along "
+                      f"{retract_dir} to disengage hook")
+
+        success = self.active_position_convergence(
+            retract_target, target_yaw=current_yaw,
+            pos_thresh=0.03, yaw_thresh=0.1, timeout=10.0,
+            max_linear_vel=0.03
+        )
+        if (not success and
+                (not self._loose_position_reached(retract_target,
+                                                  RETURN_LOOSE_RETRACT_TOLERANCE,
+                                                  context) or
+                 not self._return_attitude_safe(context))):
+            return False
+        rospy.sleep(0.5)
+        return True
+
     def execute(self, userdata):
         rospy.loginfo("=== Disengage and Return State ===")
 
@@ -1848,69 +1951,19 @@ class DisengageAndReturnState(TowingStateBase):
             rospy.logerr("Cannot get current position")
             return 'failed'
 
-        # Phase 0: Brief stabilization after load release
-        # Hold a FIXED target position to prevent upward drift from pitch transient
-        rospy.loginfo("[Phase 0] Stabilizing after load release")
-
-        stabilize_duration = 3.0
-        stabilize_start = rospy.Time.now()
-        stabilize_target = current_pos  # fixed target, NOT updated each loop
-
-        while (rospy.Time.now() - stabilize_start).to_sec() < stabilize_duration:
-            self.send_assembly_command_from_end_effector(stabilize_target, current_yaw)
-
-            elapsed = (rospy.Time.now() - stabilize_start).to_sec()
-            actual_pos = self.get_end_effector_position()
-            rpy = self.beetle.getAssemblyRPY()
-            if rpy is not None and actual_pos is not None:
-                rospy.loginfo_throttle(0.5, f"[Phase 0] t={elapsed:.1f}s, "
-                    f"roll={np.degrees(rpy[0]):.2f} deg, pitch={np.degrees(rpy[1]):.2f} deg, "
-                    f"pos={FormationUtils.format_vec(actual_pos)}")
-            rospy.sleep(0.1)
-
-        rospy.loginfo(f"[Phase 0] Stabilization complete after {stabilize_duration}s")
-        if not self._return_attitude_safe("[Phase 0]"):
-            return 'failed'
-
+        # Phase 0: disengage before any long hold. Holding at the contact pose
+        # after a no-breakaway exit can let the load reaction roll the formation.
         if no_breakaway_timeout:
-            rospy.logwarn("[Phase 0.5-pre] No load breakaway detected; "
-                          "ascending before horizontal retract")
-            if not self._ascend_to_return_height(
-                    userdata, start_pos, current_yaw, "[Phase 0.5-pre]",
-                    max_linear_vel=0.03):
-                return 'failed'
-            updated_yaw = self.get_end_effector_yaw()
-            if updated_yaw is not None:
-                current_yaw = updated_yaw
+            rospy.logwarn("[Phase 0] No load breakaway detected; "
+                          "horizontal disengage before return hold/ascent")
 
-        # Phase 0.5: Retract along towing reverse direction to disengage hook
-        towing_dir = np.array(userdata.towing_direction)
-        retract_dir = -towing_dir  # reverse of towing = back into box, then past wall
-        retract_distance = 0.13  # 130mm
-        current_pos = self.get_end_effector_position()
-        if current_pos is None:
-            rospy.logerr("[Phase 0.5] Current position unavailable before retract")
+        if not self._retract_to_disengage(userdata, current_yaw, "[Phase 0]"):
             return 'failed'
-        retract_target = np.array(current_pos) + retract_dir * retract_distance
-        rospy.loginfo(f"[Phase 0.5] Retracting {retract_distance*1000:.0f}mm along "
-                      f"{retract_dir} to disengage hook")
+        updated_yaw = self.get_end_effector_yaw()
+        if updated_yaw is not None:
+            current_yaw = updated_yaw
 
-        success = self.active_position_convergence(
-            retract_target, target_yaw=current_yaw,
-            pos_thresh=0.03, yaw_thresh=0.1, timeout=10.0,
-            max_linear_vel=0.03
-        )
-        if (not success and
-                (not self._loose_position_reached(retract_target,
-                                                  RETURN_LOOSE_RETRACT_TOLERANCE,
-                                                  "[Phase 0.5]") or
-                 not self._return_attitude_safe("[Phase 0.5]"))):
-            return 'failed'
-        rospy.sleep(0.5)
-
-        # Phase 1: Return to start height (hook is already disengaged in Phase 0.5).
-        # The no-breakaway timeout path may have already climbed before retract;
-        # this call then only verifies/finishes the height recovery.
+        # Phase 1: Return to start height (hook is already disengaged in Phase 0).
         if not self._ascend_to_return_height(
                 userdata, start_pos, current_yaw, "[Phase 1]",
                 max_linear_vel=0.05):

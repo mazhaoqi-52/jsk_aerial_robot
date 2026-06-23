@@ -71,7 +71,7 @@ TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
 # Final insertion is defined by the hook contact point, not by virtual EE descent.
 # Positive clearance keeps the hook contact above the box top; negative means
 # intentionally inserting below the box top.
-HOOK_CONTACT_INSERT_CLEARANCE = 0.02
+HOOK_CONTACT_INSERT_CLEARANCE = 0.03
 # Reject "contact" detections that stop far above the intended hook height.
 HOOK_CONTACT_CLEARANCE_TOLERANCE = 0.06
 # Final insertion is complete only when the hook is within this clearance band
@@ -2106,9 +2106,11 @@ def log_towing_preflight(module_ids, real_machine, simulation):
 def main():
     rospy.init_node('formation_load_towing')
 
-    global TOWING_DISTANCE, TOWING_MAX_FORCE
+    global TOWING_DISTANCE, TOWING_MAX_FORCE, HOOK_CONTACT_INSERT_CLEARANCE
     TOWING_DISTANCE = rospy.get_param("~towing_distance", 0.6)
     TOWING_MAX_FORCE = rospy.get_param("~towing_force", 5.0)
+    HOOK_CONTACT_INSERT_CLEARANCE = float(rospy.get_param(
+        "~hook_contact_insert_clearance", HOOK_CONTACT_INSERT_CLEARANCE))
     module_ids = _parse_module_ids(rospy.get_param("~module_ids", ""))
     real_machine = _as_bool(rospy.get_param("~real_machine", False))
     simulation = _as_bool(rospy.get_param("~simulation", True))

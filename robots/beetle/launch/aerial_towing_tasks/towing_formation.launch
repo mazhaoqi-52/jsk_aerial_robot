@@ -36,6 +36,8 @@
        doc="Initial towing force (N), ramps adaptively"/>
   <arg name="hook_contact_insert_clearance" default="0.03"
        doc="Hook contact clearance above load top at insertion (m)"/>
+  <arg name="towing_pitch_torque_task_weight" default="0.18"
+       doc="Unified QP task weight for towing pitch torque compensation"/>
   <arg name="stall_window_time" default="5.0"
        doc="Stall watchdog window duration (s)"/>
   <arg name="stall_timeout_count" default="4"
@@ -57,6 +59,7 @@
     <param name="towing_distance" value="$(arg towing_distance)"/>
     <param name="towing_force"    value="$(arg towing_force)"/>
     <param name="hook_contact_insert_clearance" value="$(arg hook_contact_insert_clearance)"/>
+    <param name="towing_pitch_torque_task_weight" value="$(arg towing_pitch_torque_task_weight)"/>
     <param name="stall_window_time" value="$(arg stall_window_time)"/>
     <param name="stall_timeout_count" value="$(arg stall_timeout_count)"/>
     <param name="stall_min_force_ratio" value="$(arg stall_min_force_ratio)"/>

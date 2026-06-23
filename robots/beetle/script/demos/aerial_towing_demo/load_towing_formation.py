@@ -91,7 +91,7 @@ MIN_SPLIT_INSERTION_DROP = 0.10
 
 # Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Horizontal force weights are
 # rebuilt from the actual body-frame towing direction before publishing.
-TOWING_TASK_WRENCH_WEIGHTS = [1.0, 0.10, 0.0, 0.08, 0.08, 0.01]
+TOWING_TASK_WRENCH_WEIGHTS = [1.0, 0.10, 0.0, 0.08, 0.18, 0.01]
 TOWING_PRIMARY_FORCE_TASK_WEIGHT = 1.0
 TOWING_SECONDARY_FORCE_TASK_WEIGHT = 0.10
 TOWING_TASK_PRIORITY_WEIGHT_FLOOR = 0.55
@@ -2111,6 +2111,8 @@ def main():
     TOWING_MAX_FORCE = rospy.get_param("~towing_force", 5.0)
     HOOK_CONTACT_INSERT_CLEARANCE = float(rospy.get_param(
         "~hook_contact_insert_clearance", HOOK_CONTACT_INSERT_CLEARANCE))
+    TOWING_TASK_WRENCH_WEIGHTS[4] = float(rospy.get_param(
+        "~towing_pitch_torque_task_weight", TOWING_TASK_WRENCH_WEIGHTS[4]))
     module_ids = _parse_module_ids(rospy.get_param("~module_ids", ""))
     real_machine = _as_bool(rospy.get_param("~real_machine", False))
     simulation = _as_bool(rospy.get_param("~simulation", True))
@@ -2124,6 +2126,7 @@ def main():
     rospy.loginfo(f"Retract distance: {RETRACT_DISTANCE*1000:.0f}mm")
     rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
     rospy.loginfo(f"Max towing force: {TOWING_MAX_FORCE}N (adaptive from 0N)")
+    rospy.loginfo(f"Towing pitch torque task weight: {TOWING_TASK_WRENCH_WEIGHTS[4]:.2f}")
     rospy.loginfo("=" * 60)
     log_towing_preflight(module_ids, real_machine, simulation)
 

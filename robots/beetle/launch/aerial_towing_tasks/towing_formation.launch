@@ -38,6 +38,8 @@
        doc="Hook contact clearance above load top at insertion (m)"/>
   <arg name="towing_pitch_torque_task_weight" default="0.18"
        doc="Unified QP task weight for towing pitch torque compensation"/>
+  <arg name="towing_pitch_torque_task_weight_floor" default="0.10"
+       doc="Minimum unified QP task weight for towing pitch torque compensation during guard scaling"/>
   <arg name="stall_window_time" default="5.0"
        doc="Stall watchdog window duration (s)"/>
   <arg name="stall_timeout_count" default="4"
@@ -48,6 +50,10 @@
        doc="Load travel before breakaway force relief starts (m)"/>
   <arg name="breakaway_force_floor_ratio" default="0.60"
        doc="Temporary floor as a ratio of the force when load motion starts"/>
+  <arg name="stable_rolling_distance" default="0.25"
+       doc="Load travel before post-breakaway rolling is treated as stable (m)"/>
+  <arg name="stable_rolling_force_floor_ratio" default="0.85"
+       doc="Temporary force floor as a ratio of breakaway force before stable rolling"/>
   <arg name="overspeed_force_relief_time" default="10.0"
        doc="Time constant for velocity-error towing force relief (s)"/>
   <arg name="unload_contact_lead" default="0.03"
@@ -66,11 +72,14 @@
     <param name="towing_force"    value="$(arg towing_force)"/>
     <param name="hook_contact_insert_clearance" value="$(arg hook_contact_insert_clearance)"/>
     <param name="towing_pitch_torque_task_weight" value="$(arg towing_pitch_torque_task_weight)"/>
+    <param name="towing_pitch_torque_task_weight_floor" value="$(arg towing_pitch_torque_task_weight_floor)"/>
     <param name="stall_window_time" value="$(arg stall_window_time)"/>
     <param name="stall_timeout_count" value="$(arg stall_timeout_count)"/>
     <param name="stall_min_force_ratio" value="$(arg stall_min_force_ratio)"/>
     <param name="breakaway_relief_min_distance" value="$(arg breakaway_relief_min_distance)"/>
     <param name="breakaway_force_floor_ratio" value="$(arg breakaway_force_floor_ratio)"/>
+    <param name="stable_rolling_distance" value="$(arg stable_rolling_distance)"/>
+    <param name="stable_rolling_force_floor_ratio" value="$(arg stable_rolling_force_floor_ratio)"/>
     <param name="overspeed_force_relief_time" value="$(arg overspeed_force_relief_time)"/>
     <param name="unload_contact_lead" value="$(arg unload_contact_lead)"/>
     <param name="unload_force_rate" value="$(arg unload_force_rate)"/>

@@ -95,6 +95,7 @@ TOWING_TASK_WRENCH_WEIGHTS = [1.0, 0.10, 0.0, 0.08, 0.18, 0.01]
 TOWING_PRIMARY_FORCE_TASK_WEIGHT = 1.0
 TOWING_SECONDARY_FORCE_TASK_WEIGHT = 0.10
 TOWING_TASK_PRIORITY_WEIGHT_FLOOR = 0.55
+TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR = 0.10
 TOWING_FORCE_RAMP_TIME = 25.0
 TOWING_STALL_WINDOW_TIME = 5.0
 TOWING_STALL_TIMEOUT_COUNT = 4
@@ -125,6 +126,8 @@ TOWING_BREAKAWAY_FORCE_HOLD_TIME = 0.8
 TOWING_BREAKAWAY_FORCE_RELIEF_RATE = 3.0
 TOWING_BREAKAWAY_RELIEF_MIN_DISTANCE = 0.05
 TOWING_BREAKAWAY_FORCE_FLOOR_RATIO = 0.60
+TOWING_STABLE_ROLLING_DISTANCE = 0.25
+TOWING_STABLE_ROLLING_FORCE_FLOOR_RATIO = 0.85
 TOWING_OVERSPEED_FORCE_RELIEF_TIME = 10.0
 TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.25
 TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
@@ -156,6 +159,11 @@ def build_towing_task_wrench_weights(force_body=None, task_scale=1.0):
     if primary_axis is not None and task_scale > 0.0:
         scaled_weights[primary_axis] = max(
             scaled_weights[primary_axis], TOWING_TASK_PRIORITY_WEIGHT_FLOOR)
+    pitch_floor = min(
+        float(TOWING_TASK_WRENCH_WEIGHTS[4]),
+        float(TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR))
+    if pitch_floor > 0.0 and task_scale > 0.0:
+        scaled_weights[4] = max(scaled_weights[4], pitch_floor)
     return scaled_weights
 
 
@@ -225,6 +233,8 @@ class LinearTowingTrajectoryGenerator:
         self.breakaway_candidate_detected = False
         self.breakaway_candidate_time = None
         self.breakaway_candidate_force = None
+        self.stable_rolling_detected = False
+        self.stable_rolling_time = None
         self.breakaway_force_ratio = 0.65
         self.overspeed_breakaway_force_ratio = 0.35
         self.continue_force_floor_ratio = 0.35
@@ -239,6 +249,15 @@ class LinearTowingTrajectoryGenerator:
             0.0, min(1.0, float(rospy.get_param(
                 "~breakaway_force_floor_ratio",
                 TOWING_BREAKAWAY_FORCE_FLOOR_RATIO))))
+        self.stable_rolling_distance = max(
+            self.breakaway_relief_min_distance,
+            float(rospy.get_param(
+                "~stable_rolling_distance",
+                TOWING_STABLE_ROLLING_DISTANCE)))
+        self.stable_rolling_force_floor_ratio = max(
+            0.0, min(1.0, float(rospy.get_param(
+                "~stable_rolling_force_floor_ratio",
+                TOWING_STABLE_ROLLING_FORCE_FLOOR_RATIO))))
         overspeed_force_relief_time = max(
             0.5, float(rospy.get_param(
                 "~overspeed_force_relief_time",
@@ -281,6 +300,8 @@ class LinearTowingTrajectoryGenerator:
                      f"stall={self.stall_timeout_count}x{self.stall_window_time:.1f}s, "
                      f"relief_dist={self.breakaway_relief_min_distance*1000:.0f}mm, "
                      f"floor={self.breakaway_force_floor_ratio:.2f}x, "
+                     f"stable_roll={self.stable_rolling_distance*1000:.0f}mm/"
+                     f"{self.stable_rolling_force_floor_ratio:.2f}x, "
                      f"speed_relief={self.overspeed_force_relief_rate:.1f}N/s")
 
     def _update_force_guard(self, attitude_rp=None, z_error=0.0, current_time=None,
@@ -430,6 +451,15 @@ class LinearTowingTrajectoryGenerator:
                              f"vel={self.motion_velocity*1000:.0f}mm/s, "
                              f"ff={self.current_force:.1f}N, "
                              f"waiting for {self.breakaway_distance*1000:.0f}mm confirmed travel")
+        elif self.breakaway_detected and not self.stable_rolling_detected:
+            if (motion_distance >= self.stable_rolling_distance and
+                    self.motion_velocity >= low_speed):
+                self.stable_rolling_detected = True
+                self.stable_rolling_time = current_time
+                rospy.loginfo(f"[Towing] Stable rolling confirmed: "
+                             f"dist={motion_distance*1000:.0f}mm, "
+                             f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                             f"ff={self.current_force:.1f}N")
 
         # Velocity profile with ramp-up and ramp-down
         remaining_distance = self.target_distance - motion_distance
@@ -489,6 +519,10 @@ class LinearTowingTrajectoryGenerator:
         breakaway_floor_force = 0.0
         if self.breakaway_force is not None:
             breakaway_floor_force = self.breakaway_force * self.breakaway_force_floor_ratio
+        rolling_floor_force = 0.0
+        if self.breakaway_force is not None and not self.stable_rolling_detected:
+            rolling_floor_force = (
+                self.breakaway_force * self.stable_rolling_force_floor_ratio)
         initial_breakaway_phase = (
             self.breakaway_detected and
             motion_distance < self.breakaway_relief_min_distance + self.breakaway_distance)
@@ -512,7 +546,9 @@ class LinearTowingTrajectoryGenerator:
                                  else self.continue_force_floor_ratio))
             floor_force = min(
                 prev_force,
-                max(self.max_force * floor_ratio, breakaway_floor_force))
+                max(self.max_force * floor_ratio,
+                    breakaway_floor_force,
+                    rolling_floor_force))
             self.breakaway_relief_target = max(prev_force * relief_ratio,
                                                floor_force)
             self.breakaway_relief_applied = True
@@ -579,6 +615,10 @@ class LinearTowingTrajectoryGenerator:
                 self.current_force = max(
                     self.current_force,
                     min(self.max_force, breakaway_floor_force))
+            if (rolling_floor_force > 0.0 and not attitude_relief_requested):
+                self.current_force = max(
+                    self.current_force,
+                    min(self.max_force, rolling_floor_force))
             self.current_force = min(self.max_force, max(0.0, self.current_force))
 
         progress_ratio = motion_distance / max(self.target_distance, 1e-6)
@@ -625,6 +665,7 @@ class LinearTowingTrajectoryGenerator:
             'motion_velocity': self.motion_velocity,
             'breakaway_detected': self.breakaway_detected,
             'breakaway_candidate': self.breakaway_candidate_detected,
+            'stable_rolling': self.stable_rolling_detected,
             'overspeed': overspeed,
             'severe_overspeed': severe_overspeed,
             'force_guard': self.force_guard_state,
@@ -1846,7 +1887,9 @@ class TowingWithFeedforwardState(TowingStateBase):
 
             task_weight_text = ""
             if task_weights is not None:
-                task_weight_text = f"task_w_xy=({task_weights[0]:.2f},{task_weights[1]:.2f}), "
+                task_weight_text = (
+                    f"task_w_xy=({task_weights[0]:.2f},{task_weights[1]:.2f}), "
+                    f"task_w_ty={task_weights[4]:.2f}, ")
             rospy.loginfo_throttle(
                 2.0,
                 f"[Towing FF] ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N, "
@@ -1854,7 +1897,8 @@ class TowingWithFeedforwardState(TowingStateBase):
                 f"guard={state_info['force_guard']}, task_scale={state_info['task_weight_scale']:.2f}, "
                 f"{task_weight_text}"
                 f"vel={state_info['motion_velocity']*1000:.0f}mm/s, "
-                f"breakaway={state_info['breakaway_detected']}, overspeed={state_info['overspeed']}, "
+                f"breakaway={state_info['breakaway_detected']}, "
+                f"stable_roll={state_info['stable_rolling']}, overspeed={state_info['overspeed']}, "
                 f"severe={state_info['severe_overspeed']}, "
                 f"mode={'unified' if unified_mode else 'LF'}, "
                 f"cmd_frame={ff_frame}, tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm")
@@ -2176,12 +2220,18 @@ def main():
     rospy.init_node('formation_load_towing')
 
     global TOWING_DISTANCE, TOWING_MAX_FORCE, HOOK_CONTACT_INSERT_CLEARANCE
+    global TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR
     TOWING_DISTANCE = rospy.get_param("~towing_distance", 0.6)
     TOWING_MAX_FORCE = rospy.get_param("~towing_force", 5.0)
     HOOK_CONTACT_INSERT_CLEARANCE = float(rospy.get_param(
         "~hook_contact_insert_clearance", HOOK_CONTACT_INSERT_CLEARANCE))
-    TOWING_TASK_WRENCH_WEIGHTS[4] = float(rospy.get_param(
-        "~towing_pitch_torque_task_weight", TOWING_TASK_WRENCH_WEIGHTS[4]))
+    TOWING_TASK_WRENCH_WEIGHTS[4] = max(0.0, float(rospy.get_param(
+        "~towing_pitch_torque_task_weight", TOWING_TASK_WRENCH_WEIGHTS[4])))
+    requested_pitch_floor = float(rospy.get_param(
+        "~towing_pitch_torque_task_weight_floor",
+        TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR))
+    TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR = max(
+        0.0, min(TOWING_TASK_WRENCH_WEIGHTS[4], requested_pitch_floor))
     module_ids = _parse_module_ids(rospy.get_param("~module_ids", ""))
     real_machine = _as_bool(rospy.get_param("~real_machine", False))
     simulation = _as_bool(rospy.get_param("~simulation", True))
@@ -2195,7 +2245,9 @@ def main():
     rospy.loginfo(f"Retract distance: {RETRACT_DISTANCE*1000:.0f}mm")
     rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
     rospy.loginfo(f"Max towing force: {TOWING_MAX_FORCE}N (adaptive from 0N)")
-    rospy.loginfo(f"Towing pitch torque task weight: {TOWING_TASK_WRENCH_WEIGHTS[4]:.2f}")
+    rospy.loginfo(
+        f"Towing pitch torque task weight: {TOWING_TASK_WRENCH_WEIGHTS[4]:.2f} "
+        f"(floor={TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR:.2f})")
     rospy.loginfo("=" * 60)
     log_towing_preflight(module_ids, real_machine, simulation)
 

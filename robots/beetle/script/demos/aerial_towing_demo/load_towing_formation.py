@@ -222,6 +222,9 @@ class LinearTowingTrajectoryGenerator:
         self.breakaway_time = None
         self.breakaway_reason = None
         self.breakaway_force = None
+        self.breakaway_candidate_detected = False
+        self.breakaway_candidate_time = None
+        self.breakaway_candidate_force = None
         self.breakaway_force_ratio = 0.65
         self.overspeed_breakaway_force_ratio = 0.35
         self.continue_force_floor_ratio = 0.35
@@ -408,16 +411,25 @@ class LinearTowingTrajectoryGenerator:
             early_motion = (
                 motion_distance >= self.early_breakaway_distance and
                 self.motion_velocity >= self.early_breakaway_velocity)
-            if confirmed_motion or early_motion:
+            if confirmed_motion:
                 self.breakaway_detected = True
                 self.breakaway_time = current_time
-                self.breakaway_reason = "confirmed" if confirmed_motion else "early"
+                self.breakaway_reason = "confirmed"
                 self.breakaway_force = self.current_force
-                rospy.loginfo(f"[Towing] Load motion detected ({self.breakaway_reason}): "
+                rospy.loginfo(f"[Towing] Load breakaway confirmed: "
                              f"dist={motion_distance*1000:.0f}mm, "
                              f"vel={self.motion_velocity*1000:.0f}mm/s, "
                              f"ff={self.current_force:.1f}N, "
-                             f"relief after {self.breakaway_relief_min_distance*1000:.0f}mm")
+                             f"relief_min={self.breakaway_relief_min_distance*1000:.0f}mm")
+            elif early_motion and not self.breakaway_candidate_detected:
+                self.breakaway_candidate_detected = True
+                self.breakaway_candidate_time = current_time
+                self.breakaway_candidate_force = self.current_force
+                rospy.loginfo(f"[Towing] Load motion candidate: "
+                             f"dist={motion_distance*1000:.0f}mm, "
+                             f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                             f"ff={self.current_force:.1f}N, "
+                             f"waiting for {self.breakaway_distance*1000:.0f}mm confirmed travel")
 
         # Velocity profile with ramp-up and ramp-down
         remaining_distance = self.target_distance - motion_distance
@@ -612,6 +624,7 @@ class LinearTowingTrajectoryGenerator:
             'current_force': self.current_force,
             'motion_velocity': self.motion_velocity,
             'breakaway_detected': self.breakaway_detected,
+            'breakaway_candidate': self.breakaway_candidate_detected,
             'overspeed': overspeed,
             'severe_overspeed': severe_overspeed,
             'force_guard': self.force_guard_state,
@@ -1611,7 +1624,8 @@ class TowingWithFeedforwardState(TowingStateBase):
             f"target_xy_err={target_xy_error*1000:.0f}mm, "
             f"{load_text}, ff={np.linalg.norm(ff_world):.1f}N, "
             f"guard={state_info['force_guard']}, "
-            f"breakaway={state_info['breakaway_detected']}"
+            f"breakaway={state_info['breakaway_detected']}, "
+            f"candidate={state_info.get('breakaway_candidate', False)}"
         )
         rospy.loginfo(diag_text)
         self.towing_alignment_diag_pub.publish(String(data=diag_text))

@@ -53,6 +53,8 @@
        doc="S-curve force ramp time (s)"/>
   <arg name="push_duration" default="10.0"
        doc="Total pushing hold duration including ramp (s)"/>
+  <arg name="full_force_hold_time" default="2.0"
+       doc="Minimum time to hold after push_force is reached (s)"/>
   <arg name="push_position_lead" default="0.03"
        doc="Small position lead into the wall to maintain contact (m)"/>
   <arg name="retreat_after_push" default="true"/>
@@ -83,6 +85,7 @@
     <param name="push_force"               value="$(arg push_force)"/>
     <param name="force_ramp_time"          value="$(arg force_ramp_time)"/>
     <param name="push_duration"            value="$(arg push_duration)"/>
+    <param name="full_force_hold_time"     value="$(arg full_force_hold_time)"/>
     <param name="push_position_lead"       value="$(arg push_position_lead)"/>
     <param name="retreat_after_push"       value="$(arg retreat_after_push)"/>
     <param name="retreat_distance"         value="$(arg retreat_distance)"/>

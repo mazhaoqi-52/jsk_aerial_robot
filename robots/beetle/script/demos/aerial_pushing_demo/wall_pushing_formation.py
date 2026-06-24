@@ -64,6 +64,7 @@ PUSH_CONTACT_REQUIRED_CYCLES = 8
 PUSH_FORCE = 5.0
 PUSH_FORCE_RAMP_TIME = 3.0
 PUSH_DURATION = 10.0
+PUSH_FULL_FORCE_HOLD_TIME = 2.0
 PUSH_POSITION_LEAD = 0.03
 PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
@@ -493,9 +494,19 @@ class PushWithFeedforwardState(PushingStateBase):
         target_pos = contact_pos + push_dir * PUSH_POSITION_LEAD
 
         control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
+        ramp_time = max(PUSH_FORCE_RAMP_TIME, 1e-3)
+        effective_duration = max(
+            PUSH_DURATION, ramp_time + PUSH_FULL_FORCE_HOLD_TIME)
         rospy.loginfo(
-            "Pushing force %.2fN, ramp %.1fs, duration %.1fs, mode=%s",
-            PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION, control_mode)
+            "Pushing force %.2fN, ramp %.1fs, duration %.1fs, "
+            "full_force_hold %.1fs, effective %.1fs, mode=%s",
+            PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION,
+            PUSH_FULL_FORCE_HOLD_TIME, effective_duration, control_mode)
+        if effective_duration > PUSH_DURATION + 1e-3:
+            rospy.logwarn(
+                "[Pushing] Extending duration to %.1fs so feedforward reaches %.2fN "
+                "and holds for %.1fs",
+                effective_duration, PUSH_FORCE, PUSH_FULL_FORCE_HOLD_TIME)
         rospy.loginfo("Pushing hold target: %s", FormationUtils.format_vec(target_pos))
 
         module_masses = rospy.get_param("~module_masses", None)
@@ -514,10 +525,11 @@ class PushWithFeedforwardState(PushingStateBase):
         start_time = rospy.get_time()
         rate = rospy.Rate(25)
         unified_mode_seen = self.beetle.isUnifiedMode()
+        force_ready_logged = False
 
         while not rospy.is_shutdown():
             elapsed = rospy.get_time() - start_time
-            if elapsed >= PUSH_DURATION:
+            if elapsed >= effective_duration:
                 break
 
             current_pos = self.get_end_effector_position()
@@ -548,8 +560,13 @@ class PushWithFeedforwardState(PushingStateBase):
                     userdata, 'unified_exit', current_pos, maintain_yaw)
                 return 'timeout'
 
-            ramp = smoothstep01(elapsed / max(PUSH_FORCE_RAMP_TIME, 1e-3))
+            ramp = smoothstep01(elapsed / ramp_time)
             ff_world = push_dir * (PUSH_FORCE * ramp)
+            if not force_ready_logged and elapsed >= ramp_time:
+                force_ready_logged = True
+                rospy.loginfo(
+                    "[Pushing] Feedforward reached target %.2fN at %.1fs",
+                    PUSH_FORCE, elapsed)
             ff_force, ff_torque, ff_frame = self._build_pushing_wrench_command(
                 ff_world, unified_mode)
             task_weights = (
@@ -563,11 +580,13 @@ class PushWithFeedforwardState(PushingStateBase):
 
             force_abs, force_norm, _ = self.wall_force_along_push(push_dir)
             wall_force_text = "NA" if force_abs is None else f"{force_abs:.2f}N"
-            progress = min(1.0, elapsed / max(PUSH_DURATION, 1e-3))
+            progress = min(1.0, elapsed / max(effective_duration, 1e-3))
+            full_force_hold = max(0.0, elapsed - ramp_time)
             diag_text = (
-                f"[Pushing FF] t={elapsed:.1f}s/{PUSH_DURATION:.1f}s "
+                f"[Pushing FF] t={elapsed:.1f}s/{effective_duration:.1f}s "
                 f"ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N "
                 f"mag={np.linalg.norm(ff_world):.2f}N wall_force={wall_force_text} "
+                f"full_hold={full_force_hold:.1f}s "
                 f"mode={'unified' if unified_mode else 'LF'} frame={ff_frame} "
                 f"tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm "
                 f"progress={progress*100:.0f}% max_rp={math.degrees(max_rp):.1f}deg")
@@ -694,6 +713,7 @@ def _load_params():
     global PUSH_CONTACT_STALL_LEAD, PUSH_CONTACT_STALL_VELOCITY
     global PUSH_CONTACT_REQUIRED_CYCLES
     global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION
+    global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
     global PUSH_UNLOAD_MIN_DURATION
     global PUSH_CONTACT_DX_FROM_EE, PUSH_CONTACT_DY_FROM_EE, PUSH_CONTACT_DZ_FROM_EE
@@ -713,8 +733,12 @@ def _load_params():
     PUSH_CONTACT_REQUIRED_CYCLES = int(rospy.get_param("~contact_required_cycles", PUSH_CONTACT_REQUIRED_CYCLES))
 
     PUSH_FORCE = float(rospy.get_param("~push_force", PUSH_FORCE))
-    PUSH_FORCE_RAMP_TIME = float(rospy.get_param("~force_ramp_time", PUSH_FORCE_RAMP_TIME))
-    PUSH_DURATION = float(rospy.get_param("~push_duration", PUSH_DURATION))
+    PUSH_FORCE_RAMP_TIME = max(
+        0.1, float(rospy.get_param("~force_ramp_time", PUSH_FORCE_RAMP_TIME)))
+    PUSH_DURATION = max(0.1, float(rospy.get_param("~push_duration", PUSH_DURATION)))
+    PUSH_FULL_FORCE_HOLD_TIME = max(
+        0.0, float(rospy.get_param(
+            "~full_force_hold_time", PUSH_FULL_FORCE_HOLD_TIME)))
     PUSH_POSITION_LEAD = float(rospy.get_param("~push_position_lead", PUSH_POSITION_LEAD))
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
@@ -746,8 +770,10 @@ def main():
         "Approach: distance=%.3fm, speed=%.3fm/s, contact_wrench=%.2fN",
         PUSH_APPROACH_DISTANCE, PUSH_APPROACH_SPEED, PUSH_CONTACT_WRENCH_THRESHOLD)
     rospy.loginfo(
-        "Push: force=%.2fN, ramp=%.1fs, duration=%.1fs, lead=%.0fmm",
-        PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION, PUSH_POSITION_LEAD * 1000.0)
+        "Push: force=%.2fN, ramp=%.1fs, duration=%.1fs, "
+        "full_force_hold=%.1fs, lead=%.0fmm",
+        PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION,
+        PUSH_FULL_FORCE_HOLD_TIME, PUSH_POSITION_LEAD * 1000.0)
     rospy.loginfo("=" * 60)
     log_pushing_preflight(module_ids, real_machine, simulation)
 

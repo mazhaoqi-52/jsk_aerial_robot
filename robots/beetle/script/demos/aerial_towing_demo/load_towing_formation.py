@@ -72,8 +72,6 @@ TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
 # Positive clearance keeps the hook contact above the box top; negative means
 # intentionally inserting below the box top.
 HOOK_CONTACT_INSERT_CLEARANCE = 0.03
-# Reject "contact" detections that stop far above the intended hook height.
-HOOK_CONTACT_CLEARANCE_TOLERANCE = 0.06
 # Final insertion is complete only when the hook is within this clearance band
 # above the intended hook contact height.
 HOOK_INSERTION_DEPTH_TOLERANCE = 0.02
@@ -1234,7 +1232,7 @@ class DescendAndInsertState(TowingStateBase):
                 insertion_pos,
                 insertion_yaw,
                 descent_speed=0.05,
-                contact_detection_remaining=HOOK_CONTACT_CLEARANCE_TOLERANCE
+                contact_detection_remaining=HOOK_INSERTION_DEPTH_TOLERANCE
             )
         else:
             self.log_module_debug_status("[Insertion Debug] before approach descent")
@@ -1245,7 +1243,7 @@ class DescendAndInsertState(TowingStateBase):
                 approach_pos,
                 insertion_yaw,
                 descent_speed=0.05,
-                contact_detection_remaining=HOOK_CONTACT_CLEARANCE_TOLERANCE
+                contact_detection_remaining=HOOK_INSERTION_DEPTH_TOLERANCE
             )
 
             if not success:
@@ -1282,7 +1280,7 @@ class DescendAndInsertState(TowingStateBase):
                 insertion_pos,
                 insertion_yaw,
                 descent_speed=0.03,
-                contact_detection_remaining=HOOK_CONTACT_CLEARANCE_TOLERANCE
+                contact_detection_remaining=HOOK_INSERTION_DEPTH_TOLERANCE
             )
 
         insertion_descent_soft_failed = not success
@@ -1302,8 +1300,8 @@ class DescendAndInsertState(TowingStateBase):
                 self.log_module_debug_status("[Insertion Debug] insertion descent failed")
                 return 'failed'
             rospy.logwarn(
-                "Z descent soft-failed; continuing to hook attempt with planned "
-                "insertion centerline"
+                "Z descent soft-failed; continuing to insertion-depth check "
+                "with planned centerline"
             )
             self.log_module_debug_status("[Insertion Debug] insertion descent soft-failed")
 
@@ -1316,14 +1314,25 @@ class DescendAndInsertState(TowingStateBase):
             f"Achieved hook contact clearance: {achieved_clearance*1000:.1f}mm "
             f"(target={HOOK_CONTACT_INSERT_CLEARANCE*1000:.1f}mm, positive=above box top)"
         )
+        min_allowed_clearance = (
+            HOOK_CONTACT_INSERT_CLEARANCE - HOOK_INSERTION_DEPTH_TOLERANCE
+        )
         max_allowed_clearance = (
             HOOK_CONTACT_INSERT_CLEARANCE + HOOK_INSERTION_DEPTH_TOLERANCE
         )
-        insertion_clearance_ok = achieved_clearance <= max_allowed_clearance
+        insertion_clearance_ok = (
+            min_allowed_clearance <= achieved_clearance <= max_allowed_clearance
+        )
+        final_clearance = achieved_clearance
         if not insertion_clearance_ok:
+            depth_reason = (
+                "too deep" if achieved_clearance < min_allowed_clearance
+                else "too shallow")
             rospy.logwarn(
-                f"Hook insertion incomplete: clearance={achieved_clearance*1000:.1f}mm "
-                f"> allowed={max_allowed_clearance*1000:.1f}mm; continuing to hook/tow attempt"
+                f"Hook insertion {depth_reason}: clearance={achieved_clearance*1000:.1f}mm "
+                f"outside [{min_allowed_clearance*1000:.1f}, "
+                f"{max_allowed_clearance*1000:.1f}]mm; "
+                "retrying at planned insertion height"
             )
             self.log_module_debug_status("[Insertion Debug] hook clearance failed")
 
@@ -1335,12 +1344,12 @@ class DescendAndInsertState(TowingStateBase):
             contact_pos[2] = achieved_pos[2]
         else:
             rospy.logwarn(
-                f"Using planned insertion Z={contact_pos[2]:.3f}m for hook attempt "
+                f"Using planned insertion Z={contact_pos[2]:.3f}m for stabilization "
                 f"(achieved_Z={achieved_pos[2]:.3f}m)"
             )
 
-        # Stabilize at the planned insertion XY. If insertion was incomplete,
-        # keep the planned Z so the next hook phase can still attempt engagement.
+        # Stabilize at the planned insertion XY/Z once more before deciding
+        # whether the hook is inside the allowed depth band.
         rospy.loginfo("Stabilizing at insertion contact position...")
         self.active_stabilization_wait(contact_pos, insertion_yaw, duration=2.0)
         settled_contact_pos = self.get_end_effector_position()
@@ -1351,25 +1360,43 @@ class DescendAndInsertState(TowingStateBase):
             settled_clearance = (
                 settled_contact_pos[2] + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
             )
+            final_clearance = settled_clearance
             rospy.loginfo(
                 f"Settled hook contact clearance: {settled_clearance*1000:.1f}mm "
-                f"(allowed={max_allowed_clearance*1000:.1f}mm)"
+                f"(allowed=[{min_allowed_clearance*1000:.1f}, "
+                f"{max_allowed_clearance*1000:.1f}]mm)"
             )
-            if settled_clearance <= max_allowed_clearance:
+            if min_allowed_clearance <= settled_clearance <= max_allowed_clearance:
                 contact_pos[2] = settled_contact_pos[2]
                 insertion_clearance_ok = True
             else:
                 insertion_clearance_ok = False
                 contact_pos[2] = insertion_pos[2]
+                depth_reason = (
+                    "too deep" if settled_clearance < min_allowed_clearance
+                    else "too shallow")
                 rospy.logwarn(
-                    f"Hook insertion still shallow after stabilization; keeping planned "
-                    f"insertion Z={contact_pos[2]:.3f}m for hook attempt "
+                    f"Hook insertion still {depth_reason} after stabilization; keeping planned "
+                    f"insertion Z={contact_pos[2]:.3f}m for diagnostics "
                     f"(measured_Z={settled_contact_pos[2]:.3f}m)"
                 )
             rospy.loginfo(
                 f"Insertion contact pose locked at {FormationUtils.format_vec(contact_pos)} "
                 f"(measured={FormationUtils.format_vec(settled_contact_pos)})"
             )
+
+        if not insertion_clearance_ok:
+            depth_reason = (
+                "too deep" if final_clearance < min_allowed_clearance
+                else "too shallow")
+            rospy.logwarn(
+                f"Hook insertion remains {depth_reason} after calibration: "
+                f"clearance={final_clearance*1000:.1f}mm, "
+                f"allowed=[{min_allowed_clearance*1000:.1f}, "
+                f"{max_allowed_clearance*1000:.1f}]mm. "
+                "Proceeding to hook/tow by experiment policy; watch for EE middle-section contact."
+            )
+            self.log_module_debug_status("[Insertion Debug] hook clearance failed")
 
         # Calculate hook position (retract to hook edge)
         hook_pos = contact_pos.copy()
@@ -1378,8 +1405,14 @@ class DescendAndInsertState(TowingStateBase):
         userdata.hook_position = hook_pos
         userdata.hook_yaw = insertion_yaw
 
-        if insertion_descent_soft_failed or not insertion_clearance_ok:
-            rospy.logwarn("Insertion incomplete; proceeding to hook/tow attempt")
+        if insertion_descent_soft_failed and not insertion_clearance_ok:
+            rospy.logwarn(
+                "Z descent soft-failed and insertion depth is outside the preferred band; "
+                "proceeding to hook/tow")
+        elif insertion_descent_soft_failed:
+            rospy.logwarn("Z descent soft-failed but hook depth is acceptable; proceeding")
+        elif not insertion_clearance_ok:
+            rospy.logwarn("Insertion depth is outside the preferred band; proceeding to hook/tow")
         else:
             rospy.loginfo("Insertion complete")
         return 'succeeded'

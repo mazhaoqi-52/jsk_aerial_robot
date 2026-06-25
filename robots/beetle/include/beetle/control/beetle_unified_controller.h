@@ -32,11 +32,13 @@
 // header (e.g. ninja) do not need to link against OsqpEigen.
 namespace OsqpEigen { class Solver; }
 #include <spinal/FourAxisCommand.h>
+#include <spinal/MotorInfo.h>
 #include <spinal/Pwms.h>
 #include <spinal/TorqueAllocationMatrixInv.h>
 #include <spinal/RollPitchYawTerms.h>
 #include <sensor_msgs/JointState.h>
 #include <geometry_msgs/WrenchStamped.h>
+#include <std_msgs/Float32.h>
 #include <std_msgs/Float32MultiArray.h>
 #include <std_msgs/UInt8.h>
 #include <tf/LinearMath/Vector3.h>
@@ -307,7 +309,11 @@ private:
   ros::Publisher formation_wrench_pub_;
   ros::Publisher formation_vectoring_f_pub_;
   ros::Publisher interface_load_pub_;
+  ros::Publisher qp_pwm_pred_pub_;
   ros::Publisher pinv_pwm_pred_pub_;
+  ros::Publisher qp_thrust_margin_pub_;
+  ros::Publisher pinv_thrust_margin_pub_;
+  ros::Subscriber battery_voltage_sub_;
 
   // Internal methods
   Eigen::MatrixXd buildFormationAllocationMatrix(
@@ -428,9 +434,19 @@ private:
                                        const std::vector<std::pair<int, int>>& interface_cuts,
                                        const Eigen::VectorXd& vectoring_f,
                                        const Eigen::VectorXd& interface_load_reference);
-  void publishPseudoinversePwmPrediction(const Eigen::VectorXd& pinv_vectoring_f,
-                                         const std::vector<int>& assembled_ids);
+  void publishAllocationPwmPredictions(const Eigen::VectorXd& qp_vectoring_f,
+                                       const Eigen::VectorXd& pinv_vectoring_f,
+                                       const std::vector<int>& assembled_ids);
+  bool buildPwmPredictionMsg(const Eigen::VectorXd& vectoring_f,
+                             const std::vector<int>& assembled_ids,
+                             spinal::Pwms& msg) const;
+  bool buildThrustMarginMsg(const Eigen::VectorXd& vectoring_f,
+                            const std::vector<int>& assembled_ids,
+                            std_msgs::Float32MultiArray& msg) const;
+  void batteryVoltageCallback(const std_msgs::Float32ConstPtr& msg);
   uint16_t predictPwmFromThrust(double thrust) const;
+  double convertThrustToPwmDuty(double thrust) const;
+  double predictThrustLimit() const;
 
   double getModuleAllocationWeight(int module_id) const;
 
@@ -438,6 +454,11 @@ private:
   double last_pinv_pwm_pred_pub_time_;
   double pinv_pwm_min_;
   double pinv_pwm_max_;
+  double pinv_pwm_min_thrust_;
+  int pinv_pwm_conversion_mode_;
+  std::vector<spinal::MotorInfo> pinv_motor_info_;
+  double battery_voltage_;
+  bool battery_voltage_received_;
 
   void rosParamInit();
 };

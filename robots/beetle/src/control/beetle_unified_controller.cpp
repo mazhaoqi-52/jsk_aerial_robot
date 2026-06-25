@@ -74,6 +74,10 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    last_pinv_pwm_pred_pub_time_(-1.0),
 	    pinv_pwm_min_(0.5),
 	    pinv_pwm_max_(0.85),
+	    pinv_pwm_min_thrust_(0.0),
+	    pinv_pwm_conversion_mode_(-1),
+	    battery_voltage_(0.0),
+	    battery_voltage_received_(false),
 	    qp_solver_(std::make_unique<OsqpEigen::Solver>())
 {
 }
@@ -108,7 +112,12 @@ void BeetleUnifiedController::initialize(
   formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("unified_control/formation_wrench", 1);
   formation_vectoring_f_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/vectoring_force", 1);
   interface_load_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/interface_load", 1);
+  qp_pwm_pred_pub_ = nh_.advertise<spinal::Pwms>("unified_control/qp_pwm_pred", 1);
   pinv_pwm_pred_pub_ = nh_.advertise<spinal::Pwms>("unified_control/pinv_pwm_pred", 1);
+  qp_thrust_margin_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/qp_thrust_margin", 1);
+  pinv_thrust_margin_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/pinv_thrust_margin", 1);
+  battery_voltage_sub_ = nh_.subscribe("battery_voltage_status", 1,
+                                       &BeetleUnifiedController::batteryVoltageCallback, this);
 
   ROS_INFO("[UnifiedCtrl] Initialized: motor_per_module=%d, gimbal_dof=%d, rotor_coef=%d, gimbal_calc_in_fc=%d",
            motor_num_per_module_, gimbal_dof_, rotor_coef_, gimbal_calc_in_fc_);
@@ -157,6 +166,32 @@ void BeetleUnifiedController::rosParamInit()
   ros::NodeHandle motor_nh(nh_, "motor_info");
   motor_nh.param<double>("min_pwm", pinv_pwm_min_, 0.5);
   motor_nh.param<double>("max_pwm", pinv_pwm_max_, 0.85);
+  motor_nh.param<double>("min_thrust", pinv_pwm_min_thrust_, 0.0);
+  motor_nh.param<int>("pwm_conversion_mode", pinv_pwm_conversion_mode_, -1);
+
+  int vel_ref_num = 0;
+  motor_nh.param<int>("vel_ref_num", vel_ref_num, 0);
+  pinv_motor_info_.clear();
+  pinv_motor_info_.reserve(std::max(0, vel_ref_num));
+  for (int i = 0; i < vel_ref_num; i++) {
+    std::stringstream ss;
+    ss << i + 1;
+    ros::NodeHandle ref_nh(motor_nh, "ref" + ss.str());
+
+    spinal::MotorInfo info;
+    double val = 0.0;
+    ref_nh.param<double>("voltage", val, 0.0);
+    info.voltage = val;
+    ref_nh.param<double>("max_thrust", val, 0.0);
+    info.max_thrust = val;
+    for (int j = 0; j < 5; j++) {
+      std::stringstream ss2;
+      ss2 << j;
+      ref_nh.param<double>("polynominal" + ss2.str(), val, 0.0);
+      info.polynominal[j] = val;
+    }
+    pinv_motor_info_.push_back(info);
+  }
 
   alloc_priority_tolerances_ = Eigen::VectorXd::Zero(6);
   XmlRpc::XmlRpcValue priority_tolerances;
@@ -559,9 +594,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         alloc_rate_weight_, alloc_lateral_rate_weight_, alloc_rate_limit_,
         alloc_direction_rate_limit_rad_ * 180.0 / M_PI);
   }
-  const Eigen::VectorXd pinv_vectoring_f =
+  Eigen::VectorXd pinv_vectoring_f =
       integrated_map_inv_ * (control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
-  publishPseudoinversePwmPrediction(pinv_vectoring_f, assembled_ids);
   Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
   Eigen::MatrixXd interface_load_matrix;
   std::vector<std::pair<int, int>> interface_cuts;
@@ -656,6 +690,9 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       target_vectoring_f_ = pinv_vectoring_f;
     }
   }
+  pinv_vectoring_f =
+      integrated_map_inv_ * (control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
+  publishAllocationPwmPredictions(target_vectoring_f_, pinv_vectoring_f, assembled_ids);
 
   // Target attitude for spinal inner loop is the operator's commanded attitude
   // (navigator->target_rpy_), NOT atan2(target_acc) derived from XY-PID.
@@ -980,29 +1017,159 @@ void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
       ss.str().c_str());
 }
 
-uint16_t BeetleUnifiedController::predictPwmFromThrust(double thrust) const
+void BeetleUnifiedController::batteryVoltageCallback(const std_msgs::Float32ConstPtr& msg)
+{
+  if (!msg || !std::isfinite(msg->data) || msg->data <= 0.0f) return;
+  battery_voltage_ = msg->data;
+  battery_voltage_received_ = true;
+}
+
+double BeetleUnifiedController::convertThrustToPwmDuty(double thrust) const
 {
   if (!std::isfinite(thrust)) thrust = 0.0;
-  const double t_max = std::max(alloc_t_max_, 1e-6);
-  const double ratio = std::max(0.0, std::min(thrust / t_max, 1.0));
+  thrust = std::max(0.0, thrust);
+
+  double voltage = 0.0;
+  if (battery_voltage_received_ && std::isfinite(battery_voltage_) && battery_voltage_ > 0.0) {
+    voltage = battery_voltage_;
+  } else if (!pinv_motor_info_.empty() &&
+             std::isfinite(pinv_motor_info_.front().voltage) &&
+             pinv_motor_info_.front().voltage > 0.0f) {
+    voltage = pinv_motor_info_.front().voltage;
+  }
+
+  int motor_ref_index = -1;
+  double min_voltage_diff = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < pinv_motor_info_.size(); i++) {
+    const double ref_voltage = pinv_motor_info_[i].voltage;
+    if (!std::isfinite(ref_voltage) || ref_voltage <= 0.0) continue;
+    const double voltage_diff = std::abs(voltage - ref_voltage);
+    if (voltage_diff < min_voltage_diff) {
+      motor_ref_index = static_cast<int>(i);
+      min_voltage_diff = voltage_diff;
+    }
+  }
+
   const double pwm_min = std::max(0.0, pinv_pwm_min_);
   const double pwm_max = std::max(pwm_min, pinv_pwm_max_);
-  const double pwm_norm = pwm_min + (pwm_max - pwm_min) * std::sqrt(ratio);
+
+  if (motor_ref_index >= 0 && voltage > 0.0) {
+    const spinal::MotorInfo& info = pinv_motor_info_[motor_ref_index];
+    double v_factor = 1.0;
+    switch (pinv_pwm_conversion_mode_) {
+      case spinal::MotorInfo::SQRT_MODE:
+        v_factor = (info.voltage / voltage) * (info.voltage / voltage);
+        break;
+      case spinal::MotorInfo::POLYNOMINAL_MODE:
+        v_factor = (info.voltage / voltage) * std::sqrt(info.voltage / voltage);
+        break;
+      default:
+        break;
+    }
+
+    const double scaled_thrust = std::max(0.0, v_factor * thrust);
+    double target_pwm_percent = std::numeric_limits<double>::quiet_NaN();
+    switch (pinv_pwm_conversion_mode_) {
+      case spinal::MotorInfo::SQRT_MODE: {
+        const double c0 = info.polynominal[0];
+        const double c1 = info.polynominal[1];
+        const double c2 = info.polynominal[2];
+        const double disc = c1 * c1 - 40.0 * c2 * (c0 - scaled_thrust);
+        if (std::abs(c2) > 1e-9 && disc >= 0.0) {
+          target_pwm_percent = (-c1 + std::sqrt(disc)) / (2.0 * c2);
+        }
+        break;
+      }
+      case spinal::MotorInfo::POLYNOMINAL_MODE: {
+        const double tenth_scaled_thrust = scaled_thrust * 0.1;
+        target_pwm_percent = info.polynominal[4];
+        for (int j = 3; j >= 0; j--) {
+          target_pwm_percent = target_pwm_percent * tenth_scaled_thrust + info.polynominal[j];
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    if (std::isfinite(target_pwm_percent)) {
+      return target_pwm_percent / 100.0;
+    }
+  }
+
+  const double t_max = std::max(alloc_t_max_, 1e-6);
+  const double ratio = std::max(0.0, std::min(thrust / t_max, 1.0));
+  return pwm_min + (pwm_max - pwm_min) * std::sqrt(ratio);
+}
+
+double BeetleUnifiedController::predictThrustLimit() const
+{
+  double voltage = 0.0;
+  if (battery_voltage_received_ && std::isfinite(battery_voltage_) && battery_voltage_ > 0.0) {
+    voltage = battery_voltage_;
+  } else if (!pinv_motor_info_.empty() &&
+             std::isfinite(pinv_motor_info_.front().voltage) &&
+             pinv_motor_info_.front().voltage > 0.0f) {
+    voltage = pinv_motor_info_.front().voltage;
+  }
+
+  int motor_ref_index = -1;
+  double min_voltage_diff = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < pinv_motor_info_.size(); i++) {
+    const double ref_voltage = pinv_motor_info_[i].voltage;
+    if (!std::isfinite(ref_voltage) || ref_voltage <= 0.0) continue;
+    const double voltage_diff = std::abs(voltage - ref_voltage);
+    if (voltage_diff < min_voltage_diff) {
+      motor_ref_index = static_cast<int>(i);
+      min_voltage_diff = voltage_diff;
+    }
+  }
+
+  if (motor_ref_index >= 0 && voltage > 0.0) {
+    const spinal::MotorInfo& info = pinv_motor_info_[motor_ref_index];
+    double v_factor = 1.0;
+    switch (pinv_pwm_conversion_mode_) {
+      case spinal::MotorInfo::SQRT_MODE:
+        v_factor = (info.voltage / voltage) * (info.voltage / voltage);
+        break;
+      case spinal::MotorInfo::POLYNOMINAL_MODE:
+        v_factor = (info.voltage / voltage) * std::sqrt(info.voltage / voltage);
+        break;
+      default:
+        break;
+    }
+
+    if (std::isfinite(info.max_thrust) && info.max_thrust > 0.0 &&
+        std::isfinite(v_factor) && v_factor > 0.0) {
+      return info.max_thrust / v_factor;
+    }
+  }
+
+  return std::max(alloc_t_max_, 0.0);
+}
+
+uint16_t BeetleUnifiedController::predictPwmFromThrust(double thrust) const
+{
+  double pwm_min = std::max(0.0, pinv_pwm_min_);
+  if (pinv_pwm_min_thrust_ > 0.0) {
+    const double min_thrust_pwm = convertThrustToPwmDuty(pinv_pwm_min_thrust_);
+    if (std::isfinite(min_thrust_pwm) && min_thrust_pwm > 0.0) {
+      pwm_min = min_thrust_pwm;
+    }
+  }
+  const double pwm_max = std::max(pwm_min, pinv_pwm_max_);
+  const double pwm_norm =
+      std::max(pwm_min, std::min(convertThrustToPwmDuty(thrust), pwm_max));
   const double pwm_us = std::max(0.0, std::min(2000.0 * pwm_norm, 65535.0));
   return static_cast<uint16_t>(std::lround(pwm_us));
 }
 
-void BeetleUnifiedController::publishPseudoinversePwmPrediction(
-    const Eigen::VectorXd& pinv_vectoring_f,
-    const std::vector<int>& assembled_ids)
+bool BeetleUnifiedController::buildPwmPredictionMsg(
+    const Eigen::VectorXd& vectoring_f,
+    const std::vector<int>& assembled_ids,
+    spinal::Pwms& msg) const
 {
-  if (pinv_pwm_pred_pub_interval_ <= 0.0 || !pinv_vectoring_f.allFinite()) return;
-
-  const double now = ros::Time::now().toSec();
-  if (last_pinv_pwm_pred_pub_time_ >= 0.0 &&
-      now - last_pinv_pwm_pred_pub_time_ < pinv_pwm_pred_pub_interval_) {
-    return;
-  }
+  if (!vectoring_f.allFinite()) return false;
 
   const int my_id = navigator_ ? navigator_->getMyID() : 0;
   int module_index = -1;
@@ -1012,21 +1179,95 @@ void BeetleUnifiedController::publishPseudoinversePwmPrediction(
       break;
     }
   }
-  if (module_index < 0) return;
+  if (module_index < 0) return false;
 
   const int elems_per_module = motor_num_per_module_ * rotor_coef_;
   const int col_start = module_index * elems_per_module;
-  if (pinv_vectoring_f.size() < col_start + elems_per_module) return;
+  if (vectoring_f.size() < col_start + elems_per_module) return false;
 
-  spinal::Pwms msg;
   msg.motor_value.resize(motor_num_per_module_);
   for (int r = 0; r < motor_num_per_module_; r++) {
     const int idx = col_start + r * rotor_coef_;
-    const double thrust = pinv_vectoring_f.segment(idx, rotor_coef_).norm();
+    const double thrust = vectoring_f.segment(idx, rotor_coef_).norm();
     msg.motor_value[r] = predictPwmFromThrust(thrust);
   }
-  pinv_pwm_pred_pub_.publish(msg);
-  last_pinv_pwm_pred_pub_time_ = now;
+  return true;
+}
+
+bool BeetleUnifiedController::buildThrustMarginMsg(
+    const Eigen::VectorXd& vectoring_f,
+    const std::vector<int>& assembled_ids,
+    std_msgs::Float32MultiArray& msg) const
+{
+  if (!vectoring_f.allFinite()) return false;
+
+  const int my_id = navigator_ ? navigator_->getMyID() : 0;
+  int module_index = -1;
+  for (size_t i = 0; i < assembled_ids.size(); i++) {
+    if (assembled_ids[i] == my_id) {
+      module_index = static_cast<int>(i);
+      break;
+    }
+  }
+  if (module_index < 0) return false;
+
+  const int elems_per_module = motor_num_per_module_ * rotor_coef_;
+  const int col_start = module_index * elems_per_module;
+  if (vectoring_f.size() < col_start + elems_per_module) return false;
+
+  const double thrust_limit = predictThrustLimit();
+  if (!std::isfinite(thrust_limit)) return false;
+
+  msg.data.resize(motor_num_per_module_);
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    const int idx = col_start + r * rotor_coef_;
+    const double thrust = vectoring_f.segment(idx, rotor_coef_).norm();
+    msg.data[r] = static_cast<float>(thrust_limit - thrust);
+  }
+  return true;
+}
+
+void BeetleUnifiedController::publishAllocationPwmPredictions(
+    const Eigen::VectorXd& qp_vectoring_f,
+    const Eigen::VectorXd& pinv_vectoring_f,
+    const std::vector<int>& assembled_ids)
+{
+  if (pinv_pwm_pred_pub_interval_ <= 0.0) return;
+
+  const double now = ros::Time::now().toSec();
+  if (last_pinv_pwm_pred_pub_time_ >= 0.0 &&
+      now - last_pinv_pwm_pred_pub_time_ < pinv_pwm_pred_pub_interval_) {
+    return;
+  }
+
+  bool published = false;
+  if (use_constrained_alloc_) {
+    spinal::Pwms qp_msg;
+    if (buildPwmPredictionMsg(qp_vectoring_f, assembled_ids, qp_msg)) {
+      qp_pwm_pred_pub_.publish(qp_msg);
+      published = true;
+    }
+
+    std_msgs::Float32MultiArray qp_margin_msg;
+    if (buildThrustMarginMsg(qp_vectoring_f, assembled_ids, qp_margin_msg)) {
+      qp_thrust_margin_pub_.publish(qp_margin_msg);
+      published = true;
+    }
+  }
+
+  spinal::Pwms pinv_msg;
+  if (buildPwmPredictionMsg(pinv_vectoring_f, assembled_ids, pinv_msg)) {
+    pinv_pwm_pred_pub_.publish(pinv_msg);
+    published = true;
+  }
+
+  std_msgs::Float32MultiArray pinv_margin_msg;
+  if (buildThrustMarginMsg(pinv_vectoring_f, assembled_ids, pinv_margin_msg)) {
+    pinv_thrust_margin_pub_.publish(pinv_margin_msg);
+    published = true;
+  }
+
+  if (published) last_pinv_pwm_pred_pub_time_ = now;
 }
 
 bool BeetleUnifiedController::solveFullVectorQP(

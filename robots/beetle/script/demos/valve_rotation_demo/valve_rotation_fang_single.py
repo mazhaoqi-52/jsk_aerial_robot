@@ -23,10 +23,11 @@ import math
 import threading
 import numpy as np
 
-from geometry_msgs.msg import PoseStamped, WrenchStamped
-from nav_msgs.msg import Odometry
-from tf.transformations import euler_from_quaternion
-from trajectory import create_constant_distance_trajectory, ValveRotationTrajectoryManager, SelfRotationRevolutionTrajectory, OnlineCircularTrajectoryGenerator, PolynomialTrajectory
+from trajectory import (
+    create_constant_distance_trajectory,
+    OnlineCircularTrajectoryGenerator,
+    PolynomialTrajectory,
+)
 from simplified_motion_controller import SimplifiedMotionController
 from beetle_interface import BeetleInterface
 
@@ -45,9 +46,6 @@ class SingleUAVStateBase(smach.State):
         # Initialize BeetleInterface for control
         self.beetle = BeetleInterface(module_id=module_id, debug_view=False)
 
-        # Use simplified motion controller that internally uses BeetleInterface
-        # This maintains backward compatibility while using the new architecture
-        from simplified_motion_controller import SimplifiedMotionController
         self.motion_controller = SimplifiedMotionController(self.beetle)
 
         rospy.loginfo(f"Initialized UAV{module_id} with BeetleInterface and motion controller")
@@ -416,8 +414,6 @@ class SingleUAVStateBase(smach.State):
             rospy.loginfo(f"Start angle: {math.degrees(start_angle):.1f} deg")
 
             # Create new trajectory using existing function
-            from trajectory import create_constant_distance_trajectory
-
             new_trajectory = create_constant_distance_trajectory(
                 current_uav_pos=contact_position,
                 current_uav_yaw=contact_yaw,

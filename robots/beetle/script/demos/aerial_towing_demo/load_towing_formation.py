@@ -8,15 +8,12 @@ import sys
 import os
 import math
 import threading
-import time
 import rospy
 import rosgraph
 import smach
-import smach_ros
 import numpy as np
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
-from aerial_robot_msgs.msg import FlightNav
 from std_msgs.msg import String, UInt8
 from tf.transformations import euler_from_quaternion
 
@@ -29,14 +26,10 @@ sys.path.insert(0, os.path.join(current_dir, '..'))
 
 # Reuse components from valve rotation demo
 from valve_rotation_formation_clean import (
-    FormationAdapter,
     FormationSingleUAVStateBase,
-    FormationAssembleState,
     FormationUtils,
-    WaitState
 )
-from beetle_interface import BeetleInterface, smoothstep01
-from trajectory import PolynomialTrajectory
+from beetle_interface import smoothstep01
 
 
 # ============== Load Box Parameters (measured actual box) ==============
@@ -729,18 +722,15 @@ class LoadInterface:
 
     def _load_cb(self, msg):
         """Callback for real machine (PoseStamped from mocap)."""
-        pos = msg.pose.position
-        ori = msg.pose.orientation
-        self.load_pos = np.array([pos.x, pos.y, pos.z])
-        self.load_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
-        if not self.position_received.is_set():
-            rospy.loginfo(f"Load position received: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}), yaw={math.degrees(self.load_yaw):.1f} deg")
-            self.position_received.set()
+        self._set_load_pose(msg.pose)
 
     def _load_sim_cb(self, msg):
         """Callback for simulation (Odometry from Gazebo)."""
-        pos = msg.pose.pose.position
-        ori = msg.pose.pose.orientation
+        self._set_load_pose(msg.pose.pose)
+
+    def _set_load_pose(self, pose):
+        pos = pose.position
+        ori = pose.orientation
         self.load_pos = np.array([pos.x, pos.y, pos.z])
         self.load_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
         if not self.position_received.is_set():

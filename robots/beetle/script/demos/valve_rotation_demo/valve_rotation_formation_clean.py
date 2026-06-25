@@ -5,12 +5,9 @@ import sys
 import os
 import math
 import threading
-import time
 import rospy
 import smach
-import smach_ros
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav
 from tf.transformations import euler_from_quaternion
 import numpy as np
@@ -22,13 +19,6 @@ sys.path.insert(0, current_dir)
 
 from task.assembly_motion import AssemblyDemo
 from n_modules_tf import NModuleTFCalculator
-from valve_rotation_fang_single import (
-    SingleUAVStateBase,
-    InitializeStartPositionState,
-    MoveToValveState,
-    DescendAndContactState,
-    RotateValveState
-)
 from insertion_optimizer import InsertionOptimizer
 from trajectory import PolynomialTrajectory
 from beetle_interface import BeetleInterface
@@ -93,12 +83,7 @@ class FormationUtils:
     @staticmethod
     def _angle_diff(a, b):
         """Shortest signed difference a - b, result in [-pi, pi]."""
-        d = a - b
-        while d > math.pi:
-            d -= 2 * math.pi
-        while d < -math.pi:
-            d += 2 * math.pi
-        return d
+        return FormationUtils.normalize_angle(a - b)
 
     @staticmethod
     def monitor_valve_rotation(current_valve_yaw, initial_valve_yaw, last_valve_yaw,
@@ -1207,16 +1192,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
     def calculate_shortest_yaw_path(self, current_yaw, target_yaw):
         """Calculate the shortest yaw rotation path to avoid reverse direction rotation (from single UAV)"""
-        # Calculate the difference
-        diff = target_yaw - current_yaw
-
-        # Handle angle wrap-around to ensure shortest path
-        if diff > math.pi:
-            diff -= 2 * math.pi
-        elif diff < -math.pi:
-            diff += 2 * math.pi
-
-        # Return the shortest path target
+        diff = FormationUtils.normalize_angle(target_yaw - current_yaw)
         optimal_target = current_yaw + diff
         rospy.loginfo(f"[YawPath] {math.degrees(current_yaw):.1f} deg -> "
                       f"{math.degrees(target_yaw):.1f} deg (delta={math.degrees(diff):.1f} deg)")
@@ -1479,11 +1455,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
     def normalize_angle(self, angle):
         """Normalize angle to [-pi, pi] range"""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
+        return FormationUtils.normalize_angle(angle)
 
 
 class FormationRotateValveState(FormationSingleUAVStateBase):

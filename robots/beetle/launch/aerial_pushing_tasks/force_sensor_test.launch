@@ -2,7 +2,9 @@
 <launch>
   <arg name="force_sensor" default="CFS034CA301U"
        doc="Force sensor config under cfs_sensor/config, e.g. CFS034CA301U or PFS055YA501U6"/>
-  <arg name="record_bag" default="false"
+  <arg name="force_sensor_port" default="/dev/ttyACM0"
+       doc="Serial device for the CFS force sensor"/>
+  <arg name="record_bag" default="true"
        doc="Record raw force sensor ground truth to rosbag"/>
   <arg name="bag_prefix" default="force_sensor_ground_truth"
        doc="rosbag output prefix; may include a directory path"/>
@@ -11,6 +13,7 @@
 
   <node name="forces_node" pkg="cfs_sensor" type="cfs_node" output="screen">
     <rosparam file="$(find cfs_sensor)/config/$(arg force_sensor).yaml" command="load"/>
+    <param name="cfs_default_device_name" value="$(arg force_sensor_port)"/>
   </node>
 
   <node if="$(arg record_bag)"

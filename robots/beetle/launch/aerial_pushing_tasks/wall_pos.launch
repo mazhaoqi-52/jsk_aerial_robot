@@ -3,8 +3,9 @@
   <arg name="real_machine" default="true" />
   <arg name="simulation" default="false" />
   <arg name="robot_ns" default="wall" />
-  <arg name="wall_id" default="87" />
-  <arg name="robot_id" default="87" />
+  <arg name="wall_id" default="55" />
+  <arg name="robot_id" default="55" />
+  <arg name="use_wall_mocap" default="false" />
 
   <arg name="wall_x" default="1.5" />
   <arg name="wall_y" default="0" />
@@ -18,9 +19,11 @@
   <group ns="$(arg robot_ns)">
     <group if="$(arg real_machine)">
       <group unless="$(arg simulation)">
-        <include file="$(find aerial_robot_base)/launch/external_module/mocap.launch">
-          <arg name="robot_id" value="$(arg robot_id)" />
-        </include>
+        <group if="$(arg use_wall_mocap)">
+          <include file="$(find aerial_robot_base)/launch/external_module/mocap.launch">
+            <arg name="robot_id" value="$(arg robot_id)" />
+          </include>
+        </group>
       </group>
     </group>
     <group if="$(arg simulation)">

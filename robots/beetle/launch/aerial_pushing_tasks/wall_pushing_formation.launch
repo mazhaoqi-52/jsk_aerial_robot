@@ -5,11 +5,13 @@
   <arg name="simulation"   default="True"/>
 
   ###########  Force sensor ground truth  ###########
-  <arg name="force_sensor_enabled" default="false"
+  <arg name="force_sensor_enabled" default="true"
        doc="Start CFS force sensor for ground-truth logging only; it is not used by control"/>
   <arg name="force_sensor" default="CFS034CA301U"
        doc="Force sensor config under cfs_sensor/config"/>
-  <arg name="force_sensor_record_bag" default="false"
+  <arg name="force_sensor_port" default="/dev/ttyACM0"
+       doc="Serial device for the CFS force sensor"/>
+  <arg name="force_sensor_record_bag" default="true"
        doc="Record /cfs/data with rosbag when force_sensor_enabled is true"/>
   <arg name="force_sensor_bag_prefix" default="aerial_pushing_force_ground_truth"
        doc="rosbag output prefix; may include a directory path"/>
@@ -19,6 +21,7 @@
   <include if="$(arg force_sensor_enabled)"
            file="$(find beetle)/launch/aerial_pushing_tasks/force_sensor_test.launch">
     <arg name="force_sensor"         value="$(arg force_sensor)"/>
+    <arg name="force_sensor_port"    value="$(arg force_sensor_port)"/>
     <arg name="record_bag"           value="$(arg force_sensor_record_bag)"/>
     <arg name="bag_prefix"           value="$(arg force_sensor_bag_prefix)"/>
     <arg name="record_extra_topics"  value="$(arg force_sensor_record_extra_topics)"/>
@@ -30,7 +33,7 @@
 
   ###########  Wall  ###########
   <arg name="wall_ns"        default="wall"/>
-  <arg name="wall_id"        default="87"/>
+  <arg name="wall_id"        default="55"/>
   <arg name="wall_x"         default="1.5"/>
   <arg name="wall_y"         default="0"/>
   <arg name="wall_z"         default="0"/>
@@ -39,6 +42,10 @@
   <arg name="wall_width"     default="2.0"/>
   <arg name="wall_height"    default="2.0"/>
   <arg name="wall_mass"      default="20.0"/>
+  <arg name="use_wall_mocap" default="false"
+       doc="Use wall mocap pose; false means +x/stall-only contact is enough"/>
+  <arg name="use_wall_wrench" default="false"
+       doc="Use /wall/wrench for contact detection; force sensor /cfs/data remains logging-only"/>
 
   <include file="$(find beetle)/launch/aerial_pushing_tasks/wall_pos.launch">
     <arg name="real_machine"   value="$(arg real_machine)"/>
@@ -54,10 +61,11 @@
     <arg name="wall_width"     value="$(arg wall_width)"/>
     <arg name="wall_height"    value="$(arg wall_height)"/>
     <arg name="wall_mass"      value="$(arg wall_mass)"/>
+    <arg name="use_wall_mocap" value="$(arg use_wall_mocap)"/>
   </include>
 
   ###########  Parameters  ###########
-  <arg name="push_direction" default="auto"
+  <arg name="push_direction" default="+x"
        doc="auto, +x, -x, +y, -y, or a comma-separated vector"/>
   <arg name="approach_distance" default="0.8"
        doc="Max forward distance before contact timeout (m)"/>
@@ -96,6 +104,8 @@
     <param name="wall_thickness"           value="$(arg wall_thickness)"/>
     <param name="wall_width"               value="$(arg wall_width)"/>
     <param name="wall_height"              value="$(arg wall_height)"/>
+    <param name="use_wall_mocap"           value="$(arg use_wall_mocap)"/>
+    <param name="use_wall_wrench"          value="$(arg use_wall_wrench)"/>
 
     <param name="push_direction"           value="$(arg push_direction)"/>
     <param name="approach_distance"        value="$(arg approach_distance)"/>

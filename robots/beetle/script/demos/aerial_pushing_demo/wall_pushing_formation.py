@@ -85,6 +85,9 @@ class WallInterface(object):
 
     def __init__(self):
         self.is_simulation = _as_bool(rospy.get_param("~simulation", True))
+        self.use_wall_mocap = _as_bool(rospy.get_param("~use_wall_mocap", False))
+        self.use_wall_wrench = _as_bool(rospy.get_param("~use_wall_wrench", False))
+        self.use_wall_pose = self.is_simulation or self.use_wall_mocap
         self.wall_x = float(rospy.get_param("~wall_x", 1.5))
         self.wall_y = float(rospy.get_param("~wall_y", 0.0))
         self.wall_z = float(rospy.get_param("~wall_z", 0.0))
@@ -103,13 +106,16 @@ class WallInterface(object):
 
         if self.is_simulation:
             rospy.Subscriber('/wall/odom', Odometry, self._wall_sim_cb, queue_size=1)
-        else:
+        elif self.use_wall_mocap:
             rospy.Subscriber('/wall/mocap/pose', PoseStamped, self._wall_cb, queue_size=1)
-        rospy.Subscriber('/wall/wrench', WrenchStamped, self._wrench_cb, queue_size=1)
+        if self.use_wall_wrench:
+            rospy.Subscriber('/wall/wrench', WrenchStamped, self._wrench_cb, queue_size=1)
 
         rospy.loginfo(
-            "WallInterface: mode=%s, fallback center=(%.3f, %.3f, %.3f), yaw=%.1f deg",
+            "WallInterface: mode=%s, use_wall_pose=%s, use_wall_wrench=%s, "
+            "fallback center=(%.3f, %.3f, %.3f), yaw=%.1f deg",
             'simulation' if self.is_simulation else 'real_machine',
+            self.use_wall_pose, self.use_wall_wrench,
             self.wall_pos[0], self.wall_pos[1], self.wall_pos[2],
             math.degrees(self.wall_yaw),
         )
@@ -146,6 +152,9 @@ class WallInterface(object):
             self.wrench_received.set()
 
     def wait_for_wall(self, timeout=10.0):
+        if not self.use_wall_pose:
+            rospy.loginfo("Wall pose disabled; using +x/stall-only contact approach")
+            return True
         rospy.loginfo("Waiting for wall pose...")
         if self.position_received.wait(timeout):
             return True
@@ -171,6 +180,8 @@ class WallInterface(object):
         return abs(raw), float(np.linalg.norm(self.wall_force)), raw
 
     def distance_to_near_face(self, point, push_direction):
+        if not self.use_wall_pose:
+            return None
         wall_normal = self.get_wall_normal()
         push_dir = np.array(push_direction, dtype=float)
         alignment = float(np.dot(push_dir[:2], wall_normal[:2]))
@@ -226,6 +237,10 @@ class PushingStateBase(FormationSingleUAVStateBase):
                     return self._normalize_horizontal(parts, "~push_direction")
             except ValueError:
                 rospy.logwarn("Invalid push_direction=%s; using auto", requested)
+
+        if not self.wall_interface.use_wall_pose:
+            rospy.logwarn("push_direction=auto needs wall pose; falling back to +X")
+            return np.array([1.0, 0.0, 0.0], dtype=float)
 
         wall_normal = self.wall_interface.get_wall_normal()
         wall_center = self.wall_interface.get_wall_center()
@@ -684,10 +699,19 @@ def log_pushing_preflight(module_ids, real_machine, simulation):
     if missing_mocap:
         rospy.logwarn("[PushingPreflight] Missing module mocap topics: %s", missing_mocap)
 
-    wall_pose_topic = '/wall/odom' if simulation else '/wall/mocap/pose'
-    if wall_pose_topic not in published_topics:
-        rospy.logwarn("[PushingPreflight] Missing wall pose topic: %s", wall_pose_topic)
-    if '/wall/wrench' not in published_topics:
+    use_wall_mocap = _as_bool(rospy.get_param("~use_wall_mocap", False))
+    use_wall_wrench = _as_bool(rospy.get_param("~use_wall_wrench", False))
+    if simulation:
+        wall_pose_topic = '/wall/odom'
+        if wall_pose_topic not in published_topics:
+            rospy.logwarn("[PushingPreflight] Missing wall pose topic: %s", wall_pose_topic)
+    elif use_wall_mocap:
+        wall_pose_topic = '/wall/mocap/pose'
+        if wall_pose_topic not in published_topics:
+            rospy.logwarn("[PushingPreflight] Missing wall pose topic: %s", wall_pose_topic)
+    else:
+        rospy.loginfo("[PushingPreflight] Wall mocap disabled; contact uses stall detection")
+    if use_wall_wrench and '/wall/wrench' not in published_topics:
         rospy.logwarn("[PushingPreflight] Missing wall wrench topic: /wall/wrench")
 
     nav_subscribers = _names_for_topic(subs, '/assembly/uav/nav')

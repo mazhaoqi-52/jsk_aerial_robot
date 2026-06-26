@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="force_sensor" default="CFS034CA301U"
+       doc="Force sensor config under cfs_sensor/config, e.g. CFS034CA301U or PFS055YA501U6"/>
+  <arg name="record_bag" default="false"
+       doc="Record raw force sensor ground truth to rosbag"/>
+  <arg name="bag_prefix" default="force_sensor_ground_truth"
+       doc="rosbag output prefix; may include a directory path"/>
+  <arg name="record_extra_topics" default=""
+       doc="Optional extra topics appended to the rosbag record command"/>
+
+  <node name="forces_node" pkg="cfs_sensor" type="cfs_node" output="screen">
+    <rosparam file="$(find cfs_sensor)/config/$(arg force_sensor).yaml" command="load"/>
+  </node>
+
+  <node if="$(arg record_bag)"
+        name="force_sensor_ground_truth_bag"
+        pkg="rosbag"
+        type="record"
+        output="screen"
+        args="-o $(arg bag_prefix) /cfs/data $(arg record_extra_topics)"/>
+</launch>

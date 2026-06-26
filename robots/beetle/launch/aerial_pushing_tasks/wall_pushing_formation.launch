@@ -7,24 +7,15 @@
   ###########  Force sensor ground truth  ###########
   <arg name="force_sensor_enabled" default="true"
        doc="Start CFS force sensor for ground-truth logging only; it is not used by control"/>
-  <arg name="force_sensor" default="CFS034CA301U"
+  <arg name="force_sensor" default="PFS055YA501U6"
        doc="Force sensor config under cfs_sensor/config"/>
   <arg name="force_sensor_port" default="/dev/ttyACM0"
        doc="Serial device for the CFS force sensor"/>
-  <arg name="force_sensor_record_bag" default="true"
-       doc="Record /cfs/data with rosbag when force_sensor_enabled is true"/>
-  <arg name="force_sensor_bag_prefix" default="aerial_pushing_force_ground_truth"
-       doc="rosbag output prefix; may include a directory path"/>
-  <arg name="force_sensor_record_extra_topics" default=""
-       doc="Optional extra topics appended to the force-sensor rosbag"/>
 
   <include if="$(arg force_sensor_enabled)"
            file="$(find beetle)/launch/aerial_pushing_tasks/force_sensor_test.launch">
     <arg name="force_sensor"         value="$(arg force_sensor)"/>
     <arg name="force_sensor_port"    value="$(arg force_sensor_port)"/>
-    <arg name="record_bag"           value="$(arg force_sensor_record_bag)"/>
-    <arg name="bag_prefix"           value="$(arg force_sensor_bag_prefix)"/>
-    <arg name="record_extra_topics"  value="$(arg force_sensor_record_extra_topics)"/>
   </include>
 
   ###########  Formation modules  ###########

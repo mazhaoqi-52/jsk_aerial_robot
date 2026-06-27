@@ -4,9 +4,24 @@
        doc="Force sensor config under cfs_sensor/config, e.g. CFS034CA301U or PFS055YA501U6"/>
   <arg name="force_sensor_port" default="/dev/ttyACM0"
        doc="Serial device for the CFS force sensor"/>
+  <arg name="force_sensor_auto_calib" default="true"
+       doc="Automatically call the CFS zero-offset calibration service once after startup"/>
+  <arg name="force_sensor_auto_calib_delay" default="0.5"
+       doc="Extra settling time after the first force sensor sample before calibration"/>
+  <arg name="force_sensor_auto_calib_timeout" default="10.0"
+       doc="Timeout for waiting for the calibration service and first force sensor sample"/>
 
   <node name="forces_node" pkg="cfs_sensor" type="cfs_node" output="screen">
     <rosparam file="$(find cfs_sensor)/config/$(arg force_sensor).yaml" command="load"/>
     <param name="cfs_default_device_name" value="$(arg force_sensor_port)"/>
+  </node>
+
+  <node if="$(arg force_sensor_auto_calib)"
+        name="force_sensor_auto_calib" pkg="beetle" type="force_sensor_auto_calib.py" output="screen">
+    <param name="service_name" value="cfs_sensor_calib"/>
+    <param name="topic_name" value="cfs/data"/>
+    <param name="startup_delay" value="$(arg force_sensor_auto_calib_delay)"/>
+    <param name="service_timeout" value="$(arg force_sensor_auto_calib_timeout)"/>
+    <param name="topic_timeout" value="$(arg force_sensor_auto_calib_timeout)"/>
   </node>
 </launch>

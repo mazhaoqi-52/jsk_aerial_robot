@@ -11,11 +11,20 @@
        doc="Force sensor config under cfs_sensor/config"/>
   <arg name="force_sensor_port" default="/dev/ttyACM0"
        doc="Serial device for the CFS force sensor"/>
+  <arg name="force_sensor_auto_calib" default="true"
+       doc="Automatically zero the CFS force sensor once after startup"/>
+  <arg name="force_sensor_auto_calib_delay" default="0.5"
+       doc="Extra settling time after the first force sensor sample before calibration"/>
+  <arg name="force_sensor_auto_calib_timeout" default="10.0"
+       doc="Timeout for waiting for the calibration service and first force sensor sample"/>
 
   <include if="$(arg force_sensor_enabled)"
            file="$(find beetle)/launch/aerial_pushing_tasks/force_sensor_test.launch">
-    <arg name="force_sensor"         value="$(arg force_sensor)"/>
-    <arg name="force_sensor_port"    value="$(arg force_sensor_port)"/>
+    <arg name="force_sensor"                    value="$(arg force_sensor)"/>
+    <arg name="force_sensor_port"               value="$(arg force_sensor_port)"/>
+    <arg name="force_sensor_auto_calib"         value="$(arg force_sensor_auto_calib)"/>
+    <arg name="force_sensor_auto_calib_delay"   value="$(arg force_sensor_auto_calib_delay)"/>
+    <arg name="force_sensor_auto_calib_timeout" value="$(arg force_sensor_auto_calib_timeout)"/>
   </include>
 
   ###########  Formation modules  ###########
@@ -70,9 +79,9 @@
        doc="Target pushing force feedforward (N)"/>
   <arg name="force_ramp_time" default="3.0"
        doc="S-curve force ramp time (s)"/>
-  <arg name="push_duration" default="10.0"
+  <arg name="push_duration" default="3.0"
        doc="Total pushing hold duration including ramp (s)"/>
-  <arg name="full_force_hold_time" default="2.0"
+  <arg name="full_force_hold_time" default="0.0"
        doc="Minimum time to hold after push_force is reached (s)"/>
   <arg name="push_position_lead" default="0.03"
        doc="Small position lead into the wall to maintain contact (m)"/>

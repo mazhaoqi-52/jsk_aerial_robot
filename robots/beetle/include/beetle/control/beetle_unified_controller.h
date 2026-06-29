@@ -359,6 +359,7 @@ private:
   double alloc_interface_torque_weight_;  // optional soft cost on interface torque proxy [1/(Nm)^2]
   double alloc_interface_force_limit_;    // optional component-wise interface force proxy limit [N]
   double alloc_interface_torque_limit_;   // optional component-wise interface torque proxy limit [Nm]
+  double alloc_module_balance_weight_;    // optional soft penalty on per-module vertical-thrust spread
   bool alloc_priority_enabled_;       // hard-prioritize selected 6D wrench tracking rows
   Eigen::VectorXd alloc_priority_tolerances_;  // [Fx,Fy,Fz,Tx,Ty,Tz] acc-space bands; <=0 disables row
   bool alloc_task_priority_enabled_;  // hard-band active task rows before secondary objectives

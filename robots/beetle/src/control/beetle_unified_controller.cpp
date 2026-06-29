@@ -61,6 +61,7 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_interface_torque_weight_(0.0),
 	    alloc_interface_force_limit_(0.0),
 	    alloc_interface_torque_limit_(0.0),
+	    alloc_module_balance_weight_(0.0),
 	    alloc_priority_enabled_(false),
 	    alloc_priority_tolerances_(Eigen::VectorXd::Zero(6)),
 	    alloc_task_priority_enabled_(true),
@@ -142,6 +143,8 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_interface_torque_weight", alloc_interface_torque_weight_, 0.0);
   control_nh.param<double>("alloc_interface_force_limit", alloc_interface_force_limit_, 0.0);
   control_nh.param<double>("alloc_interface_torque_limit", alloc_interface_torque_limit_, 0.0);
+  control_nh.param<double>("alloc_module_balance_weight", alloc_module_balance_weight_, 0.0);
+  alloc_module_balance_weight_ = std::max(0.0, alloc_module_balance_weight_);
   control_nh.param<bool>("alloc_priority_enabled", alloc_priority_enabled_, false);
   control_nh.param<bool>("alloc_task_priority_enabled", alloc_task_priority_enabled_, true);
   control_nh.param<double>("alloc_task_priority_min_weight", alloc_task_priority_min_weight_, 0.5);
@@ -1466,7 +1469,13 @@ bool BeetleUnifiedController::solveFullVectorQP(
           (tracking_weight_diag * desired_tracking_target);
 
   if (alloc_effort_weight_ > 0.0) {
+    // Center the effort penalty on the balanced+internal reference f_ref, not on
+    // zero. Penalizing ||f||^2 toward zero would fight any internal force (f_int
+    // in N(A) raises ||f|| without producing net wrench); centering on f_ref
+    // leaves the intended internal force unpenalized while still regularizing
+    // the wrench-producing part toward the balanced reference.
     P_dense.diagonal().array() += alloc_effort_weight_;
+    q_vec -= alloc_effort_weight_ * f_ref;
   }
 
   for (int m = 0; m < static_cast<int>(assembled_ids.size()); m++) {
@@ -1491,6 +1500,32 @@ bool BeetleUnifiedController::solveFullVectorQP(
       const int fx_idx = rotor_coef_ * i;
       P_dense(fx_idx, fx_idx) += alloc_lateral_rate_weight_;
       q_vec(fx_idx) -= alloc_lateral_rate_weight_ * prev_vectoring_f_(fx_idx);
+    }
+  }
+
+  // Module thrust-balance: discourage one module from doing all the work while
+  // another idles, WITHOUT forcing a distribution or capping cooperation.
+  // Penalize the spread of per-module vertical-thrust sums s_m = sum_{r in m} f_z
+  // about their mean:  beta * sum_m (s_m - mean)^2 = beta * ||M S f||^2, where S
+  // sums each module's f_z and M = I - (1/N) 11^T centers them. Pure quadratic
+  // (the mean is intrinsic), so it only adds to the Hessian; the connector load
+  // is bounded separately by the hard interface limits, leaving cooperation free
+  // below those limits.
+  if (alloc_module_balance_weight_ > 0.0 && rotor_coef_ == 2) {
+    const int n_modules = static_cast<int>(assembled_ids.size());
+    if (n_modules > 1) {
+      Eigen::MatrixXd S = Eigen::MatrixXd::Zero(n_modules, n_cols);
+      for (int m = 0; m < n_modules; m++) {
+        const int module_col = m * motor_num_per_module_ * rotor_coef_;
+        for (int r = 0; r < motor_num_per_module_; r++) {
+          const int fz_idx = module_col + r * rotor_coef_ + rotor_coef_ - 1;
+          if (fz_idx < n_cols) S(m, fz_idx) = 1.0;
+        }
+      }
+      const Eigen::MatrixXd M =
+          Eigen::MatrixXd::Identity(n_modules, n_modules) -
+          (1.0 / n_modules) * Eigen::MatrixXd::Ones(n_modules, n_modules);
+      P_dense += alloc_module_balance_weight_ * S.transpose() * M * S;
     }
   }
 

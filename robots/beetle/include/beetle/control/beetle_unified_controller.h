@@ -379,13 +379,21 @@ private:
    * @brief Full-vector constrained QP allocation.
    *
    * Formulation:
-   *   min_{f} ||Wc_eff^(1/2)(A*f - w_control)||^2
-   *           + ||Wt^(1/2)(A*f - (w_control + w_task))||^2
+   *   w_des = w_control + w_task + w_feedback
+   *
+   *   min_{f} ||W_eff^(1/2)(A*f - w_des)||^2
    *           + ρ||f||^2
    *           + λ||f - f_ref||^2 + ||Wi^(1/2)(D*f - d_ref)||^2
    *           + smoothness terms
-   *   where Wc_eff clears active task-priority rows so task bands are not
-   *   softened by a competing control-only target.
+   *
+   *   W_eff is a single per-axis wrench-tracking weight (alloc_wrench_weights_);
+   *   task/feedback weights only select which rows are promoted to hard bands,
+   *   they no longer scale the soft tracking.
+   *
+   *   Active task-priority rows become hard bands around w_control+w_task and
+   *   are removed from W_eff, so secondary objectives can only act in the
+   *   remaining freedom. This follows the same hierarchy as spidar's static
+   *   balance QPs: satisfy the task/balance rows first, then shape redundancy.
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
    *         optional task/6D wrench priority bands
@@ -394,7 +402,7 @@ private:
    * @param w_control     Desired 6D control/stabilization wrench-acceleration vector
    * @param w_task        6D task feedforward wrench-acceleration vector
    * @param task_weights  6D task soft residual weights
-   * @param w_feedback    6D observer residual-feedback wrench-acceleration vector
+   * @param w_feedback    6D low-priority observer residual-feedback wrench-acceleration vector
    * @param feedback_weights 6D low feedback residual weights
    * @param w_priority    6D wrench-acceleration vector used as the center of hard priority bands
    * @param secondary_ref Preferred allocation in the nullspace / soft secondary objective

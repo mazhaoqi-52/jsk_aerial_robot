@@ -596,6 +596,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   }
   Eigen::VectorXd pinv_vectoring_f =
       integrated_map_inv_ * (control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
+  Eigen::VectorXd desired_wrench_acc =
+      control_wrench_acc + task_wrench_acc + feedback_wrench_acc;
   Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
   Eigen::MatrixXd interface_load_matrix;
   std::vector<std::pair<int, int>> interface_cuts;
@@ -660,32 +662,12 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
     }
   } else {
     if (alloc_lambda_ > 0.0 && secondary_ref.size() == integrated_map_.cols()) {
-      Eigen::VectorXd blended_wrench_acc = control_wrench_acc;
-      if (task_wrench_acc.size() == control_wrench_acc.size() &&
-          effective_task_weights.size() == control_wrench_acc.size() &&
-          feedback_wrench_acc.size() == control_wrench_acc.size() &&
-          effective_feedback_weights.size() == control_wrench_acc.size() &&
-          alloc_wrench_weights_.size() == control_wrench_acc.size()) {
-        for (int i = 0; i < blended_wrench_acc.size(); i++) {
-          const double denom = alloc_wrench_weights_(i) +
-                               effective_task_weights(i) +
-                               effective_feedback_weights(i);
-          if (denom > 1e-9) {
-            blended_wrench_acc(i) +=
-                (effective_task_weights(i) * task_wrench_acc(i) +
-                 effective_feedback_weights(i) *
-                     (task_wrench_acc(i) + feedback_wrench_acc(i))) / denom;
-          }
-        }
-      } else {
-        blended_wrench_acc += task_wrench_acc + feedback_wrench_acc;
-      }
       Eigen::MatrixXd lhs = integrated_map_ * integrated_map_.transpose()
                            + alloc_lambda_ * Eigen::MatrixXd::Identity(integrated_map_.rows(),
                                                                        integrated_map_.rows());
       target_vectoring_f_ = secondary_ref
           + integrated_map_.transpose()
-              * lhs.ldlt().solve(blended_wrench_acc - integrated_map_ * secondary_ref);
+              * lhs.ldlt().solve(desired_wrench_acc - integrated_map_ * secondary_ref);
     } else {
       target_vectoring_f_ = pinv_vectoring_f;
     }
@@ -794,6 +776,7 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
   const bool has_allocation_block =
       (integrated_map_.rows() == 6 && integrated_map_.cols() == ref.size());
   const double delta_limit = 0.25 * alloc_t_max_;
+  Eigen::VectorXd internal_delta = Eigen::VectorXd::Zero(ref.size());
 
   for (size_t m = 0; m < assembled_ids.size(); m++) {
     auto it = module_internal_wrench_comp_.find(assembled_ids[m]);
@@ -827,14 +810,32 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
       const int base = module_col + r * rotor_coef_;
       for (int c = 0; c < rotor_coef_; c++) {
         const int idx = base + c;
-        const double bounded_delta =
+        internal_delta(idx) +=
             std::max(-delta_limit, std::min(delta(r * rotor_coef_ + c), delta_limit));
-        if (rotor_coef_ == 2 && c == rotor_coef_ - 1) {
-          ref(idx) = std::max(0.0, std::min(ref(idx) + bounded_delta, alloc_t_max_));
-        } else {
-          ref(idx) = std::max(-alloc_t_max_, std::min(ref(idx) + bounded_delta, alloc_t_max_));
-        }
       }
+    }
+  }
+  if (has_allocation_block && internal_delta.size() == integrated_map_.cols()) {
+    // Reuse the member pseudoinverse already computed in
+    // computeUnifiedAllocation() for this same integrated_map_; only recompute
+    // if it is not dimensionally consistent (e.g. early/stale call).
+    const bool inv_consistent =
+        (integrated_map_inv_.rows() == integrated_map_.cols() &&
+         integrated_map_inv_.cols() == integrated_map_.rows());
+    const Eigen::MatrixXd recomputed_pinv =
+        inv_consistent ? Eigen::MatrixXd()
+                       : aerial_robot_model::pseudoinverse(integrated_map_);
+    const Eigen::MatrixXd& map_pinv =
+        inv_consistent ? integrated_map_inv_ : recomputed_pinv;
+    internal_delta =
+        (Eigen::MatrixXd::Identity(internal_delta.size(), internal_delta.size()) -
+         map_pinv * integrated_map_) * internal_delta;
+  }
+  for (int idx = 0; idx < ref.size(); idx++) {
+    if (rotor_coef_ == 2 && (idx % rotor_coef_) == rotor_coef_ - 1) {
+      ref(idx) = std::max(0.0, std::min(ref(idx) + internal_delta(idx), alloc_t_max_));
+    } else {
+      ref(idx) = std::max(-alloc_t_max_, std::min(ref(idx) + internal_delta(idx), alloc_t_max_));
     }
   }
   return ref;
@@ -1288,10 +1289,13 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // For 1-DOF gimbal: each rotor contributes 2 variables [f_x, f_z].
   //
   // Objective:  min_f  0.5 * f' * P * f + q' * f
-  //   where P = A'(Wc_eff+Wt+Wfb)A + effort + R + optional rate/lateral-rate/interface terms,
-  //         q = -A'(Wc_eff*w_control + Wt*w_task_target + Wfb*w_feedback_target) - R*f_ref
-  //             - D'Wi*d_ref - smoothness refs
-  //         and Wc_eff is cleared on active task-priority rows.
+  //   where w_des = w_control + w_task + w_feedback,
+  //         W_eff is a single per-axis wrench-tracking weight (alloc_wrench_weights_);
+  //         task/feedback weights only select hard-band rows, not soft tracking.
+  //         P = A'W_eff A + effort + R + optional rate/lateral-rate/interface terms,
+  //         q = -A'W_eff*w_des - R*f_ref - D'Wi*d_ref - smoothness refs.
+  //         Active task-priority rows are represented as hard bands around
+  //         w_control+w_task and removed from W_eff.
   //
   // This separates stabilization/control tracking, explicit task feedforward,
   // and low-weight observer residual feedback. Optional interface terms are a
@@ -1396,21 +1400,20 @@ bool BeetleUnifiedController::solveFullVectorQP(
   if (task_weights.size() == alloc_matrix.rows()) {
     effective_task_weights = task_weights;
   }
-  Eigen::VectorXd effective_feedback_weights = Eigen::VectorXd::Zero(alloc_matrix.rows());
-  if (feedback_weights.size() == alloc_matrix.rows()) {
-    effective_feedback_weights = feedback_weights;
-  }
   for (int r = 0; r < effective_task_weights.size(); r++) {
+    wrench_weights(r) = std::max(0.0, wrench_weights(r));
     effective_task_weights(r) = std::max(0.0, effective_task_weights(r));
-    effective_feedback_weights(r) = std::max(0.0, effective_feedback_weights(r));
   }
-  Eigen::VectorXd task_target = w_control;
+  Eigen::VectorXd desired_tracking_target = w_control;
   if (w_task.size() == alloc_matrix.rows()) {
-    task_target += w_task;
+    desired_tracking_target += w_task;
   }
-  Eigen::VectorXd feedback_target = task_target;
   if (w_feedback.size() == alloc_matrix.rows()) {
-    feedback_target += w_feedback;
+    desired_tracking_target += w_feedback;
+  }
+  Eigen::VectorXd task_priority_target = w_control;
+  if (w_task.size() == alloc_matrix.rows()) {
+    task_priority_target += w_task;
   }
 
   std::vector<int> task_priority_rows;
@@ -1447,21 +1450,20 @@ bool BeetleUnifiedController::solveFullVectorQP(
                       n_direction_rate_rows + n_interface_rows +
                       n_task_priority_rows + n_priority_rows;
 
-  Eigen::VectorXd control_tracking_weights = wrench_weights;
+  // Single per-axis wrench-tracking weight on the composed target w_des.
+  // Task/feedback weights only gate which rows are promoted to hard bands
+  // (below); they no longer scale the soft tracking, so the per-axis weight is
+  // a deliberate priority rather than a function of how many sources contribute.
+  Eigen::VectorXd tracking_weights = wrench_weights;
   for (int row_idx : task_priority_rows) {
-    control_tracking_weights(row_idx) = 0.0;
+    tracking_weights(row_idx) = 0.0;
   }
-  Eigen::MatrixXd wrench_weight_diag = control_tracking_weights.asDiagonal();
-  Eigen::MatrixXd task_weight_diag = effective_task_weights.asDiagonal();
-  Eigen::MatrixXd feedback_weight_diag = effective_feedback_weights.asDiagonal();
+  Eigen::MatrixXd tracking_weight_diag = tracking_weights.asDiagonal();
   Eigen::MatrixXd P_dense =
-      alloc_matrix.transpose() *
-      (wrench_weight_diag + task_weight_diag + feedback_weight_diag) *
-      alloc_matrix;
+      alloc_matrix.transpose() * tracking_weight_diag * alloc_matrix;
   Eigen::VectorXd q_vec =
-      -alloc_matrix.transpose() * (wrench_weight_diag * w_control +
-                                   task_weight_diag * task_target +
-                                   feedback_weight_diag * feedback_target);
+      -alloc_matrix.transpose() *
+          (tracking_weight_diag * desired_tracking_target);
 
   if (alloc_effort_weight_ > 0.0) {
     P_dense.diagonal().array() += alloc_effort_weight_;
@@ -1654,8 +1656,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
         const double v = alloc_matrix(task_row, c);
         if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
       }
-      lb(row) = task_target(task_row) - tol;
-      ub(row) = task_target(task_row) + tol;
+      lb(row) = task_priority_target(task_row) - tol;
+      ub(row) = task_priority_target(task_row) + tol;
       row++;
     }
   }
@@ -1899,11 +1901,15 @@ bool BeetleUnifiedController::solveFullVectorQP(
         last_qp_diag_log_time_ = now;
 
         Eigen::VectorXd realized_acc = alloc_matrix * vectoring_f_out;
-        Eigen::VectorXd control_residual = realized_acc - w_control;
-        Eigen::VectorXd task_residual = realized_acc - task_target;
+        Eigen::VectorXd desired_residual =
+            realized_acc - desired_tracking_target;
+        Eigen::VectorXd task_priority_residual =
+            realized_acc - task_priority_target;
         double task_priority_residual_norm = 0.0;
         for (int task_row : task_priority_rows) {
-          task_priority_residual_norm += task_residual(task_row) * task_residual(task_row);
+          task_priority_residual_norm +=
+              task_priority_residual(task_row) *
+              task_priority_residual(task_row);
         }
         task_priority_residual_norm = std::sqrt(task_priority_residual_norm);
         Eigen::VectorXd priority_residual = realized_acc - priority_target;
@@ -1929,7 +1935,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
         }
 
         const char* fmt =
-            "[UnifiedCtrl QPDiag] ctrl_res=%.3f task_res=%.3f "
+            "[UnifiedCtrl QPDiag] desired_res=%.3f "
             "task_prio_res=%.3f task_rows=%d prio_res=%.3f prio_rows=%d "
             "max_t=%.2f max_angle=%.1fdeg "
             "max|fx|=%.2f max_fz=%.2f comp_margin_min=%.2f "
@@ -1937,7 +1943,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
             "alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
         if (actuator_suspicious) {
           ROS_WARN(fmt,
-                   control_residual.norm(), task_residual.norm(),
+                   desired_residual.norm(),
                    task_priority_residual_norm, n_task_priority_rows,
                    priority_residual_norm, n_priority_rows,
                    max_t, max_abs_angle_deg,
@@ -1947,7 +1953,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
                    thrust_stream.str().c_str(), angle_stream.str().c_str());
         } else {
           ROS_INFO(fmt,
-                   control_residual.norm(), task_residual.norm(),
+                   desired_residual.norm(),
                    task_priority_residual_norm, n_task_priority_rows,
                    priority_residual_norm, n_priority_rows,
                    max_t, max_abs_angle_deg,

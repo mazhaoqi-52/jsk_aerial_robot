@@ -99,5 +99,6 @@ catkin_install_python(PROGRAMS
 )
 catkin_install_python(PROGRAMS
   script/demos/aerial_pushing_demo/wall_pushing_formation.py
+  script/demos/aerial_pushing_demo/force_sensor_auto_calib.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

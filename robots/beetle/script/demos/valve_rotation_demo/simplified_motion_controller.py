@@ -14,8 +14,6 @@ import os
 import sys
 import rospy
 import time
-import math
-from math import pi, sqrt
 
 # script/demos on the path so the shared demo helpers import regardless of how
 # this module is launched.

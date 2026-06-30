@@ -9,7 +9,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from demo_common import normalize_angle, normalize_angle_diff
 import math
 import rospy
-from tf.transformations import euler_from_quaternion
 
 
 class InsertionOptimizer:

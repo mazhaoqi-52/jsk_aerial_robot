@@ -12,7 +12,6 @@ import threading
 from aerial_robot_msgs.msg import FlightNav
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
-from tf.transformations import euler_from_quaternion
 from task.assembly_motion import *
 from task.disassembly_motion import *
 from trajectory import PolynomialTrajectory
@@ -265,7 +264,6 @@ class MoveAndRotateValveState(AssemblyMotionStateBase):
 
     def wait_for_initialization(self, timeout=10):
         rospy.sleep(0.5)
-        from std_msgs.msg import Empty
         rospy.logwarn("Waiting for position messages...")
         events = [self.beetle1_received, self.beetle2_received, self.valve_received]
         all_received = all(event.wait(timeout) for event in events)

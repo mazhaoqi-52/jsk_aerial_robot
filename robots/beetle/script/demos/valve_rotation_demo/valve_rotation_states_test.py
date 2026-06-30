@@ -7,11 +7,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'
 
 import rospy
 import smach
-import smach_ros
 import time
 import math
 import threading
-import numpy as np
 from aerial_robot_msgs.msg import FlightNav
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry

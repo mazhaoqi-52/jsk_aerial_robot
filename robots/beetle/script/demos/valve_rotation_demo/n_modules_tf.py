@@ -8,11 +8,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import rospy
-import numpy as np
 import math
-from tf.transformations import euler_from_quaternion
-from math import pi, atan2, cos, sin
-import tf
 
 class NModuleTFCalculator:
     def __init__(self, module_ids_str = rospy.get_param("~module_ids", "1,2")):

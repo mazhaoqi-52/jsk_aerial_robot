@@ -7,17 +7,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../valve_rotation_demo'
 
 import math
 import threading
-import time
 import rospy
 import smach
-import smach_ros
-import numpy as np
 from aerial_robot_msgs.msg import FlightNav
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
 from tf.transformations import euler_from_quaternion
 from valve_rotation_demo.trajectory import PolynomialTrajectory
-from task.assembly_motion import AssemblyDemo
 
 class SeperatedMotionStateBase(smach.State):
     def __init__(self, outcomes, pub_topic_format="/beetle{}/target_pose", sub_topic_format="/beetle{}/mocap/pose"):

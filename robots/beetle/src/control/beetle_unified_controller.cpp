@@ -1892,116 +1892,124 @@ bool BeetleUnifiedController::solveFullVectorQP(
   vectoring_f_out = f_sol;
   prev_vectoring_f_ = f_sol;
 
-  // Short-term hardware diagnostic: expose hidden actuator saturation.
-  // QP constrains fx/fz components, while the spinal receives sqrt(fx^2+fz^2).
-  {
-    if (rotor_coef_ == 2) {
-      const double low_voltage_limit = 17.2;   // MotorInfo ref4 (21.2V)
-      const double mid_voltage_limit = 18.44;  // MotorInfo ref3 (22.2V)
-      const double model_limit = robot_model_ ? robot_model_->getThrustUpperLimit() : alloc_t_max_;
-      double max_t = 0.0;
-      double max_abs_angle_deg = 0.0;
-      double max_abs_fx = 0.0;
-      double max_fz = 0.0;
-      double min_component_margin = std::numeric_limits<double>::infinity();
-      int over_low = 0;
-      int over_mid = 0;
-      int over_alloc = 0;
-      int over_model = 0;
-      int near_component_bound = 0;
-      for (int i = 0; i < n_rotors; i++) {
-        double fx = f_sol(2 * i), fz = f_sol(2 * i + 1);
-        double tmag = std::sqrt(fx * fx + fz * fz);
-        double angle_deg = std::atan2(-fx, fz) * 180.0 / M_PI;
-
-        max_t = std::max(max_t, tmag);
-        max_abs_angle_deg = std::max(max_abs_angle_deg, std::abs(angle_deg));
-        max_abs_fx = std::max(max_abs_fx, std::abs(fx));
-        max_fz = std::max(max_fz, fz);
-        const double component_margin = std::min(alloc_t_max_ - std::abs(fx), alloc_t_max_ - fz);
-        min_component_margin = std::min(min_component_margin, component_margin);
-        if (component_margin < 0.2) near_component_bound++;
-        if (tmag > low_voltage_limit) over_low++;
-        if (tmag > mid_voltage_limit) over_mid++;
-        if (tmag > alloc_t_max_) over_alloc++;
-        if (tmag > model_limit) over_model++;
-      }
-
-      const bool actuator_suspicious = over_low > 0 || over_alloc > 0 ||
-                                       over_model > 0 || near_component_bound > 0;
-      const double now = ros::Time::now().toSec();
-      const bool qp_diag_due =
-          last_qp_diag_log_time_ < 0.0 || now - last_qp_diag_log_time_ >= 0.5;
-      if (qp_diag_due) {
-        last_qp_diag_log_time_ = now;
-
-        Eigen::VectorXd realized_acc = alloc_matrix * vectoring_f_out;
-        Eigen::VectorXd desired_residual =
-            realized_acc - desired_tracking_target;
-        Eigen::VectorXd task_priority_residual =
-            realized_acc - task_priority_target;
-        double task_priority_residual_norm = 0.0;
-        for (int task_row : task_priority_rows) {
-          task_priority_residual_norm +=
-              task_priority_residual(task_row) *
-              task_priority_residual(task_row);
-        }
-        task_priority_residual_norm = std::sqrt(task_priority_residual_norm);
-        Eigen::VectorXd priority_residual = realized_acc - priority_target;
-        double priority_residual_norm = 0.0;
-        for (int priority_row : priority_rows) {
-          priority_residual_norm += priority_residual(priority_row) * priority_residual(priority_row);
-        }
-        priority_residual_norm = std::sqrt(priority_residual_norm);
-
-        std::ostringstream thrust_stream;
-        std::ostringstream angle_stream;
-        thrust_stream << std::fixed << std::setprecision(1);
-        angle_stream << std::fixed << std::setprecision(0);
-        for (int i = 0; i < n_rotors; i++) {
-          const double fx = f_sol(2 * i);
-          const double fz = f_sol(2 * i + 1);
-          if (i > 0) {
-            thrust_stream << ",";
-            angle_stream << ",";
-          }
-          thrust_stream << std::sqrt(fx * fx + fz * fz);
-          angle_stream << std::atan2(-fx, fz) * 180.0 / M_PI;
-        }
-
-        const char* fmt =
-            "[UnifiedCtrl QPDiag] desired_res=%.3f "
-            "task_prio_res=%.3f task_rows=%d prio_res=%.3f prio_rows=%d "
-            "max_t=%.2f max_angle=%.1fdeg "
-            "max|fx|=%.2f max_fz=%.2f comp_margin_min=%.2f "
-            "over_t(17.2/18.44/alloc/model)=%d/%d/%d/%d "
-            "alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
-        if (actuator_suspicious) {
-          ROS_WARN(fmt,
-                   desired_residual.norm(),
-                   task_priority_residual_norm, n_task_priority_rows,
-                   priority_residual_norm, n_priority_rows,
-                   max_t, max_abs_angle_deg,
-                   max_abs_fx, max_fz, min_component_margin,
-                   over_low, over_mid, over_alloc, over_model,
-                   alloc_t_max_, model_limit,
-                   thrust_stream.str().c_str(), angle_stream.str().c_str());
-        } else {
-          ROS_INFO(fmt,
-                   desired_residual.norm(),
-                   task_priority_residual_norm, n_task_priority_rows,
-                   priority_residual_norm, n_priority_rows,
-                   max_t, max_abs_angle_deg,
-                   max_abs_fx, max_fz, min_component_margin,
-                   over_low, over_mid, over_alloc, over_model,
-                   alloc_t_max_, model_limit,
-                   thrust_stream.str().c_str(), angle_stream.str().c_str());
-        }
-      }
-    }
-  }
+  logQpDiagnostics(f_sol, alloc_matrix, desired_tracking_target, task_priority_target,
+                   task_priority_rows, priority_target, priority_rows, n_rotors);
 
   return true;
+}
+
+void BeetleUnifiedController::logQpDiagnostics(
+    const Eigen::VectorXd& f_sol,
+    const Eigen::MatrixXd& alloc_matrix,
+    const Eigen::VectorXd& desired_tracking_target,
+    const Eigen::VectorXd& task_priority_target,
+    const std::vector<int>& task_priority_rows,
+    const Eigen::VectorXd& priority_target,
+    const std::vector<int>& priority_rows,
+    int n_rotors)
+{
+  // Short-term hardware diagnostic: expose hidden actuator saturation.
+  // QP constrains fx/fz components, while the spinal receives sqrt(fx^2+fz^2).
+  if (rotor_coef_ != 2) return;
+
+  const double low_voltage_limit = 17.2;   // MotorInfo ref4 (21.2V)
+  const double mid_voltage_limit = 18.44;  // MotorInfo ref3 (22.2V)
+  const double model_limit = robot_model_ ? robot_model_->getThrustUpperLimit() : alloc_t_max_;
+  double max_t = 0.0;
+  double max_abs_angle_deg = 0.0;
+  double max_abs_fx = 0.0;
+  double max_fz = 0.0;
+  double min_component_margin = std::numeric_limits<double>::infinity();
+  int over_low = 0;
+  int over_mid = 0;
+  int over_alloc = 0;
+  int over_model = 0;
+  int near_component_bound = 0;
+  for (int i = 0; i < n_rotors; i++) {
+    double fx = f_sol(2 * i), fz = f_sol(2 * i + 1);
+    double tmag = std::sqrt(fx * fx + fz * fz);
+    double angle_deg = std::atan2(-fx, fz) * 180.0 / M_PI;
+
+    max_t = std::max(max_t, tmag);
+    max_abs_angle_deg = std::max(max_abs_angle_deg, std::abs(angle_deg));
+    max_abs_fx = std::max(max_abs_fx, std::abs(fx));
+    max_fz = std::max(max_fz, fz);
+    const double component_margin = std::min(alloc_t_max_ - std::abs(fx), alloc_t_max_ - fz);
+    min_component_margin = std::min(min_component_margin, component_margin);
+    if (component_margin < 0.2) near_component_bound++;
+    if (tmag > low_voltage_limit) over_low++;
+    if (tmag > mid_voltage_limit) over_mid++;
+    if (tmag > alloc_t_max_) over_alloc++;
+    if (tmag > model_limit) over_model++;
+  }
+
+  const bool actuator_suspicious = over_low > 0 || over_alloc > 0 ||
+                                   over_model > 0 || near_component_bound > 0;
+  const double now = ros::Time::now().toSec();
+  const bool qp_diag_due =
+      last_qp_diag_log_time_ < 0.0 || now - last_qp_diag_log_time_ >= 0.5;
+  if (!qp_diag_due) return;
+  last_qp_diag_log_time_ = now;
+
+  Eigen::VectorXd realized_acc = alloc_matrix * f_sol;
+  Eigen::VectorXd desired_residual = realized_acc - desired_tracking_target;
+  Eigen::VectorXd task_priority_residual = realized_acc - task_priority_target;
+  double task_priority_residual_norm = 0.0;
+  for (int task_row : task_priority_rows) {
+    task_priority_residual_norm +=
+        task_priority_residual(task_row) * task_priority_residual(task_row);
+  }
+  task_priority_residual_norm = std::sqrt(task_priority_residual_norm);
+  Eigen::VectorXd priority_residual = realized_acc - priority_target;
+  double priority_residual_norm = 0.0;
+  for (int priority_row : priority_rows) {
+    priority_residual_norm += priority_residual(priority_row) * priority_residual(priority_row);
+  }
+  priority_residual_norm = std::sqrt(priority_residual_norm);
+
+  std::ostringstream thrust_stream;
+  std::ostringstream angle_stream;
+  thrust_stream << std::fixed << std::setprecision(1);
+  angle_stream << std::fixed << std::setprecision(0);
+  for (int i = 0; i < n_rotors; i++) {
+    const double fx = f_sol(2 * i);
+    const double fz = f_sol(2 * i + 1);
+    if (i > 0) {
+      thrust_stream << ",";
+      angle_stream << ",";
+    }
+    thrust_stream << std::sqrt(fx * fx + fz * fz);
+    angle_stream << std::atan2(-fx, fz) * 180.0 / M_PI;
+  }
+
+  const char* fmt =
+      "[UnifiedCtrl QPDiag] desired_res=%.3f "
+      "task_prio_res=%.3f task_rows=%d prio_res=%.3f prio_rows=%d "
+      "max_t=%.2f max_angle=%.1fdeg "
+      "max|fx|=%.2f max_fz=%.2f comp_margin_min=%.2f "
+      "over_t(17.2/18.44/alloc/model)=%d/%d/%d/%d "
+      "alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
+  if (actuator_suspicious) {
+    ROS_WARN(fmt,
+             desired_residual.norm(),
+             task_priority_residual_norm, static_cast<int>(task_priority_rows.size()),
+             priority_residual_norm, static_cast<int>(priority_rows.size()),
+             max_t, max_abs_angle_deg,
+             max_abs_fx, max_fz, min_component_margin,
+             over_low, over_mid, over_alloc, over_model,
+             alloc_t_max_, model_limit,
+             thrust_stream.str().c_str(), angle_stream.str().c_str());
+  } else {
+    ROS_INFO(fmt,
+             desired_residual.norm(),
+             task_priority_residual_norm, static_cast<int>(task_priority_rows.size()),
+             priority_residual_norm, static_cast<int>(priority_rows.size()),
+             max_t, max_abs_angle_deg,
+             max_abs_fx, max_fz, min_component_margin,
+             over_low, over_mid, over_alloc, over_model,
+             alloc_t_max_, model_limit,
+             thrust_stream.str().c_str(), angle_stream.str().c_str());
+  }
 }
 
 void BeetleUnifiedController::extractThrustAndGimbal(
@@ -2051,30 +2059,6 @@ int BeetleUnifiedController::getModuleIndex(int module_id) const
     if (assembled_ids[index] == module_id) return static_cast<int>(index);
   }
   return -1;
-}
-
-int BeetleUnifiedController::getModuleCount() const
-{
-  std::lock_guard<std::mutex> lock(allocation_mutex_);
-  return static_cast<int>(module_commands_.size());
-}
-
-Eigen::MatrixXd BeetleUnifiedController::getFormationWrenchMatrix() const
-{
-  std::lock_guard<std::mutex> lock(allocation_mutex_);
-  return integrated_map_;
-}
-
-Eigen::MatrixXd BeetleUnifiedController::getFormationWrenchMatrixInv() const
-{
-  std::lock_guard<std::mutex> lock(allocation_mutex_);
-  return integrated_map_inv_;
-}
-
-Eigen::MatrixXd BeetleUnifiedController::getFormationWrenchMatrixInvRot() const
-{
-  std::lock_guard<std::mutex> lock(allocation_mutex_);
-  return integrated_map_inv_rot_;
 }
 
 Eigen::VectorXd BeetleUnifiedController::getTargetVectoringForce() const
@@ -2194,23 +2178,6 @@ bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInvLocked(
     msg.rows[i].z = static_cast<int16_t>(integrated_map_inv_rot_(row_start + i, 2) * 1000);
   }
   return true;
-}
-
-bool BeetleUnifiedController::isAllocationSaturated() const
-{
-  std::lock_guard<std::mutex> lock(allocation_mutex_);
-  if (module_commands_.empty()) return false;
-  const double t_max = robot_model_->getThrustUpperLimit();
-  const double t_min = robot_model_->getThrustLowerLimit();
-  const double sat_margin = 0.05;
-  const double t_upper = t_max * (1.0 - sat_margin);
-  const double t_lower = t_min + t_max * sat_margin;
-  for (const auto& kv : module_commands_) {
-    for (float t : kv.second.full_thrusts) {
-      if (t >= t_upper || t <= t_lower) return true;
-    }
-  }
-  return false;
 }
 
 Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const

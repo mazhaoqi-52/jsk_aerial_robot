@@ -203,13 +203,8 @@ public:
   const Eigen::Vector3d& getFormationCogOffset() const { return formation_cog_offset_; }
   const Eigen::Matrix3d& getFormationInertia() const { return formation_inertia_; }
   double getFormationMass() const { return formation_mass_; }
-  int getModuleCount() const;
   int getMotorNumPerModule() const { return motor_num_per_module_; }
-  double getSingleModuleMass() const { return robot_model_ ? robot_model_->getMass() : 0.0; }
   bool getModuleMassInertia(int module_id, double& mass, Eigen::Matrix3d& inertia) const;
-  Eigen::MatrixXd getFormationWrenchMatrix() const;
-  Eigen::MatrixXd getFormationWrenchMatrixInv() const;
-  Eigen::MatrixXd getFormationWrenchMatrixInvRot() const;
   double getCandidateYawTerm() const { return candidate_yaw_term_; }
   Eigen::VectorXd getTargetVectoringForce() const;
   std::map<int, ModuleCommand> getModuleCommands() const;
@@ -236,9 +231,6 @@ public:
    */
   Eigen::VectorXd getRealizedWrenchBody() const;
   bool getRealizedModuleWrenchBody(int module_id, Eigen::VectorXd& realized) const;
-
-  /** @brief Check if any rotor in the formation allocation is near thrust limits (anti-windup). */
-  bool isAllocationSaturated() const;
 
 private:
   ros::NodeHandle nh_;
@@ -423,6 +415,17 @@ private:
                          const Eigen::MatrixXd& interface_load_matrix,
                          const Eigen::VectorXd& interface_load_reference,
                          Eigen::VectorXd& vectoring_f_out);
+
+  /** @brief Throttled post-solve QP diagnostic logging (saturation, residuals,
+   *  per-rotor thrust/angle). Pure side-effect; no control impact. */
+  void logQpDiagnostics(const Eigen::VectorXd& f_sol,
+                        const Eigen::MatrixXd& alloc_matrix,
+                        const Eigen::VectorXd& desired_tracking_target,
+                        const Eigen::VectorXd& task_priority_target,
+                        const std::vector<int>& task_priority_rows,
+                        const Eigen::VectorXd& priority_target,
+                        const std::vector<int>& priority_rows,
+                        int n_rotors);
 
   /** @brief Build the current secondary allocation reference.
    *  Base term is balanced hover load. Optional internal-wrench compensation

@@ -1322,7 +1322,7 @@ class DescendAndInsertState(TowingStateBase):
                 f"Hook insertion {depth_reason}: clearance={achieved_clearance*1000:.1f}mm "
                 f"outside [{min_allowed_clearance*1000:.1f}, "
                 f"{max_allowed_clearance*1000:.1f}]mm; "
-                "retrying at planned insertion height"
+                "holding measured insertion height"
             )
             self.log_module_debug_status("[Insertion Debug] hook clearance failed")
 
@@ -1330,15 +1330,14 @@ class DescendAndInsertState(TowingStateBase):
             "after final insertion", achieved_pos, insertion_pos, approach_dir)
 
         contact_pos = np.array(insertion_pos, dtype=float)
-        if insertion_clearance_ok:
-            contact_pos[2] = achieved_pos[2]
-        else:
+        contact_pos[2] = achieved_pos[2]
+        if not insertion_clearance_ok:
             rospy.logwarn(
-                f"Using planned insertion Z={contact_pos[2]:.3f}m for stabilization "
-                f"(achieved_Z={achieved_pos[2]:.3f}m)"
+                f"Using measured insertion Z={contact_pos[2]:.3f}m for stabilization "
+                f"instead of forcing planned_Z={insertion_pos[2]:.3f}m"
             )
 
-        # Stabilize at the planned insertion XY/Z once more before deciding
+        # Stabilize at the measured insertion Z once more before deciding
         # whether the hook is inside the allowed depth band.
         rospy.loginfo("Stabilizing at insertion contact position...")
         self.active_stabilization_wait(contact_pos, insertion_yaw, duration=2.0)
@@ -1361,14 +1360,14 @@ class DescendAndInsertState(TowingStateBase):
                 insertion_clearance_ok = True
             else:
                 insertion_clearance_ok = False
-                contact_pos[2] = insertion_pos[2]
+                contact_pos[2] = settled_contact_pos[2]
                 depth_reason = (
                     "too deep" if settled_clearance < min_allowed_clearance
                     else "too shallow")
                 rospy.logwarn(
-                    f"Hook insertion still {depth_reason} after stabilization; keeping planned "
-                    f"insertion Z={contact_pos[2]:.3f}m for diagnostics "
-                    f"(measured_Z={settled_contact_pos[2]:.3f}m)"
+                    f"Hook insertion still {depth_reason} after stabilization; keeping measured "
+                    f"insertion Z={contact_pos[2]:.3f}m for hook/retract "
+                    f"(planned_Z={insertion_pos[2]:.3f}m)"
                 )
             rospy.loginfo(
                 f"Insertion contact pose locked at {FormationUtils.format_vec(contact_pos)} "

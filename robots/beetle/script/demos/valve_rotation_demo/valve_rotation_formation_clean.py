@@ -184,7 +184,15 @@ class FormationAdapter:
         self.base_offset_y = assembly_to_leader['offset_y'] + leader_to_ee['y']
         self.total_offset_z = assembly_to_leader['offset_z'] + leader_to_ee['z']
 
+        # Assembly CoG -> URDF contact_point (pushing force application point),
+        # kept separate from the end-effector offsets above (towing).
+        leader_to_contact = self.tf_calculator.calculate_leader_to_contact_point_transform(reference_yaw)
+        self.contact_offset_x = assembly_to_leader['offset_x'] + leader_to_contact['x']
+        self.contact_offset_y = assembly_to_leader['offset_y'] + leader_to_contact['y']
+        self.contact_offset_z = assembly_to_leader['offset_z'] + leader_to_contact['z']
+
         rospy.loginfo(f"Assembly->EE offsets: X={self.base_offset_x:.3f}m, Y={self.base_offset_y:.3f}m, Z={self.total_offset_z:.3f}m")
+        rospy.loginfo(f"Assembly->contact_point offsets: X={self.contact_offset_x:.3f}m, Y={self.contact_offset_y:.3f}m, Z={self.contact_offset_z:.3f}m")
 
     def uav_callback(self, msg, module_id):
         """Receive individual UAV position from mocap (PoseStamped format)"""

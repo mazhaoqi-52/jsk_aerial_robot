@@ -70,10 +70,12 @@ PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
 PUSH_UNLOAD_MIN_DURATION = 1.0
 
-# Contact point offset from the virtual end-effector in formation body frame.
-PUSH_CONTACT_DX_FROM_EE = 0.0
-PUSH_CONTACT_DY_FROM_EE = 0.0
-PUSH_CONTACT_DZ_FROM_EE = 0.0
+# Optional fine-tune of the contact point (the URDF contact_point), in formation
+# body frame. Defaults to zero, i.e. the force is applied exactly at the URDF
+# contact_point provided by the FormationAdapter (not the end-effector).
+PUSH_CONTACT_DX_FROM_CP = 0.0
+PUSH_CONTACT_DY_FROM_CP = 0.0
+PUSH_CONTACT_DZ_FROM_CP = 0.0
 
 # Exit behavior.
 PUSH_RETREAT_AFTER = True
@@ -444,9 +446,9 @@ class PushWithFeedforwardState(PushingStateBase):
             return force_world, [0.0, 0.0, 0.0], "world_yaw"
 
         contact_offset_body = np.array([
-            self.formation_adapter.base_offset_x + PUSH_CONTACT_DX_FROM_EE,
-            self.formation_adapter.base_offset_y + PUSH_CONTACT_DY_FROM_EE,
-            self.formation_adapter.total_offset_z + PUSH_CONTACT_DZ_FROM_EE,
+            self.formation_adapter.contact_offset_x + PUSH_CONTACT_DX_FROM_CP,
+            self.formation_adapter.contact_offset_y + PUSH_CONTACT_DY_FROM_CP,
+            self.formation_adapter.contact_offset_z + PUSH_CONTACT_DZ_FROM_CP,
         ], dtype=float)
         force_body, torque_body = self.beetle.buildFormationCoGWrench(
             force_world,
@@ -740,7 +742,7 @@ def _load_params():
     global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
     global PUSH_UNLOAD_MIN_DURATION
-    global PUSH_CONTACT_DX_FROM_EE, PUSH_CONTACT_DY_FROM_EE, PUSH_CONTACT_DZ_FROM_EE
+    global PUSH_CONTACT_DX_FROM_CP, PUSH_CONTACT_DY_FROM_CP, PUSH_CONTACT_DZ_FROM_CP
     global PUSH_RETREAT_AFTER, PUSH_RETREAT_DISTANCE
 
     WALL_THICKNESS = float(rospy.get_param("~wall_thickness", WALL_THICKNESS))
@@ -768,9 +770,9 @@ def _load_params():
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
     PUSH_UNLOAD_MIN_DURATION = float(rospy.get_param("~unload_min_duration", PUSH_UNLOAD_MIN_DURATION))
 
-    PUSH_CONTACT_DX_FROM_EE = float(rospy.get_param("~push_contact_dx_from_ee", PUSH_CONTACT_DX_FROM_EE))
-    PUSH_CONTACT_DY_FROM_EE = float(rospy.get_param("~push_contact_dy_from_ee", PUSH_CONTACT_DY_FROM_EE))
-    PUSH_CONTACT_DZ_FROM_EE = float(rospy.get_param("~push_contact_dz_from_ee", PUSH_CONTACT_DZ_FROM_EE))
+    PUSH_CONTACT_DX_FROM_CP = float(rospy.get_param("~push_contact_dx_from_cp", PUSH_CONTACT_DX_FROM_CP))
+    PUSH_CONTACT_DY_FROM_CP = float(rospy.get_param("~push_contact_dy_from_cp", PUSH_CONTACT_DY_FROM_CP))
+    PUSH_CONTACT_DZ_FROM_CP = float(rospy.get_param("~push_contact_dz_from_cp", PUSH_CONTACT_DZ_FROM_CP))
 
     PUSH_RETREAT_AFTER = _as_bool(rospy.get_param("~retreat_after_push", PUSH_RETREAT_AFTER))
     PUSH_RETREAT_DISTANCE = float(rospy.get_param("~retreat_distance", PUSH_RETREAT_DISTANCE))

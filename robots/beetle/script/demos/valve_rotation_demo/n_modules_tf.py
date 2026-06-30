@@ -33,6 +33,13 @@ class NModuleTFCalculator:
         # End-effector offset parameters (from single UAV version)
         self.dual_fang_center_offset = 0.246  # Distance from UAV CoG to end-effector center
         self.end_effector_offset_z = 0.074382  # Z-axis offset of end-effector
+
+        # Contact point from URDF (beetle_fang.urdf.xacro cp_base_joint:
+        # contact_point at xyz="0.26 0 0" relative to base_link). This is the
+        # external-force application point for aerial pushing, kept independent
+        # of the (redesigned) end-effector, which towing uses.
+        self.contact_point_offset_x = 0.26
+        self.contact_point_offset_z = 0.0
         
     def calculate_assembly_to_leader_transform(self):
         """
@@ -100,10 +107,31 @@ class NModuleTFCalculator:
         
         return {
             'x': end_effector_x,
-            'y': end_effector_y, 
+            'y': end_effector_y,
             'z': end_effector_z
         }
-    
+
+    def calculate_leader_to_contact_point_transform(self, leader_yaw=0.0, leader_pitch=0.0):
+        """Transform from leader UAV CoG to the URDF contact_point (pushing).
+
+        Mirrors calculate_leader_to_end_effector_transform but uses the
+        contact_point offset (from base_link) instead of the end-effector, so
+        the pushing force application point follows the URDF, not the EE.
+        """
+        cos_yaw = math.cos(leader_yaw)
+        sin_yaw = math.sin(leader_yaw)
+        cos_pitch = math.cos(leader_pitch)
+        sin_pitch = math.sin(leader_pitch)
+
+        arm_body_x = self.contact_point_offset_x * cos_pitch
+        arm_body_z = -self.contact_point_offset_x * sin_pitch
+
+        return {
+            'x': arm_body_x * cos_yaw,
+            'y': arm_body_x * sin_yaw,
+            'z': self.contact_point_offset_z + arm_body_z
+        }
+
     def transform_assembly_to_end_effector(self, assembly_pos, assembly_yaw, assembly_pitch=0.0):
         """
         Complete transformation from assembly CoG to end-effector position.

@@ -6,6 +6,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
+from demo_common import normalize_angle, normalize_angle_diff
 import math
 import rospy
 from tf.transformations import euler_from_quaternion
@@ -75,7 +76,7 @@ class InsertionOptimizer:
     @staticmethod
     def _normalize_angle(angle):
         """Normalize angle to [-pi, pi]."""
-        return math.atan2(math.sin(angle), math.cos(angle))
+        return normalize_angle(angle)
 
     def update_valve_info(self, valve_pos, valve_yaw):
         """Cache valve pose information."""
@@ -283,11 +284,7 @@ class InsertionOptimizer:
     
     def _normalize_angle_diff(self, angle):
         """Normalize angle difference to [-pi, pi]."""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
+        return normalize_angle_diff(angle)
     
     def verify_dual_fang_geometry(self, uav_pos, uav_yaw):
         """Verify dual-fang geometry calculations."""

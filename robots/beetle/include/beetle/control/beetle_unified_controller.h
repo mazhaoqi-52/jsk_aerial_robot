@@ -53,6 +53,11 @@ namespace aerial_robot_control
 
 class BeetleUnifiedController
 {
+  // Grants the offline allocation unit test access to the private QP solver
+  // (solveFullVectorQP) and its tuning members, so the math can be exercised
+  // without ROS / hardware. Test-only; no effect on production behavior.
+  friend class BeetleUnifiedAllocTest;
+
 public:
   BeetleUnifiedController();
   ~BeetleUnifiedController();  // defined in .cpp where OsqpEigen::Solver is complete

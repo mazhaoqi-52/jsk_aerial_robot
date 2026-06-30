@@ -102,3 +102,24 @@ catkin_install_python(PROGRAMS
   script/demos/aerial_pushing_demo/force_sensor_auto_calib.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+# ---- Unit test for the unified-mode allocation QP ----
+# Run under rostest so an auto-launched roscore satisfies the ROS logging /
+# NodeHandle calls that beetle_unified_controller.cpp's transitive dependencies
+# pull in (otherwise they block retrying to contact a master). The test itself
+# exercises only the allocation math via a friend fixture; no hardware needed.
+if(CATKIN_ENABLE_TESTING)
+  find_package(rostest REQUIRED)
+  add_rostest_gtest(test_unified_allocation
+    test/test_unified_allocation.test
+    test/test_unified_allocation.cpp
+    src/control/beetle_unified_controller.cpp)
+  if(TARGET test_unified_allocation)
+    add_dependencies(test_unified_allocation
+      ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+    target_link_libraries(test_unified_allocation
+      -Wl,--no-as-needed
+      beetle_navigation beetle_robot_model
+      ${catkin_LIBRARIES} ${OsqpEigen_LIBRARIES})
+  endif()
+endif()

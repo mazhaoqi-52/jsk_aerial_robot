@@ -1,0 +1,5 @@
+<launch>
+  <!-- Offline allocation unit test; rostest auto-launches a roscore so the
+       controller's transitive ROS calls do not block on a master. -->
+  <test test-name="test_unified_allocation" pkg="beetle" type="test_unified_allocation"/>
+</launch>

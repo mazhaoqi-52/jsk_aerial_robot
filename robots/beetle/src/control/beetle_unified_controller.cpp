@@ -1274,6 +1274,204 @@ void BeetleUnifiedController::publishAllocationPwmPredictions(
   if (published) last_pinv_pwm_pred_pub_time_ = now;
 }
 
+bool BeetleUnifiedController::buildAllocationConstraints(
+    const Eigen::MatrixXd& alloc_matrix,
+    const Eigen::MatrixXd& interface_load_matrix,
+    int n_cols, int n_rotors, int n_constraints,
+    double cos_limit, double sin_limit, int thrust_poly_edges,
+    bool use_rate_bound, bool use_direction_rate_bound,
+    int n_interface_rows,
+    const std::vector<int>& task_priority_rows,
+    const Eigen::VectorXd& task_priority_target,
+    const std::vector<int>& priority_rows,
+    const Eigen::VectorXd& priority_target,
+    std::vector<Eigen::Triplet<double>>& C_trips,
+    Eigen::VectorXd& lb, Eigen::VectorXd& ub) const
+{
+  // C * f ∈ [lb, ub]
+  const int n_gimbal_rows = (rotor_coef_ == 2) ? 2 * n_rotors : 0;
+  const int n_thrust_rows = thrust_poly_edges * n_rotors;
+  const int n_bound_rows = n_cols;
+  const int n_rate_rows = use_rate_bound ? n_cols : 0;
+  const int n_direction_rate_rows = use_direction_rate_bound ? 2 * n_rotors : 0;
+  const int n_task_priority_rows = static_cast<int>(task_priority_rows.size());
+  const int n_priority_rows = static_cast<int>(priority_rows.size());
+  C_trips.clear();
+  C_trips.reserve(n_gimbal_rows * 2 + n_thrust_rows * 2 + n_bound_rows +
+                  n_rate_rows + n_direction_rate_rows * 2 +
+                  n_interface_rows * n_cols +
+                  (n_task_priority_rows + n_priority_rows) * n_cols);
+  lb.resize(n_constraints);
+  ub.resize(n_constraints);
+
+  int row = 0;
+
+  // (a) Gimbal angle constraints (only for rotor_coef == 2)
+  // Convention: f_i = [f_x, f_z], gimbal angle θ = atan2(-f_x, f_z)
+  // |θ| ≤ θ_max  ⟺  cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0
+  //              AND -cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0
+  // (valid when f_z ≥ 0, which is enforced by component bounds)
+  if (rotor_coef_ == 2) {
+    for (int i = 0; i < n_rotors; i++) {
+      int fx_idx = rotor_coef_ * i;      // f_x index
+      int fz_idx = rotor_coef_ * i + 1;  // f_z index
+
+      // Row: cos_limit * f_x + sin_limit * f_z ≥ 0
+      C_trips.emplace_back(row, fx_idx, cos_limit);
+      C_trips.emplace_back(row, fz_idx, sin_limit);
+      lb(row) = 0.0;
+      ub(row) = OsqpEigen::INFTY;
+      row++;
+
+      // Row: -cos_limit * f_x + sin_limit * f_z ≥ 0
+      C_trips.emplace_back(row, fx_idx, -cos_limit);
+      C_trips.emplace_back(row, fz_idx, sin_limit);
+      lb(row) = 0.0;
+      ub(row) = OsqpEigen::INFTY;
+      row++;
+    }
+  }
+
+  // (b) Per-rotor thrust magnitude constraints.
+  // OSQP accepts only linear constraints, so approximate the circle
+  // sqrt(f_x^2 + f_z^2) <= T_max with an inscribed regular polygon.
+  if (rotor_coef_ == 2 && thrust_poly_edges > 0) {
+    const double thrust_poly_bound = alloc_t_max_ * std::cos(M_PI / thrust_poly_edges);
+    for (int i = 0; i < n_rotors; i++) {
+      int fx_idx = rotor_coef_ * i;
+      int fz_idx = rotor_coef_ * i + 1;
+      for (int k = 0; k < thrust_poly_edges; k++) {
+        const double angle = 2.0 * M_PI * static_cast<double>(k) /
+                             static_cast<double>(thrust_poly_edges);
+        const double nx = std::cos(angle);
+        const double nz = std::sin(angle);
+        if (std::abs(nx) > 1e-12) C_trips.emplace_back(row, fx_idx, nx);
+        if (std::abs(nz) > 1e-12) C_trips.emplace_back(row, fz_idx, nz);
+        lb(row) = -OsqpEigen::INFTY;
+        ub(row) = thrust_poly_bound;
+        row++;
+      }
+    }
+  }
+
+  // (c) Component bounds: identity rows
+  for (int j = 0; j < n_cols; j++) {
+    C_trips.emplace_back(row, j, 1.0);
+    if (rotor_coef_ == 2 && (j % rotor_coef_ == 1)) {
+      // f_z: must be non-negative (thrust points "up" in rotor frame)
+      lb(row) = 0.0;
+      ub(row) = alloc_t_max_;
+    } else {
+      // f_x (lateral component): symmetric bounds
+      lb(row) = -alloc_t_max_;
+      ub(row) = alloc_t_max_;
+    }
+    row++;
+  }
+
+  // (d) Optional per-cycle component rate bounds around previous allocation.
+  if (use_rate_bound) {
+    for (int j = 0; j < n_cols; j++) {
+      C_trips.emplace_back(row, j, 1.0);
+      lb(row) = prev_vectoring_f_(j) - alloc_rate_limit_;
+      ub(row) = prev_vectoring_f_(j) + alloc_rate_limit_;
+      row++;
+    }
+  }
+
+  // (e) Optional per-cycle direction bounds. Unlike component rate limits,
+  // these suppress servo direction flips without hard-limiting thrust magnitude.
+  if (use_direction_rate_bound) {
+    for (int i = 0; i < n_rotors; i++) {
+      const int fx_idx = rotor_coef_ * i;
+      const int fz_idx = rotor_coef_ * i + 1;
+      const double prev_fx = prev_vectoring_f_(fx_idx);
+      const double prev_fz = prev_vectoring_f_(fz_idx);
+      const double theta_prev = std::atan2(-prev_fx, prev_fz);
+      const double theta_center =
+          std::max(-alloc_gimbal_limit_rad_,
+                   std::min(theta_prev, alloc_gimbal_limit_rad_));
+      const double theta_lo =
+          std::max(theta_center - alloc_direction_rate_limit_rad_,
+                   -alloc_gimbal_limit_rad_);
+      const double theta_hi =
+          std::min(theta_center + alloc_direction_rate_limit_rad_,
+                   alloc_gimbal_limit_rad_);
+
+      // Same cos/sin form as the gimbal-limit rows, to stay well-conditioned as
+      // theta_hi/theta_lo approach +/- pi/2 (cos(theta) >= 0 there).
+      C_trips.emplace_back(row, fx_idx, std::cos(theta_hi));
+      C_trips.emplace_back(row, fz_idx, std::sin(theta_hi));
+      lb(row) = 0.0;
+      ub(row) = OsqpEigen::INFTY;
+      row++;
+
+      C_trips.emplace_back(row, fx_idx, -std::cos(theta_lo));
+      C_trips.emplace_back(row, fz_idx, -std::sin(theta_lo));
+      lb(row) = 0.0;
+      ub(row) = OsqpEigen::INFTY;
+      row++;
+    }
+  }
+
+  // (f) Optional component-wise interface cut-load proxy bounds.
+  if (n_interface_rows > 0) {
+    for (int r = 0; r < interface_load_matrix.rows(); r++) {
+      const bool force_row = (r % 6) < 3;
+      const double limit = force_row ? alloc_interface_force_limit_
+                                     : alloc_interface_torque_limit_;
+      if (limit <= 0.0) continue;
+      for (int c = 0; c < n_cols; c++) {
+        const double v = interface_load_matrix(r, c);
+        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
+      }
+      lb(row) = -limit;
+      ub(row) = limit;
+      row++;
+    }
+  }
+
+  // (g) Task hard bands: satisfy active feedforward wrench axes first, then let
+  // effort/rate/balancing costs choose the actuator distribution.
+  if (n_task_priority_rows > 0) {
+    for (int i = 0; i < n_task_priority_rows; i++) {
+      const int task_row = task_priority_rows[i];
+      const double tol = alloc_priority_tolerances_(task_row);
+      for (int c = 0; c < n_cols; c++) {
+        const double v = alloc_matrix(task_row, c);
+        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
+      }
+      lb(row) = task_priority_target(task_row) - tol;
+      ub(row) = task_priority_target(task_row) + tol;
+      row++;
+    }
+  }
+
+  // (h) Optional hard priority bands for non-task high-output allocation.
+  // The band center can differ from the soft target so fast feedback artifacts
+  // do not become hard constraints.
+  if (n_priority_rows > 0) {
+    for (int i = 0; i < n_priority_rows; i++) {
+      const int priority_row = priority_rows[i];
+      const double tol = alloc_priority_tolerances_(priority_row);
+      for (int c = 0; c < n_cols; c++) {
+        const double v = alloc_matrix(priority_row, c);
+        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
+      }
+      lb(row) = priority_target(priority_row) - tol;
+      ub(row) = priority_target(priority_row) + tol;
+      row++;
+    }
+  }
+
+  if (row != n_constraints) {
+    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] constraint row mismatch: built=%d expected=%d",
+                      row, n_constraints);
+    return false;
+  }
+  return true;
+}
+
 bool BeetleUnifiedController::solveFullVectorQP(
     const Eigen::MatrixXd& alloc_matrix,
     const Eigen::VectorXd& w_control,
@@ -1554,178 +1752,16 @@ bool BeetleUnifiedController::solveFullVectorQP(
            * interface_target;
   }
 
-  // --- Build constraint matrix C and bounds [lb, ub] ---
-  // C * f ∈ [lb, ub]
+  // --- Build constraint matrix C and bounds [lb, ub] (C * f in [lb, ub]) ---
   std::vector<Eigen::Triplet<double>> C_trips;
-  C_trips.reserve(n_gimbal_rows * 2 + n_thrust_rows * 2 + n_bound_rows +
-                  n_rate_rows + n_direction_rate_rows * 2 +
-                  n_interface_rows * n_cols +
-                  (n_task_priority_rows + n_priority_rows) * n_cols);
-  Eigen::VectorXd lb(n_constraints), ub(n_constraints);
-
-  int row = 0;
-
-  // (a) Gimbal angle constraints (only for rotor_coef == 2)
-  // Convention: f_i = [f_x, f_z], gimbal angle θ = atan2(-f_x, f_z)
-  // |θ| ≤ θ_max  ⟺  cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0
-  //              AND -cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0
-  // (valid when f_z ≥ 0, which is enforced by component bounds)
-  if (rotor_coef_ == 2) {
-    for (int i = 0; i < n_rotors; i++) {
-      int fx_idx = rotor_coef_ * i;      // f_x index
-      int fz_idx = rotor_coef_ * i + 1;  // f_z index
-
-      // Row: cos_limit * f_x + sin_limit * f_z ≥ 0
-      C_trips.emplace_back(row, fx_idx, cos_limit);
-      C_trips.emplace_back(row, fz_idx, sin_limit);
-      lb(row) = 0.0;
-      ub(row) = OsqpEigen::INFTY;
-      row++;
-
-      // Row: -cos_limit * f_x + sin_limit * f_z ≥ 0
-      C_trips.emplace_back(row, fx_idx, -cos_limit);
-      C_trips.emplace_back(row, fz_idx, sin_limit);
-      lb(row) = 0.0;
-      ub(row) = OsqpEigen::INFTY;
-      row++;
-    }
-  }
-
-  // (b) Per-rotor thrust magnitude constraints.
-  // OSQP accepts only linear constraints, so approximate the circle
-  // sqrt(f_x^2 + f_z^2) <= T_max with an inscribed regular polygon.
-  if (rotor_coef_ == 2 && thrust_poly_edges > 0) {
-    const double thrust_poly_bound = alloc_t_max_ * std::cos(M_PI / thrust_poly_edges);
-    for (int i = 0; i < n_rotors; i++) {
-      int fx_idx = rotor_coef_ * i;
-      int fz_idx = rotor_coef_ * i + 1;
-      for (int k = 0; k < thrust_poly_edges; k++) {
-        const double angle = 2.0 * M_PI * static_cast<double>(k) /
-                             static_cast<double>(thrust_poly_edges);
-        const double nx = std::cos(angle);
-        const double nz = std::sin(angle);
-        if (std::abs(nx) > 1e-12) C_trips.emplace_back(row, fx_idx, nx);
-        if (std::abs(nz) > 1e-12) C_trips.emplace_back(row, fz_idx, nz);
-        lb(row) = -OsqpEigen::INFTY;
-        ub(row) = thrust_poly_bound;
-        row++;
-      }
-    }
-  }
-
-  // (c) Component bounds: identity rows
-  for (int j = 0; j < n_cols; j++) {
-    C_trips.emplace_back(row, j, 1.0);
-    if (rotor_coef_ == 2 && (j % rotor_coef_ == 1)) {
-      // f_z: must be non-negative (thrust points "up" in rotor frame)
-      lb(row) = 0.0;
-      ub(row) = alloc_t_max_;
-    } else {
-      // f_x (lateral component): symmetric bounds
-      lb(row) = -alloc_t_max_;
-      ub(row) = alloc_t_max_;
-    }
-    row++;
-  }
-
-  // (d) Optional per-cycle component rate bounds around previous allocation.
-  if (use_rate_bound) {
-    for (int j = 0; j < n_cols; j++) {
-      C_trips.emplace_back(row, j, 1.0);
-      lb(row) = prev_vectoring_f_(j) - alloc_rate_limit_;
-      ub(row) = prev_vectoring_f_(j) + alloc_rate_limit_;
-      row++;
-    }
-  }
-
-  // (e) Optional per-cycle direction bounds. Unlike component rate limits,
-  // these suppress servo direction flips without hard-limiting thrust magnitude.
-  if (use_direction_rate_bound) {
-    for (int i = 0; i < n_rotors; i++) {
-      const int fx_idx = rotor_coef_ * i;
-      const int fz_idx = rotor_coef_ * i + 1;
-      const double prev_fx = prev_vectoring_f_(fx_idx);
-      const double prev_fz = prev_vectoring_f_(fz_idx);
-      const double theta_prev = std::atan2(-prev_fx, prev_fz);
-      const double theta_center =
-          std::max(-alloc_gimbal_limit_rad_,
-                   std::min(theta_prev, alloc_gimbal_limit_rad_));
-      const double theta_lo =
-          std::max(theta_center - alloc_direction_rate_limit_rad_,
-                   -alloc_gimbal_limit_rad_);
-      const double theta_hi =
-          std::min(theta_center + alloc_direction_rate_limit_rad_,
-                   alloc_gimbal_limit_rad_);
-
-      // Same cos/sin form as the gimbal-limit rows, to stay well-conditioned as
-      // theta_hi/theta_lo approach +/- pi/2 (cos(theta) >= 0 there).
-      C_trips.emplace_back(row, fx_idx, std::cos(theta_hi));
-      C_trips.emplace_back(row, fz_idx, std::sin(theta_hi));
-      lb(row) = 0.0;
-      ub(row) = OsqpEigen::INFTY;
-      row++;
-
-      C_trips.emplace_back(row, fx_idx, -std::cos(theta_lo));
-      C_trips.emplace_back(row, fz_idx, -std::sin(theta_lo));
-      lb(row) = 0.0;
-      ub(row) = OsqpEigen::INFTY;
-      row++;
-    }
-  }
-
-  // (f) Optional component-wise interface cut-load proxy bounds.
-  if (n_interface_rows > 0) {
-    for (int r = 0; r < interface_load_matrix.rows(); r++) {
-      const bool force_row = (r % 6) < 3;
-      const double limit = force_row ? alloc_interface_force_limit_
-                                     : alloc_interface_torque_limit_;
-      if (limit <= 0.0) continue;
-      for (int c = 0; c < n_cols; c++) {
-        const double v = interface_load_matrix(r, c);
-        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
-      }
-      lb(row) = -limit;
-      ub(row) = limit;
-      row++;
-    }
-  }
-
-  // (g) Task hard bands: satisfy active feedforward wrench axes first, then let
-  // effort/rate/balancing costs choose the actuator distribution.
-  if (n_task_priority_rows > 0) {
-    for (int i = 0; i < n_task_priority_rows; i++) {
-      const int task_row = task_priority_rows[i];
-      const double tol = alloc_priority_tolerances_(task_row);
-      for (int c = 0; c < n_cols; c++) {
-        const double v = alloc_matrix(task_row, c);
-        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
-      }
-      lb(row) = task_priority_target(task_row) - tol;
-      ub(row) = task_priority_target(task_row) + tol;
-      row++;
-    }
-  }
-
-  // (h) Optional hard priority bands for non-task high-output allocation.
-  // The band center can differ from the soft target so fast feedback artifacts
-  // do not become hard constraints.
-  if (n_priority_rows > 0) {
-    for (int i = 0; i < n_priority_rows; i++) {
-      const int priority_row = priority_rows[i];
-      const double tol = alloc_priority_tolerances_(priority_row);
-      for (int c = 0; c < n_cols; c++) {
-        const double v = alloc_matrix(priority_row, c);
-        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
-      }
-      lb(row) = priority_target(priority_row) - tol;
-      ub(row) = priority_target(priority_row) + tol;
-      row++;
-    }
-  }
-
-  if (row != n_constraints) {
-    ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] constraint row mismatch: built=%d expected=%d",
-                      row, n_constraints);
+  Eigen::VectorXd lb, ub;
+  if (!buildAllocationConstraints(alloc_matrix, interface_load_matrix,
+                                  n_cols, n_rotors, n_constraints,
+                                  cos_limit, sin_limit, thrust_poly_edges,
+                                  use_rate_bound, use_direction_rate_bound, n_interface_rows,
+                                  task_priority_rows, task_priority_target,
+                                  priority_rows, priority_target,
+                                  C_trips, lb, ub)) {
     return false;
   }
   bool bounds_have_nan = false;

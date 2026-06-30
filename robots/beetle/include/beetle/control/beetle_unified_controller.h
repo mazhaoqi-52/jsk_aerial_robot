@@ -20,6 +20,7 @@
 
 #include <ros/ros.h>
 #include <Eigen/Dense>
+#include <Eigen/Sparse>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -420,6 +421,24 @@ private:
                          const Eigen::MatrixXd& interface_load_matrix,
                          const Eigen::VectorXd& interface_load_reference,
                          Eigen::VectorXd& vectoring_f_out);
+
+  /** @brief Build the QP linear-constraint triplets and [lb, ub] bounds:
+   *  gimbal-angle, thrust polygon, component bounds, optional rate / direction
+   *  / interface-limit rows, and task/priority hard bands. Returns false if the
+   *  built row count disagrees with n_constraints. Pure assembly of the
+   *  pre-counted constraints; no member state is modified. */
+  bool buildAllocationConstraints(const Eigen::MatrixXd& alloc_matrix,
+                                  const Eigen::MatrixXd& interface_load_matrix,
+                                  int n_cols, int n_rotors, int n_constraints,
+                                  double cos_limit, double sin_limit, int thrust_poly_edges,
+                                  bool use_rate_bound, bool use_direction_rate_bound,
+                                  int n_interface_rows,
+                                  const std::vector<int>& task_priority_rows,
+                                  const Eigen::VectorXd& task_priority_target,
+                                  const std::vector<int>& priority_rows,
+                                  const Eigen::VectorXd& priority_target,
+                                  std::vector<Eigen::Triplet<double>>& C_trips,
+                                  Eigen::VectorXd& lb, Eigen::VectorXd& ub) const;
 
   /** @brief Throttled post-solve QP diagnostic logging (saturation, residuals,
    *  per-rotor thrust/angle). Pure side-effect; no control impact. */

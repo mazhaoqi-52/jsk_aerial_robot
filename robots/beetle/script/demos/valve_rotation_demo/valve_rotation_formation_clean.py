@@ -22,6 +22,7 @@ from n_modules_tf import NModuleTFCalculator
 from insertion_optimizer import InsertionOptimizer
 from trajectory import PolynomialTrajectory
 from beetle_interface import BeetleInterface
+import demo_common
 
 
 # Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Valve rotation primarily
@@ -65,11 +66,7 @@ class FormationUtils:
     @staticmethod
     def normalize_angle(angle):
         """Normalize angle to [-pi, pi]"""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
+        return demo_common.normalize_angle(angle)
 
     @staticmethod
     def get_valve_yaw_safe(beetle_interface, fallback):

@@ -179,6 +179,25 @@ TEST_F(BeetleUnifiedAllocTest, ModuleBalanceReducesSpread)
   EXPECT_LT(spread_on, spread_off) << "spread off=" << spread_off << " on=" << spread_on;
 }
 
+// (4) A vertical gimbal limit (pi/2) must not break QP conditioning. Before the
+//     cos/sin reformulation of the gimbal-angle constraint, tan(pi/2) ~ 1.6e16
+//     produced a pathologically scaled row and the solver failed here.
+TEST_F(BeetleUnifiedAllocTest, HandlesVerticalGimbalLimit)
+{
+  gimbal_limit_ = M_PI / 2.0;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.5, 0.5, 0.2;
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solve(A, w, Eigen::VectorXd::Zero(kCols), f));
+  for (int i = 0; i < kCols / kRotorCoef; ++i) {
+    const double fx = f(2 * i), fz = f(2 * i + 1);
+    EXPECT_GE(fz, -1e-6) << "rotor " << i;
+    EXPECT_LE(std::sqrt(fx * fx + fz * fz), t_max_ + 1e-3) << "rotor " << i;
+  }
+}
+
 }  // namespace aerial_robot_control
 
 int main(int argc, char** argv)

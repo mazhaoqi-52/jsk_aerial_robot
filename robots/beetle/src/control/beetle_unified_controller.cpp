@@ -1307,8 +1307,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   //
   // Constraints (all linear, OSQP-compatible):
   //   Per rotor i (rotor_coef=2, gimbal_dof=1):
-  //     (a) Gimbal angle:  f_x + tan(θ_max)*f_z ≥ 0   (angle ≥ -θ_max)
-  //                       -f_x + tan(θ_max)*f_z ≥ 0   (angle ≤ +θ_max)
+  //     (a) Gimbal angle:  cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0   (angle ≥ -θ_max)
+  //                       -cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0   (angle ≤ +θ_max)
   //     (b) Thrust magnitude: inner polygon approximation of sqrt(f_x^2+f_z^2) ≤ T_max
   //     (c) Component bounds: -T_max ≤ f_x ≤ T_max,  0 ≤ f_z ≤ T_max
   //   Optional:
@@ -1357,8 +1357,14 @@ bool BeetleUnifiedController::solveFullVectorQP(
   }
 
   const int n_rotors = n_cols / rotor_coef_;
-  const double tan_limit = std::tan(alloc_gimbal_limit_rad_);
-  if (!std::isfinite(tan_limit)) {
+  // Gimbal-angle constraint coefficients. Use (cos, sin) rather than (1, tan):
+  // tan(theta_max) -> 1.6e16 as theta_max -> pi/2 (the default 90 deg limit),
+  // which makes that constraint row astronomically scaled and wrecks the QP
+  // conditioning. cos/sin stays bounded in [0,1] and is the same constraint
+  // (multiply f_x + tan(theta)*f_z >= 0 by cos(theta) >= 0 for theta in [0,pi/2]).
+  const double cos_limit = std::cos(alloc_gimbal_limit_rad_);
+  const double sin_limit = std::sin(alloc_gimbal_limit_rad_);
+  if (!std::isfinite(cos_limit) || !std::isfinite(sin_limit)) {
     ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl QP] reject invalid gimbal limit %.3f rad",
                       alloc_gimbal_limit_rad_);
     return false;
@@ -1561,23 +1567,24 @@ bool BeetleUnifiedController::solveFullVectorQP(
 
   // (a) Gimbal angle constraints (only for rotor_coef == 2)
   // Convention: f_i = [f_x, f_z], gimbal angle θ = atan2(-f_x, f_z)
-  // |θ| ≤ θ_max  ⟺  f_x + tan(θ_max)*f_z ≥ 0  AND  -f_x + tan(θ_max)*f_z ≥ 0
+  // |θ| ≤ θ_max  ⟺  cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0
+  //              AND -cos(θ_max)*f_x + sin(θ_max)*f_z ≥ 0
   // (valid when f_z ≥ 0, which is enforced by component bounds)
   if (rotor_coef_ == 2) {
     for (int i = 0; i < n_rotors; i++) {
       int fx_idx = rotor_coef_ * i;      // f_x index
       int fz_idx = rotor_coef_ * i + 1;  // f_z index
 
-      // Row: f_x + tan_limit * f_z ≥ 0
-      C_trips.emplace_back(row, fx_idx, 1.0);
-      C_trips.emplace_back(row, fz_idx, tan_limit);
+      // Row: cos_limit * f_x + sin_limit * f_z ≥ 0
+      C_trips.emplace_back(row, fx_idx, cos_limit);
+      C_trips.emplace_back(row, fz_idx, sin_limit);
       lb(row) = 0.0;
       ub(row) = OsqpEigen::INFTY;
       row++;
 
-      // Row: -f_x + tan_limit * f_z ≥ 0
-      C_trips.emplace_back(row, fx_idx, -1.0);
-      C_trips.emplace_back(row, fz_idx, tan_limit);
+      // Row: -cos_limit * f_x + sin_limit * f_z ≥ 0
+      C_trips.emplace_back(row, fx_idx, -cos_limit);
+      C_trips.emplace_back(row, fz_idx, sin_limit);
       lb(row) = 0.0;
       ub(row) = OsqpEigen::INFTY;
       row++;
@@ -1650,14 +1657,16 @@ bool BeetleUnifiedController::solveFullVectorQP(
           std::min(theta_center + alloc_direction_rate_limit_rad_,
                    alloc_gimbal_limit_rad_);
 
-      C_trips.emplace_back(row, fx_idx, 1.0);
-      C_trips.emplace_back(row, fz_idx, std::tan(theta_hi));
+      // Same cos/sin form as the gimbal-limit rows, to stay well-conditioned as
+      // theta_hi/theta_lo approach +/- pi/2 (cos(theta) >= 0 there).
+      C_trips.emplace_back(row, fx_idx, std::cos(theta_hi));
+      C_trips.emplace_back(row, fz_idx, std::sin(theta_hi));
       lb(row) = 0.0;
       ub(row) = OsqpEigen::INFTY;
       row++;
 
-      C_trips.emplace_back(row, fx_idx, -1.0);
-      C_trips.emplace_back(row, fz_idx, -std::tan(theta_lo));
+      C_trips.emplace_back(row, fx_idx, -std::cos(theta_lo));
+      C_trips.emplace_back(row, fz_idx, -std::sin(theta_lo));
       lb(row) = 0.0;
       ub(row) = OsqpEigen::INFTY;
       row++;

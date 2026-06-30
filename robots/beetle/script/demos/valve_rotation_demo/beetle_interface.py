@@ -16,6 +16,11 @@ from aerial_robot_msgs.msg import FlightNav, PoseControlPid
 from tf.transformations import euler_from_quaternion
 from sensor_msgs.msg import Joy
 
+# script/demos on the path so the shared demo helpers import regardless of how
+# this module is launched.
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from demo_common import normalize_angle
+
 
 def smoothstep01(value):
     """C1-continuous easing for wrench/trajectory blend factors in [0, 1]."""
@@ -854,8 +859,4 @@ class BeetleInterface(object):
     @staticmethod
     def _normalize_angle(angle):
         """Normalize angle to [-pi, pi]."""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
+        return normalize_angle(angle)

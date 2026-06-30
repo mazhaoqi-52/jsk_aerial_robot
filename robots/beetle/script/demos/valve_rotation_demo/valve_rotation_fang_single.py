@@ -14,6 +14,7 @@ if current_dir not in sys.path:
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+import demo_common  # shared demo helpers (script/demos is on the path above)
 
 import rospy
 import smach
@@ -241,11 +242,7 @@ class SingleUAVStateBase(smach.State):
         return self.uav_pos
 
     def normalize_angle(self, angle):
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
+        return demo_common.normalize_angle(angle)
 
     def get_current_yaw(self):
         return self.current_yaw
@@ -1941,11 +1938,7 @@ class MoveToValveState(SingleUAVStateBase):
 
     def normalize_angle(self, angle):
         """Normalize angle to [-pi, pi]"""
-        while angle > math.pi:
-            angle -= 2*math.pi
-        while angle < -math.pi:
-            angle += 2*math.pi
-        return angle
+        return demo_common.normalize_angle(angle)
 
     def generate_polynomial_trajectory(self, start_pos, target_pos, target_yaw, num_points=20):
         """

@@ -10,10 +10,17 @@ This follows the 分层控制 architecture:
 - No external PID controllers
 """
 
+import os
+import sys
 import rospy
 import time
 import math
 from math import pi, sqrt
+
+# script/demos on the path so the shared demo helpers import regardless of how
+# this module is launched.
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from demo_common import normalize_angle_diff
 
 
 class SimplifiedMotionController:
@@ -275,11 +282,7 @@ class SimplifiedMotionController:
         Returns:
             float: Normalized angle difference
         """
-        while angle_diff > pi:
-            angle_diff -= 2 * pi
-        while angle_diff < -pi:
-            angle_diff += 2 * pi
-        return angle_diff
+        return normalize_angle_diff(angle_diff)
     
     def reset_control_state(self):
         """

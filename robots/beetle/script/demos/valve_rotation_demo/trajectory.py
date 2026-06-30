@@ -4,10 +4,17 @@ Trajectory generation module for valve rotation tasks.
 Provides polynomial trajectories and online circular trajectory generation.
 """
 
+import os
+import sys
 import rospy
 import numpy as np
 import math
 from math import pi, atan2, cos, sin
+
+# script/demos on the path so the shared demo helpers import regardless of how
+# this module is launched.
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from demo_common import normalize_angle
 
 
 class AdaptiveTrajectoryController:
@@ -706,11 +713,7 @@ class AdaptiveTrajectoryPlanner:
     
     def _normalize_angle(self, angle):
         """Normalize angle to [-π, π]."""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
+        return normalize_angle(angle)
     
     def create_z_only_trajectory(self, start_pos, target_z, duration):
         """Create Z-axis only trajectory."""

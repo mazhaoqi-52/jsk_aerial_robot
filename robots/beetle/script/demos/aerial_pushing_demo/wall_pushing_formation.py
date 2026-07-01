@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.join(current_dir, '../..'))
 sys.path.insert(0, os.path.join(current_dir, '..'))
 
 from beetle_interface import smoothstep01
+from adaptive_force_manager import AdaptiveForceManager
 from load_towing_formation import (
     TOWING_UNLOAD_FORCE_RATE,
     TOWING_UNLOAD_MAX_DURATION,
@@ -550,19 +551,28 @@ class PushWithFeedforwardState(PushingStateBase):
         dynamic_push = PUSH_MOVE_DISTANCE > 1e-6
         push_deadline = PUSH_MOVE_MAX_DURATION if dynamic_push else effective_duration
         advance = 0.0
+        # Dynamic mode uses the shared adaptive-force manager (towing's mocap-
+        # feedback behavior): ramp up until the wall breaks away, then fall back
+        # to a maintain force; if it never moves, the manager reports abort and
+        # we end as a static force test.
+        force_mgr = AdaptiveForceManager(
+            max_force=PUSH_FORCE, ramp_time=ramp_time) if dynamic_push else None
         if dynamic_push:
             rospy.loginfo(
                 "[Pushing] Dynamic mode: advance the wall up to %.2fm along push_dir "
-                "(timeout %.1fs). A fixed wall cannot advance -> static force test.",
-                PUSH_MOVE_DISTANCE, push_deadline)
+                "(timeout %.1fs), adaptive force up to %.2fN. A fixed wall cannot "
+                "advance -> static force test.",
+                PUSH_MOVE_DISTANCE, push_deadline, PUSH_FORCE)
 
         start_time = rospy.get_time()
+        prev_t = start_time
         rate = rospy.Rate(25)
         unified_mode_seen = self.beetle.isUnifiedMode()
         force_ready_logged = False
 
         while not rospy.is_shutdown():
-            elapsed = rospy.get_time() - start_time
+            now = rospy.get_time()
+            elapsed = now - start_time
             if elapsed >= push_deadline:
                 break
 
@@ -607,8 +617,20 @@ class PushWithFeedforwardState(PushingStateBase):
                     userdata, 'unified_exit', current_pos, maintain_yaw)
                 return 'timeout'
 
-            ramp = smoothstep01(elapsed / ramp_time)
-            ff_world = push_dir * (PUSH_FORCE * ramp)
+            if dynamic_push:
+                # Mocap-feedback adaptive force: ramp up until breakaway, hold a
+                # maintain force after, abort if the wall stays stuck.
+                fres = force_mgr.update(advance, now - prev_t)
+                prev_t = now
+                ff_mag = fres['force']
+                if fres['abort']:
+                    rospy.logwarn(
+                        "[Pushing] Dynamic abort: wall did not move under %.2fN "
+                        "(stall) -> static wall", ff_mag)
+                    break
+            else:
+                ff_mag = PUSH_FORCE * smoothstep01(elapsed / ramp_time)
+            ff_world = push_dir * ff_mag
             if not force_ready_logged and elapsed >= ramp_time:
                 force_ready_logged = True
                 rospy.loginfo(

@@ -35,8 +35,8 @@ class AdaptiveForceManagerTest(unittest.TestCase):
         self.assertEqual(res['phase'], 'ramp')
 
     def test_breakaway_on_advance(self):
-        # Once advance crosses breakaway_distance, breakaway is detected and the
-        # force is not relieved immediately; it holds/ramp-recovers first.
+        # Once advance crosses breakaway_distance with real motion, breakaway
+        # is detected and the force is not relieved immediately.
         mgr = AdaptiveForceManager(max_force=20.0, ramp_time=1.0,
                                    breakaway_distance=0.03, maintain_force_ratio=0.6)
         advances = [0.0] * 25 + [0.05]  # sit at max, then jump past breakaway_distance
@@ -44,6 +44,46 @@ class AdaptiveForceManagerTest(unittest.TestCase):
         self.assertTrue(res['breakaway'])
         self.assertEqual(res['phase'], 'breakaway_hold')
         self.assertGreater(res['force'], 0.6 * 20.0)
+
+    def test_velocity_spike_is_only_candidate(self):
+        # A tiny mocap jump can have a large instantaneous velocity, but it
+        # must not confirm breakaway without enough displacement.
+        mgr = AdaptiveForceManager(max_force=20.0, ramp_time=1.0,
+                                   breakaway_distance=0.03,
+                                   breakaway_velocity=0.02,
+                                   early_breakaway_distance=0.001,
+                                   early_breakaway_velocity=0.02)
+        mgr.update(0.0, DT)
+        res = mgr.update(0.002, DT)
+        self.assertFalse(res['breakaway'])
+        self.assertTrue(res['breakaway_candidate'])
+        self.assertEqual(res['phase'], 'motion_candidate')
+
+    def test_breakaway_waits_for_stable_motion_before_relief(self):
+        mgr = AdaptiveForceManager(max_force=20.0, ramp_time=0.2,
+                                   breakaway_distance=0.03,
+                                   breakaway_velocity=0.02,
+                                   stable_motion_distance=0.10,
+                                   stable_motion_velocity=0.03,
+                                   maintain_force_ratio=0.5)
+        run(mgr, [0.0] * 10)
+        res = mgr.update(0.04, DT)  # confirmed breakaway
+        self.assertTrue(res['breakaway'])
+        self.assertFalse(res['stable_motion'])
+        self.assertEqual(res['phase'], 'breakaway_hold')
+        for _ in range(50):
+            res = mgr.update(0.05, DT)  # not enough stable progress
+        self.assertFalse(res['stable_motion'])
+        self.assertEqual(res['phase'], 'breakaway_hold')
+        self.assertGreater(res['force'], 0.5 * 20.0)
+
+        a = 0.05
+        for _ in range(40):
+            a += 0.05 * DT
+            res = mgr.update(a, DT)
+        self.assertTrue(res['stable_motion'])
+        self.assertEqual(res['phase'], 'breakaway')
+        self.assertLessEqual(res['force'], 0.5 * 20.0 + 1e-6)
 
     def test_force_falls_back_after_breakaway(self):
         # After breakaway the held force must not exceed the maintain force even

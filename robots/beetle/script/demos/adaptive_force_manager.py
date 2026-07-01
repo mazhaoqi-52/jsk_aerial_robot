@@ -6,10 +6,9 @@ feedforward controller so it can be shared and unit-tested offline:
 
   - ramp the feedforward force up while the object has not broken away
     (has not started moving);
-  - once the object breaks away (advance distance / speed crosses a threshold),
-    keep pushing briefly until the motion is established, then fall back to a
-    lower "maintain" force and relieve it further if the object moves faster
-    than the target speed;
+  - treat early motion as a candidate, confirm breakaway only after both
+    distance and speed thresholds are met, then keep pushing until stable
+    motion is established before falling back to a lower "maintain" force;
   - if the force is already high but the object still does not move, count
     consecutive stall windows and raise an abort (the object is effectively
     fixed -> the push degrades to a static force test).
@@ -29,10 +28,14 @@ class AdaptiveForceManager:
                  ramp_time=3.0,
                  breakaway_distance=0.03,
                  breakaway_velocity=0.02,
+                 early_breakaway_distance=0.008,
+                 early_breakaway_velocity=None,
                  maintain_force_ratio=0.6,
                  breakaway_hold_time=0.8,
                  breakaway_relief_min_advance=0.05,
                  target_velocity=0.05,
+                 stable_motion_distance=None,
+                 stable_motion_velocity=None,
                  overspeed_relief_time=8.0,
                  stall_window_time=5.0,
                  stall_min_advance=0.01,
@@ -42,12 +45,16 @@ class AdaptiveForceManager:
         Args:
             max_force: force ceiling / target while ramping (N).
             ramp_time: time to ramp from 0 to max_force before breakaway (s).
-            breakaway_distance: object advance that confirms breakaway (m).
-            breakaway_velocity: object advance speed that confirms breakaway (m/s).
+            breakaway_distance: object advance required to confirm breakaway (m).
+            breakaway_velocity: object speed required to confirm breakaway (m/s).
+            early_breakaway_distance: advance that marks a motion candidate (m).
+            early_breakaway_velocity: speed that marks a motion candidate (m/s).
             maintain_force_ratio: post-breakaway hold force as a ratio of max_force.
-            breakaway_hold_time: minimum time to keep ramping before force relief (s).
-            breakaway_relief_min_advance: extra advance after breakaway before relief (m).
+            breakaway_hold_time: minimum time to keep force before relief (s).
+            breakaway_relief_min_advance: extra confirmed advance before relief (m).
             target_velocity: desired advance speed after breakaway (m/s).
+            stable_motion_distance: advance required before force relief (m).
+            stable_motion_velocity: speed required before force relief (m/s).
             overspeed_relief_time: time constant for reducing force when overspeeding (s).
             stall_window_time: stall detection window length (s).
             stall_min_advance: min advance within a window to not be stalled (m).
@@ -63,6 +70,18 @@ class AdaptiveForceManager:
         self.breakaway_relief_advance = (
             self.breakaway_distance + max(0.0, float(breakaway_relief_min_advance)))
         self.target_velocity = float(target_velocity)
+        self.early_breakaway_distance = max(0.0, float(early_breakaway_distance))
+        self.early_breakaway_velocity = (
+            self.target_velocity * 0.6 if early_breakaway_velocity is None
+            else float(early_breakaway_velocity))
+        self.stable_motion_distance = (
+            self.breakaway_relief_advance if stable_motion_distance is None
+            else float(stable_motion_distance))
+        self.stable_motion_distance = max(
+            self.breakaway_distance, self.stable_motion_distance)
+        self.stable_motion_velocity = (
+            self.target_velocity * 0.6 if stable_motion_velocity is None
+            else float(stable_motion_velocity))
         self.overspeed_relief_rate = self.max_force / max(float(overspeed_relief_time), 1e-3)
         self.stall_window_time = float(stall_window_time)
         self.stall_min_advance = float(stall_min_advance)
@@ -77,6 +96,9 @@ class AdaptiveForceManager:
         self.advance_velocity = 0.0
         self.stall_windows = 0
         self.abort = False
+        self.breakaway_candidate_detected = False
+        self.breakaway_candidate_force = None
+        self.stable_motion_detected = False
 
         self._prev_advance = 0.0
         self._have_prev = False
@@ -104,11 +126,17 @@ class AdaptiveForceManager:
         self._prev_advance = advance
 
         holding_breakaway = False
+        motion_candidate = False
         if not self.breakaway_detected:
             # Phase 1: keep raising the force until the object starts moving.
             self.current_force = min(self.max_force, self.current_force + self.ramp_rate * dt)
-            if (advance >= self.breakaway_distance or
-                    self.advance_velocity >= self.breakaway_velocity):
+            confirmed_motion = (
+                advance >= self.breakaway_distance and
+                self.advance_velocity >= self.breakaway_velocity)
+            early_motion = (
+                advance >= self.early_breakaway_distance and
+                self.advance_velocity >= self.early_breakaway_velocity)
+            if confirmed_motion:
                 self.breakaway_detected = True
                 self.breakaway_force = self.current_force
                 self.breakaway_elapsed = 0.0
@@ -116,11 +144,20 @@ class AdaptiveForceManager:
                 self.stall_windows = 0
                 self._window_elapsed = 0.0
                 self._window_start_advance = advance
+            elif early_motion:
+                motion_candidate = True
+                if not self.breakaway_candidate_detected:
+                    self.breakaway_candidate_detected = True
+                    self.breakaway_candidate_force = self.current_force
         else:
             self.breakaway_elapsed += dt
+            if (not self.stable_motion_detected and
+                    advance >= self.stable_motion_distance and
+                    self.advance_velocity >= self.stable_motion_velocity):
+                self.stable_motion_detected = True
             holding_breakaway = (
                 self.breakaway_elapsed < self.breakaway_hold_time or
-                advance < self.breakaway_relief_advance)
+                not self.stable_motion_detected)
             if holding_breakaway:
                 self.current_force = min(self.max_force, self.current_force + self.ramp_rate * dt)
             else:
@@ -134,13 +171,13 @@ class AdaptiveForceManager:
                                              self.current_force + self.ramp_rate * dt)
                 self.current_force = min(self.current_force, self.maintain_force)
 
-        # Stall detection: only meaningful while ramping (pushing hard, no motion).
+        # Stall detection: only meaningful until stable object motion is established.
         stalled_window = False
         self._window_elapsed += dt
         if self._window_elapsed >= self.stall_window_time:
             gained = advance - self._window_start_advance
             pushing_hard = self.current_force >= self.stall_min_force
-            if (not self.breakaway_detected and pushing_hard and
+            if (not self.stable_motion_detected and pushing_hard and
                     gained < self.stall_min_advance):
                 self.stall_windows += 1
                 stalled_window = True
@@ -151,13 +188,15 @@ class AdaptiveForceManager:
             self._window_elapsed = 0.0
             self._window_start_advance = advance
 
-        phase = 'ramp'
+        phase = 'motion_candidate' if motion_candidate else 'ramp'
         if self.breakaway_detected:
             phase = 'breakaway_hold' if holding_breakaway else 'breakaway'
 
         return {
             'force': self.current_force,
             'breakaway': self.breakaway_detected,
+            'breakaway_candidate': self.breakaway_candidate_detected,
+            'stable_motion': self.stable_motion_detected,
             'stalled': stalled_window or self.stall_windows > 0,
             'abort': self.abort,
             'phase': phase,

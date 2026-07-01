@@ -19,14 +19,16 @@
        doc="Timeout for waiting for the calibration service and first force sensor sample"/>
 
   <!-- Real CFS sensor is hardware-only (serial device); never start it in sim. -->
-  <include if="$(arg force_sensor_enabled)" unless="$(arg simulation)"
-           file="$(find beetle)/launch/aerial_pushing_tasks/force_sensor_test.launch">
-    <arg name="force_sensor"                    value="$(arg force_sensor)"/>
-    <arg name="force_sensor_port"               value="$(arg force_sensor_port)"/>
-    <arg name="force_sensor_auto_calib"         value="$(arg force_sensor_auto_calib)"/>
-    <arg name="force_sensor_auto_calib_delay"   value="$(arg force_sensor_auto_calib_delay)"/>
-    <arg name="force_sensor_auto_calib_timeout" value="$(arg force_sensor_auto_calib_timeout)"/>
-  </include>
+  <group if="$(arg force_sensor_enabled)">
+    <include unless="$(arg simulation)"
+             file="$(find beetle)/launch/aerial_pushing_tasks/force_sensor_test.launch">
+      <arg name="force_sensor"                    value="$(arg force_sensor)"/>
+      <arg name="force_sensor_port"               value="$(arg force_sensor_port)"/>
+      <arg name="force_sensor_auto_calib"         value="$(arg force_sensor_auto_calib)"/>
+      <arg name="force_sensor_auto_calib_delay"   value="$(arg force_sensor_auto_calib_delay)"/>
+      <arg name="force_sensor_auto_calib_timeout" value="$(arg force_sensor_auto_calib_timeout)"/>
+    </include>
+  </group>
 
   ###########  Formation modules  ###########
   <arg name="module_ids" default="2,3,1"
@@ -50,8 +52,10 @@
   <arg name="wall_slide_damping"  default="50.0"/>
   <arg name="use_wall_mocap" default="false"
        doc="Use wall mocap pose; false means +x/stall-only contact is enough"/>
-  <arg name="use_wall_wrench" default="$(arg simulation)"
-       doc="Use /wall/wrench for contact detection. Defaults to true in sim (the gazebo wall FT sensor gives a clean contact force); on real hardware /cfs/data stays logging-only unless set true."/>
+  <arg name="use_wall_wrench" default="false"
+       doc="Use /wall/wrench for contact detection. Defaults false so sim and real use the same stall gate; on real hardware /cfs/data stays logging-only unless bridged to /wall/wrench and set true."/>
+  <arg name="use_wall_plane_contact" default="false"
+       doc="Use wall pose geometry as an extra contact gate. Defaults false so sim and real use the same stall gate."/>
 
   <include file="$(find beetle)/launch/aerial_pushing_tasks/wall_pos.launch">
     <arg name="real_machine"   value="$(arg real_machine)"/>
@@ -82,8 +86,16 @@
        doc="Forward approach speed (m/s)"/>
   <arg name="approach_overrun" default="0.12"
        doc="Extra commanded travel past the estimated wall face (m)"/>
+  <arg name="min_approach_distance" default="0.04"
+       doc="Minimum commanded approach distance before contact can be accepted (m)"/>
   <arg name="contact_wrench_threshold" default="0.8"
-       doc="Wall wrench threshold for contact detection (N)"/>
+       doc="Optional wall wrench threshold for contact detection when use_wall_wrench=true (N)"/>
+  <arg name="contact_stall_lead" default="0.06"
+       doc="Stall contact gate: commanded lead over actual end-effector progress (m)"/>
+  <arg name="contact_stall_velocity" default="0.004"
+       doc="Stall contact gate: maximum short-window average progress speed along push direction (m/s)"/>
+  <arg name="contact_required_cycles" default="8"
+       doc="Stall contact gate: consecutive 25Hz cycles required before contact is accepted"/>
   <arg name="push_force" default="5.0"
        doc="Target pushing force feedforward (N)"/>
   <arg name="force_ramp_time" default="3.0"
@@ -117,12 +129,17 @@
     <param name="wall_height"              value="$(arg wall_height)"/>
     <param name="use_wall_mocap"           value="$(arg use_wall_mocap)"/>
     <param name="use_wall_wrench"          value="$(arg use_wall_wrench)"/>
+    <param name="use_wall_plane_contact"   value="$(arg use_wall_plane_contact)"/>
 
     <param name="push_direction"           value="$(arg push_direction)"/>
     <param name="approach_distance"        value="$(arg approach_distance)"/>
     <param name="approach_speed"           value="$(arg approach_speed)"/>
     <param name="approach_overrun"         value="$(arg approach_overrun)"/>
+    <param name="min_approach_distance"    value="$(arg min_approach_distance)"/>
     <param name="contact_wrench_threshold" value="$(arg contact_wrench_threshold)"/>
+    <param name="contact_stall_lead"       value="$(arg contact_stall_lead)"/>
+    <param name="contact_stall_velocity"   value="$(arg contact_stall_velocity)"/>
+    <param name="contact_required_cycles"  value="$(arg contact_required_cycles)"/>
     <param name="push_force"               value="$(arg push_force)"/>
     <param name="force_ramp_time"          value="$(arg force_ramp_time)"/>
     <param name="push_duration"            value="$(arg push_duration)"/>

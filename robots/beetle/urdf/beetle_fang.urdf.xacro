@@ -89,7 +89,7 @@
      <link name="beetle_fang_link">
       <inertial>
         <origin xyz="0.00659 0 -0.01082" rpy="0 0 0"/>
-        <mass value="0.37"/>
+        <mass value="0.25"/>
         <inertia
             ixx="0.00327" iyy="0.00007" izz="0.00324"
             ixy="0.00000" ixz="-0.00001" iyz="0.00001"/>

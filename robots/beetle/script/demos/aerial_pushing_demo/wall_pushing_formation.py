@@ -97,6 +97,8 @@ class WallInterface(object):
         self.is_simulation = _as_bool(rospy.get_param("~simulation", True))
         self.use_wall_mocap = _as_bool(rospy.get_param("~use_wall_mocap", False))
         self.use_wall_wrench = _as_bool(rospy.get_param("~use_wall_wrench", False))
+        self.use_wall_plane_contact = _as_bool(
+            rospy.get_param("~use_wall_plane_contact", False))
         self.use_wall_pose = self.is_simulation or self.use_wall_mocap
         self.wall_x = float(rospy.get_param("~wall_x", 1.5))
         self.wall_y = float(rospy.get_param("~wall_y", 0.0))
@@ -123,9 +125,11 @@ class WallInterface(object):
 
         rospy.loginfo(
             "WallInterface: mode=%s, use_wall_pose=%s, use_wall_wrench=%s, "
-            "fallback center=(%.3f, %.3f, %.3f), yaw=%.1f deg",
+            "use_wall_plane_contact=%s, fallback center=(%.3f, %.3f, %.3f), "
+            "yaw=%.1f deg",
             'simulation' if self.is_simulation else 'real_machine',
             self.use_wall_pose, self.use_wall_wrench,
+            self.use_wall_plane_contact,
             self.wall_pos[0], self.wall_pos[1], self.wall_pos[2],
             math.degrees(self.wall_yaw),
         )
@@ -340,11 +344,16 @@ class ApproachWallUntilContactState(PushingStateBase):
             "Approach target distance=%.3fm, speed=%.3fm/s, max_duration=%.1fs",
             target_distance, PUSH_APPROACH_SPEED, max_duration)
 
-        rate = rospy.Rate(25)
+        approach_rate_hz = 25.0
+        rate = rospy.Rate(approach_rate_hz)
         t0 = rospy.get_time()
         prev_t = t0
         prev_actual_dist = 0.0
-        stall_count = 0
+        stall_samples = []
+        stall_window_limit = (
+            PUSH_CONTACT_STALL_VELOCITY *
+            PUSH_CONTACT_REQUIRED_CYCLES / approach_rate_hz)
+        stall_window_motion = 0.0
 
         while not rospy.is_shutdown():
             now = rospy.get_time()
@@ -379,17 +388,26 @@ class ApproachWallUntilContactState(PushingStateBase):
                 force_abs >= PUSH_CONTACT_WRENCH_THRESHOLD)
 
             contact_by_plane = (
+                self.wall_interface.use_wall_plane_contact and
                 distance_to_face is not None and
                 distance_to_face <= -0.01 and
                 lead > 0.02)
 
-            if (cmd_dist > PUSH_MIN_APPROACH_DISTANCE and
-                    lead > PUSH_CONTACT_STALL_LEAD and
-                    abs(actual_vel) < PUSH_CONTACT_STALL_VELOCITY):
-                stall_count += 1
+            stall_lead_ready = (
+                cmd_dist > PUSH_MIN_APPROACH_DISTANCE and
+                lead > PUSH_CONTACT_STALL_LEAD)
+            if stall_lead_ready:
+                stall_samples.append(actual_dist)
+                if len(stall_samples) > PUSH_CONTACT_REQUIRED_CYCLES:
+                    stall_samples.pop(0)
             else:
-                stall_count = 0
-            contact_by_stall = stall_count >= PUSH_CONTACT_REQUIRED_CYCLES
+                stall_samples = []
+            stall_window_motion = (
+                abs(stall_samples[-1] - stall_samples[0])
+                if len(stall_samples) >= 2 else 0.0)
+            contact_by_stall = (
+                len(stall_samples) >= PUSH_CONTACT_REQUIRED_CYCLES and
+                stall_window_motion <= stall_window_limit)
 
             if contact_by_wrench or contact_by_stall or contact_by_plane:
                 reasons = []
@@ -414,7 +432,8 @@ class ApproachWallUntilContactState(PushingStateBase):
                 1.0,
                 f"[Approach Wall] cmd={cmd_dist*1000:.0f}mm actual={actual_dist*1000:.0f}mm "
                 f"lead={lead*1000:.0f}mm vel={actual_vel*1000:.1f}mm/s "
-                f"face={face_text} wall_force={force_text} stall={stall_count}/{PUSH_CONTACT_REQUIRED_CYCLES}")
+                f"win={stall_window_motion*1000:.1f}/{stall_window_limit*1000:.1f}mm "
+                f"face={face_text} wall_force={force_text} stall={len(stall_samples)}/{PUSH_CONTACT_REQUIRED_CYCLES}")
 
             if cmd_dist >= target_distance and elapsed > max_duration - 2.0:
                 rospy.logwarn_throttle(1.0, "At approach target without contact; waiting for contact gate")
@@ -770,6 +789,8 @@ def log_pushing_preflight(module_ids, real_machine, simulation):
 
     use_wall_mocap = _as_bool(rospy.get_param("~use_wall_mocap", False))
     use_wall_wrench = _as_bool(rospy.get_param("~use_wall_wrench", False))
+    use_wall_plane_contact = _as_bool(
+        rospy.get_param("~use_wall_plane_contact", False))
     if simulation:
         wall_pose_topic = '/wall/odom'
         if wall_pose_topic not in published_topics:
@@ -782,6 +803,8 @@ def log_pushing_preflight(module_ids, real_machine, simulation):
         rospy.loginfo("[PushingPreflight] Wall mocap disabled; contact uses stall detection")
     if use_wall_wrench and '/wall/wrench' not in published_topics:
         rospy.logwarn("[PushingPreflight] Missing wall wrench topic: /wall/wrench")
+    if use_wall_plane_contact:
+        rospy.loginfo("[PushingPreflight] Wall-plane contact gate enabled")
 
     nav_subscribers = _names_for_topic(subs, '/assembly/uav/nav')
     if nav_subscribers:
@@ -862,8 +885,16 @@ def main():
         "Wall: thickness=%.3fm, width=%.3fm, height=%.3fm",
         WALL_THICKNESS, WALL_WIDTH, WALL_HEIGHT)
     rospy.loginfo(
-        "Approach: distance=%.3fm, speed=%.3fm/s, contact_wrench=%.2fN",
-        PUSH_APPROACH_DISTANCE, PUSH_APPROACH_SPEED, PUSH_CONTACT_WRENCH_THRESHOLD)
+        "Approach: distance=%.3fm, speed=%.3fm/s",
+        PUSH_APPROACH_DISTANCE, PUSH_APPROACH_SPEED)
+    rospy.loginfo(
+        "Contact gate: stall lead>%.0fmm, window progress<%.1fmm over "
+        "%d cycles at 25Hz; optional wrench>=%.2fN; optional plane<=-10mm "
+        "and lead>20mm",
+        PUSH_CONTACT_STALL_LEAD * 1000.0,
+        PUSH_CONTACT_STALL_VELOCITY * PUSH_CONTACT_REQUIRED_CYCLES / 25.0 * 1000.0,
+        PUSH_CONTACT_REQUIRED_CYCLES,
+        PUSH_CONTACT_WRENCH_THRESHOLD)
     rospy.loginfo(
         "Push: force=%.2fN, ramp=%.1fs, duration=%.1fs, "
         "full_force_hold=%.1fs, lead=%.0fmm",

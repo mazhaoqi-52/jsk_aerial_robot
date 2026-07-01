@@ -39,11 +39,29 @@ class AdaptiveForceManagerTest(unittest.TestCase):
         # is detected and the force is not relieved immediately.
         mgr = AdaptiveForceManager(max_force=20.0, ramp_time=1.0,
                                    breakaway_distance=0.03, maintain_force_ratio=0.6)
-        advances = [0.0] * 25 + [0.05]  # sit at max, then jump past breakaway_distance
+        advances = [0.0] * 25
+        a = 0.031
+        for _ in range(10):
+            a += 0.04 * DT
+            advances.append(a)
         res = run(mgr, advances)
         self.assertTrue(res['breakaway'])
         self.assertEqual(res['phase'], 'breakaway_hold')
         self.assertGreater(res['force'], 0.6 * 20.0)
+
+    def test_transient_flex_does_not_confirm_breakaway(self):
+        # A top-mounted marker can jump when the wall flexes at impact. If the
+        # displacement does not keep increasing, it must not unlock force relief.
+        mgr = AdaptiveForceManager(max_force=20.0, ramp_time=0.5,
+                                   breakaway_distance=0.03,
+                                   breakaway_velocity=0.02,
+                                   stable_motion_distance=0.08)
+        seq = [0.0] * 10 + [0.05, 0.052, 0.051, 0.050, 0.050]
+        seq += [0.050] * 20
+        res = run(mgr, seq)
+        self.assertFalse(res['breakaway'])
+        self.assertFalse(res['stable_motion'])
+        self.assertEqual(res['phase'], 'ramp')
 
     def test_velocity_spike_is_only_candidate(self):
         # A tiny mocap jump can have a large instantaneous velocity, but it
@@ -67,7 +85,10 @@ class AdaptiveForceManagerTest(unittest.TestCase):
                                    stable_motion_velocity=0.03,
                                    maintain_force_ratio=0.5)
         run(mgr, [0.0] * 10)
-        res = mgr.update(0.04, DT)  # confirmed breakaway
+        a = 0.031
+        for _ in range(10):
+            a += 0.04 * DT
+            res = mgr.update(a, DT)  # confirmed breakaway after sustained motion
         self.assertTrue(res['breakaway'])
         self.assertFalse(res['stable_motion'])
         self.assertEqual(res['phase'], 'breakaway_hold')
@@ -78,7 +99,7 @@ class AdaptiveForceManagerTest(unittest.TestCase):
         self.assertGreater(res['force'], 0.5 * 20.0)
 
         a = 0.05
-        for _ in range(40):
+        for _ in range(70):
             a += 0.05 * DT
             res = mgr.update(a, DT)
         self.assertTrue(res['stable_motion'])

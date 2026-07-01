@@ -67,6 +67,7 @@ PUSH_FORCE_RAMP_TIME = 3.0
 PUSH_DURATION = 10.0
 PUSH_FULL_FORCE_HOLD_TIME = 2.0
 PUSH_POSITION_LEAD = 0.03
+PUSH_TARGET_MAX_LAG = 0.03
 PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
 PUSH_UNLOAD_MIN_DURATION = 1.0
@@ -592,6 +593,7 @@ class PushWithFeedforwardState(PushingStateBase):
         advance = 0.0
         ee_advance = 0.0
         wall_advance = None
+        target_lag = 0.0
         wall_start_pos = None
         advance_source = 'time'
         # Dynamic mode uses the shared adaptive-force manager. When wall pose is
@@ -658,6 +660,12 @@ class PushWithFeedforwardState(PushingStateBase):
                         advance, advance_source)
                     break
                 lead = min(PUSH_MOVE_DISTANCE, advance + PUSH_POSITION_LEAD)
+                if PUSH_TARGET_MAX_LAG > 1e-6:
+                    lead = max(
+                        lead,
+                        min(PUSH_MOVE_DISTANCE, ee_advance - PUSH_TARGET_MAX_LAG))
+                lead = max(0.0, min(PUSH_MOVE_DISTANCE, lead))
+                target_lag = ee_advance - lead
                 target_pos = contact_pos + push_dir * lead
 
             rpy = self.beetle.getAssemblyRPY()
@@ -733,7 +741,8 @@ class PushWithFeedforwardState(PushingStateBase):
                 f"tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm "
                 f"progress={progress*100:.0f}% source={advance_source} "
                 f"phase={phase_text} wall_adv={wall_advance_text} "
-                f"ee_adv={ee_advance:.3f}m max_rp={math.degrees(max_rp):.1f}deg")
+                f"ee_adv={ee_advance:.3f}m target_lag={target_lag:.3f}m "
+                f"max_rp={math.degrees(max_rp):.1f}deg")
             rospy.loginfo_throttle(1.0, diag_text)
             self.diag_pub.publish(String(data=diag_text))
 
@@ -761,9 +770,9 @@ class PushWithFeedforwardState(PushingStateBase):
                         "motion was not observed (static/unverified test)",
                         advance, PUSH_MOVE_DISTANCE)
 
-        hold_pos = self.get_end_effector_position()
+        hold_pos = target_pos
         if hold_pos is None:
-            hold_pos = target_pos
+            hold_pos = self.get_end_effector_position()
         self._finish_push_exit(
             userdata, 'succeeded', hold_pos, maintain_yaw,
             clear_duration=max(2.0, PUSH_UNLOAD_MIN_DURATION))
@@ -888,7 +897,8 @@ def _load_params():
     global PUSH_CONTACT_REQUIRED_CYCLES
     global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION
     global PUSH_FULL_FORCE_HOLD_TIME
-    global PUSH_POSITION_LEAD, PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
+    global PUSH_POSITION_LEAD, PUSH_TARGET_MAX_LAG
+    global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
     global PUSH_UNLOAD_MIN_DURATION
     global PUSH_END_EFFECTOR_OFFSET_X, PUSH_END_EFFECTOR_OFFSET_Z
     global PUSH_MOVE_DISTANCE
@@ -916,6 +926,8 @@ def _load_params():
         0.0, float(rospy.get_param(
             "~full_force_hold_time", PUSH_FULL_FORCE_HOLD_TIME)))
     PUSH_POSITION_LEAD = float(rospy.get_param("~push_position_lead", PUSH_POSITION_LEAD))
+    PUSH_TARGET_MAX_LAG = max(
+        0.0, float(rospy.get_param("~push_target_max_lag", PUSH_TARGET_MAX_LAG)))
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
     PUSH_UNLOAD_MIN_DURATION = float(rospy.get_param("~unload_min_duration", PUSH_UNLOAD_MIN_DURATION))

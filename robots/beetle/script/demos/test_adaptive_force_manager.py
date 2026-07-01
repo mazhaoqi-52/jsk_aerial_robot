@@ -36,13 +36,14 @@ class AdaptiveForceManagerTest(unittest.TestCase):
 
     def test_breakaway_on_advance(self):
         # Once advance crosses breakaway_distance, breakaway is detected and the
-        # force is capped at the maintain level (< max).
+        # force is not relieved immediately; it holds/ramp-recovers first.
         mgr = AdaptiveForceManager(max_force=20.0, ramp_time=1.0,
                                    breakaway_distance=0.03, maintain_force_ratio=0.6)
-        advances = [0.0] * 10 + [0.05]  # sit, then jump past breakaway_distance
+        advances = [0.0] * 25 + [0.05]  # sit at max, then jump past breakaway_distance
         res = run(mgr, advances)
         self.assertTrue(res['breakaway'])
-        self.assertLessEqual(res['force'], 0.6 * 20.0 + 1e-6)
+        self.assertEqual(res['phase'], 'breakaway_hold')
+        self.assertGreater(res['force'], 0.6 * 20.0)
 
     def test_force_falls_back_after_breakaway(self):
         # After breakaway the held force must not exceed the maintain force even
@@ -53,11 +54,12 @@ class AdaptiveForceManagerTest(unittest.TestCase):
         # Ramp hard while blocked, then start moving slowly at ~target speed.
         seq = [0.0] * 20
         a = 0.031
-        for _ in range(20):
+        for _ in range(80):
             a += 0.05 * DT  # ~target_velocity
             seq.append(a)
         res = run(mgr, seq)
         self.assertTrue(res['breakaway'])
+        self.assertEqual(res['phase'], 'breakaway')
         self.assertLessEqual(res['force'], 0.5 * 30.0 + 1e-6)
 
     def test_overspeed_relief(self):

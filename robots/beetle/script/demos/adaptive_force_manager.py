@@ -7,8 +7,9 @@ feedforward controller so it can be shared and unit-tested offline:
   - ramp the feedforward force up while the object has not broken away
     (has not started moving);
   - once the object breaks away (advance distance / speed crosses a threshold),
-    fall back to a lower "maintain" force and relieve it further if the object
-    moves faster than the target speed;
+    keep pushing briefly until the motion is established, then fall back to a
+    lower "maintain" force and relieve it further if the object moves faster
+    than the target speed;
   - if the force is already high but the object still does not move, count
     consecutive stall windows and raise an abort (the object is effectively
     fixed -> the push degrades to a static force test).
@@ -29,6 +30,8 @@ class AdaptiveForceManager:
                  breakaway_distance=0.03,
                  breakaway_velocity=0.02,
                  maintain_force_ratio=0.6,
+                 breakaway_hold_time=0.8,
+                 breakaway_relief_min_advance=0.05,
                  target_velocity=0.05,
                  overspeed_relief_time=8.0,
                  stall_window_time=5.0,
@@ -42,6 +45,8 @@ class AdaptiveForceManager:
             breakaway_distance: object advance that confirms breakaway (m).
             breakaway_velocity: object advance speed that confirms breakaway (m/s).
             maintain_force_ratio: post-breakaway hold force as a ratio of max_force.
+            breakaway_hold_time: minimum time to keep ramping before force relief (s).
+            breakaway_relief_min_advance: extra advance after breakaway before relief (m).
             target_velocity: desired advance speed after breakaway (m/s).
             overspeed_relief_time: time constant for reducing force when overspeeding (s).
             stall_window_time: stall detection window length (s).
@@ -54,6 +59,9 @@ class AdaptiveForceManager:
         self.breakaway_distance = float(breakaway_distance)
         self.breakaway_velocity = float(breakaway_velocity)
         self.maintain_force = self.max_force * float(maintain_force_ratio)
+        self.breakaway_hold_time = max(0.0, float(breakaway_hold_time))
+        self.breakaway_relief_advance = (
+            self.breakaway_distance + max(0.0, float(breakaway_relief_min_advance)))
         self.target_velocity = float(target_velocity)
         self.overspeed_relief_rate = self.max_force / max(float(overspeed_relief_time), 1e-3)
         self.stall_window_time = float(stall_window_time)
@@ -65,6 +73,7 @@ class AdaptiveForceManager:
         self.current_force = 0.0
         self.breakaway_detected = False
         self.breakaway_force = None
+        self.breakaway_elapsed = 0.0
         self.advance_velocity = 0.0
         self.stall_windows = 0
         self.abort = False
@@ -94,6 +103,7 @@ class AdaptiveForceManager:
         self.advance_velocity = (advance - self._prev_advance) / dt
         self._prev_advance = advance
 
+        holding_breakaway = False
         if not self.breakaway_detected:
             # Phase 1: keep raising the force until the object starts moving.
             self.current_force = min(self.max_force, self.current_force + self.ramp_rate * dt)
@@ -101,18 +111,28 @@ class AdaptiveForceManager:
                     self.advance_velocity >= self.breakaway_velocity):
                 self.breakaway_detected = True
                 self.breakaway_force = self.current_force
+                self.breakaway_elapsed = 0.0
+                holding_breakaway = True
                 self.stall_windows = 0
                 self._window_elapsed = 0.0
                 self._window_start_advance = advance
         else:
-            # Phase 2: fall back to the maintain force; relieve if overspeeding,
-            # recover toward maintain if slow. Never exceed the maintain force.
-            if self.advance_velocity > self.target_velocity:
-                self.current_force = max(0.0, self.current_force - self.overspeed_relief_rate * dt)
+            self.breakaway_elapsed += dt
+            holding_breakaway = (
+                self.breakaway_elapsed < self.breakaway_hold_time or
+                advance < self.breakaway_relief_advance)
+            if holding_breakaway:
+                self.current_force = min(self.max_force, self.current_force + self.ramp_rate * dt)
             else:
-                self.current_force = min(self.maintain_force,
-                                         self.current_force + self.ramp_rate * dt)
-            self.current_force = min(self.current_force, self.maintain_force)
+                # Phase 2: fall back to the maintain force; relieve if overspeeding,
+                # recover toward maintain if slow. Never exceed the maintain force.
+                if self.advance_velocity > self.target_velocity:
+                    self.current_force = max(
+                        0.0, self.current_force - self.overspeed_relief_rate * dt)
+                else:
+                    self.current_force = min(self.maintain_force,
+                                             self.current_force + self.ramp_rate * dt)
+                self.current_force = min(self.current_force, self.maintain_force)
 
         # Stall detection: only meaningful while ramping (pushing hard, no motion).
         stalled_window = False
@@ -131,11 +151,15 @@ class AdaptiveForceManager:
             self._window_elapsed = 0.0
             self._window_start_advance = advance
 
+        phase = 'ramp'
+        if self.breakaway_detected:
+            phase = 'breakaway_hold' if holding_breakaway else 'breakaway'
+
         return {
             'force': self.current_force,
             'breakaway': self.breakaway_detected,
             'stalled': stalled_window or self.stall_windows > 0,
             'abort': self.abort,
-            'phase': 'breakaway' if self.breakaway_detected else 'ramp',
+            'phase': phase,
             'advance_velocity': self.advance_velocity,
         }

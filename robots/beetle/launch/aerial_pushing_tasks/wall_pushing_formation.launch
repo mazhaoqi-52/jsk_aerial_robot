@@ -50,8 +50,8 @@
   <arg name="wall_slide_friction" default="10.0"
        doc="Coulomb friction (N) resisting a movable wall; push_force must exceed it to slide"/>
   <arg name="wall_slide_damping"  default="50.0"/>
-  <arg name="use_wall_mocap" default="false"
-       doc="Use wall mocap pose; false means +x/stall-only contact is enough"/>
+  <arg name="use_wall_mocap" default="true"
+       doc="Use wall_id mocap pose for dynamic wall displacement; set false only for stall-only/static tests"/>
   <arg name="use_wall_wrench" default="false"
        doc="Use /wall/wrench for contact detection. Defaults false so sim and real use the same stall gate; on real hardware /cfs/data stays logging-only unless bridged to /wall/wrench and set true."/>
   <arg name="use_wall_plane_contact" default="false"

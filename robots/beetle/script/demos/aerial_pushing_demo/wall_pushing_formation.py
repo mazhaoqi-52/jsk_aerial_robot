@@ -572,13 +572,32 @@ class PushWithFeedforwardState(PushingStateBase):
         push_deadline = (ramp_time + PUSH_MOVE_DISTANCE / max(PUSH_APPROACH_SPEED, 1e-3) + 5.0
                          if dynamic_push else effective_duration)
         advance = 0.0
-        # Dynamic mode uses the shared adaptive-force manager (towing's mocap-
-        # feedback behavior): ramp up until the wall breaks away, then fall back
-        # to a maintain force; if it never moves, the manager reports abort and
-        # we end as a static force test.
+        ee_advance = 0.0
+        wall_advance = None
+        wall_start_pos = None
+        advance_source = 'time'
+        # Dynamic mode uses the shared adaptive-force manager. When wall pose is
+        # available, use wall displacement as the progress/breakaway signal (the
+        # same object-mocap pattern towing uses); otherwise keep an explicit EE
+        # fallback for static tests and old launches.
         force_mgr = AdaptiveForceManager(
             max_force=PUSH_FORCE, ramp_time=ramp_time) if dynamic_push else None
         if dynamic_push:
+            wall_tracking = (
+                self.wall_interface.use_wall_pose and
+                self.wall_interface.position_received.is_set())
+            if wall_tracking:
+                wall_start_pos = self.wall_interface.get_wall_center()
+                advance_source = 'wall'
+                rospy.loginfo(
+                    "[Pushing] Dynamic progress uses wall mocap: start=%s",
+                    FormationUtils.format_vec(wall_start_pos))
+            else:
+                advance_source = 'ee_fallback'
+                rospy.logwarn(
+                    "[Pushing] Dynamic progress has no wall pose; using EE advance "
+                    "fallback. For real movable-wall tests set use_wall_mocap:=true "
+                    "wall_id:=55 and record /wall/mocap/pose.")
             rospy.loginfo(
                 "[Pushing] Dynamic mode: advance the wall up to %.2fm along push_dir "
                 "(timeout %.1fs), adaptive force up to %.2fN. A fixed wall cannot "
@@ -603,15 +622,22 @@ class PushWithFeedforwardState(PushingStateBase):
                 rate.sleep()
                 continue
 
-            # Dynamic push: measure how far the formation has actually advanced
-            # along push_dir and lead the position target just ahead of it (the
-            # same lead-and-follow pattern towing uses). A fixed wall blocks the
-            # advance so this stays a static force test; a movable wall is pushed.
+            # Dynamic push: measure object progress along push_dir and lead the
+            # position target just ahead of it. Prefer wall mocap; EE advance is
+            # only a compatibility fallback and does not prove wall motion.
+            ee_advance = float(np.dot(current_pos - contact_pos, push_dir))
             if dynamic_push:
-                advance = float(np.dot(current_pos - contact_pos, push_dir))
+                if wall_start_pos is not None:
+                    wall_pos = self.wall_interface.get_wall_center()
+                    wall_advance = float(np.dot(wall_pos - wall_start_pos, push_dir))
+                    advance = wall_advance
+                else:
+                    advance = ee_advance
                 advance = max(0.0, min(advance, PUSH_MOVE_DISTANCE))
                 if advance >= PUSH_MOVE_DISTANCE - 0.01:
-                    rospy.loginfo("[Pushing] Dynamic push reached target: %.3fm", advance)
+                    rospy.loginfo(
+                        "[Pushing] Dynamic push reached target: %.3fm (%s)",
+                        advance, advance_source)
                     break
                 lead = min(PUSH_MOVE_DISTANCE, advance + PUSH_POSITION_LEAD)
                 target_pos = contact_pos + push_dir * lead
@@ -652,7 +678,10 @@ class PushWithFeedforwardState(PushingStateBase):
             else:
                 ff_mag = PUSH_FORCE * smoothstep01(elapsed / ramp_time)
             ff_world = push_dir * ff_mag
-            if not force_ready_logged and elapsed >= ramp_time:
+            force_reached = (
+                ff_mag >= PUSH_FORCE - 1e-3 if dynamic_push
+                else elapsed >= ramp_time)
+            if not force_ready_logged and force_reached:
                 force_ready_logged = True
                 rospy.loginfo(
                     "[Pushing] Feedforward reached target %.2fN at %.1fs",
@@ -673,15 +702,20 @@ class PushWithFeedforwardState(PushingStateBase):
             progress = (min(1.0, advance / max(PUSH_MOVE_DISTANCE, 1e-3))
                         if dynamic_push
                         else min(1.0, elapsed / max(effective_duration, 1e-3)))
+            diag_duration = push_deadline if dynamic_push else effective_duration
+            phase_text = fres['phase'] if dynamic_push else 'static'
+            wall_advance_text = "NA" if wall_advance is None else f"{wall_advance:.3f}m"
             full_force_hold = max(0.0, elapsed - ramp_time)
             diag_text = (
-                f"[Pushing FF] t={elapsed:.1f}s/{effective_duration:.1f}s "
+                f"[Pushing FF] t={elapsed:.1f}s/{diag_duration:.1f}s "
                 f"ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N "
                 f"mag={np.linalg.norm(ff_world):.2f}N wall_force={wall_force_text} "
                 f"full_hold={full_force_hold:.1f}s "
                 f"mode={'unified' if unified_mode else 'LF'} frame={ff_frame} "
                 f"tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm "
-                f"progress={progress*100:.0f}% max_rp={math.degrees(max_rp):.1f}deg")
+                f"progress={progress*100:.0f}% source={advance_source} "
+                f"phase={phase_text} wall_adv={wall_advance_text} "
+                f"ee_adv={ee_advance:.3f}m max_rp={math.degrees(max_rp):.1f}deg")
             rospy.loginfo_throttle(1.0, diag_text)
             self.diag_pub.publish(String(data=diag_text))
 
@@ -695,13 +729,19 @@ class PushWithFeedforwardState(PushingStateBase):
         if dynamic_push:
             if advance >= PUSH_MOVE_DISTANCE - 0.01:
                 rospy.loginfo(
-                    "[Pushing] Dynamic result: wall pushed %.3fm (target %.2fm) -> movable wall",
-                    advance, PUSH_MOVE_DISTANCE)
+                    "[Pushing] Dynamic result: %s advanced %.3fm (target %.2fm)",
+                    advance_source, advance, PUSH_MOVE_DISTANCE)
             else:
-                rospy.logwarn(
-                    "[Pushing] Dynamic result: advanced only %.3fm of %.2fm before timeout "
-                    "-> wall did not move (static force test)",
-                    advance, PUSH_MOVE_DISTANCE)
+                if wall_start_pos is not None:
+                    rospy.logwarn(
+                        "[Pushing] Dynamic result: wall advanced only %.3fm of %.2fm "
+                        "before timeout -> wall did not complete the push",
+                        advance, PUSH_MOVE_DISTANCE)
+                else:
+                    rospy.logwarn(
+                        "[Pushing] Dynamic result: EE advanced %.3fm of %.2fm but wall "
+                        "motion was not observed (static/unverified test)",
+                        advance, PUSH_MOVE_DISTANCE)
 
         hold_pos = self.get_end_effector_position()
         if hold_pos is None:

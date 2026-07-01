@@ -85,6 +85,10 @@
        doc="Minimum time to hold after push_force is reached (s)"/>
   <arg name="push_position_lead" default="0.03"
        doc="Small position lead into the wall to maintain contact (m)"/>
+  <arg name="push_move_distance" default="0.0"
+       doc="Dynamic push: advance the wall this far along push_dir (m). 0 = static force test. A fixed wall stays a static test; a movable wall is pushed."/>
+  <arg name="push_move_max_duration" default="25.0"
+       doc="Timeout for the dynamic push advance (s)"/>
   <arg name="retreat_after_push" default="true"/>
   <arg name="retreat_distance" default="0.20"/>
   <arg name="debug" default="false"/>
@@ -117,6 +121,8 @@
     <param name="push_duration"            value="$(arg push_duration)"/>
     <param name="full_force_hold_time"     value="$(arg full_force_hold_time)"/>
     <param name="push_position_lead"       value="$(arg push_position_lead)"/>
+    <param name="push_move_distance"       value="$(arg push_move_distance)"/>
+    <param name="push_move_max_duration"   value="$(arg push_move_max_duration)"/>
     <param name="retreat_after_push"       value="$(arg retreat_after_push)"/>
     <param name="retreat_distance"         value="$(arg retreat_distance)"/>
   </node>

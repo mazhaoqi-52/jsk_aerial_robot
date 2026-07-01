@@ -70,6 +70,14 @@ PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
 PUSH_UNLOAD_MIN_DURATION = 1.0
 
+# Dynamic push: advance the wall this far (m) along the push direction while
+# holding the feedforward force. 0.0 => static force test (hold in place).
+# The target leads-and-follows the formation's actual advance, so a fixed wall
+# never advances (degrades to a static test), while a movable wall is pushed the
+# full distance. Reuses the aerial-towing lead-target + force-ramp pattern.
+PUSH_MOVE_DISTANCE = 0.0
+PUSH_MOVE_MAX_DURATION = 25.0  # timeout for the dynamic advance (s)
+
 # Optional fine-tune of the contact point (the URDF contact_point), in formation
 # body frame. Defaults to zero, i.e. the force is applied exactly at the URDF
 # contact_point provided by the FormationAdapter (not the end-effector).
@@ -539,6 +547,15 @@ class PushWithFeedforwardState(PushingStateBase):
 
         self.formation_adapter.set_pitch_compensation(False)
 
+        dynamic_push = PUSH_MOVE_DISTANCE > 1e-6
+        push_deadline = PUSH_MOVE_MAX_DURATION if dynamic_push else effective_duration
+        advance = 0.0
+        if dynamic_push:
+            rospy.loginfo(
+                "[Pushing] Dynamic mode: advance the wall up to %.2fm along push_dir "
+                "(timeout %.1fs). A fixed wall cannot advance -> static force test.",
+                PUSH_MOVE_DISTANCE, push_deadline)
+
         start_time = rospy.get_time()
         rate = rospy.Rate(25)
         unified_mode_seen = self.beetle.isUnifiedMode()
@@ -546,7 +563,7 @@ class PushWithFeedforwardState(PushingStateBase):
 
         while not rospy.is_shutdown():
             elapsed = rospy.get_time() - start_time
-            if elapsed >= effective_duration:
+            if elapsed >= push_deadline:
                 break
 
             current_pos = self.get_end_effector_position()
@@ -554,6 +571,19 @@ class PushWithFeedforwardState(PushingStateBase):
                 rospy.logwarn("Lost EE position during pushing")
                 rate.sleep()
                 continue
+
+            # Dynamic push: measure how far the formation has actually advanced
+            # along push_dir and lead the position target just ahead of it (the
+            # same lead-and-follow pattern towing uses). A fixed wall blocks the
+            # advance so this stays a static force test; a movable wall is pushed.
+            if dynamic_push:
+                advance = float(np.dot(current_pos - contact_pos, push_dir))
+                advance = max(0.0, min(advance, PUSH_MOVE_DISTANCE))
+                if advance >= PUSH_MOVE_DISTANCE - 0.01:
+                    rospy.loginfo("[Pushing] Dynamic push reached target: %.3fm", advance)
+                    break
+                lead = min(PUSH_MOVE_DISTANCE, advance + PUSH_POSITION_LEAD)
+                target_pos = contact_pos + push_dir * lead
 
             rpy = self.beetle.getAssemblyRPY()
             if rpy is not None:
@@ -597,7 +627,9 @@ class PushWithFeedforwardState(PushingStateBase):
 
             force_abs, force_norm, _ = self.wall_force_along_push(push_dir)
             wall_force_text = "NA" if force_abs is None else f"{force_abs:.2f}N"
-            progress = min(1.0, elapsed / max(effective_duration, 1e-3))
+            progress = (min(1.0, advance / max(PUSH_MOVE_DISTANCE, 1e-3))
+                        if dynamic_push
+                        else min(1.0, elapsed / max(effective_duration, 1e-3)))
             full_force_hold = max(0.0, elapsed - ramp_time)
             diag_text = (
                 f"[Pushing FF] t={elapsed:.1f}s/{effective_duration:.1f}s "
@@ -616,6 +648,17 @@ class PushWithFeedforwardState(PushingStateBase):
             hold_pos = self.get_end_effector_position()
             self._finish_push_exit(userdata, 'ros_shutdown', hold_pos, maintain_yaw)
             return 'timeout'
+
+        if dynamic_push:
+            if advance >= PUSH_MOVE_DISTANCE - 0.01:
+                rospy.loginfo(
+                    "[Pushing] Dynamic result: wall pushed %.3fm (target %.2fm) -> movable wall",
+                    advance, PUSH_MOVE_DISTANCE)
+            else:
+                rospy.logwarn(
+                    "[Pushing] Dynamic result: advanced only %.3fm of %.2fm before timeout "
+                    "-> wall did not move (static force test)",
+                    advance, PUSH_MOVE_DISTANCE)
 
         hold_pos = self.get_end_effector_position()
         if hold_pos is None:
@@ -742,6 +785,7 @@ def _load_params():
     global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
     global PUSH_UNLOAD_MIN_DURATION
+    global PUSH_MOVE_DISTANCE, PUSH_MOVE_MAX_DURATION
     global PUSH_CONTACT_DX_FROM_CP, PUSH_CONTACT_DY_FROM_CP, PUSH_CONTACT_DZ_FROM_CP
     global PUSH_RETREAT_AFTER, PUSH_RETREAT_DISTANCE
 
@@ -769,6 +813,9 @@ def _load_params():
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
     PUSH_UNLOAD_MIN_DURATION = float(rospy.get_param("~unload_min_duration", PUSH_UNLOAD_MIN_DURATION))
+    PUSH_MOVE_DISTANCE = max(0.0, float(rospy.get_param("~push_move_distance", PUSH_MOVE_DISTANCE)))
+    PUSH_MOVE_MAX_DURATION = max(
+        0.1, float(rospy.get_param("~push_move_max_duration", PUSH_MOVE_MAX_DURATION)))
 
     PUSH_CONTACT_DX_FROM_CP = float(rospy.get_param("~push_contact_dx_from_cp", PUSH_CONTACT_DX_FROM_CP))
     PUSH_CONTACT_DY_FROM_CP = float(rospy.get_param("~push_contact_dy_from_cp", PUSH_CONTACT_DY_FROM_CP))

@@ -71,6 +71,12 @@ PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
 PUSH_UNLOAD_MIN_DURATION = 1.0
 
+# Wall-pushing front contact face in the leader body frame. The redesigned tool
+# extends 60mm beyond the Beetle front edge/contact_point at x=0.26m, so the
+# CoG-relative x offset is 0.32m. The measured contact face is 0.53mm above CoG.
+PUSH_END_EFFECTOR_OFFSET_X = 0.32
+PUSH_END_EFFECTOR_OFFSET_Z = 0.00053
+
 # Dynamic push: advance the wall this far (m) along the push direction while
 # holding the feedforward force. 0.0 => static force test (hold in place).
 # The target leads-and-follows the formation's actual advance, so a fixed wall
@@ -78,9 +84,8 @@ PUSH_UNLOAD_MIN_DURATION = 1.0
 # full distance. Reuses the aerial-towing lead-target + force-ramp pattern.
 PUSH_MOVE_DISTANCE = 0.0
 
-# Optional fine-tune of the contact point (the URDF contact_point), in formation
-# body frame. Defaults to zero, i.e. the force is applied exactly at the URDF
-# contact_point provided by the FormationAdapter (not the end-effector).
+# Optional fine-tune of the calibrated pushing force application point, in
+# formation body frame. Defaults to zero after applying PUSH_END_EFFECTOR_OFFSET_X.
 PUSH_CONTACT_DX_FROM_CP = 0.0
 PUSH_CONTACT_DY_FROM_CP = 0.0
 PUSH_CONTACT_DZ_FROM_CP = 0.0
@@ -215,9 +220,22 @@ class PushingStateBase(FormationSingleUAVStateBase):
             self, outcomes=outcomes,
             input_keys=input_keys or [], output_keys=output_keys or [])
 
+        self._apply_pushing_end_effector_offset()
+
         if PushingStateBase._shared_wall_interface is None:
             PushingStateBase._shared_wall_interface = WallInterface()
         self.wall_interface = PushingStateBase._shared_wall_interface
+
+    def _apply_pushing_end_effector_offset(self):
+        tf_calculator = self.formation_adapter.tf_calculator
+        tf_calculator.dual_fang_center_offset = PUSH_END_EFFECTOR_OFFSET_X
+        tf_calculator.end_effector_offset_z = PUSH_END_EFFECTOR_OFFSET_Z
+        tf_calculator.contact_point_offset_x = PUSH_END_EFFECTOR_OFFSET_X
+        tf_calculator.contact_point_offset_z = PUSH_END_EFFECTOR_OFFSET_Z
+        self.formation_adapter._calculate_offset_parameters()
+        rospy.loginfo(
+            "[Pushing] front contact offset: x=%.3fm z=%.3fm in leader body frame",
+            PUSH_END_EFFECTOR_OFFSET_X, PUSH_END_EFFECTOR_OFFSET_Z)
 
     def _normalize_horizontal(self, vec, label):
         arr = np.array(vec, dtype=float)
@@ -872,6 +890,7 @@ def _load_params():
     global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
     global PUSH_UNLOAD_MIN_DURATION
+    global PUSH_END_EFFECTOR_OFFSET_X, PUSH_END_EFFECTOR_OFFSET_Z
     global PUSH_MOVE_DISTANCE
     global PUSH_CONTACT_DX_FROM_CP, PUSH_CONTACT_DY_FROM_CP, PUSH_CONTACT_DZ_FROM_CP
     global PUSH_RETREAT_AFTER, PUSH_RETREAT_DISTANCE
@@ -900,6 +919,10 @@ def _load_params():
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
     PUSH_UNLOAD_MIN_DURATION = float(rospy.get_param("~unload_min_duration", PUSH_UNLOAD_MIN_DURATION))
+    PUSH_END_EFFECTOR_OFFSET_X = float(rospy.get_param(
+        "~push_end_effector_offset_x", PUSH_END_EFFECTOR_OFFSET_X))
+    PUSH_END_EFFECTOR_OFFSET_Z = float(rospy.get_param(
+        "~push_end_effector_offset_z", PUSH_END_EFFECTOR_OFFSET_Z))
     PUSH_MOVE_DISTANCE = max(0.0, float(rospy.get_param("~push_move_distance", PUSH_MOVE_DISTANCE)))
 
     PUSH_CONTACT_DX_FROM_CP = float(rospy.get_param("~push_contact_dx_from_cp", PUSH_CONTACT_DX_FROM_CP))

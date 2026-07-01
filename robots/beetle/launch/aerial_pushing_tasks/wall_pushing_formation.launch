@@ -42,6 +42,11 @@
   <arg name="wall_width"     default="2.0"/>
   <arg name="wall_height"    default="2.0"/>
   <arg name="wall_mass"      default="20.0"/>
+  <arg name="wall_static"    default="true"
+       doc="true = fixed wall (static force test); false = movable wall that slides along push X (dynamic push). Pair false with push_move_distance."/>
+  <arg name="wall_slide_friction" default="10.0"
+       doc="Coulomb friction (N) resisting a movable wall; push_force must exceed it to slide"/>
+  <arg name="wall_slide_damping"  default="50.0"/>
   <arg name="use_wall_mocap" default="false"
        doc="Use wall mocap pose; false means +x/stall-only contact is enough"/>
   <arg name="use_wall_wrench" default="false"
@@ -61,6 +66,9 @@
     <arg name="wall_width"     value="$(arg wall_width)"/>
     <arg name="wall_height"    value="$(arg wall_height)"/>
     <arg name="wall_mass"      value="$(arg wall_mass)"/>
+    <arg name="wall_static"    value="$(arg wall_static)"/>
+    <arg name="wall_slide_friction" value="$(arg wall_slide_friction)"/>
+    <arg name="wall_slide_damping"  value="$(arg wall_slide_damping)"/>
     <arg name="use_wall_mocap" value="$(arg use_wall_mocap)"/>
   </include>
 

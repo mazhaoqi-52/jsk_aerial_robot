@@ -6,6 +6,15 @@
   <xacro:arg name="wall_height" default="2.0" />
   <xacro:arg name="wall_mass" default="20.0" />
 
+  <!-- wall_static=true (default): anchor the wall to the world -> static force
+       test (force sensor at wall_joint reads the push). wall_static=false: let
+       the wall slide along the push axis (prismatic X) with Coulomb friction, so
+       a sufficient push moves it in the plane without tipping -> dynamic push. -->
+  <xacro:arg name="wall_static" default="true" />
+  <xacro:arg name="wall_slide_friction" default="10.0" />
+  <xacro:arg name="wall_slide_damping" default="50.0" />
+  <xacro:property name="wall_static" value="$(arg wall_static)" />
+
   <xacro:property name="wall_thickness" value="$(arg wall_thickness)" />
   <xacro:property name="wall_width" value="$(arg wall_width)" />
   <xacro:property name="wall_height" value="$(arg wall_height)" />
@@ -21,12 +30,24 @@
 
   <link name="world" />
 
-  <joint name="wall_joint" type="fixed">
-    <parent link="world" />
-    <child link="wall_panel" />
-    <origin xyz="0 0 ${wall_height/2}" rpy="0 0 0" />
-    <axis xyz="1 0 0" />
-  </joint>
+  <xacro:if value="${wall_static}">
+    <joint name="wall_joint" type="fixed">
+      <parent link="world" />
+      <child link="wall_panel" />
+      <origin xyz="0 0 ${wall_height/2}" rpy="0 0 0" />
+      <axis xyz="1 0 0" />
+    </joint>
+  </xacro:if>
+  <xacro:unless value="${wall_static}">
+    <joint name="wall_joint" type="prismatic">
+      <parent link="world" />
+      <child link="wall_panel" />
+      <origin xyz="0 0 ${wall_height/2}" rpy="0 0 0" />
+      <axis xyz="1 0 0" />
+      <limit lower="-2.0" upper="2.0" effort="100000" velocity="1.0" />
+      <dynamics friction="$(arg wall_slide_friction)" damping="$(arg wall_slide_damping)" />
+    </joint>
+  </xacro:unless>
 
   <link name="wall_panel">
     <visual>

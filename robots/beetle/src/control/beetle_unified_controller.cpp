@@ -1152,6 +1152,19 @@ double BeetleUnifiedController::predictThrustLimit() const
   return std::max(alloc_t_max_, 0.0);
 }
 
+double BeetleUnifiedController::getAllocationThrustLimit() const
+{
+  const double configured_limit = std::max(alloc_t_max_, 0.0);
+  const double predicted_limit = predictThrustLimit();
+  if (!std::isfinite(predicted_limit) || predicted_limit <= 0.0) {
+    return configured_limit;
+  }
+  if (configured_limit <= 0.0) {
+    return predicted_limit;
+  }
+  return std::min(configured_limit, predicted_limit);
+}
+
 uint16_t BeetleUnifiedController::predictPwmFromThrust(double thrust) const
 {
   double pwm_min = std::max(0.0, pinv_pwm_min_);
@@ -1219,7 +1232,7 @@ bool BeetleUnifiedController::buildThrustMarginMsg(
   const int col_start = module_index * elems_per_module;
   if (vectoring_f.size() < col_start + elems_per_module) return false;
 
-  const double thrust_limit = predictThrustLimit();
+  const double thrust_limit = getAllocationThrustLimit();
   if (!std::isfinite(thrust_limit)) return false;
 
   msg.data.resize(motor_num_per_module_);
@@ -1278,6 +1291,7 @@ bool BeetleUnifiedController::buildAllocationConstraints(
     const Eigen::MatrixXd& alloc_matrix,
     const Eigen::MatrixXd& interface_load_matrix,
     int n_cols, int n_rotors, int n_constraints,
+    double thrust_limit,
     double cos_limit, double sin_limit, int thrust_poly_edges,
     bool use_rate_bound, bool use_direction_rate_bound,
     int n_interface_rows,
@@ -1336,7 +1350,7 @@ bool BeetleUnifiedController::buildAllocationConstraints(
   // OSQP accepts only linear constraints, so approximate the circle
   // sqrt(f_x^2 + f_z^2) <= T_max with an inscribed regular polygon.
   if (rotor_coef_ == 2 && thrust_poly_edges > 0) {
-    const double thrust_poly_bound = alloc_t_max_ * std::cos(M_PI / thrust_poly_edges);
+    const double thrust_poly_bound = thrust_limit * std::cos(M_PI / thrust_poly_edges);
     for (int i = 0; i < n_rotors; i++) {
       int fx_idx = rotor_coef_ * i;
       int fz_idx = rotor_coef_ * i + 1;
@@ -1360,11 +1374,11 @@ bool BeetleUnifiedController::buildAllocationConstraints(
     if (rotor_coef_ == 2 && (j % rotor_coef_ == 1)) {
       // f_z: must be non-negative (thrust points "up" in rotor frame)
       lb(row) = 0.0;
-      ub(row) = alloc_t_max_;
+      ub(row) = thrust_limit;
     } else {
       // f_x (lateral component): symmetric bounds
-      lb(row) = -alloc_t_max_;
-      ub(row) = alloc_t_max_;
+      lb(row) = -thrust_limit;
+      ub(row) = thrust_limit;
     }
     row++;
   }
@@ -1555,6 +1569,13 @@ bool BeetleUnifiedController::solveFullVectorQP(
   }
 
   const int n_rotors = n_cols / rotor_coef_;
+  const double thrust_limit = getAllocationThrustLimit();
+  if (!std::isfinite(thrust_limit) || thrust_limit <= 0.0) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[UnifiedCtrl QP] reject invalid thrust limit: alloc=%.3f predicted=%.3f",
+                      alloc_t_max_, predictThrustLimit());
+    return false;
+  }
   // Gimbal-angle constraint coefficients. Use (cos, sin) rather than (1, tan):
   // tan(theta_max) -> 1.6e16 as theta_max -> pi/2 (the default 90 deg limit),
   // which makes that constraint row astronomically scaled and wrecks the QP
@@ -1572,7 +1593,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // For rotor_coef == 2:
   //   2 gimbal angle rows + thrust polygon rows + 2 component-bound rows per rotor
   int n_gimbal_rows = (rotor_coef_ == 2) ? 2 * n_rotors : 0;
-  const int thrust_poly_edges = (rotor_coef_ == 2 && alloc_t_max_ > 0.0) ? 16 : 0;
+  const int thrust_poly_edges = (rotor_coef_ == 2 && thrust_limit > 0.0) ? 16 : 0;
   int n_thrust_rows = thrust_poly_edges * n_rotors;
   int n_bound_rows = n_cols;  // one bound per variable
   const bool has_prev_alloc = (prev_vectoring_f_.size() == n_cols);
@@ -1757,6 +1778,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   Eigen::VectorXd lb, ub;
   if (!buildAllocationConstraints(alloc_matrix, interface_load_matrix,
                                   n_cols, n_rotors, n_constraints,
+                                  thrust_limit,
                                   cos_limit, sin_limit, thrust_poly_edges,
                                   use_rate_bound, use_direction_rate_bound, n_interface_rows,
                                   task_priority_rows, task_priority_target,
@@ -1938,7 +1960,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   prev_vectoring_f_ = f_sol;
 
   logQpDiagnostics(f_sol, alloc_matrix, desired_tracking_target, task_priority_target,
-                   task_priority_rows, priority_target, priority_rows, n_rotors);
+                   task_priority_rows, priority_target, priority_rows,
+                   thrust_limit, n_rotors);
 
   return true;
 }
@@ -1951,6 +1974,7 @@ void BeetleUnifiedController::logQpDiagnostics(
     const std::vector<int>& task_priority_rows,
     const Eigen::VectorXd& priority_target,
     const std::vector<int>& priority_rows,
+    double thrust_limit,
     int n_rotors)
 {
   // Short-term hardware diagnostic: expose hidden actuator saturation.
@@ -1979,12 +2003,12 @@ void BeetleUnifiedController::logQpDiagnostics(
     max_abs_angle_deg = std::max(max_abs_angle_deg, std::abs(angle_deg));
     max_abs_fx = std::max(max_abs_fx, std::abs(fx));
     max_fz = std::max(max_fz, fz);
-    const double component_margin = std::min(alloc_t_max_ - std::abs(fx), alloc_t_max_ - fz);
+    const double component_margin = std::min(thrust_limit - std::abs(fx), thrust_limit - fz);
     min_component_margin = std::min(min_component_margin, component_margin);
     if (component_margin < 0.2) near_component_bound++;
     if (tmag > low_voltage_limit) over_low++;
     if (tmag > mid_voltage_limit) over_mid++;
-    if (tmag > alloc_t_max_) over_alloc++;
+    if (tmag > thrust_limit) over_alloc++;
     if (tmag > model_limit) over_model++;
   }
 
@@ -2032,8 +2056,8 @@ void BeetleUnifiedController::logQpDiagnostics(
       "task_prio_res=%.3f task_rows=%d prio_res=%.3f prio_rows=%d "
       "max_t=%.2f max_angle=%.1fdeg "
       "max|fx|=%.2f max_fz=%.2f comp_margin_min=%.2f "
-      "over_t(17.2/18.44/alloc/model)=%d/%d/%d/%d "
-      "alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
+      "over_t(17.2/18.44/qp/model)=%d/%d/%d/%d "
+      "qp_t_max=%.2f alloc_t_max=%.2f model_t_max=%.2f t=[%s] angle_deg=[%s]";
   if (actuator_suspicious) {
     ROS_WARN(fmt,
              desired_residual.norm(),
@@ -2042,7 +2066,7 @@ void BeetleUnifiedController::logQpDiagnostics(
              max_t, max_abs_angle_deg,
              max_abs_fx, max_fz, min_component_margin,
              over_low, over_mid, over_alloc, over_model,
-             alloc_t_max_, model_limit,
+             thrust_limit, alloc_t_max_, model_limit,
              thrust_stream.str().c_str(), angle_stream.str().c_str());
   } else {
     ROS_INFO(fmt,
@@ -2052,7 +2076,7 @@ void BeetleUnifiedController::logQpDiagnostics(
              max_t, max_abs_angle_deg,
              max_abs_fx, max_fz, min_component_margin,
              over_low, over_mid, over_alloc, over_model,
-             alloc_t_max_, model_limit,
+             thrust_limit, alloc_t_max_, model_limit,
              thrust_stream.str().c_str(), angle_stream.str().c_str());
   }
 }

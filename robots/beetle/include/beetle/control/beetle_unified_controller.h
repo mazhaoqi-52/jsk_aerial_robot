@@ -340,7 +340,7 @@ private:
   // Decision variables: f ∈ R^{rotor_coef * n_rotors} (all force components).
   // Constraints:
   //   - Gimbal angle:  |f_x| ≤ tan(θ_max) * f_z  (linearized)
-  //   - Thrust bound:  each component within [-T_max, T_max], f_z ≥ 0
+  //   - Thrust bound:  each component within the configured/dynamic T_max, f_z ≥ 0
   bool use_constrained_alloc_;        // if true, use OsqpEigen QP; fallback to pseudoinverse
   double alloc_lambda_;               // secondary objective weight toward balanced hover reference
   double alloc_t_max_;                // per-rotor thrust upper bound [N]
@@ -430,6 +430,7 @@ private:
   bool buildAllocationConstraints(const Eigen::MatrixXd& alloc_matrix,
                                   const Eigen::MatrixXd& interface_load_matrix,
                                   int n_cols, int n_rotors, int n_constraints,
+                                  double thrust_limit,
                                   double cos_limit, double sin_limit, int thrust_poly_edges,
                                   bool use_rate_bound, bool use_direction_rate_bound,
                                   int n_interface_rows,
@@ -449,6 +450,7 @@ private:
                         const std::vector<int>& task_priority_rows,
                         const Eigen::VectorXd& priority_target,
                         const std::vector<int>& priority_rows,
+                        double thrust_limit,
                         int n_rotors);
 
   /** @brief Build the current secondary allocation reference.
@@ -483,6 +485,7 @@ private:
   uint16_t predictPwmFromThrust(double thrust) const;
   double convertThrustToPwmDuty(double thrust) const;
   double predictThrustLimit() const;
+  double getAllocationThrustLimit() const;
 
   double getModuleAllocationWeight(int module_id) const;
 

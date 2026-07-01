@@ -18,7 +18,8 @@
   <arg name="force_sensor_auto_calib_timeout" default="10.0"
        doc="Timeout for waiting for the calibration service and first force sensor sample"/>
 
-  <include if="$(arg force_sensor_enabled)"
+  <!-- Real CFS sensor is hardware-only (serial device); never start it in sim. -->
+  <include if="$(arg force_sensor_enabled)" unless="$(arg simulation)"
            file="$(find beetle)/launch/aerial_pushing_tasks/force_sensor_test.launch">
     <arg name="force_sensor"                    value="$(arg force_sensor)"/>
     <arg name="force_sensor_port"               value="$(arg force_sensor_port)"/>
@@ -49,8 +50,8 @@
   <arg name="wall_slide_damping"  default="50.0"/>
   <arg name="use_wall_mocap" default="false"
        doc="Use wall mocap pose; false means +x/stall-only contact is enough"/>
-  <arg name="use_wall_wrench" default="false"
-       doc="Use /wall/wrench for contact detection; force sensor /cfs/data remains logging-only"/>
+  <arg name="use_wall_wrench" default="$(arg simulation)"
+       doc="Use /wall/wrench for contact detection. Defaults to true in sim (the gazebo wall FT sensor gives a clean contact force); on real hardware /cfs/data stays logging-only unless set true."/>
 
   <include file="$(find beetle)/launch/aerial_pushing_tasks/wall_pos.launch">
     <arg name="real_machine"   value="$(arg real_machine)"/>
@@ -94,9 +95,7 @@
   <arg name="push_position_lead" default="0.03"
        doc="Small position lead into the wall to maintain contact (m)"/>
   <arg name="push_move_distance" default="0.0"
-       doc="Dynamic push: advance the wall this far along push_dir (m). 0 = static force test. A fixed wall stays a static test; a movable wall is pushed."/>
-  <arg name="push_move_max_duration" default="25.0"
-       doc="Timeout for the dynamic push advance (s)"/>
+       doc="Dynamic push: advance the wall this far along push_dir (m). 0 = static force test. A fixed wall stays a static test; a movable wall is pushed. The advance timeout is auto-computed from the ramp time, distance and approach speed."/>
   <arg name="retreat_after_push" default="true"/>
   <arg name="retreat_distance" default="0.20"/>
   <arg name="debug" default="false"/>
@@ -130,7 +129,6 @@
     <param name="full_force_hold_time"     value="$(arg full_force_hold_time)"/>
     <param name="push_position_lead"       value="$(arg push_position_lead)"/>
     <param name="push_move_distance"       value="$(arg push_move_distance)"/>
-    <param name="push_move_max_duration"   value="$(arg push_move_max_duration)"/>
     <param name="retreat_after_push"       value="$(arg retreat_after_push)"/>
     <param name="retreat_distance"         value="$(arg retreat_distance)"/>
   </node>

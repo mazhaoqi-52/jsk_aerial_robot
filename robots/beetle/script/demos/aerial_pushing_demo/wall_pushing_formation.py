@@ -77,7 +77,6 @@ PUSH_UNLOAD_MIN_DURATION = 1.0
 # never advances (degrades to a static test), while a movable wall is pushed the
 # full distance. Reuses the aerial-towing lead-target + force-ramp pattern.
 PUSH_MOVE_DISTANCE = 0.0
-PUSH_MOVE_MAX_DURATION = 25.0  # timeout for the dynamic advance (s)
 
 # Optional fine-tune of the contact point (the URDF contact_point), in formation
 # body frame. Defaults to zero, i.e. the force is applied exactly at the URDF
@@ -549,7 +548,10 @@ class PushWithFeedforwardState(PushingStateBase):
         self.formation_adapter.set_pitch_compensation(False)
 
         dynamic_push = PUSH_MOVE_DISTANCE > 1e-6
-        push_deadline = PUSH_MOVE_MAX_DURATION if dynamic_push else effective_duration
+        # Auto timeout for the dynamic advance: force ramp + time to cover the
+        # target distance at the (slow) approach speed + margin. No launch param.
+        push_deadline = (ramp_time + PUSH_MOVE_DISTANCE / max(PUSH_APPROACH_SPEED, 1e-3) + 5.0
+                         if dynamic_push else effective_duration)
         advance = 0.0
         # Dynamic mode uses the shared adaptive-force manager (towing's mocap-
         # feedback behavior): ramp up until the wall breaks away, then fall back
@@ -807,7 +809,7 @@ def _load_params():
     global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
     global PUSH_UNLOAD_MIN_DURATION
-    global PUSH_MOVE_DISTANCE, PUSH_MOVE_MAX_DURATION
+    global PUSH_MOVE_DISTANCE
     global PUSH_CONTACT_DX_FROM_CP, PUSH_CONTACT_DY_FROM_CP, PUSH_CONTACT_DZ_FROM_CP
     global PUSH_RETREAT_AFTER, PUSH_RETREAT_DISTANCE
 
@@ -836,8 +838,6 @@ def _load_params():
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
     PUSH_UNLOAD_MIN_DURATION = float(rospy.get_param("~unload_min_duration", PUSH_UNLOAD_MIN_DURATION))
     PUSH_MOVE_DISTANCE = max(0.0, float(rospy.get_param("~push_move_distance", PUSH_MOVE_DISTANCE)))
-    PUSH_MOVE_MAX_DURATION = max(
-        0.1, float(rospy.get_param("~push_move_max_duration", PUSH_MOVE_MAX_DURATION)))
 
     PUSH_CONTACT_DX_FROM_CP = float(rospy.get_param("~push_contact_dx_from_cp", PUSH_CONTACT_DX_FROM_CP))
     PUSH_CONTACT_DY_FROM_CP = float(rospy.get_param("~push_contact_dy_from_cp", PUSH_CONTACT_DY_FROM_CP))

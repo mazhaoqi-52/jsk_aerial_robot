@@ -33,6 +33,13 @@ sys.path.insert(0, os.path.join(current_dir, '..'))
 from beetle_interface import smoothstep01
 from adaptive_force_manager import AdaptiveForceManager
 from load_towing_formation import (
+    TOWING_FORCE_HOLD_ATTITUDE,
+    TOWING_FORCE_HOLD_Z_ERROR,
+    TOWING_FORCE_RELIEF_ATTITUDE,
+    TOWING_FORCE_RELIEF_Z_ERROR,
+    TOWING_TASK_HOLD_SCALE,
+    TOWING_TASK_RELIEF_SCALE,
+    TOWING_TASK_SCALE_RECOVER_RATE,
     TOWING_UNLOAD_FORCE_RATE,
     TOWING_UNLOAD_MAX_DURATION,
     _as_bool,
@@ -75,6 +82,7 @@ PUSH_UNLOAD_MIN_DURATION = 1.0
 PUSH_EMERGENCY_UNLOAD_DURATION = 0.5
 PUSH_STABLE_MOTION_DISTANCE = 0.25
 PUSH_MAINTAIN_FORCE_RATIO = 0.85
+PUSH_FEEDFORWARD_BODY_X = True
 
 # Wall-pushing front contact face in the leader body frame. The redesigned tool
 # extends 60mm beyond the Beetle front edge/contact_point at x=0.26m, so the
@@ -103,6 +111,12 @@ PUSH_RETREAT_DISTANCE = 0.20
 def _effective_push_ramp_time():
     rate_limited_time = abs(PUSH_FORCE) / max(PUSH_FORCE_RAMP_RATE, 1e-3)
     return max(PUSH_FORCE_RAMP_TIME, rate_limited_time)
+
+
+def build_pushing_task_wrench_weights(force_body=None, task_scale=1.0):
+    if PUSH_FEEDFORWARD_BODY_X:
+        return build_towing_task_wrench_weights([1.0, 0.0, 0.0], task_scale)
+    return build_towing_task_wrench_weights(force_body, task_scale)
 
 
 class WallInterface(object):
@@ -505,6 +519,11 @@ class PushWithFeedforwardState(PushingStateBase):
             self.formation_adapter.contact_offset_y + PUSH_CONTACT_DY_FROM_CP,
             self.formation_adapter.contact_offset_z + PUSH_CONTACT_DZ_FROM_CP,
         ], dtype=float)
+        if PUSH_FEEDFORWARD_BODY_X:
+            force_body = np.array([float(np.linalg.norm(force_world)), 0.0, 0.0])
+            torque_body = np.cross(contact_offset_body, force_body).tolist()
+            return force_body.tolist(), torque_body, "fc"
+
         force_body, torque_body = self.beetle.buildFormationCoGWrench(
             force_world,
             application_offset_body=contact_offset_body,
@@ -551,7 +570,7 @@ class PushWithFeedforwardState(PushingStateBase):
                 force = ((1.0 - blend) * start_force).tolist()
                 torque = ((1.0 - blend) * start_torque).tolist()
             task_weights = (
-                build_towing_task_wrench_weights(force, PUSH_TASK_WEIGHT_SCALE)
+                build_pushing_task_wrench_weights(force, PUSH_TASK_WEIGHT_SCALE)
                 if unified_now else None)
             self.beetle.addExternalWrench(
                 force, torque, frame_id="fc", task_weights=task_weights)
@@ -674,10 +693,14 @@ class PushWithFeedforwardState(PushingStateBase):
         rate = rospy.Rate(25)
         unified_mode_seen = self.beetle.isUnifiedMode()
         force_ready_logged = False
+        force_guard_task_scale = 1.0
+        last_guarded_ff_mag = 0.0
+        last_force_guard = None
 
         while not rospy.is_shutdown():
             now = rospy.get_time()
             elapsed = now - start_time
+            loop_dt = max(now - prev_t, 1e-3)
             if elapsed >= push_deadline:
                 break
 
@@ -727,6 +750,35 @@ class PushWithFeedforwardState(PushingStateBase):
                     return 'timeout'
             else:
                 max_rp = 0.0
+            z_error = abs(float(current_pos[2] - target_pos[2]))
+            if not math.isfinite(z_error):
+                z_error = 0.0
+
+            force_guard = 'nominal'
+            target_task_scale = 1.0
+            if (max_rp > TOWING_FORCE_RELIEF_ATTITUDE or
+                    z_error > TOWING_FORCE_RELIEF_Z_ERROR):
+                force_guard = 'relief'
+                target_task_scale = TOWING_TASK_RELIEF_SCALE
+            elif (max_rp > TOWING_FORCE_HOLD_ATTITUDE or
+                    z_error > TOWING_FORCE_HOLD_Z_ERROR):
+                force_guard = 'hold'
+                target_task_scale = TOWING_TASK_HOLD_SCALE
+            if target_task_scale > force_guard_task_scale:
+                force_guard_task_scale = min(
+                    target_task_scale,
+                    force_guard_task_scale +
+                    TOWING_TASK_SCALE_RECOVER_RATE * loop_dt)
+            else:
+                force_guard_task_scale = target_task_scale
+            if force_guard != last_force_guard:
+                log_fn = rospy.loginfo if force_guard == 'nominal' else rospy.logwarn
+                log_fn(
+                    "[Pushing ForceGuard] %s: max_rp=%.1fdeg z_err=%.3fm "
+                    "task_scale=%.2f",
+                    force_guard, math.degrees(max_rp), z_error,
+                    force_guard_task_scale)
+                last_force_guard = force_guard
 
             unified_mode = self.beetle.isUnifiedMode()
             if unified_mode:
@@ -742,8 +794,7 @@ class PushWithFeedforwardState(PushingStateBase):
             if dynamic_push:
                 # Mocap-feedback adaptive force: ramp up until breakaway, hold a
                 # maintain force after, abort if the wall stays stuck.
-                fres = force_mgr.update(advance, now - prev_t)
-                prev_t = now
+                fres = force_mgr.update(advance, loop_dt)
                 ff_mag = fres['force']
                 if fres['abort']:
                     rospy.logwarn(
@@ -752,6 +803,18 @@ class PushWithFeedforwardState(PushingStateBase):
                     break
             else:
                 ff_mag = PUSH_FORCE * smoothstep01(elapsed / ramp_time)
+            if force_guard == 'relief':
+                ff_mag = max(
+                    0.0,
+                    min(ff_mag,
+                        last_guarded_ff_mag -
+                        TOWING_UNLOAD_FORCE_RATE * loop_dt))
+            elif force_guard == 'hold':
+                ff_mag = min(ff_mag, last_guarded_ff_mag)
+            if dynamic_push and force_mgr is not None and ff_mag < fres['force']:
+                force_mgr.current_force = ff_mag
+            last_guarded_ff_mag = ff_mag
+            prev_t = now
             ff_world = push_dir * ff_mag
             force_reached = (
                 ff_mag >= PUSH_FORCE - 1e-3 if dynamic_push
@@ -763,8 +826,9 @@ class PushWithFeedforwardState(PushingStateBase):
                     PUSH_FORCE, elapsed)
             ff_force, ff_torque, ff_frame = self._build_pushing_wrench_command(
                 ff_world, unified_mode)
+            task_scale = PUSH_TASK_WEIGHT_SCALE * force_guard_task_scale
             task_weights = (
-                build_towing_task_wrench_weights(ff_force, PUSH_TASK_WEIGHT_SCALE)
+                build_pushing_task_wrench_weights(ff_force, task_scale)
                 if unified_mode else None)
 
             self.send_assembly_command_from_end_effector(target_pos, maintain_yaw)
@@ -784,6 +848,7 @@ class PushWithFeedforwardState(PushingStateBase):
             diag_text = (
                 f"[Pushing FF] t={elapsed:.1f}s/{diag_duration:.1f}s "
                 f"ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N "
+                f"ff_cmd=({ff_force[0]:.2f},{ff_force[1]:.2f},{ff_force[2]:.2f})N "
                 f"mag={np.linalg.norm(ff_world):.2f}N wall_force={wall_force_text} "
                 f"full_hold={full_force_hold:.1f}s "
                 f"mode={'unified' if unified_mode else 'LF'} frame={ff_frame} "
@@ -791,7 +856,8 @@ class PushWithFeedforwardState(PushingStateBase):
                 f"progress={progress*100:.0f}% source={advance_source} "
                 f"phase={phase_text} wall_adv={wall_advance_text} "
                 f"ee_adv={ee_advance:.3f}m target_lag={target_lag:.3f}m "
-                f"max_rp={math.degrees(max_rp):.1f}deg")
+                f"max_rp={math.degrees(max_rp):.1f}deg z_err={z_error:.3f}m "
+                f"guard={force_guard} task_scale={task_scale:.2f}")
             rospy.loginfo_throttle(1.0, diag_text)
             self.diag_pub.publish(String(data=diag_text))
 
@@ -950,7 +1016,7 @@ def _load_params():
     global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_FORCE_RAMP_RATE, PUSH_DURATION
     global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TARGET_MAX_LAG
-    global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
+    global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH, PUSH_FEEDFORWARD_BODY_X
     global PUSH_UNLOAD_MIN_DURATION
     global PUSH_END_EFFECTOR_OFFSET_X, PUSH_END_EFFECTOR_OFFSET_Z
     global PUSH_MOVE_DISTANCE
@@ -984,6 +1050,8 @@ def _load_params():
         0.0, float(rospy.get_param("~push_target_max_lag", PUSH_TARGET_MAX_LAG)))
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
+    PUSH_FEEDFORWARD_BODY_X = _as_bool(rospy.get_param(
+        "~push_body_x_feedforward", PUSH_FEEDFORWARD_BODY_X))
     PUSH_UNLOAD_MIN_DURATION = float(rospy.get_param("~unload_min_duration", PUSH_UNLOAD_MIN_DURATION))
     PUSH_END_EFFECTOR_OFFSET_X = float(rospy.get_param(
         "~push_end_effector_offset_x", PUSH_END_EFFECTOR_OFFSET_X))
@@ -1026,10 +1094,16 @@ def main():
         PUSH_CONTACT_WRENCH_THRESHOLD)
     rospy.loginfo(
         "Push: force=%.2fN, ramp=%.1fs (min %.1fs, rate %.1fN/s), "
-        "duration=%.1fs, full_force_hold=%.1fs, lead=%.0fmm",
+        "duration=%.1fs, full_force_hold=%.1fs, lead=%.0fmm, body_x=%s",
         PUSH_FORCE, _effective_push_ramp_time(), PUSH_FORCE_RAMP_TIME,
         PUSH_FORCE_RAMP_RATE, PUSH_DURATION,
-        PUSH_FULL_FORCE_HOLD_TIME, PUSH_POSITION_LEAD * 1000.0)
+        PUSH_FULL_FORCE_HOLD_TIME, PUSH_POSITION_LEAD * 1000.0,
+        PUSH_FEEDFORWARD_BODY_X)
+    rospy.loginfo(
+        "Force guard: hold %.1fdeg/%.2fm, relief %.1fdeg/%.2fm, relief %.1fN/s",
+        math.degrees(TOWING_FORCE_HOLD_ATTITUDE), TOWING_FORCE_HOLD_Z_ERROR,
+        math.degrees(TOWING_FORCE_RELIEF_ATTITUDE), TOWING_FORCE_RELIEF_Z_ERROR,
+        TOWING_UNLOAD_FORCE_RATE)
     rospy.loginfo("=" * 60)
     log_pushing_preflight(module_ids, real_machine, simulation)
 

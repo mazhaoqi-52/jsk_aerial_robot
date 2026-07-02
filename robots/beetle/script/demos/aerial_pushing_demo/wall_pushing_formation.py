@@ -64,6 +64,7 @@ PUSH_CONTACT_REQUIRED_CYCLES = 8
 # Pushing feedforward.
 PUSH_FORCE = 5.0
 PUSH_FORCE_RAMP_TIME = 3.0
+PUSH_FORCE_RAMP_RATE = 3.0
 PUSH_DURATION = 10.0
 PUSH_FULL_FORCE_HOLD_TIME = 2.0
 PUSH_POSITION_LEAD = 0.03
@@ -71,6 +72,7 @@ PUSH_TARGET_MAX_LAG = 0.03
 PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
 PUSH_UNLOAD_MIN_DURATION = 1.0
+PUSH_EMERGENCY_UNLOAD_DURATION = 0.5
 
 # Wall-pushing front contact face in the leader body frame. The redesigned tool
 # extends 60mm beyond the Beetle front edge/contact_point at x=0.26m, so the
@@ -94,6 +96,11 @@ PUSH_CONTACT_DZ_FROM_CP = 0.0
 # Exit behavior.
 PUSH_RETREAT_AFTER = True
 PUSH_RETREAT_DISTANCE = 0.20
+
+
+def _effective_push_ramp_time():
+    rate_limited_time = abs(PUSH_FORCE) / max(PUSH_FORCE_RAMP_RATE, 1e-3)
+    return max(PUSH_FORCE_RAMP_TIME, rate_limited_time)
 
 
 class WallInterface(object):
@@ -503,24 +510,47 @@ class PushWithFeedforwardState(PushingStateBase):
         return force_body, torque_body, "fc"
 
     def _clear_external_wrench(self, hold_pos=None, hold_yaw=None,
-                               duration=PUSH_UNLOAD_MIN_DURATION):
-        duration = self._scaled_unload_duration(duration)
+                               duration=PUSH_UNLOAD_MIN_DURATION,
+                               emergency=False):
         zero = [0.0, 0.0, 0.0]
         start_force = np.asarray(self.beetle.current_ff_force, dtype=float)
         start_torque = np.asarray(self.beetle.current_ff_torque, dtype=float)
+        unified_at_clear_start = self.beetle.isUnifiedMode()
 
-        rospy.loginfo("Clearing pushing external wrench")
+        if emergency:
+            duration = max(0.05, float(duration))
+            force_norm = float(np.linalg.norm(start_force))
+            rospy.logwarn(
+                "[Pushing Emergency Unload] ff_mag=%.2fN, duration=%.2fs",
+                force_norm, duration)
+        else:
+            duration = self._scaled_unload_duration(duration)
+            rospy.loginfo("Clearing pushing external wrench")
+
+        if emergency and not unified_at_clear_start:
+            rospy.logwarn(
+                "[Pushing Emergency Unload] unified mode is inactive; zeroing "
+                "wrench without positive-force ramp")
+            start_force = np.zeros(3)
+            start_torque = np.zeros(3)
+            duration = 0.05
+
         rate = rospy.Rate(25)
         steps = max(1, int(duration * 25.0))
         for step in range(1, steps + 1):
             if hold_pos is not None:
                 self.send_assembly_command_from_end_effector(hold_pos, hold_yaw)
-            blend = smoothstep01(float(step) / steps)
-            force = ((1.0 - blend) * start_force).tolist()
-            torque = ((1.0 - blend) * start_torque).tolist()
+            unified_now = self.beetle.isUnifiedMode()
+            if (emergency or unified_at_clear_start) and not unified_now:
+                force = zero
+                torque = zero
+            else:
+                blend = smoothstep01(float(step) / steps)
+                force = ((1.0 - blend) * start_force).tolist()
+                torque = ((1.0 - blend) * start_torque).tolist()
             task_weights = (
                 build_towing_task_wrench_weights(force, PUSH_TASK_WEIGHT_SCALE)
-                if self.beetle.isUnifiedMode() else None)
+                if unified_now else None)
             self.beetle.addExternalWrench(
                 force, torque, frame_id="fc", task_weights=task_weights)
             if rospy.is_shutdown():
@@ -536,9 +566,11 @@ class PushWithFeedforwardState(PushingStateBase):
         self.beetle.setAttachModule(None)
 
     def _finish_push_exit(self, userdata, reason, hold_pos, hold_yaw,
-                          clear_duration=PUSH_UNLOAD_MIN_DURATION):
+                          clear_duration=PUSH_UNLOAD_MIN_DURATION,
+                          emergency=False):
         self._clear_external_wrench(
-            hold_pos=hold_pos, hold_yaw=hold_yaw, duration=clear_duration)
+            hold_pos=hold_pos, hold_yaw=hold_yaw, duration=clear_duration,
+            emergency=emergency)
         final_pos = self.get_end_effector_position()
         if final_pos is None:
             final_pos = hold_pos
@@ -557,14 +589,15 @@ class PushWithFeedforwardState(PushingStateBase):
         target_pos = contact_pos + push_dir * PUSH_POSITION_LEAD
 
         control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
-        ramp_time = max(PUSH_FORCE_RAMP_TIME, 1e-3)
+        ramp_time = max(_effective_push_ramp_time(), 1e-3)
         effective_duration = max(
             PUSH_DURATION, ramp_time + PUSH_FULL_FORCE_HOLD_TIME)
         rospy.loginfo(
-            "Pushing force %.2fN, ramp %.1fs, duration %.1fs, "
-            "full_force_hold %.1fs, effective %.1fs, mode=%s",
-            PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION,
-            PUSH_FULL_FORCE_HOLD_TIME, effective_duration, control_mode)
+            "Pushing force %.2fN, ramp %.1fs (min %.1fs, rate %.1fN/s), "
+            "duration %.1fs, full_force_hold %.1fs, effective %.1fs, mode=%s",
+            PUSH_FORCE, ramp_time, PUSH_FORCE_RAMP_TIME, PUSH_FORCE_RAMP_RATE,
+            PUSH_DURATION, PUSH_FULL_FORCE_HOLD_TIME, effective_duration,
+            control_mode)
         if effective_duration > PUSH_DURATION + 1e-3:
             rospy.logwarn(
                 "[Pushing] Extending duration to %.1fs so feedforward reaches %.2fN "
@@ -676,7 +709,9 @@ class PushWithFeedforwardState(PushingStateBase):
                         "Pushing abort: roll/pitch too large (%.1f deg)",
                         math.degrees(max_rp))
                     self._finish_push_exit(
-                        userdata, 'attitude_limit', current_pos, maintain_yaw)
+                        userdata, 'attitude_limit', current_pos, maintain_yaw,
+                        clear_duration=PUSH_EMERGENCY_UNLOAD_DURATION,
+                        emergency=True)
                     return 'timeout'
             else:
                 max_rp = 0.0
@@ -687,7 +722,9 @@ class PushWithFeedforwardState(PushingStateBase):
             if unified_mode_seen and not unified_mode:
                 rospy.logwarn("Pushing abort: unified mode exited during pushing")
                 self._finish_push_exit(
-                    userdata, 'unified_exit', current_pos, maintain_yaw)
+                    userdata, 'unified_exit', current_pos, maintain_yaw,
+                    clear_duration=PUSH_EMERGENCY_UNLOAD_DURATION,
+                    emergency=True)
                 return 'timeout'
 
             if dynamic_push:
@@ -750,7 +787,10 @@ class PushWithFeedforwardState(PushingStateBase):
 
         if rospy.is_shutdown():
             hold_pos = self.get_end_effector_position()
-            self._finish_push_exit(userdata, 'ros_shutdown', hold_pos, maintain_yaw)
+            self._finish_push_exit(
+                userdata, 'ros_shutdown', hold_pos, maintain_yaw,
+                clear_duration=PUSH_EMERGENCY_UNLOAD_DURATION,
+                emergency=True)
             return 'timeout'
 
         if dynamic_push:
@@ -895,7 +935,7 @@ def _load_params():
     global PUSH_MIN_APPROACH_DISTANCE, PUSH_CONTACT_WRENCH_THRESHOLD
     global PUSH_CONTACT_STALL_LEAD, PUSH_CONTACT_STALL_VELOCITY
     global PUSH_CONTACT_REQUIRED_CYCLES
-    global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION
+    global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_FORCE_RAMP_RATE, PUSH_DURATION
     global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TARGET_MAX_LAG
     global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH
@@ -921,6 +961,8 @@ def _load_params():
     PUSH_FORCE = float(rospy.get_param("~push_force", PUSH_FORCE))
     PUSH_FORCE_RAMP_TIME = max(
         0.1, float(rospy.get_param("~force_ramp_time", PUSH_FORCE_RAMP_TIME)))
+    PUSH_FORCE_RAMP_RATE = max(
+        0.1, float(rospy.get_param("~force_ramp_rate", PUSH_FORCE_RAMP_RATE)))
     PUSH_DURATION = max(0.1, float(rospy.get_param("~push_duration", PUSH_DURATION)))
     PUSH_FULL_FORCE_HOLD_TIME = max(
         0.0, float(rospy.get_param(
@@ -971,9 +1013,10 @@ def main():
         PUSH_CONTACT_REQUIRED_CYCLES,
         PUSH_CONTACT_WRENCH_THRESHOLD)
     rospy.loginfo(
-        "Push: force=%.2fN, ramp=%.1fs, duration=%.1fs, "
-        "full_force_hold=%.1fs, lead=%.0fmm",
-        PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_DURATION,
+        "Push: force=%.2fN, ramp=%.1fs (min %.1fs, rate %.1fN/s), "
+        "duration=%.1fs, full_force_hold=%.1fs, lead=%.0fmm",
+        PUSH_FORCE, _effective_push_ramp_time(), PUSH_FORCE_RAMP_TIME,
+        PUSH_FORCE_RAMP_RATE, PUSH_DURATION,
         PUSH_FULL_FORCE_HOLD_TIME, PUSH_POSITION_LEAD * 1000.0)
     rospy.loginfo("=" * 60)
     log_pushing_preflight(module_ids, real_machine, simulation)

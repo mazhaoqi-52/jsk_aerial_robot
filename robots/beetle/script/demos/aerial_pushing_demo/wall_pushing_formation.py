@@ -73,6 +73,8 @@ PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
 PUSH_UNLOAD_MIN_DURATION = 1.0
 PUSH_EMERGENCY_UNLOAD_DURATION = 0.5
+PUSH_STABLE_MOTION_DISTANCE = 0.25
+PUSH_MAINTAIN_FORCE_RATIO = 0.85
 
 # Wall-pushing front contact face in the leader body frame. The redesigned tool
 # extends 60mm beyond the Beetle front edge/contact_point at x=0.26m, so the
@@ -633,8 +635,13 @@ class PushWithFeedforwardState(PushingStateBase):
         # available, use wall displacement as the progress/breakaway signal (the
         # same object-mocap pattern towing uses); otherwise keep an explicit EE
         # fallback for static tests and old launches.
+        stable_motion_distance = min(PUSH_MOVE_DISTANCE, PUSH_STABLE_MOTION_DISTANCE)
         force_mgr = AdaptiveForceManager(
-            max_force=PUSH_FORCE, ramp_time=ramp_time) if dynamic_push else None
+            max_force=PUSH_FORCE,
+            ramp_time=ramp_time,
+            maintain_force_ratio=PUSH_MAINTAIN_FORCE_RATIO,
+            stable_motion_distance=stable_motion_distance,
+            force_relief_rate=TOWING_UNLOAD_FORCE_RATE) if dynamic_push else None
         if dynamic_push:
             wall_tracking = (
                 self.wall_interface.use_wall_pose and
@@ -656,6 +663,11 @@ class PushWithFeedforwardState(PushingStateBase):
                 "(timeout %.1fs), adaptive force up to %.2fN. A fixed wall cannot "
                 "advance -> static force test.",
                 PUSH_MOVE_DISTANCE, push_deadline, PUSH_FORCE)
+            rospy.loginfo(
+                "[Pushing] Breakaway relief waits for %.2fm stable wall motion; "
+                "maintain force %.0f%%, relief %.1fN/s",
+                stable_motion_distance, PUSH_MAINTAIN_FORCE_RATIO * 100.0,
+                TOWING_UNLOAD_FORCE_RATE)
 
         start_time = rospy.get_time()
         prev_t = start_time

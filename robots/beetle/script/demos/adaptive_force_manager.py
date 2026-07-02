@@ -38,6 +38,7 @@ class AdaptiveForceManager:
                  stable_motion_distance=None,
                  stable_motion_velocity=None,
                  stable_motion_time=0.8,
+                 force_relief_rate=3.0,
                  overspeed_relief_time=8.0,
                  stall_window_time=5.0,
                  stall_min_advance=0.01,
@@ -59,6 +60,7 @@ class AdaptiveForceManager:
             stable_motion_distance: advance required before force relief (m).
             stable_motion_velocity: speed required before force relief (m/s).
             stable_motion_time: continuous stable-motion time before force relief (s).
+            force_relief_rate: normal post-breakaway force reduction rate (N/s).
             overspeed_relief_time: time constant for reducing force when overspeeding (s).
             stall_window_time: stall detection window length (s).
             stall_min_advance: min advance within a window to not be stalled (m).
@@ -88,6 +90,7 @@ class AdaptiveForceManager:
             self.target_velocity * 0.6 if stable_motion_velocity is None
             else float(stable_motion_velocity))
         self.stable_motion_time = max(0.0, float(stable_motion_time))
+        self.force_relief_rate = max(0.0, float(force_relief_rate))
         self.overspeed_relief_rate = self.max_force / max(float(overspeed_relief_time), 1e-3)
         self.stall_window_time = float(stall_window_time)
         self.stall_min_advance = float(stall_min_advance)
@@ -182,15 +185,18 @@ class AdaptiveForceManager:
             if holding_breakaway:
                 self.current_force = min(self.max_force, self.current_force + self.ramp_rate * dt)
             else:
-                # Phase 2: fall back to the maintain force; relieve if overspeeding,
-                # recover toward maintain if slow. Never exceed the maintain force.
+                # Phase 2: fall back to the maintain force gradually; relieve
+                # below maintain only when the object is overspeeding.
                 if self.advance_velocity > self.target_velocity:
                     self.current_force = max(
                         0.0, self.current_force - self.overspeed_relief_rate * dt)
+                elif self.current_force > self.maintain_force:
+                    self.current_force = max(
+                        self.maintain_force,
+                        self.current_force - self.force_relief_rate * dt)
                 else:
                     self.current_force = min(self.maintain_force,
                                              self.current_force + self.ramp_rate * dt)
-                self.current_force = min(self.current_force, self.maintain_force)
 
         # Stall detection: only meaningful until stable object motion is established.
         stalled_window = False

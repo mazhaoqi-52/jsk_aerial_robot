@@ -100,15 +100,20 @@ class AdaptiveForceManagerTest(unittest.TestCase):
 
         a = 0.05
         for _ in range(70):
-            a += 0.05 * DT
+            a += 0.04 * DT
             res = mgr.update(a, DT)
         self.assertTrue(res['stable_motion'])
         self.assertEqual(res['phase'], 'breakaway')
+        self.assertGreater(res['force'], 0.5 * 20.0)
+
+        for _ in range(80):
+            a += 0.04 * DT
+            res = mgr.update(a, DT)
         self.assertLessEqual(res['force'], 0.5 * 20.0 + 1e-6)
 
     def test_force_falls_back_after_breakaway(self):
-        # After breakaway the held force must not exceed the maintain force even
-        # if the pre-breakaway force was higher.
+        # After breakaway the held force falls back gradually rather than being
+        # clamped to the maintain force in one control tick.
         mgr = AdaptiveForceManager(max_force=30.0, ramp_time=0.5,
                                    breakaway_distance=0.03, maintain_force_ratio=0.5,
                                    target_velocity=0.05)
@@ -121,6 +126,12 @@ class AdaptiveForceManagerTest(unittest.TestCase):
         res = run(mgr, seq)
         self.assertTrue(res['breakaway'])
         self.assertEqual(res['phase'], 'breakaway')
+        self.assertGreater(res['force'], 0.5 * 30.0)
+        self.assertLess(res['force'], 30.0)
+
+        for _ in range(120):
+            a += 0.04 * DT
+            res = mgr.update(a, DT)
         self.assertLessEqual(res['force'], 0.5 * 30.0 + 1e-6)
 
     def test_overspeed_relief(self):
@@ -128,7 +139,10 @@ class AdaptiveForceManagerTest(unittest.TestCase):
         # the maintain level.
         mgr = AdaptiveForceManager(max_force=20.0, ramp_time=0.5,
                                    breakaway_distance=0.02, maintain_force_ratio=0.6,
-                                   target_velocity=0.05, overspeed_relief_time=1.0)
+                                   target_velocity=0.05, breakaway_hold_time=0.0,
+                                   stable_motion_distance=0.03,
+                                   stable_motion_time=0.0,
+                                   overspeed_relief_time=1.0)
         seq = [0.0] * 10
         a = 0.03
         for _ in range(30):

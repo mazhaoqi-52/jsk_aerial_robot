@@ -54,8 +54,8 @@
        doc="Use wall_id mocap pose for dynamic wall displacement; set false only for stall-only/static tests"/>
   <arg name="use_wall_wrench" default="false"
        doc="Use /wall/wrench for contact detection. Defaults false so sim and real use the same stall gate; on real hardware /cfs/data stays logging-only unless bridged to /wall/wrench and set true."/>
-  <arg name="use_wall_plane_contact" default="false"
-       doc="Use wall pose geometry as an extra contact gate. Defaults false so sim and real use the same stall gate."/>
+  <arg name="use_wall_plane_contact" default="true"
+       doc="Use wall pose geometry as an extra approach contact gate; set false for stall/wrench-only contact detection."/>
 
   <include file="$(find beetle)/launch/aerial_pushing_tasks/wall_pos.launch">
     <arg name="real_machine"   value="$(arg real_machine)"/>

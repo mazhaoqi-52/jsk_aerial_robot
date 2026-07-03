@@ -106,6 +106,8 @@
        doc="Total pushing hold duration including ramp (s)"/>
   <arg name="full_force_hold_time" default="0.0"
        doc="Minimum time to hold after push_force is reached (s)"/>
+  <arg name="full_force_try_time" default="10.0"
+       doc="Dynamic push: maximum time to keep trying after push_force is reached without stable wall motion (s)"/>
   <arg name="force_guard_yaw_hold_deg" default="6.0"
        doc="Hold force increase when yaw error exceeds this value (deg)"/>
   <arg name="force_guard_yaw_relief_deg" default="10.0"
@@ -165,6 +167,7 @@
     <param name="force_ramp_rate"          value="$(arg force_ramp_rate)"/>
     <param name="push_duration"            value="$(arg push_duration)"/>
     <param name="full_force_hold_time"     value="$(arg full_force_hold_time)"/>
+    <param name="full_force_try_time"      value="$(arg full_force_try_time)"/>
     <param name="force_guard_yaw_hold_deg" value="$(arg force_guard_yaw_hold_deg)"/>
     <param name="force_guard_yaw_relief_deg" value="$(arg force_guard_yaw_relief_deg)"/>
     <param name="force_guard_lateral_hold" value="$(arg force_guard_lateral_hold)"/>

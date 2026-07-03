@@ -68,6 +68,9 @@ PUSH_CONTACT_WRENCH_THRESHOLD = 0.8
 PUSH_CONTACT_STALL_LEAD = 0.06
 PUSH_CONTACT_STALL_VELOCITY = 0.004
 PUSH_CONTACT_REQUIRED_CYCLES = 8
+PUSH_YAW_TARGET = 0.0
+PUSH_YAW_ALIGN_TIMEOUT = 8.0
+PUSH_YAW_ALIGN_THRESH = math.radians(3.0)
 
 # Pushing feedforward.
 PUSH_FORCE = 5.0
@@ -75,9 +78,13 @@ PUSH_FORCE_RAMP_TIME = 3.0
 PUSH_FORCE_RAMP_RATE = 3.0
 PUSH_DURATION = 10.0
 PUSH_FULL_FORCE_HOLD_TIME = 2.0
+PUSH_FULL_FORCE_TRY_TIME = 10.0
 PUSH_POSITION_LEAD = 0.03
 PUSH_TARGET_VELOCITY = 0.05
 PUSH_TARGET_MAX_LAG = 0.03
+PUSH_STALL_WINDOW_TIME = 2.0
+PUSH_STALL_MIN_ADVANCE = 0.02
+PUSH_STALL_MIN_FORCE_RATIO = 0.9
 PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
 PUSH_FORCE_HOLD_YAW_ERROR = math.radians(6.0)
@@ -340,6 +347,26 @@ class PushingInitializeState(PushingStateBase):
             rospy.logerr("Current end-effector pose is not available")
             return 'failed'
 
+        yaw_error = abs(normalize_angle_diff(PUSH_YAW_TARGET - current_yaw))
+        rospy.loginfo(
+            "Pushing yaw target: %.1f deg (current %.1f deg, err %.1f deg)",
+            math.degrees(PUSH_YAW_TARGET), math.degrees(current_yaw),
+            math.degrees(yaw_error))
+        if yaw_error > PUSH_YAW_ALIGN_THRESH:
+            if not self.active_position_convergence(
+                    current_pos, PUSH_YAW_TARGET, pos_thresh=0.05,
+                    yaw_thresh=PUSH_YAW_ALIGN_THRESH,
+                    timeout=PUSH_YAW_ALIGN_TIMEOUT,
+                    max_angular_vel=0.1, yaw_only=True):
+                rospy.logerr("Failed to align yaw to %.1f deg before pushing",
+                             math.degrees(PUSH_YAW_TARGET))
+                return 'failed'
+            current_pos = self.get_end_effector_position()
+            current_yaw = self.get_end_effector_yaw()
+            if current_pos is None or current_yaw is None:
+                rospy.logerr("Current end-effector pose is not available after yaw align")
+                return 'failed'
+
         push_dir = self.resolve_push_direction(current_pos)
         face_distance = self.wall_interface.distance_to_near_face(current_pos, push_dir)
         if face_distance is None:
@@ -348,13 +375,15 @@ class PushingInitializeState(PushingStateBase):
         self.formation_adapter.set_pitch_compensation(False)
 
         userdata.start_position = np.array(current_pos, dtype=float)
-        userdata.start_yaw = current_yaw
+        userdata.start_yaw = PUSH_YAW_TARGET
         userdata.push_direction = push_dir
         userdata.wall_face_distance = face_distance
 
         face_text = "NA" if not math.isfinite(face_distance) else f"{face_distance:.3f}m"
         rospy.loginfo("Manual start EE position: %s", FormationUtils.format_vec(current_pos))
-        rospy.loginfo("Manual start yaw: %.1f deg", math.degrees(current_yaw))
+        rospy.loginfo(
+            "Manual start yaw: %.1f deg, pushing command yaw: %.1f deg",
+            math.degrees(current_yaw), math.degrees(PUSH_YAW_TARGET))
         rospy.loginfo("Push direction: (%.3f, %.3f, %.3f)", push_dir[0], push_dir[1], push_dir[2])
         rospy.loginfo("Estimated distance to wall near face: %s", face_text)
         return 'succeeded'
@@ -661,14 +690,22 @@ class PushWithFeedforwardState(PushingStateBase):
         # same object-mocap pattern towing uses); otherwise keep an explicit EE
         # fallback for static tests and old launches.
         stable_motion_distance = min(PUSH_MOVE_DISTANCE, PUSH_STABLE_MOTION_DISTANCE)
-        force_mgr = AdaptiveForceManager(
-            max_force=PUSH_FORCE,
-            ramp_time=ramp_time,
-            target_velocity=PUSH_TARGET_VELOCITY,
-            maintain_force_ratio=PUSH_MAINTAIN_FORCE_RATIO,
-            stable_motion_distance=stable_motion_distance,
-            force_relief_rate=TOWING_UNLOAD_FORCE_RATE) if dynamic_push else None
+        stall_timeout_count = max(
+            1, int(math.ceil(
+                PUSH_FULL_FORCE_TRY_TIME / max(PUSH_STALL_WINDOW_TIME, 1e-3))))
+        force_mgr = None
         if dynamic_push:
+            force_mgr = AdaptiveForceManager(
+                max_force=PUSH_FORCE,
+                ramp_time=ramp_time,
+                target_velocity=PUSH_TARGET_VELOCITY,
+                maintain_force_ratio=PUSH_MAINTAIN_FORCE_RATIO,
+                stable_motion_distance=stable_motion_distance,
+                force_relief_rate=TOWING_UNLOAD_FORCE_RATE,
+                stall_window_time=PUSH_STALL_WINDOW_TIME,
+                stall_min_advance=PUSH_STALL_MIN_ADVANCE,
+                stall_min_force_ratio=PUSH_STALL_MIN_FORCE_RATIO,
+                stall_timeout_count=stall_timeout_count)
             wall_tracking = (
                 self.wall_interface.use_wall_pose and
                 self.wall_interface.position_received.is_set())
@@ -694,12 +731,21 @@ class PushWithFeedforwardState(PushingStateBase):
                 "maintain force %.0f%%, relief %.1fN/s",
                 stable_motion_distance, PUSH_MAINTAIN_FORCE_RATIO * 100.0,
                 TOWING_UNLOAD_FORCE_RATE)
+            rospy.loginfo(
+                "[Pushing] Stall guard: %.1fs windows, %.0fmm min advance, "
+                "high force %.0f%%, %d windows, full-force try %.1fs",
+                PUSH_STALL_WINDOW_TIME, PUSH_STALL_MIN_ADVANCE * 1000.0,
+                PUSH_STALL_MIN_FORCE_RATIO * 100.0, stall_timeout_count,
+                PUSH_FULL_FORCE_TRY_TIME)
 
         start_time = rospy.get_time()
         prev_t = start_time
         rate = rospy.Rate(25)
         unified_mode_seen = self.beetle.isUnifiedMode()
         force_ready_logged = False
+        full_force_reached_time = None
+        push_exit_reason = 'succeeded'
+        push_outcome = 'succeeded'
         force_guard_task_scale = 1.0
         last_guarded_ff_mag = 0.0
         last_force_guard = None
@@ -829,6 +875,8 @@ class PushWithFeedforwardState(PushingStateBase):
                     rospy.logwarn(
                         "[Pushing] Dynamic abort: wall did not move under %.2fN "
                         "(stall) -> static wall", ff_mag)
+                    push_exit_reason = 'dynamic_stall'
+                    push_outcome = 'timeout'
                     break
             else:
                 ff_mag = PUSH_FORCE * smoothstep01(elapsed / ramp_time)
@@ -850,9 +898,21 @@ class PushWithFeedforwardState(PushingStateBase):
                 else elapsed >= ramp_time)
             if not force_ready_logged and force_reached:
                 force_ready_logged = True
+                full_force_reached_time = now
                 rospy.loginfo(
                     "[Pushing] Feedforward reached target %.2fN at %.1fs",
                     PUSH_FORCE, elapsed)
+            if (dynamic_push and full_force_reached_time is not None and
+                    force_mgr is not None and
+                    not force_mgr.stable_motion_detected and
+                    now - full_force_reached_time >= PUSH_FULL_FORCE_TRY_TIME):
+                rospy.logwarn(
+                    "[Pushing] Dynamic abort: tried full force %.2fN for %.1fs "
+                    "without stable wall motion (advance=%.3fm)",
+                    PUSH_FORCE, now - full_force_reached_time, advance)
+                push_exit_reason = 'full_force_timeout'
+                push_outcome = 'timeout'
+                break
             ff_force, ff_torque, ff_frame = self._build_pushing_wrench_command(
                 ff_world, unified_mode)
             task_scale = PUSH_TASK_WEIGHT_SCALE * force_guard_task_scale
@@ -927,9 +987,9 @@ class PushWithFeedforwardState(PushingStateBase):
         if hold_pos is None:
             hold_pos = self.get_end_effector_position()
         self._finish_push_exit(
-            userdata, 'succeeded', hold_pos, maintain_yaw,
+            userdata, push_exit_reason, hold_pos, maintain_yaw,
             clear_duration=max(2.0, PUSH_UNLOAD_MIN_DURATION))
-        return 'succeeded'
+        return push_outcome
 
 
 class RetreatFromWallState(PushingStateBase):
@@ -1049,7 +1109,7 @@ def _load_params():
     global PUSH_CONTACT_STALL_LEAD, PUSH_CONTACT_STALL_VELOCITY
     global PUSH_CONTACT_REQUIRED_CYCLES
     global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_FORCE_RAMP_RATE, PUSH_DURATION
-    global PUSH_FULL_FORCE_HOLD_TIME
+    global PUSH_FULL_FORCE_HOLD_TIME, PUSH_FULL_FORCE_TRY_TIME
     global PUSH_POSITION_LEAD, PUSH_TARGET_VELOCITY, PUSH_TARGET_MAX_LAG
     global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH, PUSH_FEEDFORWARD_BODY_X
     global PUSH_FORCE_HOLD_YAW_ERROR, PUSH_FORCE_RELIEF_YAW_ERROR
@@ -1082,6 +1142,9 @@ def _load_params():
     PUSH_FULL_FORCE_HOLD_TIME = max(
         0.0, float(rospy.get_param(
             "~full_force_hold_time", PUSH_FULL_FORCE_HOLD_TIME)))
+    PUSH_FULL_FORCE_TRY_TIME = max(
+        0.0, float(rospy.get_param(
+            "~full_force_try_time", PUSH_FULL_FORCE_TRY_TIME)))
     PUSH_POSITION_LEAD = float(rospy.get_param("~push_position_lead", PUSH_POSITION_LEAD))
     PUSH_TARGET_VELOCITY = max(
         0.001, float(rospy.get_param("~push_target_velocity", PUSH_TARGET_VELOCITY)))
@@ -1145,10 +1208,12 @@ def main():
         PUSH_CONTACT_WRENCH_THRESHOLD)
     rospy.loginfo(
         "Push: force=%.2fN, ramp=%.1fs (min %.1fs, rate %.1fN/s), "
-        "duration=%.1fs, full_force_hold=%.1fs, lead=%.0fmm, target_vel=%.0fmm/s, body_x=%s",
+        "duration=%.1fs, full_force_hold=%.1fs, full_force_try=%.1fs, "
+        "lead=%.0fmm, target_vel=%.0fmm/s, body_x=%s",
         PUSH_FORCE, _effective_push_ramp_time(), PUSH_FORCE_RAMP_TIME,
         PUSH_FORCE_RAMP_RATE, PUSH_DURATION,
-        PUSH_FULL_FORCE_HOLD_TIME, PUSH_POSITION_LEAD * 1000.0,
+        PUSH_FULL_FORCE_HOLD_TIME, PUSH_FULL_FORCE_TRY_TIME,
+        PUSH_POSITION_LEAD * 1000.0,
         PUSH_TARGET_VELOCITY * 1000.0, PUSH_FEEDFORWARD_BODY_X)
     rospy.loginfo(
         "Force guard: hold rp %.1fdeg/z %.2fm/yaw %.1fdeg/lat %.2fm, "

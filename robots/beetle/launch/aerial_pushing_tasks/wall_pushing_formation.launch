@@ -108,6 +108,8 @@
        doc="Minimum time to hold after push_force is reached (s)"/>
   <arg name="push_position_lead" default="0.03"
        doc="Small position lead into the wall to maintain contact (m)"/>
+  <arg name="push_target_velocity" default="0.05"
+       doc="Dynamic push: towing-like target advance speed after contact (m/s)"/>
   <arg name="push_target_max_lag" default="0.03"
        doc="Dynamic push: maximum push-axis lag from the current contact point to the position target (m)"/>
   <arg name="push_body_x_feedforward" default="true"
@@ -117,7 +119,7 @@
   <arg name="push_end_effector_offset_z" default="0.00053"
        doc="Leader body-frame Z offset of the wall-pushing front contact face (m); positive is above CoG"/>
   <arg name="push_move_distance" default="0.0"
-       doc="Dynamic push: advance the wall this far along push_dir (m). 0 = static force test. A fixed wall stays a static test; a movable wall is pushed. The advance timeout is auto-computed from the ramp time, distance and approach speed."/>
+       doc="Dynamic push: advance the wall this far along push_dir (m). 0 = static force test. A fixed wall stays a static test; a movable wall is pushed. The advance timeout is auto-computed from the ramp time, distance and target velocity."/>
   <arg name="retreat_after_push" default="true"/>
   <arg name="retreat_distance" default="0.20"/>
   <arg name="debug" default="false"/>
@@ -156,6 +158,7 @@
     <param name="push_duration"            value="$(arg push_duration)"/>
     <param name="full_force_hold_time"     value="$(arg full_force_hold_time)"/>
     <param name="push_position_lead"       value="$(arg push_position_lead)"/>
+    <param name="push_target_velocity"     value="$(arg push_target_velocity)"/>
     <param name="push_target_max_lag"      value="$(arg push_target_max_lag)"/>
     <param name="push_body_x_feedforward"  value="$(arg push_body_x_feedforward)"/>
     <param name="push_end_effector_offset_x" value="$(arg push_end_effector_offset_x)"/>

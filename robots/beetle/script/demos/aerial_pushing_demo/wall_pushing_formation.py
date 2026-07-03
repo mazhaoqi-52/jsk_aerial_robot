@@ -75,6 +75,7 @@ PUSH_FORCE_RAMP_RATE = 3.0
 PUSH_DURATION = 10.0
 PUSH_FULL_FORCE_HOLD_TIME = 2.0
 PUSH_POSITION_LEAD = 0.03
+PUSH_TARGET_VELOCITY = 0.05
 PUSH_TARGET_MAX_LAG = 0.03
 PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
@@ -92,9 +93,8 @@ PUSH_END_EFFECTOR_OFFSET_Z = 0.00053
 
 # Dynamic push: advance the wall this far (m) along the push direction while
 # holding the feedforward force. 0.0 => static force test (hold in place).
-# The target leads-and-follows the formation's actual advance, so a fixed wall
-# never advances (degrades to a static test), while a movable wall is pushed the
-# full distance. Reuses the aerial-towing lead-target + force-ramp pattern.
+# The target advances at a towing-like velocity and is clamped near the
+# measured wall/EE progress, so mocap jumps do not move the target abruptly.
 PUSH_MOVE_DISTANCE = 0.0
 
 # Optional fine-tune of the calibrated pushing force application point, in
@@ -641,13 +641,14 @@ class PushWithFeedforwardState(PushingStateBase):
 
         dynamic_push = PUSH_MOVE_DISTANCE > 1e-6
         # Auto timeout for the dynamic advance: force ramp + time to cover the
-        # target distance at the (slow) approach speed + margin. No launch param.
-        push_deadline = (ramp_time + PUSH_MOVE_DISTANCE / max(PUSH_APPROACH_SPEED, 1e-3) + 5.0
+        # target distance at the towing-like target speed + margin. No launch param.
+        push_deadline = (ramp_time + PUSH_MOVE_DISTANCE / max(PUSH_TARGET_VELOCITY, 1e-3) + 5.0
                          if dynamic_push else effective_duration)
         advance = 0.0
         ee_advance = 0.0
         wall_advance = None
         target_lag = 0.0
+        target_lead = min(PUSH_MOVE_DISTANCE, PUSH_POSITION_LEAD)
         wall_start_pos = None
         advance_source = 'time'
         # Dynamic mode uses the shared adaptive-force manager. When wall pose is
@@ -658,6 +659,7 @@ class PushWithFeedforwardState(PushingStateBase):
         force_mgr = AdaptiveForceManager(
             max_force=PUSH_FORCE,
             ramp_time=ramp_time,
+            target_velocity=PUSH_TARGET_VELOCITY,
             maintain_force_ratio=PUSH_MAINTAIN_FORCE_RATIO,
             stable_motion_distance=stable_motion_distance,
             force_relief_rate=TOWING_UNLOAD_FORCE_RATE) if dynamic_push else None
@@ -679,9 +681,9 @@ class PushWithFeedforwardState(PushingStateBase):
                     "wall_id:=55 and record /wall/mocap/pose.")
             rospy.loginfo(
                 "[Pushing] Dynamic mode: advance the wall up to %.2fm along push_dir "
-                "(timeout %.1fs), adaptive force up to %.2fN. A fixed wall cannot "
+                "(target %.2fm/s, timeout %.1fs), adaptive force up to %.2fN. A fixed wall cannot "
                 "advance -> static force test.",
-                PUSH_MOVE_DISTANCE, push_deadline, PUSH_FORCE)
+                PUSH_MOVE_DISTANCE, PUSH_TARGET_VELOCITY, push_deadline, PUSH_FORCE)
             rospy.loginfo(
                 "[Pushing] Breakaway relief waits for %.2fm stable wall motion; "
                 "maintain force %.0f%%, relief %.1fN/s",
@@ -727,14 +729,19 @@ class PushWithFeedforwardState(PushingStateBase):
                         "[Pushing] Dynamic push reached target: %.3fm (%s)",
                         advance, advance_source)
                     break
-                lead = min(PUSH_MOVE_DISTANCE, advance + PUSH_POSITION_LEAD)
+                target_lead = min(
+                    PUSH_MOVE_DISTANCE,
+                    target_lead + PUSH_TARGET_VELOCITY * loop_dt)
+                target_lead = min(
+                    target_lead,
+                    min(PUSH_MOVE_DISTANCE, advance + PUSH_POSITION_LEAD))
                 if PUSH_TARGET_MAX_LAG > 1e-6:
-                    lead = max(
-                        lead,
+                    target_lead = max(
+                        target_lead,
                         min(PUSH_MOVE_DISTANCE, ee_advance - PUSH_TARGET_MAX_LAG))
-                lead = max(0.0, min(PUSH_MOVE_DISTANCE, lead))
-                target_lag = ee_advance - lead
-                target_pos = contact_pos + push_dir * lead
+                target_lead = max(0.0, min(PUSH_MOVE_DISTANCE, target_lead))
+                target_lag = ee_advance - target_lead
+                target_pos = contact_pos + push_dir * target_lead
 
             rpy = self.beetle.getAssemblyRPY()
             if rpy is not None:
@@ -843,6 +850,8 @@ class PushWithFeedforwardState(PushingStateBase):
                         else min(1.0, elapsed / max(effective_duration, 1e-3)))
             diag_duration = push_deadline if dynamic_push else effective_duration
             phase_text = fres['phase'] if dynamic_push else 'static'
+            advance_velocity = fres['advance_velocity'] if dynamic_push else 0.0
+            overspeed = fres['overspeed'] if dynamic_push else False
             wall_advance_text = "NA" if wall_advance is None else f"{wall_advance:.3f}m"
             full_force_hold = max(0.0, elapsed - ramp_time)
             diag_text = (
@@ -856,6 +865,7 @@ class PushWithFeedforwardState(PushingStateBase):
                 f"progress={progress*100:.0f}% source={advance_source} "
                 f"phase={phase_text} wall_adv={wall_advance_text} "
                 f"ee_adv={ee_advance:.3f}m target_lag={target_lag:.3f}m "
+                f"adv_vel={advance_velocity:.3f}m/s overspeed={int(overspeed)} "
                 f"max_rp={math.degrees(max_rp):.1f}deg z_err={z_error:.3f}m "
                 f"guard={force_guard} task_scale={task_scale:.2f}")
             rospy.loginfo_throttle(1.0, diag_text)
@@ -1015,7 +1025,7 @@ def _load_params():
     global PUSH_CONTACT_REQUIRED_CYCLES
     global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_FORCE_RAMP_RATE, PUSH_DURATION
     global PUSH_FULL_FORCE_HOLD_TIME
-    global PUSH_POSITION_LEAD, PUSH_TARGET_MAX_LAG
+    global PUSH_POSITION_LEAD, PUSH_TARGET_VELOCITY, PUSH_TARGET_MAX_LAG
     global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH, PUSH_FEEDFORWARD_BODY_X
     global PUSH_UNLOAD_MIN_DURATION
     global PUSH_END_EFFECTOR_OFFSET_X, PUSH_END_EFFECTOR_OFFSET_Z
@@ -1046,6 +1056,8 @@ def _load_params():
         0.0, float(rospy.get_param(
             "~full_force_hold_time", PUSH_FULL_FORCE_HOLD_TIME)))
     PUSH_POSITION_LEAD = float(rospy.get_param("~push_position_lead", PUSH_POSITION_LEAD))
+    PUSH_TARGET_VELOCITY = max(
+        0.001, float(rospy.get_param("~push_target_velocity", PUSH_TARGET_VELOCITY)))
     PUSH_TARGET_MAX_LAG = max(
         0.0, float(rospy.get_param("~push_target_max_lag", PUSH_TARGET_MAX_LAG)))
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
@@ -1094,11 +1106,11 @@ def main():
         PUSH_CONTACT_WRENCH_THRESHOLD)
     rospy.loginfo(
         "Push: force=%.2fN, ramp=%.1fs (min %.1fs, rate %.1fN/s), "
-        "duration=%.1fs, full_force_hold=%.1fs, lead=%.0fmm, body_x=%s",
+        "duration=%.1fs, full_force_hold=%.1fs, lead=%.0fmm, target_vel=%.0fmm/s, body_x=%s",
         PUSH_FORCE, _effective_push_ramp_time(), PUSH_FORCE_RAMP_TIME,
         PUSH_FORCE_RAMP_RATE, PUSH_DURATION,
         PUSH_FULL_FORCE_HOLD_TIME, PUSH_POSITION_LEAD * 1000.0,
-        PUSH_FEEDFORWARD_BODY_X)
+        PUSH_TARGET_VELOCITY * 1000.0, PUSH_FEEDFORWARD_BODY_X)
     rospy.loginfo(
         "Force guard: hold %.1fdeg/%.2fm, relief %.1fdeg/%.2fm, relief %.1fN/s",
         math.degrees(TOWING_FORCE_HOLD_ATTITUDE), TOWING_FORCE_HOLD_Z_ERROR,

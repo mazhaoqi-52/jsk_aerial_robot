@@ -135,8 +135,10 @@ class AdaptiveForceManager:
             self._have_prev = True
         self.advance_velocity = (advance - self._prev_advance) / dt
         self._prev_advance = advance
+        high_speed = self.target_velocity * 1.3
 
         holding_breakaway = False
+        overspeed = self.advance_velocity > high_speed
         motion_candidate = False
         if not self.breakaway_detected:
             # Phase 1: keep raising the force until the object starts moving.
@@ -183,11 +185,18 @@ class AdaptiveForceManager:
                 self.breakaway_elapsed < self.breakaway_hold_time or
                 not self.stable_motion_detected)
             if holding_breakaway:
-                self.current_force = min(self.max_force, self.current_force + self.ramp_rate * dt)
+                if overspeed:
+                    if self.current_force > self.maintain_force:
+                        self.current_force = max(
+                            self.maintain_force,
+                            self.current_force - self.force_relief_rate * dt)
+                else:
+                    self.current_force = min(
+                        self.max_force, self.current_force + self.ramp_rate * dt)
             else:
                 # Phase 2: fall back to the maintain force gradually; relieve
                 # below maintain only when the object is overspeeding.
-                if self.advance_velocity > self.target_velocity:
+                if overspeed:
                     self.current_force = max(
                         0.0, self.current_force - self.overspeed_relief_rate * dt)
                 elif self.current_force > self.maintain_force:
@@ -230,4 +239,5 @@ class AdaptiveForceManager:
             'abort': self.abort,
             'phase': phase,
             'advance_velocity': self.advance_velocity,
+            'overspeed': overspeed,
         }

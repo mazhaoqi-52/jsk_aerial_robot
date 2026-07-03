@@ -71,6 +71,8 @@ PUSH_CONTACT_REQUIRED_CYCLES = 8
 PUSH_YAW_TARGET = 0.0
 PUSH_YAW_ALIGN_TIMEOUT = 8.0
 PUSH_YAW_ALIGN_THRESH = math.radians(3.0)
+PUSH_LATERAL_ALIGN_TIMEOUT = 12.0
+PUSH_LATERAL_ALIGN_THRESH = 0.02
 
 # Pushing feedforward.
 PUSH_FORCE = 5.0
@@ -386,6 +388,71 @@ class PushingInitializeState(PushingStateBase):
             math.degrees(current_yaw), math.degrees(PUSH_YAW_TARGET))
         rospy.loginfo("Push direction: (%.3f, %.3f, %.3f)", push_dir[0], push_dir[1], push_dir[2])
         rospy.loginfo("Estimated distance to wall near face: %s", face_text)
+        return 'succeeded'
+
+
+class AlignWallCenterState(PushingStateBase):
+    """Align the pushing end-effector laterally with the observed wall center."""
+
+    def __init__(self):
+        PushingStateBase.__init__(
+            self,
+            outcomes=['succeeded', 'failed'],
+            input_keys=['start_position', 'start_yaw', 'push_direction'],
+            output_keys=['start_position', 'start_yaw', 'push_direction',
+                         'wall_face_distance'])
+
+    def execute(self, userdata):
+        rospy.loginfo("=== Align Wall Center State ===")
+
+        if (not self.wall_interface.use_wall_pose or
+                not self.wall_interface.position_received.is_set()):
+            rospy.loginfo("Wall pose unavailable; skipping lateral wall-center align")
+            return 'succeeded'
+
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr("Current end-effector pose is not available for lateral align")
+            return 'failed'
+
+        push_dir = self._normalize_horizontal(userdata.push_direction, "push_direction")
+        lateral_axis = np.array([-push_dir[1], push_dir[0], 0.0], dtype=float)
+        wall_center = self.wall_interface.get_wall_center()
+        current_pos = np.array(current_pos, dtype=float)
+        lateral_error = float(np.dot(current_pos - wall_center, lateral_axis))
+        target_pos = current_pos - lateral_error * lateral_axis
+
+        rospy.loginfo(
+            "Lateral align to wall center: err=%.0fmm, target=%s",
+            lateral_error * 1000.0, FormationUtils.format_vec(target_pos))
+
+        if not self.active_position_convergence(
+                target_pos, PUSH_YAW_TARGET,
+                pos_thresh=PUSH_LATERAL_ALIGN_THRESH,
+                yaw_thresh=PUSH_YAW_ALIGN_THRESH,
+                timeout=PUSH_LATERAL_ALIGN_TIMEOUT,
+                max_linear_vel=0.04, max_angular_vel=0.1):
+            rospy.logerr("Failed to align laterally with wall center before pushing")
+            return 'failed'
+
+        aligned_pos = self.get_end_effector_position()
+        if aligned_pos is None:
+            rospy.logerr("Current end-effector pose is not available after lateral align")
+            return 'failed'
+
+        face_distance = self.wall_interface.distance_to_near_face(aligned_pos, push_dir)
+        if face_distance is None:
+            face_distance = float('nan')
+
+        userdata.start_position = np.array(aligned_pos, dtype=float)
+        userdata.start_yaw = PUSH_YAW_TARGET
+        userdata.push_direction = push_dir
+        userdata.wall_face_distance = face_distance
+
+        face_text = "NA" if not math.isfinite(face_distance) else f"{face_distance:.3f}m"
+        rospy.loginfo(
+            "Aligned start EE position: %s, face distance: %s",
+            FormationUtils.format_vec(aligned_pos), face_text)
         return 'succeeded'
 
 
@@ -1233,6 +1300,12 @@ def main():
             smach.StateMachine.add(
                 'PUSHING_INITIALIZE',
                 PushingInitializeState(),
+                transitions={'succeeded': 'ALIGN_WALL_CENTER',
+                             'failed': 'failure'})
+
+            smach.StateMachine.add(
+                'ALIGN_WALL_CENTER',
+                AlignWallCenterState(),
                 transitions={'succeeded': 'APPROACH_WALL',
                              'failed': 'failure'})
 

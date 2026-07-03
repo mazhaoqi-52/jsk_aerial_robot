@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(current_dir, '..'))
 
 from beetle_interface import smoothstep01
 from adaptive_force_manager import AdaptiveForceManager
+from demo_common import normalize_angle_diff
 from load_towing_formation import (
     TOWING_FORCE_HOLD_ATTITUDE,
     TOWING_FORCE_HOLD_Z_ERROR,
@@ -79,6 +80,10 @@ PUSH_TARGET_VELOCITY = 0.05
 PUSH_TARGET_MAX_LAG = 0.03
 PUSH_TASK_WEIGHT_SCALE = 1.0
 PUSH_MAX_ROLL_PITCH = math.radians(30.0)
+PUSH_FORCE_HOLD_YAW_ERROR = math.radians(6.0)
+PUSH_FORCE_RELIEF_YAW_ERROR = math.radians(10.0)
+PUSH_FORCE_HOLD_LATERAL_ERROR = 0.05
+PUSH_FORCE_RELIEF_LATERAL_ERROR = 0.10
 PUSH_UNLOAD_MIN_DURATION = 1.0
 PUSH_EMERGENCY_UNLOAD_DURATION = 0.5
 PUSH_STABLE_MOTION_DISTANCE = 0.25
@@ -713,8 +718,9 @@ class PushWithFeedforwardState(PushingStateBase):
                 continue
 
             # Dynamic push: measure object progress along push_dir and lead the
-            # position target just ahead of it. Prefer wall mocap; EE advance is
-            # only a compatibility fallback and does not prove wall motion.
+            # position target just ahead of it. Before stable wall breakaway,
+            # wall mocap owns the target; EE advance is only a fallback.
+            use_ee_lag_target = False
             ee_advance = float(np.dot(current_pos - contact_pos, push_dir))
             if dynamic_push:
                 if wall_start_pos is not None:
@@ -735,7 +741,10 @@ class PushWithFeedforwardState(PushingStateBase):
                 target_lead = min(
                     target_lead,
                     min(PUSH_MOVE_DISTANCE, advance + PUSH_POSITION_LEAD))
-                if PUSH_TARGET_MAX_LAG > 1e-6:
+                use_ee_lag_target = (
+                    wall_start_pos is None or
+                    (force_mgr is not None and force_mgr.stable_motion_detected))
+                if PUSH_TARGET_MAX_LAG > 1e-6 and use_ee_lag_target:
                     target_lead = max(
                         target_lead,
                         min(PUSH_MOVE_DISTANCE, ee_advance - PUSH_TARGET_MAX_LAG))
@@ -760,15 +769,27 @@ class PushWithFeedforwardState(PushingStateBase):
             z_error = abs(float(current_pos[2] - target_pos[2]))
             if not math.isfinite(z_error):
                 z_error = 0.0
+            current_yaw = self.get_end_effector_yaw()
+            yaw_error = 0.0
+            if current_yaw is not None:
+                yaw_error = abs(normalize_angle_diff(maintain_yaw - current_yaw))
+            pos_error_vec = np.asarray(current_pos, dtype=float) - target_pos
+            push_axis_error = float(np.dot(pos_error_vec, push_dir))
+            lateral_error_vec = pos_error_vec - push_axis_error * push_dir
+            lateral_error = float(np.linalg.norm(lateral_error_vec[:2]))
 
             force_guard = 'nominal'
             target_task_scale = 1.0
             if (max_rp > TOWING_FORCE_RELIEF_ATTITUDE or
-                    z_error > TOWING_FORCE_RELIEF_Z_ERROR):
+                    z_error > TOWING_FORCE_RELIEF_Z_ERROR or
+                    yaw_error > PUSH_FORCE_RELIEF_YAW_ERROR or
+                    lateral_error > PUSH_FORCE_RELIEF_LATERAL_ERROR):
                 force_guard = 'relief'
                 target_task_scale = TOWING_TASK_RELIEF_SCALE
             elif (max_rp > TOWING_FORCE_HOLD_ATTITUDE or
-                    z_error > TOWING_FORCE_HOLD_Z_ERROR):
+                    z_error > TOWING_FORCE_HOLD_Z_ERROR or
+                    yaw_error > PUSH_FORCE_HOLD_YAW_ERROR or
+                    lateral_error > PUSH_FORCE_HOLD_LATERAL_ERROR):
                 force_guard = 'hold'
                 target_task_scale = TOWING_TASK_HOLD_SCALE
             if target_task_scale > force_guard_task_scale:
@@ -782,8 +803,9 @@ class PushWithFeedforwardState(PushingStateBase):
                 log_fn = rospy.loginfo if force_guard == 'nominal' else rospy.logwarn
                 log_fn(
                     "[Pushing ForceGuard] %s: max_rp=%.1fdeg z_err=%.3fm "
-                    "task_scale=%.2f",
+                    "yaw_err=%.1fdeg lat_err=%.3fm task_scale=%.2f",
                     force_guard, math.degrees(max_rp), z_error,
+                    math.degrees(yaw_error), lateral_error,
                     force_guard_task_scale)
                 last_force_guard = force_guard
 
@@ -865,8 +887,11 @@ class PushWithFeedforwardState(PushingStateBase):
                 f"progress={progress*100:.0f}% source={advance_source} "
                 f"phase={phase_text} wall_adv={wall_advance_text} "
                 f"ee_adv={ee_advance:.3f}m target_lag={target_lag:.3f}m "
+                f"ee_lag_target={int(use_ee_lag_target)} "
                 f"adv_vel={advance_velocity:.3f}m/s overspeed={int(overspeed)} "
                 f"max_rp={math.degrees(max_rp):.1f}deg z_err={z_error:.3f}m "
+                f"yaw_err={math.degrees(yaw_error):.1f}deg "
+                f"lat_err={lateral_error:.3f}m "
                 f"guard={force_guard} task_scale={task_scale:.2f}")
             rospy.loginfo_throttle(1.0, diag_text)
             self.diag_pub.publish(String(data=diag_text))
@@ -1027,6 +1052,8 @@ def _load_params():
     global PUSH_FULL_FORCE_HOLD_TIME
     global PUSH_POSITION_LEAD, PUSH_TARGET_VELOCITY, PUSH_TARGET_MAX_LAG
     global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH, PUSH_FEEDFORWARD_BODY_X
+    global PUSH_FORCE_HOLD_YAW_ERROR, PUSH_FORCE_RELIEF_YAW_ERROR
+    global PUSH_FORCE_HOLD_LATERAL_ERROR, PUSH_FORCE_RELIEF_LATERAL_ERROR
     global PUSH_UNLOAD_MIN_DURATION
     global PUSH_END_EFFECTOR_OFFSET_X, PUSH_END_EFFECTOR_OFFSET_Z
     global PUSH_MOVE_DISTANCE
@@ -1062,6 +1089,18 @@ def _load_params():
         0.0, float(rospy.get_param("~push_target_max_lag", PUSH_TARGET_MAX_LAG)))
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
     PUSH_MAX_ROLL_PITCH = math.radians(float(rospy.get_param("~max_roll_pitch_deg", 30.0)))
+    PUSH_FORCE_HOLD_YAW_ERROR = max(
+        0.0, math.radians(float(rospy.get_param("~force_guard_yaw_hold_deg", 6.0))))
+    PUSH_FORCE_RELIEF_YAW_ERROR = max(
+        PUSH_FORCE_HOLD_YAW_ERROR,
+        math.radians(float(rospy.get_param("~force_guard_yaw_relief_deg", 10.0))))
+    PUSH_FORCE_HOLD_LATERAL_ERROR = max(
+        0.0, float(rospy.get_param(
+            "~force_guard_lateral_hold", PUSH_FORCE_HOLD_LATERAL_ERROR)))
+    PUSH_FORCE_RELIEF_LATERAL_ERROR = max(
+        PUSH_FORCE_HOLD_LATERAL_ERROR,
+        float(rospy.get_param(
+            "~force_guard_lateral_relief", PUSH_FORCE_RELIEF_LATERAL_ERROR)))
     PUSH_FEEDFORWARD_BODY_X = _as_bool(rospy.get_param(
         "~push_body_x_feedforward", PUSH_FEEDFORWARD_BODY_X))
     PUSH_UNLOAD_MIN_DURATION = float(rospy.get_param("~unload_min_duration", PUSH_UNLOAD_MIN_DURATION))
@@ -1112,9 +1151,12 @@ def main():
         PUSH_FULL_FORCE_HOLD_TIME, PUSH_POSITION_LEAD * 1000.0,
         PUSH_TARGET_VELOCITY * 1000.0, PUSH_FEEDFORWARD_BODY_X)
     rospy.loginfo(
-        "Force guard: hold %.1fdeg/%.2fm, relief %.1fdeg/%.2fm, relief %.1fN/s",
+        "Force guard: hold rp %.1fdeg/z %.2fm/yaw %.1fdeg/lat %.2fm, "
+        "relief rp %.1fdeg/z %.2fm/yaw %.1fdeg/lat %.2fm, relief %.1fN/s",
         math.degrees(TOWING_FORCE_HOLD_ATTITUDE), TOWING_FORCE_HOLD_Z_ERROR,
+        math.degrees(PUSH_FORCE_HOLD_YAW_ERROR), PUSH_FORCE_HOLD_LATERAL_ERROR,
         math.degrees(TOWING_FORCE_RELIEF_ATTITUDE), TOWING_FORCE_RELIEF_Z_ERROR,
+        math.degrees(PUSH_FORCE_RELIEF_YAW_ERROR), PUSH_FORCE_RELIEF_LATERAL_ERROR,
         TOWING_UNLOAD_FORCE_RATE)
     rospy.loginfo("=" * 60)
     log_pushing_preflight(module_ids, real_machine, simulation)

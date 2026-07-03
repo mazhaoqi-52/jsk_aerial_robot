@@ -106,6 +106,14 @@
        doc="Total pushing hold duration including ramp (s)"/>
   <arg name="full_force_hold_time" default="0.0"
        doc="Minimum time to hold after push_force is reached (s)"/>
+  <arg name="force_guard_yaw_hold_deg" default="6.0"
+       doc="Hold force increase when yaw error exceeds this value (deg)"/>
+  <arg name="force_guard_yaw_relief_deg" default="10.0"
+       doc="Unload force when yaw error exceeds this value (deg)"/>
+  <arg name="force_guard_lateral_hold" default="0.05"
+       doc="Hold force increase when lateral position error exceeds this value (m)"/>
+  <arg name="force_guard_lateral_relief" default="0.10"
+       doc="Unload force when lateral position error exceeds this value (m)"/>
   <arg name="push_position_lead" default="0.03"
        doc="Small position lead into the wall to maintain contact (m)"/>
   <arg name="push_target_velocity" default="0.05"
@@ -157,6 +165,10 @@
     <param name="force_ramp_rate"          value="$(arg force_ramp_rate)"/>
     <param name="push_duration"            value="$(arg push_duration)"/>
     <param name="full_force_hold_time"     value="$(arg full_force_hold_time)"/>
+    <param name="force_guard_yaw_hold_deg" value="$(arg force_guard_yaw_hold_deg)"/>
+    <param name="force_guard_yaw_relief_deg" value="$(arg force_guard_yaw_relief_deg)"/>
+    <param name="force_guard_lateral_hold" value="$(arg force_guard_lateral_hold)"/>
+    <param name="force_guard_lateral_relief" value="$(arg force_guard_lateral_relief)"/>
     <param name="push_position_lead"       value="$(arg push_position_lead)"/>
     <param name="push_target_velocity"     value="$(arg push_target_velocity)"/>
     <param name="push_target_max_lag"      value="$(arg push_target_max_lag)"/>

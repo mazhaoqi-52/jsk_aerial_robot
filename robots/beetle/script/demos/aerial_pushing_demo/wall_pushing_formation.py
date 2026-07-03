@@ -536,7 +536,11 @@ class ApproachWallUntilContactState(PushingStateBase):
                 distance_to_face <= -0.01 and
                 lead > 0.02)
 
+            near_wall_for_stall = (
+                distance_to_face is None or
+                distance_to_face <= PUSH_MIN_APPROACH_DISTANCE)
             stall_lead_ready = (
+                near_wall_for_stall and
                 cmd_dist > PUSH_MIN_APPROACH_DISTANCE and
                 lead > PUSH_CONTACT_STALL_LEAD)
             if stall_lead_ready:

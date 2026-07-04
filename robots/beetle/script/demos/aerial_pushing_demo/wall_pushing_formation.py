@@ -355,19 +355,24 @@ class PushingInitializeState(PushingStateBase):
             math.degrees(PUSH_YAW_TARGET), math.degrees(current_yaw),
             math.degrees(yaw_error))
         if yaw_error > PUSH_YAW_ALIGN_THRESH:
-            if not self.active_position_convergence(
-                    current_pos, PUSH_YAW_TARGET, pos_thresh=0.05,
-                    yaw_thresh=PUSH_YAW_ALIGN_THRESH,
-                    timeout=PUSH_YAW_ALIGN_TIMEOUT,
-                    max_angular_vel=0.1, yaw_only=True):
-                rospy.logerr("Failed to align yaw to %.1f deg before pushing",
-                             math.degrees(PUSH_YAW_TARGET))
-                return 'failed'
-            current_pos = self.get_end_effector_position()
-            current_yaw = self.get_end_effector_yaw()
-            if current_pos is None or current_yaw is None:
-                rospy.logerr("Current end-effector pose is not available after yaw align")
-                return 'failed'
+            yaw_aligned = self.active_position_convergence(
+                current_pos, PUSH_YAW_TARGET, pos_thresh=0.05,
+                yaw_thresh=PUSH_YAW_ALIGN_THRESH,
+                timeout=PUSH_YAW_ALIGN_TIMEOUT,
+                max_angular_vel=0.1, yaw_only=True)
+            latest_pos = self.get_end_effector_position()
+            latest_yaw = self.get_end_effector_yaw()
+            if latest_pos is not None and latest_yaw is not None:
+                current_pos = latest_pos
+                current_yaw = latest_yaw
+            else:
+                rospy.logwarn(
+                    "Current end-effector pose is not available after yaw align; "
+                    "continuing from the last known pose")
+            if not yaw_aligned:
+                rospy.logwarn(
+                    "Failed to align yaw to %.1f deg before pushing; continuing anyway",
+                    math.degrees(PUSH_YAW_TARGET))
 
         push_dir = self.resolve_push_direction(current_pos)
         face_distance = self.wall_interface.distance_to_near_face(current_pos, push_dir)
@@ -410,35 +415,41 @@ class AlignWallCenterState(PushingStateBase):
             rospy.loginfo("Wall pose unavailable; skipping lateral wall-center align")
             return 'succeeded'
 
-        current_pos = self.get_end_effector_position()
-        if current_pos is None:
-            rospy.logerr("Current end-effector pose is not available for lateral align")
-            return 'failed'
-
         push_dir = self._normalize_horizontal(userdata.push_direction, "push_direction")
-        lateral_axis = np.array([-push_dir[1], push_dir[0], 0.0], dtype=float)
-        wall_center = self.wall_interface.get_wall_center()
-        current_pos = np.array(current_pos, dtype=float)
-        lateral_error = float(np.dot(current_pos - wall_center, lateral_axis))
-        target_pos = current_pos - lateral_error * lateral_axis
+        current_pos = self.get_end_effector_position()
+        lateral_aligned = False
+        if current_pos is None:
+            rospy.logwarn(
+                "Current end-effector pose is not available for lateral align; "
+                "continuing from the initialized start pose")
+            aligned_pos = np.array(userdata.start_position, dtype=float)
+        else:
+            lateral_axis = np.array([-push_dir[1], push_dir[0], 0.0], dtype=float)
+            wall_center = self.wall_interface.get_wall_center()
+            current_pos = np.array(current_pos, dtype=float)
+            lateral_error = float(np.dot(current_pos - wall_center, lateral_axis))
+            target_pos = current_pos - lateral_error * lateral_axis
 
-        rospy.loginfo(
-            "Lateral align to wall center: err=%.0fmm, target=%s",
-            lateral_error * 1000.0, FormationUtils.format_vec(target_pos))
+            rospy.loginfo(
+                "Lateral align to wall center: err=%.0fmm, target=%s",
+                lateral_error * 1000.0, FormationUtils.format_vec(target_pos))
 
-        if not self.active_position_convergence(
+            lateral_aligned = self.active_position_convergence(
                 target_pos, PUSH_YAW_TARGET,
                 pos_thresh=PUSH_LATERAL_ALIGN_THRESH,
                 yaw_thresh=PUSH_YAW_ALIGN_THRESH,
                 timeout=PUSH_LATERAL_ALIGN_TIMEOUT,
-                max_linear_vel=0.04, max_angular_vel=0.1):
-            rospy.logerr("Failed to align laterally with wall center before pushing")
-            return 'failed'
-
-        aligned_pos = self.get_end_effector_position()
-        if aligned_pos is None:
-            rospy.logerr("Current end-effector pose is not available after lateral align")
-            return 'failed'
+                max_linear_vel=0.04, max_angular_vel=0.1)
+            aligned_pos = self.get_end_effector_position()
+            if aligned_pos is None:
+                rospy.logwarn(
+                    "Current end-effector pose is not available after lateral align; "
+                    "continuing from the initialized start pose")
+                aligned_pos = np.array(userdata.start_position, dtype=float)
+            elif not lateral_aligned:
+                rospy.logwarn(
+                    "Failed to align laterally with wall center before pushing; "
+                    "continuing from current pose")
 
         face_distance = self.wall_interface.distance_to_near_face(aligned_pos, push_dir)
         if face_distance is None:
@@ -451,7 +462,8 @@ class AlignWallCenterState(PushingStateBase):
 
         face_text = "NA" if not math.isfinite(face_distance) else f"{face_distance:.3f}m"
         rospy.loginfo(
-            "Aligned start EE position: %s, face distance: %s",
+            "%s start EE position: %s, face distance: %s",
+            "Aligned" if lateral_aligned else "Continuing",
             FormationUtils.format_vec(aligned_pos), face_text)
         return 'succeeded'
 

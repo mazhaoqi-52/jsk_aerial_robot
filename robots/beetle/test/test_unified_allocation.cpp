@@ -100,6 +100,23 @@ protected:
                                    secondary_ref, ids, empty_mat, empty, f_out);
   }
 
+  // Solve with an explicit task wrench whose active rows are promoted to hard
+  // priority bands (tolerances > 0, weight >= min task weight).
+  bool solveWithTaskBand(const Eigen::MatrixXd& A, const Eigen::VectorXd& w_control,
+                         const Eigen::VectorXd& w_task, const Eigen::VectorXd& task_weights,
+                         const Eigen::VectorXd& tolerances, Eigen::VectorXd& f_out)
+  {
+    ctrl_.alloc_task_priority_enabled_ = true;
+    ctrl_.alloc_priority_tolerances_ = tolerances;
+    const std::vector<int> ids = {1, 2};
+    const Eigen::VectorXd empty;
+    const Eigen::MatrixXd empty_mat(0, 0);
+    return ctrl_.solveFullVectorQP(A, w_control, w_task, task_weights,
+                                   empty, empty, empty,
+                                   Eigen::VectorXd::Zero(kCols), ids,
+                                   empty_mat, empty, f_out);
+  }
+
   static double moduleFzSum(const Eigen::VectorXd& f, int m)
   {
     double s = 0.0;
@@ -179,7 +196,32 @@ TEST_F(BeetleUnifiedAllocTest, ModuleBalanceReducesSpread)
   EXPECT_LT(spread_on, spread_off) << "spread off=" << spread_off << " on=" << spread_on;
 }
 
-// (4) A vertical gimbal limit (pi/2) must not break QP conditioning. Before the
+// (4) Hard-banded task rows keep their soft tracking: the solution must sit
+//     near the band CENTER (w_control + w_task), not be dragged to the band's
+//     lower edge by the effort cost. Regression guard for the 2026-07-03
+//     pushing log where task_prio_res was pinned at the tolerance for the
+//     whole force ramp (contact force under-delivered by exactly tol).
+TEST_F(BeetleUnifiedAllocTest, TaskBandTracksCenterNotEdge)
+{
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w_control(6), w_task(6), task_weights(6), tolerances(6);
+  w_control << 0.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+  w_task << 2.0, 0.0, 0.0, 0.0, 0.0, 0.0;   // active task row: Fx
+  task_weights << 1.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+  tolerances << 0.5, 0.0, 0.0, 0.0, 0.0, 0.0;
+
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solveWithTaskBand(A, w_control, w_task, task_weights, tolerances, f));
+  const double realized_fx = (A * f)(0);
+  // Must stay inside the hard band ...
+  EXPECT_GE(realized_fx, 2.0 - 0.5 - 1e-3);
+  EXPECT_LE(realized_fx, 2.0 + 0.5 + 1e-3);
+  // ... and near its center, not at the lower edge (1.5).
+  EXPECT_NEAR(realized_fx, 2.0, 0.15);
+}
+
+// (5) A vertical gimbal limit (pi/2) must not break QP conditioning. Before the
 //     cos/sin reformulation of the gimbal-angle constraint, tan(pi/2) ~ 1.6e16
 //     produced a pathologically scaled row and the solver failed here.
 TEST_F(BeetleUnifiedAllocTest, HandlesVerticalGimbalLimit)

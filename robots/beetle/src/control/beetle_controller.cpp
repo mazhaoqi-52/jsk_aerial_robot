@@ -3486,7 +3486,14 @@ namespace aerial_robot_control
         Eigen::VectorXd feedback_est_wrench =
             est_external_wrench - unified_external_wrench_feedback_bias_;
         if (explicit_task_wrench_active) {
-          feedback_est_wrench -= formation_wrench_cmd;
+          // The observer estimates the REACTION wrench (environment on robot),
+          // which for a perfectly realized task equals -formation_wrench_cmd
+          // (the wrench the robot applies). The task-expected component is
+          // therefore removed by ADDING the command. Subtracting it instead
+          // produced res ~ -(reaction + command) ~ -1.8*ff and a positive
+          // push-harder feedback of ~ +0.36*ff (2026-07-03 bag, t=66.4:
+          // est_x=-33.0, cmd_x=+39.2, res_x=-70.2 -> fb_x=+14N).
+          feedback_est_wrench += formation_wrench_cmd;
         }
         observer_feedback_wrench_cmd =
             -unified_external_wrench_feedback_gain_ *

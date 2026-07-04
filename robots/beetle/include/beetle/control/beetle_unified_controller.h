@@ -389,10 +389,12 @@ private:
    *   task/feedback weights only select which rows are promoted to hard bands,
    *   they no longer scale the soft tracking.
    *
-   *   Active task-priority rows become hard bands around w_control+w_task and
-   *   are removed from W_eff, so secondary objectives can only act in the
-   *   remaining freedom. This follows the same hierarchy as spidar's static
-   *   balance QPs: satisfy the task/balance rows first, then shape redundancy.
+   *   Active task-priority rows get hard bands around w_control+w_task and
+   *   KEEP their W_eff soft tracking toward w_des: the band is a guaranteed
+   *   corridor, the soft term places the solution inside it (this keeps
+   *   w_feedback effective on banded rows and avoids the band-edge bias).
+   *   This follows the same hierarchy as spidar's static balance QPs:
+   *   satisfy the task/balance rows first, then shape redundancy.
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
    *         optional task/6D wrench priority bands
@@ -453,11 +455,17 @@ private:
                         double thrust_limit,
                         int n_rotors);
 
-  /** @brief Build the current secondary allocation reference.
-   *  Base term is balanced hover load. Optional internal-wrench compensation
-   *  adds a small per-module 6D bias through that module's allocation block
-   *  when internal_wrench_secondary_gain_ > 0. */
-  Eigen::VectorXd buildSecondaryAllocationReference(const std::vector<int>& assembled_ids) const;
+  /** @brief Build the current secondary allocation reference f_ref.
+   *  f_ref = balanced hover load
+   *        + A^+ * task_wrench_acc          (cooperative min-norm task share)
+   *        + (I - A^+A) * internal bias     (observer-driven, gain-gated)
+   *  The task share keeps the effort/lambda terms and the interface-load
+   *  reference D*f_ref consistent with the inter-module load transfer the task
+   *  requires; joint capacity is bounded separately by the hard |D f| limits.
+   *  Pass a zero/empty task_wrench_acc for a hover-only reference. */
+  Eigen::VectorXd buildSecondaryAllocationReference(
+      const std::vector<int>& assembled_ids,
+      const Eigen::VectorXd& task_wrench_acc) const;
 
   /** @brief Build actuator-side cut-load proxy rows for each adjacent module
    *  boundary. Rows are ordered [Fx,Fy,Fz,Tx,Ty,Tz] per cut, with the cut placed
@@ -486,6 +494,23 @@ private:
   double convertThrustToPwmDuty(double thrust) const;
   double predictThrustLimit() const;
   double getAllocationThrustLimit() const;
+
+  // Formation-consistent thrust ceiling. Each module publishes its own
+  // voltage-derived per-rotor thrust limit (quantized to 0.25 N); every
+  // module's QP then bounds itself with the min over the assembled set, so
+  // all redundant allocation copies solve with the SAME actuator bounds.
+  // Rationale: in the 2026-07-03 pushing test beetle1's sagging battery shrank
+  // its local predictThrustLimit() to 13.5 N while beetle3 still solved with
+  // 17.5 N; once the bound became active the two "formation-optimal" solutions
+  // diverged and each module executed half of a different solution.
+  ros::Publisher shared_thrust_limit_pub_;
+  std::map<int, ros::Subscriber> peer_thrust_limit_subs_;
+  mutable std::mutex shared_thrust_limit_mutex_;
+  std::map<int, std::pair<double, double>> peer_shared_thrust_limits_;  // id -> (limit [N], stamp [s])
+  double own_shared_thrust_limit_;     // last published own limit [N]; <=0 = not yet published
+  double thrust_limit_share_timeout_;  // peer staleness warning threshold [s]; <=0 disables the warning
+  void peerThrustLimitCallback(int module_id, const std_msgs::Float32ConstPtr& msg);
+  void publishSharedThrustLimit();
 
   double getModuleAllocationWeight(int module_id) const;
 

@@ -49,7 +49,7 @@ controller:
   unified_internal_wrench_log: true
   unified_internal_wrench_detail_log: false
   unified_internal_wrench_log_period: 5.0
-  unified_internal_wrench_secondary_gain: 0.0
+  unified_internal_wrench_secondary_gain: 0.05  # observer-driven null-space internal-force trim; clamped <=0.2 in code
 
   # Leader-only compact log for aerial towing validation. Prints only while a
   # nonzero formation_desired_wrench is active.
@@ -78,8 +78,8 @@ controller:
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
   alloc_interface_force_weight: 1.0e-3   # soft tracking of actuator-side cut force proxy [1/N^2]
   alloc_interface_torque_weight: 1.0e-2  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
-  alloc_interface_force_limit: 0.0    # component-wise cut force proxy bound [N]; 0 disables
-  alloc_interface_torque_limit: 0.0   # component-wise cut torque proxy bound [Nm]; 0 disables
+  alloc_interface_force_limit: 70.0    # joint-capacity cap [N]: ~30% above 2026-07-03 peak (54N); replace with measured joint rating
+  alloc_interface_torque_limit: 18.0   # joint-capacity cap [Nm]: ~35% above 2026-07-03 peak (13.1Nm); replace with measured joint rating
   alloc_priority_enabled: false
   # Spidar-style task tracking: axes with nonzero desired wrench and task weight
   # >= min_weight are narrow hard bands; effort/rate/balance stay secondary.

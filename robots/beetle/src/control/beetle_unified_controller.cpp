@@ -79,6 +79,8 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    pinv_pwm_conversion_mode_(-1),
 	    battery_voltage_(0.0),
 	    battery_voltage_received_(false),
+	    own_shared_thrust_limit_(0.0),
+	    thrust_limit_share_timeout_(1.0),
 	    qp_solver_(std::make_unique<OsqpEigen::Solver>())
 {
 }
@@ -102,13 +104,24 @@ void BeetleUnifiedController::initialize(
 
   int max_modules = navigator_->getMaxModuleNum();
   std::string my_name = navigator_->getMyName();
+  int my_id = navigator_->getMyID();
   for (int i = 1; i <= max_modules; i++) {
     std::string ns = std::string("/") + my_name + std::to_string(i);
     module_torque_alloc_inv_pubs_[i] = nh_.advertise<spinal::TorqueAllocationMatrixInv>(
         ns + "/torque_allocation_matrix_inv", 1);
     module_rpy_gain_pubs_[i] = nh_.advertise<spinal::RollPitchYawTerms>(ns + "/rpy/gain", 1);
     module_gimbal_dof_pubs_[i] = nh_.advertise<std_msgs::UInt8>(ns + "/gimbal_dof", 1);
+    if (i != my_id) {
+      peer_thrust_limit_subs_[i] = nh_.subscribe<std_msgs::Float32>(
+          ns + "/unified_control/predicted_thrust_limit", 1,
+          boost::function<void(const std_msgs::Float32ConstPtr&)>(
+              [this, i](const std_msgs::Float32ConstPtr& msg) {
+                peerThrustLimitCallback(i, msg);
+              }));
+    }
   }
+  shared_thrust_limit_pub_ =
+      nh_.advertise<std_msgs::Float32>("unified_control/predicted_thrust_limit", 1);
 
   formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("unified_control/formation_wrench", 1);
   formation_vectoring_f_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/vectoring_force", 1);
@@ -148,6 +161,7 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<bool>("alloc_priority_enabled", alloc_priority_enabled_, false);
   control_nh.param<bool>("alloc_task_priority_enabled", alloc_task_priority_enabled_, true);
   control_nh.param<double>("alloc_task_priority_min_weight", alloc_task_priority_min_weight_, 0.5);
+  control_nh.param<double>("thrust_limit_share_timeout", thrust_limit_share_timeout_, 1.0);
   control_nh.param<double>("pinv_pwm_pred_pub_interval", pinv_pwm_pred_pub_interval_, 0.1);
   double gimbal_limit_deg;
   control_nh.param<double>("alloc_gimbal_limit_deg", gimbal_limit_deg, 90.0);
@@ -524,6 +538,11 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
   std::lock_guard<std::mutex> alloc_lock(allocation_mutex_);
 
+  // Share this module's voltage-derived thrust limit BEFORE solving, so the
+  // formation-consensus bound in getAllocationThrustLimit() stays fresh on
+  // all modules' QP copies.
+  publishSharedThrustLimit();
+
   // Build formation-wide allocation matrix (6 x rotor_coef*total_rotors)
   integrated_map_ = buildFormationAllocationMatrix(assembled_ids, formation_mass_,
                                                     formation_inertia_, formation_cog_offset_);
@@ -601,7 +620,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       integrated_map_inv_ * (control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
   Eigen::VectorXd desired_wrench_acc =
       control_wrench_acc + task_wrench_acc + feedback_wrench_acc;
-  Eigen::VectorXd secondary_ref = buildSecondaryAllocationReference(assembled_ids);
+  Eigen::VectorXd secondary_ref =
+      buildSecondaryAllocationReference(assembled_ids, task_wrench_acc);
   Eigen::MatrixXd interface_load_matrix;
   std::vector<std::pair<int, int>> interface_cuts;
   buildInterfaceLoadMatrix(assembled_ids, interface_load_matrix, interface_cuts);
@@ -632,13 +652,27 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
           retry_priority_acc = target_wrench_acc_cog;
         }
 
+        // Rebuild the secondary reference with the scaled task so the
+        // cooperative task share in f_ref matches the retried objective.
+        Eigen::VectorXd retry_secondary_ref =
+            buildSecondaryAllocationReference(assembled_ids, retry_task_wrench_acc);
+        Eigen::VectorXd retry_interface_load_reference =
+            Eigen::VectorXd::Zero(interface_load_matrix.rows());
+        if (interface_load_matrix.cols() == retry_secondary_ref.size()) {
+          retry_interface_load_reference = interface_load_matrix * retry_secondary_ref;
+        }
+
         qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                   retry_task_wrench_acc, retry_task_weights,
                                   retry_feedback_wrench_acc, retry_feedback_weights,
                                   retry_priority_acc,
-                                  secondary_ref, assembled_ids,
-                                  interface_load_matrix, interface_load_reference,
+                                  retry_secondary_ref, assembled_ids,
+                                  interface_load_matrix, retry_interface_load_reference,
                                   target_vectoring_f_);
+        if (qp_ok) {
+          secondary_ref = retry_secondary_ref;
+          interface_load_reference = retry_interface_load_reference;
+        }
         if (!qp_ok) continue;
 
         task_wrench_acc = retry_task_wrench_acc;
@@ -754,7 +788,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 }
 
 Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
-    const std::vector<int>& assembled_ids) const
+    const std::vector<int>& assembled_ids,
+    const Eigen::VectorXd& task_wrench_acc) const
 {
   const int n_rotors = static_cast<int>(assembled_ids.size()) * motor_num_per_module_;
   Eigen::VectorXd ref = Eigen::VectorXd::Zero(rotor_coef_ * n_rotors);
@@ -771,69 +806,81 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
     }
   }
 
-  if (internal_wrench_secondary_gain_ <= 0.0 || module_internal_wrench_comp_.empty()) {
-    return ref;
+  // Cooperative task share: distribute the explicit task wrench over ALL
+  // rotors with the formation pseudoinverse (min-norm sharing). With this,
+  // the effort term rho*||f - f_ref||^2, the lambda term, and the interface
+  // reference d_ref = D*f_ref are all consistent with the load transfer the
+  // task requires; without it they pull back toward a hover-only allocation
+  // and systematically discount inter-module cooperation. The joint capacity
+  // is bounded separately by the hard |D f| <= limit rows.
+  const bool has_allocation_block =
+      (integrated_map_.rows() == 6 && integrated_map_.cols() == ref.size());
+  const bool inv_consistent =
+      (integrated_map_inv_.rows() == integrated_map_.cols() &&
+       integrated_map_inv_.cols() == integrated_map_.rows());
+  if (has_allocation_block && inv_consistent &&
+      task_wrench_acc.size() == integrated_map_.rows() &&
+      task_wrench_acc.allFinite() && task_wrench_acc.norm() > 1e-9) {
+    ref += integrated_map_inv_ * task_wrench_acc;
   }
 
   const int cols_per_module = motor_num_per_module_ * rotor_coef_;
-  const bool has_allocation_block =
-      (integrated_map_.rows() == 6 && integrated_map_.cols() == ref.size());
   const double delta_limit = 0.25 * alloc_t_max_;
   Eigen::VectorXd internal_delta = Eigen::VectorXd::Zero(ref.size());
 
-  for (size_t m = 0; m < assembled_ids.size(); m++) {
-    auto it = module_internal_wrench_comp_.find(assembled_ids[m]);
-    if (it == module_internal_wrench_comp_.end() || it->second.size() < 6) continue;
+  if (internal_wrench_secondary_gain_ > 0.0 && !module_internal_wrench_comp_.empty()) {
+    for (size_t m = 0; m < assembled_ids.size(); m++) {
+      auto it = module_internal_wrench_comp_.find(assembled_ids[m]);
+      if (it == module_internal_wrench_comp_.end() || it->second.size() < 6) continue;
 
-    const Eigen::VectorXd& comp = it->second;
-    if (!comp.allFinite()) continue;
+      const Eigen::VectorXd& comp = it->second;
+      if (!comp.allFinite()) continue;
 
-    const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
-    Eigen::VectorXd delta = Eigen::VectorXd::Zero(cols_per_module);
+      const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
+      Eigen::VectorXd delta = Eigen::VectorXd::Zero(cols_per_module);
 
-    if (has_allocation_block) {
-      Eigen::VectorXd comp_acc = Eigen::VectorXd::Zero(6);
-      comp_acc.head(3) = comp.head(3) / formation_mass_;
-      comp_acc.tail(3) = formation_inertia_.inverse() * comp.tail(3);
-      const Eigen::MatrixXd module_map =
-          integrated_map_.middleCols(module_col, cols_per_module);
-      delta = aerial_robot_model::pseudoinverse(module_map) *
-              (internal_wrench_secondary_gain_ * comp_acc);
-    } else if (rotor_coef_ >= 2) {
-      // Fallback for early calls before the formation map is ready.
+      if (has_allocation_block) {
+        Eigen::VectorXd comp_acc = Eigen::VectorXd::Zero(6);
+        comp_acc.head(3) = comp.head(3) / formation_mass_;
+        comp_acc.tail(3) = formation_inertia_.inverse() * comp.tail(3);
+        const Eigen::MatrixXd module_map =
+            integrated_map_.middleCols(module_col, cols_per_module);
+        delta = aerial_robot_model::pseudoinverse(module_map) *
+                (internal_wrench_secondary_gain_ * comp_acc);
+      } else if (rotor_coef_ >= 2) {
+        // Fallback for early calls before the formation map is ready.
+        for (int r = 0; r < motor_num_per_module_; r++) {
+          delta(r * rotor_coef_) =
+              internal_wrench_secondary_gain_ * comp(0) / motor_num_per_module_;
+          delta(r * rotor_coef_ + rotor_coef_ - 1) =
+              internal_wrench_secondary_gain_ * comp(2) / motor_num_per_module_;
+        }
+      }
+
       for (int r = 0; r < motor_num_per_module_; r++) {
-        delta(r * rotor_coef_) =
-            internal_wrench_secondary_gain_ * comp(0) / motor_num_per_module_;
-        delta(r * rotor_coef_ + rotor_coef_ - 1) =
-            internal_wrench_secondary_gain_ * comp(2) / motor_num_per_module_;
+        const int base = module_col + r * rotor_coef_;
+        for (int c = 0; c < rotor_coef_; c++) {
+          const int idx = base + c;
+          internal_delta(idx) +=
+              std::max(-delta_limit, std::min(delta(r * rotor_coef_ + c), delta_limit));
+        }
       }
     }
+    if (has_allocation_block && internal_delta.size() == integrated_map_.cols()) {
+      // Reuse the member pseudoinverse already computed in
+      // computeUnifiedAllocation() for this same integrated_map_; only recompute
+      // if it is not dimensionally consistent (e.g. early/stale call).
+      const Eigen::MatrixXd recomputed_pinv =
+          inv_consistent ? Eigen::MatrixXd()
+                         : aerial_robot_model::pseudoinverse(integrated_map_);
+      const Eigen::MatrixXd& map_pinv =
+          inv_consistent ? integrated_map_inv_ : recomputed_pinv;
+      internal_delta =
+          (Eigen::MatrixXd::Identity(internal_delta.size(), internal_delta.size()) -
+           map_pinv * integrated_map_) * internal_delta;
+    }
+  }
 
-    for (int r = 0; r < motor_num_per_module_; r++) {
-      const int base = module_col + r * rotor_coef_;
-      for (int c = 0; c < rotor_coef_; c++) {
-        const int idx = base + c;
-        internal_delta(idx) +=
-            std::max(-delta_limit, std::min(delta(r * rotor_coef_ + c), delta_limit));
-      }
-    }
-  }
-  if (has_allocation_block && internal_delta.size() == integrated_map_.cols()) {
-    // Reuse the member pseudoinverse already computed in
-    // computeUnifiedAllocation() for this same integrated_map_; only recompute
-    // if it is not dimensionally consistent (e.g. early/stale call).
-    const bool inv_consistent =
-        (integrated_map_inv_.rows() == integrated_map_.cols() &&
-         integrated_map_inv_.cols() == integrated_map_.rows());
-    const Eigen::MatrixXd recomputed_pinv =
-        inv_consistent ? Eigen::MatrixXd()
-                       : aerial_robot_model::pseudoinverse(integrated_map_);
-    const Eigen::MatrixXd& map_pinv =
-        inv_consistent ? integrated_map_inv_ : recomputed_pinv;
-    internal_delta =
-        (Eigen::MatrixXd::Identity(internal_delta.size(), internal_delta.size()) -
-         map_pinv * integrated_map_) * internal_delta;
-  }
   for (int idx = 0; idx < ref.size(); idx++) {
     if (rotor_coef_ == 2 && (idx % rotor_coef_) == rotor_coef_ - 1) {
       ref(idx) = std::max(0.0, std::min(ref(idx) + internal_delta(idx), alloc_t_max_));
@@ -1152,17 +1199,80 @@ double BeetleUnifiedController::predictThrustLimit() const
   return std::max(alloc_t_max_, 0.0);
 }
 
+void BeetleUnifiedController::peerThrustLimitCallback(
+    int module_id, const std_msgs::Float32ConstPtr& msg)
+{
+  if (!msg || !std::isfinite(msg->data) || msg->data <= 0.0f) return;
+  std::lock_guard<std::mutex> lock(shared_thrust_limit_mutex_);
+  peer_shared_thrust_limits_[module_id] =
+      std::make_pair(static_cast<double>(msg->data), ros::Time::now().toSec());
+}
+
+void BeetleUnifiedController::publishSharedThrustLimit()
+{
+  // Quantize the published limit so that every module computes min() over
+  // identical values: consistency between the redundant QP copies then only
+  // depends on message arrival (one cycle), not on local voltage jitter.
+  constexpr double kThrustLimitQuantum = 0.25;  // [N]
+  const double configured_limit = std::max(alloc_t_max_, 0.0);
+  const double predicted_limit = predictThrustLimit();
+  double own_limit = configured_limit;
+  if (std::isfinite(predicted_limit) && predicted_limit > 0.0) {
+    own_limit = (own_limit > 0.0) ? std::min(own_limit, predicted_limit)
+                                  : predicted_limit;
+  }
+  if (!std::isfinite(own_limit) || own_limit <= 0.0) return;
+  own_limit = std::floor(own_limit / kThrustLimitQuantum) * kThrustLimitQuantum;
+  if (own_limit <= 0.0) return;
+  {
+    std::lock_guard<std::mutex> lock(shared_thrust_limit_mutex_);
+    own_shared_thrust_limit_ = own_limit;
+  }
+  std_msgs::Float32 msg;
+  msg.data = static_cast<float>(own_limit);
+  shared_thrust_limit_pub_.publish(msg);
+}
+
 double BeetleUnifiedController::getAllocationThrustLimit() const
 {
   const double configured_limit = std::max(alloc_t_max_, 0.0);
   const double predicted_limit = predictThrustLimit();
+  double limit;
   if (!std::isfinite(predicted_limit) || predicted_limit <= 0.0) {
-    return configured_limit;
+    limit = configured_limit;
+  } else if (configured_limit <= 0.0) {
+    limit = predicted_limit;
+  } else {
+    limit = std::min(configured_limit, predicted_limit);
   }
-  if (configured_limit <= 0.0) {
-    return predicted_limit;
+
+  // Formation consensus: min over the own PUBLISHED (quantized) limit and the
+  // assembled peers' published limits, so every module's QP copy solves with
+  // the same actuator bounds. A stale peer value is still applied (holding the
+  // last known bound preserves consistency better than reverting to a local
+  // one) but warned about, since prolonged staleness means the peer's battery
+  // sag is no longer tracked.
+  if (!navigator_) return limit;
+  const std::vector<int> assembled_ids = navigator_->getAssemblyIds();
+  const int my_id = navigator_->getMyID();
+  const double now = ros::Time::now().toSec();
+  std::lock_guard<std::mutex> lock(shared_thrust_limit_mutex_);
+  if (own_shared_thrust_limit_ > 0.0) {
+    limit = std::min(limit, own_shared_thrust_limit_);
   }
-  return std::min(configured_limit, predicted_limit);
+  for (int id : assembled_ids) {
+    if (id == my_id) continue;
+    const auto it = peer_shared_thrust_limits_.find(id);
+    if (it == peer_shared_thrust_limits_.end()) continue;
+    if (thrust_limit_share_timeout_ > 0.0 &&
+        now - it->second.second > thrust_limit_share_timeout_) {
+      ROS_WARN_THROTTLE(2.0,
+                        "[UnifiedCtrl] peer %d thrust limit stale (%.2fs old); holding %.2fN",
+                        id, now - it->second.second, it->second.first);
+    }
+    limit = std::min(limit, it->second.first);
+  }
+  return limit;
 }
 
 uint16_t BeetleUnifiedController::predictPwmFromThrust(double thrust) const
@@ -1509,8 +1619,10 @@ bool BeetleUnifiedController::solveFullVectorQP(
   //         task/feedback weights only select hard-band rows, not soft tracking.
   //         P = A'W_eff A + effort + R + optional rate/lateral-rate/interface terms,
   //         q = -A'W_eff*w_des - R*f_ref - D'Wi*d_ref - smoothness refs.
-  //         Active task-priority rows are represented as hard bands around
-  //         w_control+w_task and removed from W_eff.
+  //         Active task-priority rows additionally get hard bands around
+  //         w_control+w_task; they keep their W_eff soft tracking toward w_des,
+  //         so the band acts as guaranteed rails while the soft term places the
+  //         solution inside it (and w_feedback stays effective on those rows).
   //
   // This separates stabilization/control tracking, explicit task feedforward,
   // and low-weight observer residual feedback. Optional interface terms are a
@@ -1682,10 +1794,16 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // Task/feedback weights only gate which rows are promoted to hard bands
   // (below); they no longer scale the soft tracking, so the per-axis weight is
   // a deliberate priority rather than a function of how many sources contribute.
+  //
+  // Hard-banded task rows KEEP their soft tracking weight: the band is a
+  // guaranteed corridor, the soft term places the solution inside it. Zeroing
+  // the weight here (previous behavior) had two defects observed in the
+  // 2026-07-03 pushing log: (a) w_feedback was silently dropped on banded rows
+  // (it is in w_des but not in the band center), and (b) with no pull toward
+  // the target, the effort/rate costs dragged the solution to the band's lower
+  // edge, under-delivering the contact force by exactly the tolerance
+  // (task_prio_res pinned at 0.350 for the whole ramp).
   Eigen::VectorXd tracking_weights = wrench_weights;
-  for (int row_idx : task_priority_rows) {
-    tracking_weights(row_idx) = 0.0;
-  }
   Eigen::MatrixXd tracking_weight_diag = tracking_weights.asDiagonal();
   Eigen::MatrixXd P_dense =
       alloc_matrix.transpose() * tracking_weight_diag * alloc_matrix;

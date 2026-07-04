@@ -104,8 +104,8 @@
        doc="Maximum feedforward force increase rate (N/s); effective ramp is max(force_ramp_time, push_force/force_ramp_rate)"/>
   <arg name="push_duration" default="3.0"
        doc="Total pushing hold duration including ramp (s)"/>
-  <arg name="full_force_hold_time" default="0.0"
-       doc="Minimum time to hold after push_force is reached (s)"/>
+  <arg name="full_force_hold_time" default="10.0"
+       doc="Static push: minimum time to hold after push_force is reached (s)"/>
   <arg name="full_force_try_time" default="10.0"
        doc="Dynamic push: maximum time to keep trying after push_force is reached without stable wall motion (s)"/>
   <arg name="force_guard_yaw_hold_deg" default="6.0"

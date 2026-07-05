@@ -765,7 +765,8 @@ class PushWithFeedforwardState(PushingStateBase):
         ee_advance = 0.0
         wall_advance = None
         target_lag = 0.0
-        target_lead = min(PUSH_MOVE_DISTANCE, PUSH_POSITION_LEAD)
+        target_lead = (min(PUSH_MOVE_DISTANCE, PUSH_POSITION_LEAD)
+                       if dynamic_push else PUSH_POSITION_LEAD)
         wall_start_pos = None
         advance_source = 'time'
         # Dynamic mode uses the shared adaptive-force manager. When wall pose is
@@ -878,6 +879,19 @@ class PushWithFeedforwardState(PushingStateBase):
                         target_lead,
                         min(PUSH_MOVE_DISTANCE, ee_advance - PUSH_TARGET_MAX_LAG))
                 target_lead = max(0.0, min(PUSH_MOVE_DISTANCE, target_lead))
+                target_lag = ee_advance - target_lead
+                target_pos = contact_pos + push_dir * target_lead
+            else:
+                # Static push: keep the reference PUSH_POSITION_LEAD ahead of the
+                # measured EE so the position loop presses toward the wall even
+                # when the contact gate fired short of the real face (2026-07-04
+                # bag: a fixed target left err_p=-88mm and the XY PID pulled
+                # ~8.5N against the feedforward). Monotonic (never retreats) and
+                # rate-limited so mocap jumps cannot ratchet the target forward.
+                target_lead = max(
+                    target_lead,
+                    min(ee_advance + PUSH_POSITION_LEAD,
+                        target_lead + PUSH_TARGET_VELOCITY * loop_dt))
                 target_lag = ee_advance - target_lead
                 target_pos = contact_pos + push_dir * target_lead
 

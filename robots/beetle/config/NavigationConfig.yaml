@@ -10,7 +10,7 @@ navigation:
   max_modules_num: 8  # maximum number of modules in the system
 
   # Temporary low takeoff target for unified-mode takeoff diagnosis.
-  takeoff_height: 0.9 #1.0 for aerial towing;1.2 for static aerial towing
+  takeoff_height: 1.0 #1.0 for aerial towing;1.2 for static aerial towing
   outdoor_takeoff_height: 1.5
   convergent_duration: 10.0
   land_descend_vel: -0.15

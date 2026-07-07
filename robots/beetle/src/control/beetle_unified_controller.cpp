@@ -12,6 +12,7 @@
 #include <XmlRpcValue.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -119,6 +120,12 @@ void BeetleUnifiedController::initialize(
                 peerThrustLimitCallback(i, msg);
               }));
     }
+    module_joint_state_subs_[i] = nh_.subscribe<sensor_msgs::JointState>(
+        ns + "/joint_states", 1,
+        boost::function<void(const sensor_msgs::JointStateConstPtr&)>(
+            [this, i](const sensor_msgs::JointStateConstPtr& msg) {
+              moduleJointStateCallback(i, msg);
+            }));
   }
   shared_thrust_limit_pub_ =
       nh_.advertise<std_msgs::Float32>("unified_control/predicted_thrust_limit", 1);
@@ -130,6 +137,7 @@ void BeetleUnifiedController::initialize(
   pinv_pwm_pred_pub_ = nh_.advertise<spinal::Pwms>("unified_control/pinv_pwm_pred", 1);
   qp_thrust_margin_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/qp_thrust_margin", 1);
   pinv_thrust_margin_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/pinv_thrust_margin", 1);
+  gimbal_tracking_pub_ = nh_.advertise<sensor_msgs::JointState>("unified_control/gimbal_tracking", 1);
   battery_voltage_sub_ = nh_.subscribe("battery_voltage_status", 1,
                                        &BeetleUnifiedController::batteryVoltageCallback, this);
 
@@ -743,6 +751,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
   // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
+  publishGimbalTracking(assembled_ids);
   publishInterfaceLoadDiagnostics(interface_load_matrix, interface_cuts,
                                   target_vectoring_f_, interface_load_reference);
 
@@ -2258,6 +2267,61 @@ std::map<int, BeetleUnifiedController::ModuleCommand> BeetleUnifiedController::g
 {
   std::lock_guard<std::mutex> lock(allocation_mutex_);
   return module_commands_;
+}
+
+void BeetleUnifiedController::moduleJointStateCallback(int module_id,
+                                                       const sensor_msgs::JointStateConstPtr& msg)
+{
+  // Cache the latest Dynamixel encoder angle of each gimbal joint
+  // (servo_bridge publishes them as "gimbal1".."gimbalN" on /beetleX/joint_states).
+  std::vector<double> angles(motor_num_per_module_,
+                             std::numeric_limits<double>::quiet_NaN());
+  for (size_t j = 0; j < msg->name.size() && j < msg->position.size(); j++) {
+    const std::string& name = msg->name[j];
+    if (name.rfind("gimbal", 0) != 0) continue;
+    int rotor = std::atoi(name.substr(6).c_str());
+    if (rotor >= 1 && rotor <= motor_num_per_module_)
+      angles[rotor - 1] = msg->position[j];
+  }
+  std::lock_guard<std::mutex> lock(gimbal_meas_mutex_);
+  module_gimbal_meas_[module_id] = angles;
+}
+
+void BeetleUnifiedController::publishGimbalTracking(const std::vector<int>& assembled_ids)
+{
+  // QP-intended gimbal angle vs Dynamixel encoder feedback, per rotor.
+  // Semantics: position = intended angle (from extractThrustAndGimbal, i.e. the
+  // allocation solution WITHOUT the spinal 1kHz P+D delta), velocity = measured
+  // encoder angle, effort = intended - measured. Valid as a model-vs-physical
+  // comparison in quasi-static conditions (hover / static pushing hold).
+  if (gimbal_dof_ != 1) return;  // beetle uses 1-DoF gimbals; dof=2 naming differs
+
+  std::map<int, std::vector<double>> meas;
+  {
+    std::lock_guard<std::mutex> lock(gimbal_meas_mutex_);
+    meas = module_gimbal_meas_;
+  }
+
+  sensor_msgs::JointState msg;
+  msg.header.stamp = ros::Time::now();
+  for (int module_id : assembled_ids) {
+    const auto cmd_it = module_commands_.find(module_id);
+    if (cmd_it == module_commands_.end()) continue;
+    const std::vector<double>& cmd_angles = cmd_it->second.gimbal_angles;
+    const auto meas_it = meas.find(module_id);
+    for (int r = 0; r < motor_num_per_module_ &&
+                    r < static_cast<int>(cmd_angles.size()); r++) {
+      double measured = std::numeric_limits<double>::quiet_NaN();
+      if (meas_it != meas.end() && r < static_cast<int>(meas_it->second.size()))
+        measured = meas_it->second[r];
+      msg.name.push_back("m" + std::to_string(module_id) +
+                         "/gimbal" + std::to_string(r + 1));
+      msg.position.push_back(cmd_angles[r]);
+      msg.velocity.push_back(measured);
+      msg.effort.push_back(cmd_angles[r] - measured);
+    }
+  }
+  if (!msg.name.empty()) gimbal_tracking_pub_.publish(msg);
 }
 
 void BeetleUnifiedController::setCommandTargetRPY(const tf::Vector3& rpy)

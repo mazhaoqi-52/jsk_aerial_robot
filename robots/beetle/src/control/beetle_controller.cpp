@@ -126,6 +126,7 @@ namespace aerial_robot_control
     wrench_comp_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("debug/wrench_comp/pid", 1);
     // [Step D'] Pairwise observer disagreement diagnostic (leader-only publish).
     inter_disagreement_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("inter_disagreement", 1);
+    model_error_estimate_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/model_error_estimate", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
     desired_ext_wrench_weights_sub_ = nh_.subscribe("desired_external_wrench_weights", 1, &BeetleController::desiredExternalWrenchWeightsCallback, this);
     formation_desired_wrench_sub_ = nh_.subscribe("formation_desired_wrench", 1, &BeetleController::formationDesiredWrenchCallback, this);
@@ -3466,6 +3467,38 @@ namespace aerial_robot_control
         unified_external_wrench_feedback_bias_ready_ =
             unified_external_wrench_feedback_bias_samples_ >=
             kExtWrenchFeedbackBiasReadySamples;
+      }
+    }
+    // Mass/CoG model-error estimate from the formation observer estimate.
+    // Only meaningful in quiet level hover (gravity-only assumption; wrench in
+    // formation_body frame ~ world at level hover):
+    //   f_z   = -dm * g            -> dm  = -f_z / g
+    //   tau_x = -r_y * m_true * g  -> r_y = -tau_x / (m_true * g)
+    //   tau_y = +r_x * m_true * g  -> r_x = +tau_y / (m_true * g)
+    // Gravity cannot produce f_x, f_y, tau_z: those residuals are published
+    // as-is and indicate non-gravity model errors (gimbal zero offset, rotor
+    // asymmetry, thrust-curve mismatch, ...). Uses the LIVE observer output
+    // (not the frozen feedback bias): the observer torque channel needs
+    // ~30-40 s after takeoff to converge, so read this topic once it settles.
+    if (is_leader && unified_controller_ &&
+        formation_observer_ && formation_observer_->isActive() &&
+        formation_observer_->isInitialized()) {
+      const Eigen::VectorXd est = formation_observer_->getEstExternalWrench6D();
+      if (est.size() == 6 && est.allFinite()) {
+        const double g = aerial_robot_estimation::G;
+        const double model_mass = unified_controller_->getFormationMass();
+        const double delta_mass = -est(2) / g;
+        const double true_weight = (model_mass + delta_mass) * g;
+        std_msgs::Float32MultiArray model_error_msg;
+        model_error_msg.data = {
+          static_cast<float>(delta_mass),
+          static_cast<float>(true_weight > 1e-6 ? est(4) / true_weight : 0.0),
+          static_cast<float>(true_weight > 1e-6 ? -est(3) / true_weight : 0.0),
+          static_cast<float>(est(0)),
+          static_cast<float>(est(1)),
+          static_cast<float>(est(5)),
+          static_cast<float>(model_mass)};
+        model_error_estimate_pub_.publish(model_error_msg);
       }
     }
     if (is_leader &&

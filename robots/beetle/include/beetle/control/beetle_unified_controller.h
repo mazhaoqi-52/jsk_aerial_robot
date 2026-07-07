@@ -313,6 +313,13 @@ private:
   ros::Publisher pinv_thrust_margin_pub_;
   ros::Subscriber battery_voltage_sub_;
 
+  // Gimbal tracking diagnostics: QP-intended gimbal angle vs Dynamixel
+  // encoder feedback (from each module's /joint_states).
+  ros::Publisher gimbal_tracking_pub_;
+  std::map<int, ros::Subscriber> module_joint_state_subs_;
+  mutable std::mutex gimbal_meas_mutex_;
+  std::map<int, std::vector<double>> module_gimbal_meas_;  // module id -> per-rotor measured angle
+
   // Internal methods
   Eigen::MatrixXd buildFormationAllocationMatrix(
       const std::vector<int>& assembled_ids,
@@ -511,6 +518,9 @@ private:
   double thrust_limit_share_timeout_;  // peer staleness warning threshold [s]; <=0 disables the warning
   void peerThrustLimitCallback(int module_id, const std_msgs::Float32ConstPtr& msg);
   void publishSharedThrustLimit();
+
+  void moduleJointStateCallback(int module_id, const sensor_msgs::JointStateConstPtr& msg);
+  void publishGimbalTracking(const std::vector<int>& assembled_ids);
 
   double getModuleAllocationWeight(int module_id) const;
 

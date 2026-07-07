@@ -313,6 +313,12 @@ namespace aerial_robot_control
     // Published only when the running controller instance is the leader.
     // PURE DIAGNOSTIC — no control feedback.
     ros::Publisher inter_disagreement_pub_;
+    // Leader-only diagnostic: mass/CoG model error derived from the hover
+    // external-wrench bias (gravity-only assumption). Float32MultiArray:
+    // [delta_mass_kg, cog_offset_x_m, cog_offset_y_m,
+    //  resid_fx_N, resid_fy_N, resid_tz_Nm, model_mass_kg].
+    // PURE DIAGNOSTIC — no control feedback.
+    ros::Publisher model_error_estimate_pub_;
 
     // Assemble debug publishers (global /assemble/debug/ namespace)
     ros::Publisher assemble_pid_pub_;

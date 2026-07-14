@@ -80,6 +80,8 @@
   ###########  Parameters  ###########
   <arg name="push_direction" default="+x"
        doc="auto, +x, -x, +y, -y, or a comma-separated vector"/>
+  <arg name="auto_align" default="false"
+       doc="Automatically align yaw and wall center before approach; false uses the manually aligned pose"/>
   <arg name="approach_distance" default="0.8"
        doc="Max forward distance before contact timeout (m)"/>
   <arg name="approach_speed" default="0.03"
@@ -154,6 +156,7 @@
     <param name="use_wall_plane_contact"   value="$(arg use_wall_plane_contact)"/>
 
     <param name="push_direction"           value="$(arg push_direction)"/>
+    <param name="auto_align"               value="$(arg auto_align)"/>
     <param name="approach_distance"        value="$(arg approach_distance)"/>
     <param name="approach_speed"           value="$(arg approach_speed)"/>
     <param name="approach_overrun"         value="$(arg approach_overrun)"/>

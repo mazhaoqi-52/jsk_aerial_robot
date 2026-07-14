@@ -73,6 +73,8 @@ PUSH_YAW_ALIGN_TIMEOUT = 8.0
 PUSH_YAW_ALIGN_THRESH = math.radians(3.0)
 PUSH_LATERAL_ALIGN_TIMEOUT = 12.0
 PUSH_LATERAL_ALIGN_THRESH = 0.02
+PUSH_AUTO_ALIGN = False
+PUSH_VEL_MODE_ENTRY_SETTLE = 0.6
 
 # Pushing feedforward.
 PUSH_FORCE = 5.0
@@ -120,6 +122,38 @@ PUSH_CONTACT_DZ_FROM_CP = 0.0
 # Exit behavior.
 PUSH_RETREAT_AFTER = True
 PUSH_RETREAT_DISTANCE = 0.20
+
+
+def stop_xy_velocity_on_exit(execute):
+    """Stop a velocity segment on success, failure, shutdown, or exception."""
+    def guarded(self, userdata):
+        self._xy_velocity_guard = None
+        self._xy_velocity_exit_hold = None
+        try:
+            return execute(self, userdata)
+        finally:
+            guard = self._xy_velocity_guard
+            if guard is not None:
+                stop_pos, stop_yaw = guard
+                self.stop_xy_velocity(stop_pos, stop_yaw)
+                exit_hold = self._xy_velocity_exit_hold
+                if exit_hold is None:
+                    try:
+                        exit_hold = self.get_end_effector_position()
+                    except Exception as exc:
+                        rospy.logerr(
+                            "Failed to read XY exit position: %s", exc)
+                if exit_hold is not None:
+                    try:
+                        self.send_assembly_command_from_end_effector(
+                            exit_hold, stop_yaw)
+                    except Exception as exc:
+                        rospy.logerr(
+                            "Failed to latch XY exit position: %s", exc)
+            self._xy_velocity_guard = None
+            self._xy_velocity_exit_hold = None
+
+    return guarded
 
 
 def _effective_push_ramp_time():
@@ -324,6 +358,48 @@ class PushingStateBase(FormationSingleUAVStateBase):
             return None, None, None
         return force_data
 
+    def send_xy_velocity_from_end_effector(
+            self, hold_end_effector_pos, hold_yaw, linear_vel):
+        """Command assembly XY velocity while holding EE height and yaw."""
+        assembly_hold = self.formation_adapter.transform_end_effector_to_assembly_command(
+            hold_end_effector_pos, hold_yaw)
+        self.beetle.targetXyVelocity(
+            linear_vel=linear_vel,
+            hold_pos=assembly_hold,
+            hold_yaw=hold_yaw)
+
+    def latch_end_effector_pose(self, position, yaw, settle_time=0.0):
+        """Reset the position reference to the measured pose at a mode boundary."""
+        self.send_assembly_command_from_end_effector(position, yaw)
+        if settle_time > 0.0:
+            rospy.sleep(settle_time)
+
+    def prepare_xy_velocity(self, position, yaw):
+        """Latch the current pose and let a prior POS_VEL command expire."""
+        prepared_pos = np.array(position, dtype=float)
+        self.latch_end_effector_pose(
+            prepared_pos, yaw, settle_time=PUSH_VEL_MODE_ENTRY_SETTLE)
+        latest_pos = self.get_end_effector_position()
+        if latest_pos is not None:
+            prepared_pos = np.array(latest_pos, dtype=float)
+        self.latch_end_effector_pose(prepared_pos, yaw)
+        return prepared_pos
+
+    def stop_xy_velocity(self, hold_end_effector_pos, hold_yaw):
+        """Immediately stop integrating the XY velocity reference."""
+        try:
+            self.send_xy_velocity_from_end_effector(
+                hold_end_effector_pos, hold_yaw, [0.0, 0.0, 0.0])
+        except Exception as exc:
+            rospy.logerr("Failed to publish XY velocity stop: %s", exc)
+
+    def arm_xy_velocity_guard(self, hold_end_effector_pos, hold_yaw):
+        self._xy_velocity_guard = (
+            np.array(hold_end_effector_pos, dtype=float), hold_yaw)
+
+    def hold_position_on_xy_exit(self, position):
+        self._xy_velocity_exit_hold = np.array(position, dtype=float)
+
 
 class PushingInitializeState(PushingStateBase):
     """Capture the current manually-flown pose and compute push geometry."""
@@ -349,32 +425,52 @@ class PushingInitializeState(PushingStateBase):
             rospy.logerr("Current end-effector pose is not available")
             return 'failed'
 
-        yaw_error = abs(normalize_angle_diff(PUSH_YAW_TARGET - current_yaw))
-        rospy.loginfo(
-            "Pushing yaw target: %.1f deg (current %.1f deg, err %.1f deg)",
-            math.degrees(PUSH_YAW_TARGET), math.degrees(current_yaw),
-            math.degrees(yaw_error))
-        if yaw_error > PUSH_YAW_ALIGN_THRESH:
-            yaw_aligned = self.active_position_convergence(
-                current_pos, PUSH_YAW_TARGET, pos_thresh=0.05,
-                yaw_thresh=PUSH_YAW_ALIGN_THRESH,
-                timeout=PUSH_YAW_ALIGN_TIMEOUT,
-                max_angular_vel=0.1, yaw_only=True)
-            latest_pos = self.get_end_effector_position()
-            latest_yaw = self.get_end_effector_yaw()
-            if latest_pos is not None and latest_yaw is not None:
-                current_pos = latest_pos
-                current_yaw = latest_yaw
-            else:
-                rospy.logwarn(
-                    "Current end-effector pose is not available after yaw align; "
-                    "continuing from the last known pose")
-            if not yaw_aligned:
-                rospy.logwarn(
-                    "Failed to align yaw to %.1f deg before pushing; continuing anyway",
-                    math.degrees(PUSH_YAW_TARGET))
+        command_yaw = current_yaw
+        if PUSH_AUTO_ALIGN:
+            command_yaw = PUSH_YAW_TARGET
+            yaw_error = abs(normalize_angle_diff(PUSH_YAW_TARGET - current_yaw))
+            rospy.loginfo(
+                "Pushing yaw target: %.1f deg (current %.1f deg, err %.1f deg)",
+                math.degrees(PUSH_YAW_TARGET), math.degrees(current_yaw),
+                math.degrees(yaw_error))
+            if yaw_error > PUSH_YAW_ALIGN_THRESH:
+                yaw_aligned = self.active_position_convergence(
+                    current_pos, PUSH_YAW_TARGET, pos_thresh=0.05,
+                    yaw_thresh=PUSH_YAW_ALIGN_THRESH,
+                    timeout=PUSH_YAW_ALIGN_TIMEOUT,
+                    max_angular_vel=0.1, yaw_only=True)
+                latest_pos = self.get_end_effector_position()
+                latest_yaw = self.get_end_effector_yaw()
+                if latest_pos is not None and latest_yaw is not None:
+                    current_pos = latest_pos
+                    current_yaw = latest_yaw
+                else:
+                    rospy.logwarn(
+                        "Current end-effector pose is not available after yaw align; "
+                        "continuing from the last known pose")
+                if not yaw_aligned:
+                    rospy.logwarn(
+                        "Failed to align yaw to %.1f deg before pushing; continuing anyway",
+                        math.degrees(PUSH_YAW_TARGET))
+        else:
+            rospy.loginfo(
+                "Automatic wall/yaw alignment disabled; holding manually aligned yaw %.1f deg",
+                math.degrees(command_yaw))
 
         push_dir = self.resolve_push_direction(current_pos)
+        if PUSH_FEEDFORWARD_BODY_X:
+            body_x = np.array([
+                math.cos(command_yaw), math.sin(command_yaw), 0.0])
+            heading_error = math.acos(float(np.clip(
+                np.dot(body_x[:2], push_dir[:2]), -1.0, 1.0)))
+            if heading_error > PUSH_FORCE_HOLD_YAW_ERROR:
+                rospy.logerr(
+                    "Commanded body +X differs from push_direction by %.1f deg "
+                    "(allowed %.1f deg). Align body +X with the requested push "
+                    "direction before starting.",
+                    math.degrees(heading_error),
+                    math.degrees(PUSH_FORCE_HOLD_YAW_ERROR))
+                return 'failed'
         face_distance = self.wall_interface.distance_to_near_face(current_pos, push_dir)
         if face_distance is None:
             face_distance = float('nan')
@@ -382,7 +478,7 @@ class PushingInitializeState(PushingStateBase):
         self.formation_adapter.set_pitch_compensation(False)
 
         userdata.start_position = np.array(current_pos, dtype=float)
-        userdata.start_yaw = PUSH_YAW_TARGET
+        userdata.start_yaw = command_yaw
         userdata.push_direction = push_dir
         userdata.wall_face_distance = face_distance
 
@@ -390,7 +486,7 @@ class PushingInitializeState(PushingStateBase):
         rospy.loginfo("Manual start EE position: %s", FormationUtils.format_vec(current_pos))
         rospy.loginfo(
             "Manual start yaw: %.1f deg, pushing command yaw: %.1f deg",
-            math.degrees(current_yaw), math.degrees(PUSH_YAW_TARGET))
+            math.degrees(current_yaw), math.degrees(command_yaw))
         rospy.loginfo("Push direction: (%.3f, %.3f, %.3f)", push_dir[0], push_dir[1], push_dir[2])
         rospy.loginfo("Estimated distance to wall near face: %s", face_text)
         return 'succeeded'
@@ -409,6 +505,10 @@ class AlignWallCenterState(PushingStateBase):
 
     def execute(self, userdata):
         rospy.loginfo("=== Align Wall Center State ===")
+
+        if not PUSH_AUTO_ALIGN:
+            rospy.loginfo("Using manual alignment; skipping wall-center convergence")
+            return 'succeeded'
 
         if (not self.wall_interface.use_wall_pose or
                 not self.wall_interface.position_received.is_set()):
@@ -435,7 +535,7 @@ class AlignWallCenterState(PushingStateBase):
                 lateral_error * 1000.0, FormationUtils.format_vec(target_pos))
 
             lateral_aligned = self.active_position_convergence(
-                target_pos, PUSH_YAW_TARGET,
+                target_pos, userdata.start_yaw,
                 pos_thresh=PUSH_LATERAL_ALIGN_THRESH,
                 yaw_thresh=PUSH_YAW_ALIGN_THRESH,
                 timeout=PUSH_LATERAL_ALIGN_TIMEOUT,
@@ -456,7 +556,6 @@ class AlignWallCenterState(PushingStateBase):
             face_distance = float('nan')
 
         userdata.start_position = np.array(aligned_pos, dtype=float)
-        userdata.start_yaw = PUSH_YAW_TARGET
         userdata.push_direction = push_dir
         userdata.wall_face_distance = face_distance
 
@@ -479,14 +578,26 @@ class ApproachWallUntilContactState(PushingStateBase):
                         'wall_face_distance'],
             output_keys=['contact_position', 'push_yaw'])
 
+    @stop_xy_velocity_on_exit
     def execute(self, userdata):
         rospy.loginfo("=== Approach Wall Until Contact State ===")
 
         start_pos = np.array(userdata.start_position, dtype=float)
-        push_dir = np.array(userdata.push_direction, dtype=float)
+        push_dir = self._normalize_horizontal(
+            userdata.push_direction, "push_direction")
         maintain_yaw = userdata.start_yaw
 
+        latest_pos = self.get_end_effector_position()
+        if latest_pos is not None:
+            start_pos = np.array(latest_pos, dtype=float)
+        start_pos = self.prepare_xy_velocity(start_pos, maintain_yaw)
+        self.arm_xy_velocity_guard(start_pos, maintain_yaw)
+
         face_distance = getattr(userdata, 'wall_face_distance', float('nan'))
+        latest_face_distance = self.wall_interface.distance_to_near_face(
+            start_pos, push_dir)
+        if latest_face_distance is not None:
+            face_distance = latest_face_distance
         if math.isfinite(face_distance):
             target_distance = max(PUSH_MIN_APPROACH_DISTANCE,
                                   face_distance + PUSH_APPROACH_OVERRUN)
@@ -515,16 +626,18 @@ class ApproachWallUntilContactState(PushingStateBase):
             elapsed = now - t0
             if elapsed > max_duration:
                 rospy.logerr("Approach timeout before wall contact")
+                current_pos = self.get_end_effector_position()
+                if current_pos is not None:
+                    self.hold_position_on_xy_exit(current_pos)
                 return 'failed'
 
             cmd_dist = min(target_distance, elapsed * PUSH_APPROACH_SPEED)
-            target_pos = start_pos + push_dir * cmd_dist
             linear_vel = push_dir * PUSH_APPROACH_SPEED
             if cmd_dist >= target_distance:
                 linear_vel = np.zeros(3)
 
-            self.send_assembly_command_from_end_effector(
-                target_pos, maintain_yaw, linear_vel=linear_vel.tolist())
+            self.send_xy_velocity_from_end_effector(
+                start_pos, maintain_yaw, linear_vel.tolist())
 
             actual_pos = self.get_end_effector_position()
             if actual_pos is None:
@@ -579,6 +692,8 @@ class ApproachWallUntilContactState(PushingStateBase):
                 contact_pos = np.array(actual_pos, dtype=float)
                 userdata.contact_position = contact_pos
                 userdata.push_yaw = maintain_yaw
+                self.hold_position_on_xy_exit(
+                    contact_pos + push_dir * PUSH_POSITION_LEAD)
                 rospy.loginfo(
                     "Wall contact detected (%s) at %s",
                     ", ".join(reasons),
@@ -1098,6 +1213,7 @@ class RetreatFromWallState(PushingStateBase):
             outcomes=['succeeded', 'failed'],
             input_keys=['push_direction', 'push_yaw', 'push_end_position'])
 
+    @stop_xy_velocity_on_exit
     def execute(self, userdata):
         rospy.loginfo("=== Retreat From Wall State ===")
 
@@ -1105,35 +1221,97 @@ class RetreatFromWallState(PushingStateBase):
             rospy.loginfo("retreat_after_push=false; holding final pose")
             return 'succeeded'
 
-        push_dir = np.array(userdata.push_direction, dtype=float)
+        push_dir = self._normalize_horizontal(
+            userdata.push_direction, "push_direction")
         maintain_yaw = userdata.push_yaw
         current_pos = self.get_end_effector_position()
         if current_pos is None:
             current_pos = np.array(userdata.push_end_position, dtype=float)
 
-        retreat_target = np.array(current_pos, dtype=float) - push_dir * PUSH_RETREAT_DISTANCE
+        start_pos = self.prepare_xy_velocity(current_pos, maintain_yaw)
+        self.arm_xy_velocity_guard(start_pos, maintain_yaw)
+        retreat_target = start_pos - push_dir * PUSH_RETREAT_DISTANCE
         rospy.loginfo(
-            "Retreating %.0fmm to %s",
+            "Retreating %.0fmm with XY VEL_MODE toward %s",
             PUSH_RETREAT_DISTANCE * 1000.0,
             FormationUtils.format_vec(retreat_target))
 
-        success = self.active_position_convergence(
-            retreat_target, target_yaw=maintain_yaw,
-            pos_thresh=0.05, yaw_thresh=0.1, timeout=20.0,
-            max_linear_vel=0.04)
-        if not success:
-            final_pos = self.get_end_effector_position()
-            if final_pos is not None:
-                err = np.linalg.norm(np.array(final_pos) - retreat_target)
-                if err <= 0.20:
-                    rospy.logwarn(
-                        "Retreat convergence incomplete but close enough: %.0fmm", err * 1000.0)
-                    return 'succeeded'
-            rospy.logerr("Retreat failed")
-            return 'failed'
+        retreat_speed = max(PUSH_APPROACH_SPEED, 1e-3)
+        max_duration = PUSH_RETREAT_DISTANCE / retreat_speed + 5.0
+        start_time = rospy.get_time()
+        rate = rospy.Rate(25.0)
+        progress = 0.0
 
-        rospy.loginfo("Wall pushing task complete")
-        return 'succeeded'
+        while not rospy.is_shutdown():
+            elapsed = rospy.get_time() - start_time
+            if elapsed > max_duration:
+                actual_pos = self.get_end_effector_position()
+                if actual_pos is not None:
+                    actual_pos = np.array(actual_pos, dtype=float)
+                    progress = float(np.dot(start_pos - actual_pos, push_dir))
+                    self.hold_position_on_xy_exit(actual_pos)
+                rospy.logerr(
+                    "Retreat timeout: actual=%.0fmm target=%.0fmm",
+                    progress * 1000.0, PUSH_RETREAT_DISTANCE * 1000.0)
+                return 'failed'
+
+            cmd_dist = min(PUSH_RETREAT_DISTANCE, elapsed * retreat_speed)
+            linear_vel = -push_dir * retreat_speed
+            if cmd_dist >= PUSH_RETREAT_DISTANCE:
+                linear_vel = np.zeros(3)
+            self.send_xy_velocity_from_end_effector(
+                start_pos, maintain_yaw, linear_vel.tolist())
+
+            actual_pos = self.get_end_effector_position()
+            if actual_pos is None:
+                rate.sleep()
+                continue
+
+            actual_pos = np.array(actual_pos, dtype=float)
+            delta = actual_pos - start_pos
+            progress = float(np.dot(-delta, push_dir))
+            lateral_error = float(np.linalg.norm(
+                (delta + push_dir * progress)[:2]))
+            z_error = abs(float(delta[2]))
+            current_yaw = self.get_end_effector_yaw()
+            rpy = self.beetle.getAssemblyRPY()
+            if current_yaw is None or rpy is None:
+                self.hold_position_on_xy_exit(actual_pos)
+                rospy.logerr("Retreat safety stop: attitude is unavailable")
+                return 'failed'
+            yaw_error = abs(normalize_angle_diff(
+                current_yaw - maintain_yaw))
+            max_rp = max(abs(rpy[0]), abs(rpy[1]))
+
+            if (lateral_error > PUSH_FORCE_RELIEF_LATERAL_ERROR or
+                    z_error > TOWING_FORCE_RELIEF_Z_ERROR or
+                    yaw_error > PUSH_FORCE_RELIEF_YAW_ERROR or
+                    max_rp > TOWING_FORCE_RELIEF_ATTITUDE):
+                self.hold_position_on_xy_exit(actual_pos)
+                rospy.logerr(
+                    "Retreat safety stop: lateral=%.0fmm z=%.0fmm "
+                    "yaw=%.1fdeg rp=%.1fdeg",
+                    lateral_error * 1000.0, z_error * 1000.0,
+                    math.degrees(yaw_error), math.degrees(max_rp))
+                return 'failed'
+
+            if progress >= PUSH_RETREAT_DISTANCE - 0.005:
+                self.hold_position_on_xy_exit(actual_pos)
+                rospy.loginfo(
+                    "Retreat complete: actual=%.0fmm target=%.0fmm",
+                    progress * 1000.0, PUSH_RETREAT_DISTANCE * 1000.0)
+                rospy.loginfo("Wall pushing task complete")
+                return 'succeeded'
+
+            rospy.loginfo_throttle(
+                1.0,
+                f"[Retreat Wall] cmd={cmd_dist*1000:.0f}mm "
+                f"actual={progress*1000:.0f}mm/"
+                f"{PUSH_RETREAT_DISTANCE*1000:.0f}mm "
+                f"speed={np.linalg.norm(linear_vel[:2])*1000:.0f}mm/s")
+            rate.sleep()
+
+        return 'failed'
 
 
 def log_pushing_preflight(module_ids, real_machine, simulation):
@@ -1205,6 +1383,7 @@ def _load_params():
     global PUSH_MIN_APPROACH_DISTANCE, PUSH_CONTACT_WRENCH_THRESHOLD
     global PUSH_CONTACT_STALL_LEAD, PUSH_CONTACT_STALL_VELOCITY
     global PUSH_CONTACT_REQUIRED_CYCLES
+    global PUSH_AUTO_ALIGN
     global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_FORCE_RAMP_RATE, PUSH_DURATION
     global PUSH_FULL_FORCE_HOLD_TIME, PUSH_FULL_FORCE_TRY_TIME
     global PUSH_POSITION_LEAD, PUSH_TARGET_VELOCITY, PUSH_TARGET_MAX_LAG
@@ -1229,6 +1408,7 @@ def _load_params():
     PUSH_CONTACT_STALL_LEAD = float(rospy.get_param("~contact_stall_lead", PUSH_CONTACT_STALL_LEAD))
     PUSH_CONTACT_STALL_VELOCITY = float(rospy.get_param("~contact_stall_velocity", PUSH_CONTACT_STALL_VELOCITY))
     PUSH_CONTACT_REQUIRED_CYCLES = int(rospy.get_param("~contact_required_cycles", PUSH_CONTACT_REQUIRED_CYCLES))
+    PUSH_AUTO_ALIGN = _as_bool(rospy.get_param("~auto_align", PUSH_AUTO_ALIGN))
 
     PUSH_FORCE = float(rospy.get_param("~push_force", PUSH_FORCE))
     PUSH_FORCE_RAMP_TIME = max(
@@ -1275,7 +1455,8 @@ def _load_params():
     PUSH_CONTACT_DZ_FROM_CP = float(rospy.get_param("~push_contact_dz_from_cp", PUSH_CONTACT_DZ_FROM_CP))
 
     PUSH_RETREAT_AFTER = _as_bool(rospy.get_param("~retreat_after_push", PUSH_RETREAT_AFTER))
-    PUSH_RETREAT_DISTANCE = float(rospy.get_param("~retreat_distance", PUSH_RETREAT_DISTANCE))
+    PUSH_RETREAT_DISTANCE = max(
+        0.0, float(rospy.get_param("~retreat_distance", PUSH_RETREAT_DISTANCE)))
 
 
 def main():
@@ -1293,8 +1474,8 @@ def main():
         "Wall: thickness=%.3fm, width=%.3fm, height=%.3fm",
         WALL_THICKNESS, WALL_WIDTH, WALL_HEIGHT)
     rospy.loginfo(
-        "Approach: distance=%.3fm, speed=%.3fm/s",
-        PUSH_APPROACH_DISTANCE, PUSH_APPROACH_SPEED)
+        "Approach: distance=%.3fm, speed=%.3fm/s, xy_mode=VEL_MODE, auto_align=%s",
+        PUSH_APPROACH_DISTANCE, PUSH_APPROACH_SPEED, PUSH_AUTO_ALIGN)
     rospy.loginfo(
         "Contact gate: stall lead>%.0fmm, window progress<%.1fmm over "
         "%d cycles at 25Hz; optional wrench>=%.2fN; optional plane<=-10mm "

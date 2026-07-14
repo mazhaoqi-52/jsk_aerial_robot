@@ -483,6 +483,43 @@ class BeetleInterface(object):
         self.nav_pub.publish(nav_msg)
         self.target_pos = pos
 
+    def targetXyVelocity(self, linear_vel, hold_pos, hold_yaw):
+        """Command world-frame XY velocity while holding Z and yaw by position.
+
+        ``FlightNav.VEL_MODE`` keeps the navigator's existing XY reference and
+        advances it with the requested velocity.  ``hold_pos`` is therefore
+        used for the Z reference (and populated in XY for diagnostics), while
+        ``hold_yaw`` remains under position control.
+        """
+        pos_list = self._to_list3(hold_pos)
+        vel_list = self._to_list3(linear_vel)
+
+        nav_msg = FlightNav()
+        nav_msg.control_frame = FlightNav.WORLD_FRAME
+        nav_msg.target = FlightNav.COG
+        nav_msg.header.stamp = rospy.Time.now()
+
+        nav_msg.pos_xy_nav_mode = FlightNav.VEL_MODE
+        nav_msg.target_pos_x = pos_list[0]
+        nav_msg.target_pos_y = pos_list[1]
+        nav_msg.target_vel_x = vel_list[0]
+        nav_msg.target_vel_y = vel_list[1]
+
+        nav_msg.pos_z_nav_mode = FlightNav.POS_MODE
+        nav_msg.target_pos_z = pos_list[2]
+        nav_msg.target_vel_z = 0.0
+
+        nav_msg.yaw_nav_mode = FlightNav.POS_MODE
+        nav_msg.target_yaw = hold_yaw
+        nav_msg.target_omega_z = 0.0
+
+        nav_msg.roll_nav_mode = 0
+        nav_msg.pitch_nav_mode = FlightNav.POS_MODE
+        nav_msg.target_roll = 0.0
+        nav_msg.target_pitch = 0.0
+
+        self.nav_pub.publish(nav_msg)
+
     def isUnifiedMode(self):
         """Query C++ runtime: is unified_control_mode currently active on the leader?"""
         leader_id = self.wrench_target_id if hasattr(self, 'wrench_target_id') else self.module_id

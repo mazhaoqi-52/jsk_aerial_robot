@@ -75,7 +75,7 @@ PUSH_YAW_ALIGN_THRESH = math.radians(3.0)
 PUSH_LATERAL_ALIGN_TIMEOUT = 12.0
 PUSH_LATERAL_ALIGN_THRESH = 0.02
 PUSH_AUTO_ALIGN = False
-PUSH_VEL_MODE_ENTRY_SETTLE = 0.6
+PUSH_POS_VEL_ENTRY_SETTLE = 0.6
 
 # Pushing feedforward.
 PUSH_FORCE = 5.0
@@ -132,34 +132,34 @@ PUSH_RETREAT_DISTANCE = 0.20
 PUSH_SINGLE_UAV_MODE = False
 
 
-def stop_xy_velocity_on_exit(execute):
-    """Stop a velocity segment on success, failure, shutdown, or exception."""
+def hold_xy_position_on_exit(execute):
+    """Latch a position hold when a streamed POS_VEL segment exits."""
     def guarded(self, userdata):
-        self._xy_velocity_guard = None
-        self._xy_velocity_exit_hold = None
+        self._xy_motion_guard = None
+        self._xy_motion_exit_hold = None
         try:
             return execute(self, userdata)
         finally:
-            guard = self._xy_velocity_guard
+            guard = self._xy_motion_guard
             if guard is not None:
-                stop_pos, stop_yaw = guard
-                self.stop_xy_velocity(stop_pos, stop_yaw)
-                exit_hold = self._xy_velocity_exit_hold
+                fallback_pos, hold_yaw = guard
+                exit_hold = self._xy_motion_exit_hold
                 if exit_hold is None:
                     try:
                         exit_hold = self.get_end_effector_position()
                     except Exception as exc:
                         rospy.logerr(
                             "Failed to read XY exit position: %s", exc)
-                if exit_hold is not None:
-                    try:
-                        self.send_assembly_command_from_end_effector(
-                            exit_hold, stop_yaw)
-                    except Exception as exc:
-                        rospy.logerr(
-                            "Failed to latch XY exit position: %s", exc)
-            self._xy_velocity_guard = None
-            self._xy_velocity_exit_hold = None
+                if exit_hold is None:
+                    exit_hold = fallback_pos
+                try:
+                    self.send_assembly_command_from_end_effector(
+                        exit_hold, hold_yaw)
+                except Exception as exc:
+                    rospy.logerr(
+                        "Failed to latch XY exit position: %s", exc)
+            self._xy_motion_guard = None
+            self._xy_motion_exit_hold = None
 
     return guarded
 
@@ -442,47 +442,29 @@ class PushingStateBase(FormationSingleUAVStateBase):
             return self.beetle.getUavRPY()
         return self.beetle.getAssemblyRPY()
 
-    def send_xy_velocity_from_end_effector(
-            self, hold_end_effector_pos, hold_yaw, linear_vel):
-        """Command backend XY velocity while holding contact height and yaw."""
-        assembly_hold = self.formation_adapter.transform_end_effector_to_assembly_command(
-            hold_end_effector_pos, hold_yaw)
-        self.beetle.targetXyVelocity(
-            linear_vel=linear_vel,
-            hold_pos=assembly_hold,
-            hold_yaw=hold_yaw)
-
     def latch_end_effector_pose(self, position, yaw, settle_time=0.0):
         """Reset the position reference to the measured pose at a mode boundary."""
         self.send_assembly_command_from_end_effector(position, yaw)
         if settle_time > 0.0:
             rospy.sleep(settle_time)
 
-    def prepare_xy_velocity(self, position, yaw):
+    def prepare_xy_motion(self, position, yaw):
         """Latch the current pose and let a prior POS_VEL command expire."""
         prepared_pos = np.array(position, dtype=float)
         self.latch_end_effector_pose(
-            prepared_pos, yaw, settle_time=PUSH_VEL_MODE_ENTRY_SETTLE)
+            prepared_pos, yaw, settle_time=PUSH_POS_VEL_ENTRY_SETTLE)
         latest_pos = self.get_end_effector_position()
         if latest_pos is not None:
             prepared_pos = np.array(latest_pos, dtype=float)
         self.latch_end_effector_pose(prepared_pos, yaw)
         return prepared_pos
 
-    def stop_xy_velocity(self, hold_end_effector_pos, hold_yaw):
-        """Immediately stop integrating the XY velocity reference."""
-        try:
-            self.send_xy_velocity_from_end_effector(
-                hold_end_effector_pos, hold_yaw, [0.0, 0.0, 0.0])
-        except Exception as exc:
-            rospy.logerr("Failed to publish XY velocity stop: %s", exc)
-
-    def arm_xy_velocity_guard(self, hold_end_effector_pos, hold_yaw):
-        self._xy_velocity_guard = (
-            np.array(hold_end_effector_pos, dtype=float), hold_yaw)
+    def arm_xy_motion_guard(self, fallback_end_effector_pos, hold_yaw):
+        self._xy_motion_guard = (
+            np.array(fallback_end_effector_pos, dtype=float), hold_yaw)
 
     def hold_position_on_xy_exit(self, position):
-        self._xy_velocity_exit_hold = np.array(position, dtype=float)
+        self._xy_motion_exit_hold = np.array(position, dtype=float)
 
 
 class PushingInitializeState(PushingStateBase):
@@ -683,7 +665,7 @@ class ApproachWallUntilContactState(PushingStateBase):
                         'wall_face_distance'],
             output_keys=['contact_position', 'push_yaw'])
 
-    @stop_xy_velocity_on_exit
+    @hold_xy_position_on_exit
     def execute(self, userdata):
         rospy.loginfo("=== Approach Wall Until Contact State ===")
 
@@ -695,8 +677,8 @@ class ApproachWallUntilContactState(PushingStateBase):
         latest_pos = self.get_end_effector_position()
         if latest_pos is not None:
             start_pos = np.array(latest_pos, dtype=float)
-        start_pos = self.prepare_xy_velocity(start_pos, maintain_yaw)
-        self.arm_xy_velocity_guard(start_pos, maintain_yaw)
+        start_pos = self.prepare_xy_motion(start_pos, maintain_yaw)
+        self.arm_xy_motion_guard(start_pos, maintain_yaw)
 
         face_distance = getattr(userdata, 'wall_face_distance', float('nan'))
         latest_face_distance = self.wall_interface.distance_to_near_face(
@@ -741,8 +723,9 @@ class ApproachWallUntilContactState(PushingStateBase):
             if cmd_dist >= target_distance:
                 linear_vel = np.zeros(3)
 
-            self.send_xy_velocity_from_end_effector(
-                start_pos, maintain_yaw, linear_vel.tolist())
+            command_pos = start_pos + push_dir * cmd_dist
+            self.send_assembly_command_from_end_effector(
+                command_pos, maintain_yaw, linear_vel=linear_vel.tolist())
 
             actual_pos = self.get_end_effector_position()
             if actual_pos is None:
@@ -1364,7 +1347,7 @@ class RetreatFromWallState(PushingStateBase):
             outcomes=['succeeded', 'failed'],
             input_keys=['push_direction', 'push_yaw', 'push_end_position'])
 
-    @stop_xy_velocity_on_exit
+    @hold_xy_position_on_exit
     def execute(self, userdata):
         rospy.loginfo("=== Retreat From Wall State ===")
 
@@ -1379,11 +1362,11 @@ class RetreatFromWallState(PushingStateBase):
         if current_pos is None:
             current_pos = np.array(userdata.push_end_position, dtype=float)
 
-        start_pos = self.prepare_xy_velocity(current_pos, maintain_yaw)
-        self.arm_xy_velocity_guard(start_pos, maintain_yaw)
+        start_pos = self.prepare_xy_motion(current_pos, maintain_yaw)
+        self.arm_xy_motion_guard(start_pos, maintain_yaw)
         retreat_target = start_pos - push_dir * PUSH_RETREAT_DISTANCE
         rospy.loginfo(
-            "Retreating %.0fmm with XY VEL_MODE toward %s",
+            "Retreating %.0fmm with XY POS_VEL_MODE toward %s",
             PUSH_RETREAT_DISTANCE * 1000.0,
             FormationUtils.format_vec(retreat_target))
 
@@ -1410,8 +1393,9 @@ class RetreatFromWallState(PushingStateBase):
             linear_vel = -push_dir * retreat_speed
             if cmd_dist >= PUSH_RETREAT_DISTANCE:
                 linear_vel = np.zeros(3)
-            self.send_xy_velocity_from_end_effector(
-                start_pos, maintain_yaw, linear_vel.tolist())
+            command_pos = start_pos - push_dir * cmd_dist
+            self.send_assembly_command_from_end_effector(
+                command_pos, maintain_yaw, linear_vel=linear_vel.tolist())
 
             actual_pos = self.get_end_effector_position()
             if actual_pos is None:

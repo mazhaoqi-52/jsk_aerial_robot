@@ -85,6 +85,9 @@ PUSH_FULL_FORCE_HOLD_TIME = 10.0
 PUSH_FULL_FORCE_TRY_TIME = 10.0
 PUSH_POSITION_LEAD = 0.03
 PUSH_TARGET_VELOCITY = 0.05
+PUSH_VELOCITY_FORCE_GAIN = 0.0  # N/m; <= 0 derives the old blocked-object ramp rate
+PUSH_VELOCITY_ERROR_DEADBAND = 0.005  # m/s
+PUSH_VELOCITY_FILTER_TIME_CONSTANT = 0.15  # s
 PUSH_TARGET_MAX_LAG = 0.03
 PUSH_STALL_WINDOW_TIME = 2.0
 PUSH_STALL_MIN_ADVANCE = 0.02
@@ -191,6 +194,11 @@ class WallInterface(object):
         self.wall_torque = None
 
         self.position_received = threading.Event()
+        self.position_last_received_time = None
+        self.position_last_stamp = None
+        self.position_last_stamp_change_time = None
+        self.velocity_feedback_timeout = max(
+            0.0, float(rospy.get_param("~velocity_feedback_timeout", 0.5)))
         self.wrench_received = threading.Event()
 
         if self.is_simulation:
@@ -216,6 +224,7 @@ class WallInterface(object):
         ori = msg.pose.pose.orientation
         self.wall_pos = np.array([pos.x, pos.y, pos.z], dtype=float)
         self.wall_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
+        self._record_position_sample(msg.header)
         if not self.position_received.is_set():
             rospy.loginfo(
                 "Wall pose received: center=(%.3f, %.3f, %.3f), yaw=%.1f deg",
@@ -227,11 +236,30 @@ class WallInterface(object):
         ori = msg.pose.orientation
         self.wall_pos = np.array([pos.x, pos.y, pos.z], dtype=float)
         self.wall_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
+        self._record_position_sample(msg.header)
         if not self.position_received.is_set():
             rospy.loginfo(
                 "Wall pose received: center=(%.3f, %.3f, %.3f), yaw=%.1f deg",
                 pos.x, pos.y, pos.z, math.degrees(self.wall_yaw))
             self.position_received.set()
+
+    def _record_position_sample(self, header):
+        now = rospy.get_time()
+        self.position_last_received_time = now
+        stamp = header.stamp.to_sec() if header is not None else 0.0
+        if stamp <= 0.0 or stamp != self.position_last_stamp:
+            self.position_last_stamp = stamp
+            self.position_last_stamp_change_time = now
+
+    def is_wall_pose_fresh(self):
+        if (not self.use_wall_pose or self.position_last_received_time is None or
+                self.position_last_stamp_change_time is None):
+            return not self.use_wall_pose
+        now = rospy.get_time()
+        ages = (now - self.position_last_received_time,
+                now - self.position_last_stamp_change_time)
+        return all(math.isfinite(age) and 0.0 <= age <= self.velocity_feedback_timeout
+                   for age in ages)
 
     def _wrench_cb(self, msg):
         f = msg.wrench.force
@@ -901,6 +929,11 @@ class PushWithFeedforwardState(PushingStateBase):
                 maintain_force_ratio=PUSH_MAINTAIN_FORCE_RATIO,
                 stable_motion_distance=stable_motion_distance,
                 force_relief_rate=TOWING_UNLOAD_FORCE_RATE,
+                velocity_force_gain=(
+                    PUSH_VELOCITY_FORCE_GAIN
+                    if PUSH_VELOCITY_FORCE_GAIN > 0.0 else None),
+                velocity_error_deadband=PUSH_VELOCITY_ERROR_DEADBAND,
+                velocity_filter_time_constant=PUSH_VELOCITY_FILTER_TIME_CONSTANT,
                 stall_window_time=PUSH_STALL_WINDOW_TIME,
                 stall_min_advance=PUSH_STALL_MIN_ADVANCE,
                 stall_min_force_ratio=PUSH_STALL_MIN_FORCE_RATIO,
@@ -926,10 +959,14 @@ class PushWithFeedforwardState(PushingStateBase):
                 "advance -> static force test.",
                 PUSH_MOVE_DISTANCE, PUSH_TARGET_VELOCITY, push_deadline, PUSH_FORCE)
             rospy.loginfo(
-                "[Pushing] Breakaway relief waits for %.2fm stable wall motion; "
-                "maintain force %.0f%%, relief %.1fN/s",
-                stable_motion_distance, PUSH_MAINTAIN_FORCE_RATIO * 100.0,
-                TOWING_UNLOAD_FORCE_RATE)
+                "[Pushing] Post-breakaway velocity feedback: K=%.1fN/m, "
+                "deadband=%.1fmm/s, filter=%.2fs; keep up to %.0f%% contact floor until "
+                "%.2fm stable wall motion",
+                force_mgr.velocity_force_gain,
+                force_mgr.velocity_error_deadband * 1000.0,
+                force_mgr.velocity_filter_time_constant,
+                PUSH_MAINTAIN_FORCE_RATIO * 100.0,
+                stable_motion_distance)
             rospy.loginfo(
                 "[Pushing] Stall guard: %.1fs windows, %.0fmm min advance, "
                 "high force %.0f%%, %d windows, full-force try %.1fs",
@@ -1079,9 +1116,16 @@ class PushWithFeedforwardState(PushingStateBase):
                 return 'timeout'
 
             if dynamic_push:
-                # Mocap-feedback adaptive force: ramp up until breakaway, hold a
-                # maintain force after, abort if the wall stays stuck.
-                fres = force_mgr.update(advance, loop_dt)
+                # Ramp to breakaway, then adapt force from object-speed error;
+                # abort if the wall stays stuck.
+                measurement_valid = (
+                    wall_start_pos is None or
+                    self.wall_interface.is_wall_pose_fresh())
+                if not measurement_valid:
+                    rospy.logwarn_throttle(
+                        1.0, "[Pushing] Wall pose stale; holding adaptive force")
+                fres = force_mgr.update(
+                    advance, loop_dt, measurement_valid=measurement_valid)
                 ff_mag = fres['force']
                 if fres['abort']:
                     rospy.logwarn(
@@ -1145,6 +1189,7 @@ class PushWithFeedforwardState(PushingStateBase):
             diag_duration = push_deadline if dynamic_push else effective_duration
             phase_text = fres['phase'] if dynamic_push else 'static'
             advance_velocity = fres['advance_velocity'] if dynamic_push else 0.0
+            force_adjust_rate = fres['force_adjust_rate'] if dynamic_push else 0.0
             overspeed = fres['overspeed'] if dynamic_push else False
             wall_advance_text = "NA" if wall_advance is None else f"{wall_advance:.3f}m"
             full_force_hold = max(0.0, elapsed - ramp_time)
@@ -1160,7 +1205,9 @@ class PushWithFeedforwardState(PushingStateBase):
                 f"phase={phase_text} wall_adv={wall_advance_text} "
                 f"ee_adv={ee_advance:.3f}m target_lag={target_lag:.3f}m "
                 f"ee_lag_target={int(use_ee_lag_target)} "
-                f"adv_vel={advance_velocity:.3f}m/s overspeed={int(overspeed)} "
+                f"adv_vel={advance_velocity:.3f}m/s "
+                f"dff_cmd_dt={force_adjust_rate:.2f}N/s "
+                f"overspeed={int(overspeed)} "
                 f"max_rp={math.degrees(max_rp):.1f}deg z_err={z_error:.3f}m "
                 f"yaw_err={math.degrees(yaw_error):.1f}deg "
                 f"lat_err={lateral_error:.3f}m "
@@ -1387,6 +1434,8 @@ def _load_params():
     global PUSH_FORCE, PUSH_FORCE_RAMP_TIME, PUSH_FORCE_RAMP_RATE, PUSH_DURATION
     global PUSH_FULL_FORCE_HOLD_TIME, PUSH_FULL_FORCE_TRY_TIME
     global PUSH_POSITION_LEAD, PUSH_TARGET_VELOCITY, PUSH_TARGET_MAX_LAG
+    global PUSH_VELOCITY_FORCE_GAIN, PUSH_VELOCITY_ERROR_DEADBAND
+    global PUSH_VELOCITY_FILTER_TIME_CONSTANT
     global PUSH_TASK_WEIGHT_SCALE, PUSH_MAX_ROLL_PITCH, PUSH_FEEDFORWARD_BODY_X
     global PUSH_FORCE_HOLD_YAW_ERROR, PUSH_FORCE_RELIEF_YAW_ERROR
     global PUSH_FORCE_HOLD_LATERAL_ERROR, PUSH_FORCE_RELIEF_LATERAL_ERROR
@@ -1425,6 +1474,16 @@ def _load_params():
     PUSH_POSITION_LEAD = float(rospy.get_param("~push_position_lead", PUSH_POSITION_LEAD))
     PUSH_TARGET_VELOCITY = max(
         0.001, float(rospy.get_param("~push_target_velocity", PUSH_TARGET_VELOCITY)))
+    PUSH_VELOCITY_FORCE_GAIN = max(
+        0.0, float(rospy.get_param(
+            "~velocity_force_gain", PUSH_VELOCITY_FORCE_GAIN)))
+    PUSH_VELOCITY_ERROR_DEADBAND = max(
+        0.0, float(rospy.get_param(
+            "~velocity_error_deadband", PUSH_VELOCITY_ERROR_DEADBAND)))
+    PUSH_VELOCITY_FILTER_TIME_CONSTANT = max(
+        0.0, float(rospy.get_param(
+            "~velocity_filter_time_constant",
+            PUSH_VELOCITY_FILTER_TIME_CONSTANT)))
     PUSH_TARGET_MAX_LAG = max(
         0.0, float(rospy.get_param("~push_target_max_lag", PUSH_TARGET_MAX_LAG)))
     PUSH_TASK_WEIGHT_SCALE = float(rospy.get_param("~push_task_weight_scale", PUSH_TASK_WEIGHT_SCALE))
@@ -1487,12 +1546,17 @@ def main():
     rospy.loginfo(
         "Push: force=%.2fN, ramp=%.1fs (min %.1fs, rate %.1fN/s), "
         "duration=%.1fs, full_force_hold=%.1fs, full_force_try=%.1fs, "
-        "lead=%.0fmm, target_vel=%.0fmm/s, body_x=%s",
+        "lead=%.0fmm, target_vel=%.0fmm/s, velocity_gain=%s, "
+        "velocity_deadband=%.1fmm/s, body_x=%s",
         PUSH_FORCE, _effective_push_ramp_time(), PUSH_FORCE_RAMP_TIME,
         PUSH_FORCE_RAMP_RATE, PUSH_DURATION,
         PUSH_FULL_FORCE_HOLD_TIME, PUSH_FULL_FORCE_TRY_TIME,
         PUSH_POSITION_LEAD * 1000.0,
-        PUSH_TARGET_VELOCITY * 1000.0, PUSH_FEEDFORWARD_BODY_X)
+        PUSH_TARGET_VELOCITY * 1000.0,
+        (f"{PUSH_VELOCITY_FORCE_GAIN:.2f}N/m"
+         if PUSH_VELOCITY_FORCE_GAIN > 0.0 else "auto"),
+        PUSH_VELOCITY_ERROR_DEADBAND * 1000.0,
+        PUSH_FEEDFORWARD_BODY_X)
     rospy.loginfo(
         "Force guard: hold rp %.1fdeg/z %.2fm/yaw %.1fdeg/lat %.2fm, "
         "relief rp %.1fdeg/z %.2fm/yaw %.1fdeg/lat %.2fm, relief %.1fN/s",

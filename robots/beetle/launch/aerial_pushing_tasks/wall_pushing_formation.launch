@@ -122,6 +122,14 @@
        doc="Small position lead into the wall to maintain contact (m)"/>
   <arg name="push_target_velocity" default="0.05"
        doc="Dynamic push: towing-like target advance speed after contact (m/s)"/>
+  <arg name="velocity_force_gain" default="0.0"
+       doc="Dynamic push incremental velocity-error force gain (N/m); 0 derives the pre-breakaway ramp rate divided by target velocity; task force-rate caps still apply"/>
+  <arg name="velocity_error_deadband" default="0.005"
+       doc="Dynamic push speed-error deadband for feedforward adaptation (m/s)"/>
+  <arg name="velocity_filter_time_constant" default="0.15"
+       doc="Dynamic push first-order object-speed filter time constant (s); 0 disables filtering"/>
+  <arg name="velocity_feedback_timeout" default="0.5"
+       doc="Hold dynamic force adaptation when wall pose samples are older than this (s)"/>
   <arg name="push_target_max_lag" default="0.03"
        doc="Dynamic push: maximum push-axis lag from the current contact point to the position target (m)"/>
   <arg name="push_body_x_feedforward" default="true"
@@ -177,6 +185,10 @@
     <param name="force_guard_lateral_relief" value="$(arg force_guard_lateral_relief)"/>
     <param name="push_position_lead"       value="$(arg push_position_lead)"/>
     <param name="push_target_velocity"     value="$(arg push_target_velocity)"/>
+    <param name="velocity_force_gain"      value="$(arg velocity_force_gain)"/>
+    <param name="velocity_error_deadband"  value="$(arg velocity_error_deadband)"/>
+    <param name="velocity_filter_time_constant" value="$(arg velocity_filter_time_constant)"/>
+    <param name="velocity_feedback_timeout" value="$(arg velocity_feedback_timeout)"/>
     <param name="push_target_max_lag"      value="$(arg push_target_max_lag)"/>
     <param name="push_body_x_feedforward"  value="$(arg push_body_x_feedforward)"/>
     <param name="push_end_effector_offset_x" value="$(arg push_end_effector_offset_x)"/>

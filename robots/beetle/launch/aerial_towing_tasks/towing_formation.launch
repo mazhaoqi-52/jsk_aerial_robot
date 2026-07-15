@@ -47,7 +47,7 @@
   <arg name="stall_min_force_ratio" default="1.0"
        doc="Arm no-breakaway stall detection after this fraction of towing_force"/>
   <arg name="breakaway_relief_min_distance" default="0.05"
-       doc="Load travel before breakaway force relief starts (m)"/>
+       doc="Load travel before post-breakaway velocity feedback starts (m)"/>
   <arg name="breakaway_force_floor_ratio" default="0.60"
        doc="Temporary floor as a ratio of the force when load motion starts"/>
   <arg name="stable_rolling_distance" default="0.25"
@@ -55,7 +55,15 @@
   <arg name="stable_rolling_force_floor_ratio" default="0.85"
        doc="Temporary force floor as a ratio of breakaway force before stable rolling"/>
   <arg name="overspeed_force_relief_time" default="10.0"
-       doc="Time constant for velocity-error towing force relief (s)"/>
+       doc="Time constant that sets the maximum velocity-error towing force relief rate (s)"/>
+  <arg name="velocity_force_gain" default="0.0"
+       doc="Incremental velocity-error force gain (N/m); 0 maps a stopped load to the pre-breakaway recovery-rate limit; task force-rate caps still apply"/>
+  <arg name="velocity_error_deadband" default="0.005"
+       doc="Towing speed-error deadband for feedforward adaptation (m/s)"/>
+  <arg name="velocity_filter_time_constant" default="0.15"
+       doc="Towing first-order load-speed filter time constant (s); 0 disables filtering"/>
+  <arg name="velocity_feedback_timeout" default="0.5"
+       doc="Hold towing force adaptation when load pose samples are older than this (s)"/>
   <arg name="unload_contact_lead" default="0.03"
        doc="EE lead along towing direction while unloading feedforward (m)"/>
   <arg name="unload_force_rate" default="3.0"
@@ -81,6 +89,10 @@
     <param name="stable_rolling_distance" value="$(arg stable_rolling_distance)"/>
     <param name="stable_rolling_force_floor_ratio" value="$(arg stable_rolling_force_floor_ratio)"/>
     <param name="overspeed_force_relief_time" value="$(arg overspeed_force_relief_time)"/>
+    <param name="velocity_force_gain" value="$(arg velocity_force_gain)"/>
+    <param name="velocity_error_deadband" value="$(arg velocity_error_deadband)"/>
+    <param name="velocity_filter_time_constant" value="$(arg velocity_filter_time_constant)"/>
+    <param name="velocity_feedback_timeout" value="$(arg velocity_feedback_timeout)"/>
     <param name="unload_contact_lead" value="$(arg unload_contact_lead)"/>
     <param name="unload_force_rate" value="$(arg unload_force_rate)"/>
     <param name="unload_max_duration" value="$(arg unload_max_duration)"/>

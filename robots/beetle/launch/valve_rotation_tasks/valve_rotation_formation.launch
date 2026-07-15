@@ -43,8 +43,10 @@
   <param name="controller/valve_rotation_feedforward/contact_torque_ramp" value="0.1"/>
   <param name="controller/valve_rotation_feedforward/torque_adjust_roll_k" value="0.01"/>
   <param name="controller/valve_rotation_feedforward/torque_adjust_yaw_k" value="1.0"/>
+  <param name="controller/valve_rotation_feedforward/torque_adjust_yaw_rate_limit" value="0.3"/>
   <param name="controller/valve_rotation_feedforward/roll_moment_thresh" value="0.2"/>
   <param name="controller/valve_rotation_feedforward/yaw_velocity_thresh" value="0.05"/>
+  <param name="controller/valve_rotation_feedforward/yaw_velocity_timeout" value="0.2"/>
 
   ###########  Demo  ###########
   <node name="formation_valve_rotation" pkg="beetle" type="valve_rotation_formation_clean.py"

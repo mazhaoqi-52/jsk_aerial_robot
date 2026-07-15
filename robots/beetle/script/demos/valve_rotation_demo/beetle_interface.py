@@ -13,7 +13,7 @@ from std_msgs.msg import Empty, UInt8, Float32MultiArray
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from nav_msgs.msg import Odometry
 from aerial_robot_msgs.msg import FlightNav, PoseControlPid
-from tf.transformations import euler_from_quaternion
+from tf.transformations import euler_from_quaternion, quaternion_matrix
 from sensor_msgs.msg import Joy
 
 # script/demos on the path so the shared demo helpers import regardless of how
@@ -82,6 +82,10 @@ class BeetleInterface(object):
         # State variables
         self.uav_odom = Odometry()
         self.assembly_odom = Odometry()
+        self.cog_odom = Odometry()
+        self.cog_odom_received_time = None
+        self.cog_odom_source_stamp = None
+        self.cog_odom_source_advanced_time = None
         self.valve_pose = None
         self.flight_state = self.ARM_OFF_STATE
         self.target_pos = np.array([0, 0, 0])
@@ -190,6 +194,12 @@ class BeetleInterface(object):
         else:
             rospy.Subscriber(f'/beetle{module_id}/mocap/pose', PoseStamped, self._uav_cb, queue_size=1)
 
+        # Dragon's valve feedback uses the estimator's CoG angular velocity.
+        # Keep it separate from /assemble/cog/odom, whose publisher currently
+        # contains pose only and therefore cannot be used as a velocity source.
+        rospy.Subscriber(f'/beetle{module_id}/uav/cog/odom', Odometry,
+                         self._cog_odom_cb, queue_size=1)
+
         rospy.Subscriber(f'/beetle{module_id}/estimated_external_wrench', WrenchStamped, self._wrench_cb, queue_size=1)
         pid_topic = '/assemble/debug/pose/pid' if assembly_mode else f'/beetle{module_id}/debug/pose/pid'
         rospy.Subscriber(pid_topic, PoseControlPid, self._control_pid_cb, queue_size=1)
@@ -213,6 +223,16 @@ class BeetleInterface(object):
 
     def _assembly_cb(self, msg):
         self.assembly_odom = msg
+
+    def _cog_odom_cb(self, msg):
+        self.cog_odom = msg
+        now = rospy.get_time()
+        self.cog_odom_received_time = now
+        source_stamp = msg.header.stamp.to_sec()
+        if (source_stamp > 0.0 and
+                source_stamp != self.cog_odom_source_stamp):
+            self.cog_odom_source_stamp = source_stamp
+            self.cog_odom_source_advanced_time = now
 
     def _valve_cb(self, msg):
         self.valve_pose = msg.pose
@@ -300,6 +320,39 @@ class BeetleInterface(object):
         odom = self.assembly_odom if self.assembly_mode else self.uav_odom
         w = odom.twist.twist.angular
         return np.array([w.x, w.y, w.z])
+
+    def getFreshCogAngularVelWorld(self, max_age=0.2):
+        """Return leader CoG angular velocity in world coordinates, if fresh.
+
+        The estimator reports angular velocity in the CoG/body frame. The odom
+        orientation rotates it into world coordinates. Local receive age and
+        advancement of the source stamp are both checked, avoiding a dependency
+        on synchronized host clocks. ``None`` distinguishes missing/stale
+        feedback from a valid zero angular velocity.
+        """
+        if self.cog_odom_received_time is None:
+            return None
+        now = rospy.get_time()
+        receive_age = now - self.cog_odom_received_time
+        timeout = max(0.0, float(max_age))
+        if (self.cog_odom_source_advanced_time is None or
+                not all(math.isfinite(age) and 0.0 <= age <= timeout
+                        for age in (
+                            receive_age,
+                            now - self.cog_odom_source_advanced_time))):
+            return None
+
+        w = self.cog_odom.twist.twist.angular
+        omega_body = np.array([w.x, w.y, w.z], dtype=float)
+        q = self.cog_odom.pose.pose.orientation
+        quat = np.array([q.x, q.y, q.z, q.w], dtype=float)
+        if not np.all(np.isfinite(omega_body)) or not np.all(np.isfinite(quat)):
+            return None
+        quat_norm = np.linalg.norm(quat)
+        if quat_norm < 1e-6:
+            return None
+        quat /= quat_norm
+        return np.dot(quaternion_matrix(quat)[:3, :3], omega_body)
 
     def getControlPid(self):
         return self.control_pid

@@ -30,6 +30,7 @@ from valve_rotation_formation_clean import (
     FormationUtils,
 )
 from beetle_interface import smoothstep01
+from demo_common import low_pass_update, velocity_error_adjustment
 
 
 # ============== Load Box Parameters (measured actual box) ==============
@@ -114,13 +115,11 @@ TOWING_FORCE_HOLD_Z_ERROR = 0.15
 TOWING_FORCE_RELIEF_Z_ERROR = 0.22
 TOWING_BREAKAWAY_RECOVERY_DELAY = 5.0
 TOWING_BREAKAWAY_FORCE_HOLD_TIME = 0.8
-TOWING_BREAKAWAY_FORCE_RELIEF_RATE = 3.0
 TOWING_BREAKAWAY_RELIEF_MIN_DISTANCE = 0.05
 TOWING_BREAKAWAY_FORCE_FLOOR_RATIO = 0.60
 TOWING_STABLE_ROLLING_DISTANCE = 0.25
 TOWING_STABLE_ROLLING_FORCE_FLOOR_RATIO = 0.85
 TOWING_OVERSPEED_FORCE_RELIEF_TIME = 10.0
-TOWING_FORCE_RELIEF_FLOOR_RATIO = 0.25
 TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
 TOWING_BREAKAWAY_STABLE_Z_ERROR = 0.05
 TOWING_TASK_COOLDOWN_SCALE = 0.60
@@ -216,8 +215,9 @@ class LinearTowingTrajectoryGenerator:
         self.current_force = 0.0
         self.force_ramp_progress = 0.0
         self.breakaway_detected = False
-        self.breakaway_relief_applied = False
-        self.breakaway_relief_target = None
+        self.velocity_feedback_enabled = False
+        self.velocity_feedback_distance_reached = False
+        self.motion_measurement_was_invalid = False
         self.breakaway_time = None
         self.breakaway_reason = None
         self.breakaway_force = None
@@ -226,13 +226,11 @@ class LinearTowingTrajectoryGenerator:
         self.breakaway_candidate_force = None
         self.stable_rolling_detected = False
         self.stable_rolling_time = None
-        self.breakaway_force_ratio = 0.65
-        self.overspeed_breakaway_force_ratio = 0.35
-        self.continue_force_floor_ratio = 0.35
-        self.overspeed_force_floor_ratio = 0.10
         self.force_recover_rate = self.max_force / TOWING_FORCE_RAMP_TIME
         self.instability_force_relief_rate = self.max_force / 8.0
-        self.breakaway_relief_min_distance = max(
+        # Keep the historical ROS parameter name for launch compatibility; it
+        # now gates the start of post-breakaway velocity feedback.
+        self.velocity_feedback_min_distance = max(
             0.0, float(rospy.get_param(
                 "~breakaway_relief_min_distance",
                 TOWING_BREAKAWAY_RELIEF_MIN_DISTANCE)))
@@ -241,7 +239,7 @@ class LinearTowingTrajectoryGenerator:
                 "~breakaway_force_floor_ratio",
                 TOWING_BREAKAWAY_FORCE_FLOOR_RATIO))))
         self.stable_rolling_distance = max(
-            self.breakaway_relief_min_distance,
+            self.velocity_feedback_min_distance,
             float(rospy.get_param(
                 "~stable_rolling_distance",
                 TOWING_STABLE_ROLLING_DISTANCE)))
@@ -254,14 +252,30 @@ class LinearTowingTrajectoryGenerator:
                 "~overspeed_force_relief_time",
                 TOWING_OVERSPEED_FORCE_RELIEF_TIME)))
         self.overspeed_force_relief_rate = self.max_force / overspeed_force_relief_time
-        self.velocity_force_gain = self.max_force / max(
-            self.target_velocity * overspeed_force_relief_time, 1e-3)
+        self.velocity_error_deadband = max(
+            0.0, float(rospy.get_param("~velocity_error_deadband", 0.005)))
+        # Choose the automatic gain so only a genuinely stopped load reaches
+        # the positive rate cap; ordinary speed errors remain proportional.
+        auto_velocity_force_gain = self.force_recover_rate / max(
+            self.target_velocity - self.velocity_error_deadband, 1e-3)
+        requested_velocity_force_gain = float(rospy.get_param(
+            "~velocity_force_gain", 0.0))
+        self.velocity_force_gain = (
+            requested_velocity_force_gain
+            if requested_velocity_force_gain > 0.0
+            else auto_velocity_force_gain)
+        self.velocity_filter_time_constant = max(
+            0.0, float(rospy.get_param(
+                "~velocity_filter_time_constant", 0.15)))
+        self.velocity_error = self.target_velocity
+        self.force_adjust_rate = 0.0
         self.severe_overspeed_ratio = 2.0
         self.breakaway_distance = 0.05  # 50mm load motion confirms contact release
         self.breakaway_velocity = self.target_velocity * 0.2
         self.early_breakaway_distance = 0.008
         self.early_breakaway_velocity = self.target_velocity * 0.6
         self.last_motion_distance = 0.0
+        self.raw_motion_velocity = 0.0
         self.motion_velocity = 0.0
         self.force_guard_state = "nominal"
         self.task_weight_scale = 1.0
@@ -289,11 +303,14 @@ class LinearTowingTrajectoryGenerator:
                      f"stall_gate={self.stall_min_force:.1f}N "
                      f"({self.stall_min_force_ratio:.2f}x), "
                      f"stall={self.stall_timeout_count}x{self.stall_window_time:.1f}s, "
-                     f"relief_dist={self.breakaway_relief_min_distance*1000:.0f}mm, "
+                     f"feedback_dist={self.velocity_feedback_min_distance*1000:.0f}mm, "
                      f"floor={self.breakaway_force_floor_ratio:.2f}x, "
                      f"stable_roll={self.stable_rolling_distance*1000:.0f}mm/"
                      f"{self.stable_rolling_force_floor_ratio:.2f}x, "
-                     f"speed_relief={self.overspeed_force_relief_rate:.1f}N/s")
+                     f"velocity_gain={self.velocity_force_gain:.1f}N/m, "
+                     f"deadband={self.velocity_error_deadband*1000:.1f}mm/s, "
+                     f"filter={self.velocity_filter_time_constant:.2f}s, "
+                     f"speed_relief_limit={self.overspeed_force_relief_rate:.1f}N/s")
 
     def _update_force_guard(self, attitude_rp=None, z_error=0.0, current_time=None,
                             overspeed=False, severe_overspeed=False, dt=0.0):
@@ -355,7 +372,8 @@ class LinearTowingTrajectoryGenerator:
     def get_task_wrench_weights(self, force_body=None):
         return build_towing_task_wrench_weights(force_body, self.task_weight_scale)
 
-    def update_state(self, current_pos, load_pos=None, attitude_rp=None, z_error=0.0):
+    def update_state(self, current_pos, load_pos=None, attitude_rp=None,
+                     z_error=0.0, load_measurement_valid=True):
         """
         Update trajectory state based on current position and load position.
 
@@ -364,6 +382,7 @@ class LinearTowingTrajectoryGenerator:
             load_pos: Current load position (optional, for progress tracking)
             attitude_rp: Current formation roll/pitch tuple for force guarding
             z_error: Current towing target Z error for force guarding
+            load_measurement_valid: whether the tracked load pose is fresh.
 
         Returns:
             dict: Updated state info
@@ -372,8 +391,11 @@ class LinearTowingTrajectoryGenerator:
         actual_dt = current_time - self.last_update_time
         self.last_update_time = current_time
 
-        # Limit time step
-        safe_dt = max(0.0, min(actual_dt, 0.1))
+        # Use the full elapsed time for velocity measurement, but cap only the
+        # control integration step so a delayed loop cannot make a large wrench
+        # jump or falsely multiply the measured speed.
+        measurement_dt = max(actual_dt, 1e-3)
+        control_dt = min(measurement_dt, 0.1)
 
         # Calculate current end-effector distance traveled
         displacement = np.array(current_pos) - self.start_pos
@@ -392,37 +414,62 @@ class LinearTowingTrajectoryGenerator:
 
         # Prefer load displacement for progress/completion when available.
         motion_distance = self.current_load_distance if self.load_start_pos is not None else self.current_distance
+        motion_measurement_valid = (
+            self.load_start_pos is None or bool(load_measurement_valid))
+        relocking_measurement = (
+            motion_measurement_valid and self.motion_measurement_was_invalid)
         motion_delta = motion_distance - self.last_motion_distance
-        self.motion_velocity = motion_delta / max(safe_dt, 1e-3)
+        if motion_measurement_valid and not relocking_measurement:
+            self.raw_motion_velocity = motion_delta / measurement_dt
+            self.motion_velocity = low_pass_update(
+                self.motion_velocity, self.raw_motion_velocity, measurement_dt,
+                self.velocity_filter_time_constant)
+        elif relocking_measurement:
+            # Re-lock the position baseline after a telemetry gap; accumulated
+            # displacement has no one-cycle velocity interpretation.
+            self.raw_motion_velocity = 0.0
         self.last_motion_distance = motion_distance
+        self.motion_measurement_was_invalid = not motion_measurement_valid
+
+        # Velocity reference shared by the trajectory and the force loop. Near
+        # the goal this intentionally slows both, avoiding a force controller
+        # that fights the trajectory's ramp-down profile.
+        remaining_distance = self.target_distance - motion_distance
+        if motion_distance < self.ramp_up_distance:
+            velocity_factor = motion_distance / self.ramp_up_distance
+            self.current_velocity = self.target_velocity * max(0.2, velocity_factor)
+        elif remaining_distance < self.ramp_down_distance:
+            velocity_factor = remaining_distance / self.ramp_down_distance
+            self.current_velocity = self.target_velocity * max(0.1, velocity_factor)
+        else:
+            self.current_velocity = self.target_velocity
+
         low_speed = self.target_velocity * 0.6
         high_speed = self.target_velocity * 1.3
-        overspeed = self.motion_velocity > high_speed
-        severe_overspeed = self.motion_velocity > self.target_velocity * self.severe_overspeed_ratio
-        overspeed_relief_rate = 0.0
-        if overspeed:
-            speed_error = max(0.0, self.motion_velocity - self.target_velocity)
-            overspeed_relief_rate = min(
-                self.overspeed_force_relief_rate,
-                self.velocity_force_gain * speed_error)
-        attitude_relief_requested = False
-        if attitude_rp is not None:
-            max_rp = max(abs(float(attitude_rp[0])), abs(float(attitude_rp[1])))
-            attitude_relief_requested = max_rp > TOWING_FORCE_RELIEF_ATTITUDE
-        z_error_value = float(z_error) if z_error is not None else 0.0
-        if not math.isfinite(z_error_value):
-            z_error_value = 0.0
-        attitude_relief_requested = (
-            attitude_relief_requested or
-            abs(z_error_value) > TOWING_FORCE_RELIEF_Z_ERROR)
-
-        if not self.breakaway_detected and self.load_start_pos is not None:
+        velocity_sample_usable = motion_measurement_valid and not relocking_measurement
+        overspeed = velocity_sample_usable and self.motion_velocity > high_speed
+        severe_overspeed = velocity_sample_usable and max(
+            self.motion_velocity,
+            self.raw_motion_velocity) > self.target_velocity * self.severe_overspeed_ratio
+        self.velocity_error = self.current_velocity - self.motion_velocity
+        force_adjustment = 0.0
+        if velocity_sample_usable:
+            force_adjustment = velocity_error_adjustment(
+                self.current_velocity, self.motion_velocity,
+                self.velocity_force_gain, control_dt,
+                self.velocity_error_deadband)
+        self.force_adjust_rate = force_adjustment / max(control_dt, 1e-3)
+        self.force_adjust_rate = min(
+            self.force_recover_rate,
+            max(-self.overspeed_force_relief_rate, self.force_adjust_rate))
+        if (velocity_sample_usable and not self.breakaway_detected and
+                self.load_start_pos is not None):
             confirmed_motion = (
                 motion_distance >= self.breakaway_distance and
-                self.motion_velocity >= self.breakaway_velocity)
+                self.raw_motion_velocity >= self.breakaway_velocity)
             early_motion = (
                 motion_distance >= self.early_breakaway_distance and
-                self.motion_velocity >= self.early_breakaway_velocity)
+                self.raw_motion_velocity >= self.early_breakaway_velocity)
             if confirmed_motion:
                 self.breakaway_detected = True
                 self.breakaway_time = current_time
@@ -432,7 +479,7 @@ class LinearTowingTrajectoryGenerator:
                              f"dist={motion_distance*1000:.0f}mm, "
                              f"vel={self.motion_velocity*1000:.0f}mm/s, "
                              f"ff={self.current_force:.1f}N, "
-                             f"relief_min={self.breakaway_relief_min_distance*1000:.0f}mm")
+                             f"feedback_min={self.velocity_feedback_min_distance*1000:.0f}mm")
             elif early_motion and not self.breakaway_candidate_detected:
                 self.breakaway_candidate_detected = True
                 self.breakaway_candidate_time = current_time
@@ -442,9 +489,10 @@ class LinearTowingTrajectoryGenerator:
                              f"vel={self.motion_velocity*1000:.0f}mm/s, "
                              f"ff={self.current_force:.1f}N, "
                              f"waiting for {self.breakaway_distance*1000:.0f}mm confirmed travel")
-        elif self.breakaway_detected and not self.stable_rolling_detected:
+        elif (velocity_sample_usable and self.breakaway_detected and
+              not self.stable_rolling_detected):
             if (motion_distance >= self.stable_rolling_distance and
-                    self.motion_velocity >= low_speed):
+                    self.raw_motion_velocity >= low_speed):
                 self.stable_rolling_detected = True
                 self.stable_rolling_time = current_time
                 rospy.loginfo(f"[Towing] Stable rolling confirmed: "
@@ -452,23 +500,8 @@ class LinearTowingTrajectoryGenerator:
                              f"vel={self.motion_velocity*1000:.0f}mm/s, "
                              f"ff={self.current_force:.1f}N")
 
-        # Velocity profile with ramp-up and ramp-down
-        remaining_distance = self.target_distance - motion_distance
-
-        if motion_distance < self.ramp_up_distance:
-            # Ramp up phase
-            velocity_factor = motion_distance / self.ramp_up_distance
-            self.current_velocity = self.target_velocity * max(0.2, velocity_factor)
-        elif remaining_distance < self.ramp_down_distance:
-            # Ramp down phase
-            velocity_factor = remaining_distance / self.ramp_down_distance
-            self.current_velocity = self.target_velocity * max(0.1, velocity_factor)
-        else:
-            # Constant velocity phase
-            self.current_velocity = self.target_velocity
-
         # Update target position
-        target_distance_increment = self.current_velocity * safe_dt
+        target_distance_increment = self.current_velocity * control_dt
         new_target_distance = min(
             self.target_distance,
             np.dot(self.target_pos[:2] - self.start_pos[:2], self.towing_direction[:2]) + target_distance_increment
@@ -501,12 +534,15 @@ class LinearTowingTrajectoryGenerator:
 
         guard_state = self._update_force_guard(
             attitude_rp, z_error, current_time,
-            overspeed=overspeed, severe_overspeed=severe_overspeed, dt=safe_dt)
+            overspeed=overspeed, severe_overspeed=severe_overspeed, dt=control_dt)
 
-        relief_distance_ready = (
-            self.breakaway_detected and
-            motion_distance >= self.breakaway_relief_min_distance)
-        speed_relief_allowed = self.breakaway_relief_applied
+        feedback_distance_ready = (
+            velocity_sample_usable and self.breakaway_detected and
+            motion_distance >= self.velocity_feedback_min_distance)
+        if feedback_distance_ready:
+            # Latch travel progress: elastic recoil during the hold interval
+            # must not leave the post-breakaway controller disabled forever.
+            self.velocity_feedback_distance_reached = True
         breakaway_floor_force = 0.0
         if self.breakaway_force is not None:
             breakaway_floor_force = self.breakaway_force * self.breakaway_force_floor_ratio
@@ -516,46 +552,32 @@ class LinearTowingTrajectoryGenerator:
                 self.breakaway_force * self.stable_rolling_force_floor_ratio)
         initial_breakaway_phase = (
             self.breakaway_detected and
-            motion_distance < self.breakaway_relief_min_distance + self.breakaway_distance)
-        guard_relief_rate = self.instability_force_relief_rate
-        if overspeed:
-            if speed_relief_allowed:
-                guard_relief_rate = overspeed_relief_rate
-            elif attitude_relief_requested:
-                guard_relief_rate = self.instability_force_relief_rate
-            else:
-                guard_relief_rate = 0.0
+            motion_distance < self.velocity_feedback_min_distance + self.breakaway_distance)
+        feedback_delay_ready = (
+            self.breakaway_time is not None and
+            current_time - self.breakaway_time >= TOWING_BREAKAWAY_FORCE_HOLD_TIME)
+        if (not self.velocity_feedback_enabled and
+                velocity_sample_usable and
+                self.velocity_feedback_distance_reached and
+                feedback_delay_ready):
+            self.velocity_feedback_enabled = True
+            rospy.loginfo(
+                f"[Towing] Velocity feedback enabled ({self.breakaway_reason}): "
+                f"dist={motion_distance*1000:.0f}mm, "
+                f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                f"ff={self.current_force:.1f}N, "
+                f"K={self.velocity_force_gain:.1f}N/m")
 
-        if (self.breakaway_detected and not self.breakaway_relief_applied and
-                relief_distance_ready):
-            prev_force = self.current_force
-            relief_ratio = (self.overspeed_breakaway_force_ratio if overspeed
-                            else self.breakaway_force_ratio)
-            floor_ratio = (self.overspeed_force_floor_ratio if overspeed
-                           else (TOWING_FORCE_RELIEF_FLOOR_RATIO
-                                 if guard_state == "cooldown"
-                                 else self.continue_force_floor_ratio))
-            floor_force = min(
-                prev_force,
-                max(self.max_force * floor_ratio,
-                    breakaway_floor_force,
-                    rolling_floor_force))
-            self.breakaway_relief_target = max(prev_force * relief_ratio,
-                                               floor_force)
-            self.breakaway_relief_applied = True
-            speed_relief_allowed = True
-            rospy.loginfo(f"[Towing] Breakaway relief enabled ({self.breakaway_reason}): "
-                         f"dist={motion_distance*1000:.0f}mm, "
-                         f"vel={self.motion_velocity*1000:.0f}mm/s, "
-                         f"ff {prev_force:.1f}N -> {self.breakaway_relief_target:.1f}N "
-                         f"(smooth)")
-        elif not self.breakaway_detected:
+        force_before_adjustment = self.current_force
+        if not self.breakaway_detected:
             if guard_state == "relief":
                 self.current_force = max(
-                    0.0, self.current_force - self.instability_force_relief_rate * safe_dt)
+                    0.0, self.current_force - self.instability_force_relief_rate * control_dt)
+            elif not velocity_sample_usable:
+                pass
             elif guard_state == "hold":
                 self.current_force = max(
-                    0.0, self.current_force - self.force_recover_rate * safe_dt)
+                    0.0, self.current_force - self.force_recover_rate * control_dt)
             elif guard_state == "nominal":
                 ramp_time = TOWING_FORCE_RAMP_TIME
                 self.force_ramp_progress = min(
@@ -563,53 +585,40 @@ class LinearTowingTrajectoryGenerator:
                 ramp_force = self.max_force * smoothstep01(self.force_ramp_progress)
                 if self.current_force < ramp_force:
                     self.current_force = min(
-                        ramp_force, self.current_force + self.force_recover_rate * safe_dt)
+                        ramp_force, self.current_force + self.force_recover_rate * control_dt)
                 else:
                     self.current_force = ramp_force
         else:
-            if (self.breakaway_relief_target is not None and
-                    current_time - self.breakaway_time >= TOWING_BREAKAWAY_FORCE_HOLD_TIME):
-                self.current_force = max(
-                    self.breakaway_relief_target,
-                    self.current_force - TOWING_BREAKAWAY_FORCE_RELIEF_RATE * safe_dt)
-                if self.current_force <= self.breakaway_relief_target + 1e-3:
-                    self.breakaway_relief_target = None
-            elif self.breakaway_relief_target is not None:
-                if guard_state == "relief":
-                    self.current_force -= guard_relief_rate * safe_dt
-                elif overspeed and speed_relief_allowed:
-                    self.current_force -= overspeed_relief_rate * safe_dt
-            elif guard_state == "relief":
-                self.current_force -= guard_relief_rate * safe_dt
-            elif guard_state == "cooldown":
-                if overspeed and speed_relief_allowed:
-                    self.current_force -= overspeed_relief_rate * safe_dt
-                elif self.motion_velocity < low_speed:
-                    self.current_force += self.force_recover_rate * safe_dt
-            elif guard_state != "nominal":
-                if overspeed and speed_relief_allowed:
-                    self.current_force -= overspeed_relief_rate * safe_dt
-            elif self.motion_velocity < low_speed:
-                self.current_force += self.force_recover_rate * safe_dt
-            elif overspeed and speed_relief_allowed:
-                self.current_force -= overspeed_relief_rate * safe_dt
-            floor_ratio = (self.overspeed_force_floor_ratio if overspeed
-                           else (TOWING_FORCE_RELIEF_FLOOR_RATIO
-                                 if guard_state in ("relief", "cooldown")
-                                 else self.continue_force_floor_ratio))
-            if guard_state == "nominal" and self.motion_velocity < low_speed:
-                force_floor = self.max_force * floor_ratio
-                if self.current_force < force_floor:
-                    self.current_force = min(
-                        force_floor, self.current_force + self.force_recover_rate * safe_dt)
-            if initial_breakaway_phase and not attitude_relief_requested:
+            if guard_state == "relief":
+                # Safety relief remains independent of the object-speed loop.
+                self.current_force -= self.instability_force_relief_rate * control_dt
+            elif not velocity_sample_usable:
+                pass
+            elif not self.velocity_feedback_enabled:
+                # During the post-breakaway hold, retain the force on low
+                # speed but still permit proportional overspeed relief.
+                if self.force_adjust_rate < 0.0:
+                    self.current_force += self.force_adjust_rate * control_dt
+            elif guard_state == "hold":
+                # A hold guard may unload, but must not raise feedforward force.
+                if self.force_adjust_rate < 0.0:
+                    self.current_force += self.force_adjust_rate * control_dt
+            else:
+                self.current_force += self.force_adjust_rate * control_dt
+
+            contact_floor = 0.0
+            if initial_breakaway_phase:
+                contact_floor = max(contact_floor, breakaway_floor_force)
+            if rolling_floor_force > 0.0:
+                contact_floor = max(contact_floor, rolling_floor_force)
+            # Preserve a floor only while force was already above it. A safety
+            # guard or goal taper that unloaded below the floor must recover via
+            # the rate-limited velocity loop, never through a one-cycle jump.
+            if (guard_state != "relief" and contact_floor > 0.0 and
+                    force_before_adjustment >= contact_floor):
                 self.current_force = max(
                     self.current_force,
-                    min(self.max_force, breakaway_floor_force))
-            if (rolling_floor_force > 0.0 and not attitude_relief_requested):
-                self.current_force = max(
-                    self.current_force,
-                    min(self.max_force, rolling_floor_force))
+                    min(self.max_force, contact_floor))
             self.current_force = min(self.max_force, max(0.0, self.current_force))
 
         progress_ratio = motion_distance / max(self.target_distance, 1e-6)
@@ -633,7 +642,10 @@ class LinearTowingTrajectoryGenerator:
         self.stall_force_gate_active = stall_force_gate_ready
 
         window_elapsed = current_time - self.stall_last_check_time
-        if window_elapsed >= self.stall_window_time:
+        if not velocity_sample_usable:
+            self.stall_last_check_time = current_time
+            self.stall_last_check_distance = motion_distance
+        elif window_elapsed >= self.stall_window_time:
             window_distance = motion_distance - self.stall_last_check_distance
             recent_velocity = window_distance / window_elapsed
             self._recent_velocity = recent_velocity
@@ -653,7 +665,14 @@ class LinearTowingTrajectoryGenerator:
             'target_distance': self.target_distance,
             'current_velocity': self.current_velocity,
             'current_force': self.current_force,
+            'raw_motion_velocity': self.raw_motion_velocity,
             'motion_velocity': self.motion_velocity,
+            'velocity_reference': self.current_velocity,
+            'velocity_error': self.velocity_error,
+            'force_adjust_rate': self.force_adjust_rate,
+            'velocity_feedback_enabled': self.velocity_feedback_enabled,
+            'velocity_feedback_distance_reached': self.velocity_feedback_distance_reached,
+            'motion_measurement_valid': velocity_sample_usable,
             'breakaway_detected': self.breakaway_detected,
             'breakaway_candidate': self.breakaway_candidate_detected,
             'stable_rolling': self.stable_rolling_detected,
@@ -712,6 +731,11 @@ class LoadInterface:
         self.load_pos = None
         self.load_yaw = 0.0
         self.position_received = threading.Event()
+        self.position_last_received_time = None
+        self.position_last_stamp = None
+        self.position_last_stamp_change_time = None
+        self.velocity_feedback_timeout = max(
+            0.0, float(rospy.get_param("~velocity_feedback_timeout", 0.5)))
 
         is_simulation = rospy.get_param("~simulation", True)
         if is_simulation:
@@ -722,17 +746,23 @@ class LoadInterface:
 
     def _load_cb(self, msg):
         """Callback for real machine (PoseStamped from mocap)."""
-        self._set_load_pose(msg.pose)
+        self._set_load_pose(msg.pose, msg.header)
 
     def _load_sim_cb(self, msg):
         """Callback for simulation (Odometry from Gazebo)."""
-        self._set_load_pose(msg.pose.pose)
+        self._set_load_pose(msg.pose.pose, msg.header)
 
-    def _set_load_pose(self, pose):
+    def _set_load_pose(self, pose, header=None):
         pos = pose.position
         ori = pose.orientation
         self.load_pos = np.array([pos.x, pos.y, pos.z])
         self.load_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
+        now = rospy.get_time()
+        self.position_last_received_time = now
+        stamp = header.stamp.to_sec() if header is not None else 0.0
+        if stamp <= 0.0 or stamp != self.position_last_stamp:
+            self.position_last_stamp = stamp
+            self.position_last_stamp_change_time = now
         if not self.position_received.is_set():
             rospy.loginfo(f"Load position received: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}), yaw={math.degrees(self.load_yaw):.1f} deg")
             self.position_received.set()
@@ -742,6 +772,16 @@ class LoadInterface:
 
     def get_load_yaw(self):
         return self.load_yaw
+
+    def is_load_pose_fresh(self):
+        if (self.position_last_received_time is None or
+                self.position_last_stamp_change_time is None):
+            return False
+        now = rospy.get_time()
+        ages = (now - self.position_last_received_time,
+                now - self.position_last_stamp_change_time)
+        return all(math.isfinite(age) and 0.0 <= age <= self.velocity_feedback_timeout
+                   for age in ages)
 
     def get_load_top_z(self):
         if self.load_pos is not None:
@@ -1772,6 +1812,10 @@ class TowingWithFeedforwardState(TowingStateBase):
             current_pos = self.get_end_effector_position()
             current_yaw = self.get_end_effector_yaw()
             load_pos = self.get_load_position()
+            load_measurement_valid = self.load_interface.is_load_pose_fresh()
+            if not load_measurement_valid:
+                rospy.logwarn_throttle(
+                    1.0, "[Towing] Load pose stale; holding adaptive force")
 
             if current_pos is None:
                 rospy.logwarn("Lost position, waiting...")
@@ -1783,7 +1827,8 @@ class TowingWithFeedforwardState(TowingStateBase):
 
             # Update trajectory
             state_info = trajectory_gen.update_state(
-                current_pos, load_pos, rpy_result, z_err_for_guard)
+                current_pos, load_pos, rpy_result, z_err_for_guard,
+                load_measurement_valid=load_measurement_valid)
 
             rospy.logdebug_throttle(2.0, f"[Towing Pos] actual={current_pos}, start={start_pos}")
 
@@ -1918,7 +1963,11 @@ class TowingWithFeedforwardState(TowingStateBase):
                 f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%, "
                 f"guard={state_info['force_guard']}, task_scale={state_info['task_weight_scale']:.2f}, "
                 f"{task_weight_text}"
+                f"vref={state_info['velocity_reference']*1000:.0f}mm/s, "
                 f"vel={state_info['motion_velocity']*1000:.0f}mm/s, "
+                f"dff_cmd_dt={state_info['force_adjust_rate']:.2f}N/s, "
+                f"vel_fb={state_info['velocity_feedback_enabled']}, "
+                f"vel_valid={state_info['motion_measurement_valid']}, "
                 f"breakaway={state_info['breakaway_detected']}, "
                 f"stable_roll={state_info['stable_rolling']}, overspeed={state_info['overspeed']}, "
                 f"severe={state_info['severe_overspeed']}, "

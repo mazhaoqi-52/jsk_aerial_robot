@@ -1594,11 +1594,13 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             roll_moment = 0.0
         return roll_moment * adjust_gain * dt, roll_moment
 
-    def _formation_yaw_rate(self):
-        omega = self.beetle.getUavAngularVel()
-        if omega is None or len(omega) < 3 or not np.isfinite(omega[2]):
-            return 0.0
-        return float(omega[2])
+    def _formation_yaw_rate(self, max_age=0.2):
+        """Measure leader CoG rotation around this task's world-Z valve axis."""
+        omega_world = self.beetle.getFreshCogAngularVelWorld(max_age=max_age)
+        if (omega_world is None or len(omega_world) < 3 or
+                not np.isfinite(omega_world[2])):
+            return None
+        return float(omega_world[2])
 
     def _ee_offset_body(self):
         return [
@@ -1720,25 +1722,35 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         torque_limit = rospy.get_param(
             "controller/valve_rotation_feedforward/torque_limit",
             abs(ff_torque_z_max) if ff_torque_z_max != 0.0 else 3.0)
-        torque_ramp_up = rospy.get_param("controller/valve_rotation_feedforward/torque_ramp_up", 0.3)
-        torque_ramp_down = rospy.get_param("controller/valve_rotation_feedforward/torque_ramp_down", 0.2)
         roll_moment_thresh = rospy.get_param("controller/valve_rotation_feedforward/roll_moment_thresh", 0.2)
         torque_adjust_roll_k = rospy.get_param("controller/valve_rotation_feedforward/torque_adjust_roll_k", 0.01)
-        torque_adjust_yaw_k = rospy.get_param("controller/valve_rotation_feedforward/torque_adjust_yaw_k", 1.0)
-        yaw_velocity_thresh = rospy.get_param("controller/valve_rotation_feedforward/yaw_velocity_thresh", 0.05)
+        torque_adjust_yaw_k = max(
+            0.0, float(rospy.get_param(
+                "controller/valve_rotation_feedforward/torque_adjust_yaw_k", 1.0)))
+        torque_adjust_yaw_rate_limit = max(
+            0.0, float(rospy.get_param(
+                "controller/valve_rotation_feedforward/torque_adjust_yaw_rate_limit",
+                0.3)))
+        yaw_velocity_thresh = max(
+            0.0, float(rospy.get_param(
+                "controller/valve_rotation_feedforward/yaw_velocity_thresh", 0.05)))
+        yaw_velocity_timeout = max(
+            0.0, float(rospy.get_param(
+                "controller/valve_rotation_feedforward/yaw_velocity_timeout", 0.2)))
         rp_guard = rospy.get_param("controller/valve_rotation_feedforward/rp_guard", math.radians(12.0))
 
-        target_omega = abs(self.rotation_angular_velocity)
         torque_z = getattr(self, '_contact_final_torque_z',
                            torque_min * self.rotation_direction)
         torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
-        slow_thresh = 0.3
-        fast_thresh = 1.5
 
         rospy.loginfo(f">>> Phase 2: Rotation {math.degrees(self.target_rotation):.1f} deg "
                       f"@ {math.degrees(angular_vel):.1f} deg/s")
         rospy.loginfo(f"Feedforward: enabled={ff_enabled}, force_z={ff_force_z}, "
-                      f"torque_limit={torque_limit:.1f} N*m (adaptive from {torque_z:.2f})")
+                      f"torque_limit={torque_limit:.1f} N*m (adaptive from {torque_z:.2f}), "
+                      f"velocity_gain={torque_adjust_yaw_k:.2f}Nm/rad, "
+                      f"velocity_rate_limit={torque_adjust_yaw_rate_limit:.2f}Nm/s, "
+                      f"deadband={yaw_velocity_thresh:.3f}rad/s, "
+                      f"feedback_timeout={yaw_velocity_timeout:.2f}s")
 
         # Enable per-module y_hat^task auto-publish for the duration of the
         # rotation. The valve reaction wrench is applied at the EE module;
@@ -1768,7 +1780,7 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             # Monitor valve rotation
             cur_time = rospy.get_time()
             cur_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, start_valve_yaw)
-            valve_rot, valve_omega, updated, last_valve_yaw, last_valve_check_time = \
+            valve_rot, valve_omega, _, last_valve_yaw, last_valve_check_time = \
                 FormationUtils.monitor_cumulative_valve_rotation(
                     cur_valve_yaw, last_valve_yaw,
                     last_valve_check_time, cur_time,
@@ -1800,16 +1812,6 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                     f"max: {math.degrees(max_rotation_detected):.1f} deg")
                 break
 
-            # --- Adaptive torque based on valve response ---
-            if updated and t > 1.0:  # skip first second for sensor settling
-                if valve_omega < target_omega * slow_thresh:
-                    # Valve barely moving -> increase torque
-                    torque_z += self.rotation_direction * torque_ramp_up * dt
-                elif valve_omega > target_omega * fast_thresh:
-                    # Valve moving too fast -> decrease torque
-                    torque_z -= self.rotation_direction * torque_ramp_down * dt
-                # else: within [30%, 150%] of target -> hold (hysteresis band)
-
             # Advance angle (streaming)
             angle += angular_vel / 25.0
 
@@ -1821,10 +1823,21 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             if ff_enabled:
                 roll_adjust, roll_moment = self._dragon_roll_moment_adjust(
                     ee_yaw, dt, roll_moment_thresh, torque_adjust_roll_k)
-                delta_yaw_rate = angular_vel - self._formation_yaw_rate()
-                if abs(delta_yaw_rate) < yaw_velocity_thresh:
-                    delta_yaw_rate = 0.0
-                torque_z += roll_adjust + delta_yaw_rate * torque_adjust_yaw_k * dt
+                measured_yaw_rate = self._formation_yaw_rate(yaw_velocity_timeout)
+                yaw_rate_adjust = 0.0
+                if measured_yaw_rate is None:
+                    rospy.logwarn_throttle(
+                        1.0, "Valve FF velocity feedback stale; holding velocity adjustment")
+                else:
+                    yaw_rate_adjust = demo_common.velocity_error_adjustment(
+                        angular_vel, measured_yaw_rate,
+                        torque_adjust_yaw_k, dt, yaw_velocity_thresh)
+                    if torque_adjust_yaw_rate_limit > 0.0:
+                        max_yaw_adjust = torque_adjust_yaw_rate_limit * dt
+                        yaw_rate_adjust = max(
+                            -max_yaw_adjust,
+                            min(max_yaw_adjust, yaw_rate_adjust))
+                torque_z += roll_adjust + yaw_rate_adjust
                 rpy = self.beetle.getAssemblyRPY()
                 if rpy is not None and max(abs(rpy[0]), abs(rpy[1])) > rp_guard:
                     torque_z *= 0.8

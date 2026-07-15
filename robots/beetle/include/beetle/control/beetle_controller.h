@@ -284,9 +284,15 @@ namespace aerial_robot_control
     Eigen::VectorXd formation_desired_wrench_weights_;
     double formation_desired_wrench_timestamp_;
     double formation_desired_wrench_weights_timestamp_;
+    // Dedicated independent-UAV task wrench. It is deliberately isolated from
+    // formation_desired_wrench_ so an assembly role transition cannot reinterpret
+    // a formation command as a full single-module command.
+    Eigen::VectorXd single_desired_wrench_;
+    double single_desired_wrench_timestamp_;
     double desired_wrench_timeout_;
     ros::Subscriber formation_desired_wrench_sub_;
     ros::Subscriber formation_desired_wrench_weights_sub_;
+    ros::Subscriber single_desired_wrench_sub_;
 
     double comp_term_update_freq_;
     double prev_comp_update_time_;
@@ -340,6 +346,8 @@ namespace aerial_robot_control
     bool update() override;
     
     virtual void estWrenchTaskCallback(const beetle::TaggedWrench & msg);
+    void singleDesiredExternalWrenchCallback(
+      const geometry_msgs::WrenchStamped & msg);
     void desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg);
     void desiredExternalWrenchWeightsCallback(const std_msgs::Float32MultiArray & msg);
     void formationDesiredWrenchCallback(const geometry_msgs::WrenchStamped& msg);

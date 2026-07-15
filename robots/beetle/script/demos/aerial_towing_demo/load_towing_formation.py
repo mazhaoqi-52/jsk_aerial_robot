@@ -1689,9 +1689,9 @@ class TowingWithFeedforwardState(TowingStateBase):
         ])
         # Keep towing feedforward horizontal in the formation-yaw frame. Current
         # pitch/roll are tracking errors and should not create body-Z force.
-        force_body, torque_body = self.beetle.buildFormationCoGWrench(
+        force_body, torque_body = self.beetle.buildCoGWrench(
             force_world, application_offset_body=contact_offset_body,
-            yaw_only=True)
+            frame_id="world_yaw")
         return force_body, torque_body, "fc"
 
     def _log_towing_alignment_diag(self, current_pos, target_pos, start_pos,

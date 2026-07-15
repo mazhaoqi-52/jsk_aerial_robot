@@ -3,6 +3,10 @@
   ###########  launch config  ###########
   <arg name="real_machine" default="False"/>
   <arg name="simulation"   default="True"/>
+  <arg name="pushing_executable" default="wall_pushing_formation.py"/>
+  <arg name="pushing_node_name" default="formation_wall_pushing"/>
+  <arg name="module_id" default="1"
+       doc="Single-UAV backend module ID; ignored by the formation entry point"/>
 
   ###########  Force sensor ground truth  ###########
   <arg name="force_sensor_enabled" default="true"
@@ -133,7 +137,7 @@
   <arg name="push_target_max_lag" default="0.03"
        doc="Dynamic push: maximum push-axis lag from the current contact point to the position target (m)"/>
   <arg name="push_body_x_feedforward" default="true"
-       doc="Unified pushing: command feedforward as formation-body +X contact force"/>
+       doc="Command formation/single-UAV feedforward as body +X contact force"/>
   <arg name="push_end_effector_offset_x" default="0.32"
        doc="Leader body-frame X offset of the wall-pushing front contact face (m)"/>
   <arg name="push_end_effector_offset_z" default="0.00053"
@@ -142,16 +146,13 @@
        doc="Dynamic push: advance the wall this far along push_dir (m). 0 = static force test. A fixed wall stays a static test; a movable wall is pushed. The advance timeout is auto-computed from the ramp time, distance and target velocity."/>
   <arg name="retreat_after_push" default="true"/>
   <arg name="retreat_distance" default="0.20"/>
-  <arg name="debug" default="false"/>
-
   ###########  Demo  ###########
-  <node name="formation_wall_pushing" pkg="beetle" type="wall_pushing_formation.py"
+  <node name="$(arg pushing_node_name)" pkg="beetle" type="$(arg pushing_executable)"
         output="screen">
     <param name="module_ids"               value="$(arg module_ids)"/>
+    <param name="module_id"                value="$(arg module_id)"/>
     <param name="simulation"               value="$(arg simulation)"/>
     <param name="real_machine"             value="$(arg real_machine)"/>
-    <param name="debug"                    value="$(arg debug)"/>
-
     <param name="wall_x"                   value="$(arg wall_x)"/>
     <param name="wall_y"                   value="$(arg wall_y)"/>
     <param name="wall_z"                   value="$(arg wall_z)"/>

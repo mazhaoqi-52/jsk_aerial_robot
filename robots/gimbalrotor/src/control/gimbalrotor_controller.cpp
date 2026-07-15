@@ -96,8 +96,21 @@ namespace aerial_robot_control
 
     double target_ang_acc_x, target_ang_acc_y, target_ang_acc_z;
     if(gimbal_calc_in_fc_ && i_term_rp_calc_in_pc_){
-      target_ang_acc_x = pid_controllers_.at(ROLL).getITerm();
-      target_ang_acc_y = pid_controllers_.at(PITCH).getITerm();
+      // The flight controller owns the roll/pitch P+D terms in this mode,
+      // while the PC supplies its I term and any explicitly commanded
+      // feedforward torque. Preserve the historical direct I-term path
+      // (Beetle intentionally configures roll limit_sum=0) and bound only the
+      // combined PC torque with the existing non-zero per-axis I limit.
+      const double roll_ff_limit = pid_controllers_.at(ROLL).getLimitI();
+      const double pitch_ff_limit = pid_controllers_.at(PITCH).getLimitI();
+      target_ang_acc_x = boost::algorithm::clamp(
+          pid_controllers_.at(ROLL).getITerm() +
+          pid_controllers_.at(ROLL).getPersistentFF(),
+          -roll_ff_limit, roll_ff_limit);
+      target_ang_acc_y = boost::algorithm::clamp(
+          pid_controllers_.at(PITCH).getITerm() +
+          pid_controllers_.at(PITCH).getPersistentFF(),
+          -pitch_ff_limit, pitch_ff_limit);
       target_ang_acc_z = 0;
       target_wrench_acc_cog.tail(3) = Eigen::Vector3d(target_ang_acc_x, target_ang_acc_y, 0.0);
     }else{

@@ -17,6 +17,8 @@ namespace aerial_robot_control
     formation_desired_wrench_weights_(Eigen::VectorXd::Zero(6)),
     formation_desired_wrench_timestamp_(-1.0),
     formation_desired_wrench_weights_timestamp_(-1.0),
+    single_desired_wrench_(Eigen::VectorXd::Zero(6)),
+    single_desired_wrench_timestamp_(-1.0),
     desired_wrench_timeout_(0.5),
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
@@ -129,6 +131,7 @@ namespace aerial_robot_control
     model_error_estimate_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("unified_control/model_error_estimate", 1);
     desired_ext_wrench_sub_ = nh_.subscribe("desired_external_wrench", 1, &BeetleController::desiredExternalWrenchCallback, this);
     desired_ext_wrench_weights_sub_ = nh_.subscribe("desired_external_wrench_weights", 1, &BeetleController::desiredExternalWrenchWeightsCallback, this);
+    single_desired_wrench_sub_ = nh_.subscribe("single_desired_external_wrench", 1, &BeetleController::singleDesiredExternalWrenchCallback, this);
     formation_desired_wrench_sub_ = nh_.subscribe("formation_desired_wrench", 1, &BeetleController::formationDesiredWrenchCallback, this);
     formation_desired_wrench_weights_sub_ = nh_.subscribe("formation_desired_wrench_weights", 1, &BeetleController::formationDesiredWrenchWeightsCallback, this);
     int max_modules_num = beetle_navigator_->getMaxModuleNum();
@@ -429,6 +432,8 @@ namespace aerial_robot_control
     pid_controllers_.at(X).setPersistentFF(0.0);
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
+    pid_controllers_.at(ROLL).setPersistentFF(0.0);
+    pid_controllers_.at(PITCH).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
     clearInternalWrenchState();
   }
@@ -447,6 +452,8 @@ namespace aerial_robot_control
       formation_desired_wrench_weights_.setZero();
       formation_desired_wrench_timestamp_ = -1.0;
       formation_desired_wrench_weights_timestamp_ = -1.0;
+      single_desired_wrench_.setZero();
+      single_desired_wrench_timestamp_ = -1.0;
       unified_residual_bias_ready_ = false;
       unified_residual_bias_samples_ = 0;
       unified_residual_bias_module_num_ = 0;
@@ -675,21 +682,47 @@ namespace aerial_robot_control
     int my_id = beetle_navigator_->getMyID();
     Eigen::VectorXd lf_task_ff_acc = Eigen::VectorXd::Zero(6);
     bool lf_task_ff_active = false;
-    if(module_state != SEPARATED &&
-       beetle_navigator_->getControlFlag() &&
+    if(beetle_navigator_->getControlFlag() &&
        !unified_control_mode_){
       Eigen::VectorXd task_wrench_cog = Eigen::VectorXd::Zero(6);
       {
         std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
         const double now = ros::Time::now().toSec();
-        lf_task_ff_active =
+        const double desired_wrench_age =
+            now - formation_desired_wrench_timestamp_;
+        const bool desired_wrench_fresh =
             formation_desired_wrench_timestamp_ > 0.0 &&
+            desired_wrench_age >= 0.0 &&
             (desired_wrench_timeout_ <= 0.0 ||
-             now - formation_desired_wrench_timestamp_ <= desired_wrench_timeout_) &&
-            est_wrench_task_list_.count(my_id) > 0;
-        if(lf_task_ff_active) task_wrench_cog = est_wrench_task_list_[my_id];
+             desired_wrench_age <= desired_wrench_timeout_);
+
+        if(module_state == SEPARATED){
+          const double single_wrench_age =
+              now - single_desired_wrench_timestamp_;
+          const bool single_wrench_fresh =
+              single_desired_wrench_timestamp_ > 0.0 &&
+              single_wrench_age >= 0.0 &&
+              (desired_wrench_timeout_ <= 0.0 ||
+               single_wrench_age <= desired_wrench_timeout_);
+          // A single Beetle has no formation decomposition. Consume only the
+          // dedicated body-frame command at its own CoG.
+          // Limit this direct path to independent hover so a stale demo cannot
+          // inject feedforward during takeoff, landing, or force landing.
+          const bool independent_hover =
+              navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
+              !navigator_->getForceLandingFlag();
+          lf_task_ff_active = single_wrench_fresh && independent_hover;
+          if(lf_task_ff_active) task_wrench_cog = single_desired_wrench_;
+        }else{
+          // An assembled module receives its spatially decomposed share from
+          // est_wrench_task_list_, preserving the existing LF semantics.
+          lf_task_ff_active =
+              desired_wrench_fresh && est_wrench_task_list_.count(my_id) > 0;
+          if(lf_task_ff_active) task_wrench_cog = est_wrench_task_list_[my_id];
+        }
       }
-      if(lf_task_ff_active && task_wrench_cog.size() == 6 && task_wrench_cog.norm() > 1e-6){
+      if(lf_task_ff_active && task_wrench_cog.size() == 6 &&
+         task_wrench_cog.allFinite() && task_wrench_cog.norm() > 1e-6){
         Eigen::Matrix3d yaw_rot;
         double cur_yaw = estimator_->getEuler(Frame::COG, estimate_mode_).z();
         tf::matrixTFToEigen(tf::Matrix3x3(tf::createQuaternionFromYaw(cur_yaw)), yaw_rot);
@@ -700,6 +733,19 @@ namespace aerial_robot_control
       }else{
         lf_task_ff_active = false;
       }
+    }
+
+    // Direct single-UAV task wrench uses reversible persistent feedforward on
+    // all six axes. Clear every slot immediately on assembly so a role
+    // transition cannot carry even one cycle of a single-module command into
+    // LF control (whose first compensation update may return early).
+    if(module_state != SEPARATED){
+      pid_controllers_.at(X).setPersistentFF(0.0);
+      pid_controllers_.at(Y).setPersistentFF(0.0);
+      pid_controllers_.at(Z).setPersistentFF(0.0);
+      pid_controllers_.at(ROLL).setPersistentFF(0.0);
+      pid_controllers_.at(PITCH).setPersistentFF(0.0);
+      pid_controllers_.at(YAW).setPersistentFF(0.0);
     }
 
     if(module_state == FOLLOWER &&
@@ -836,17 +882,34 @@ namespace aerial_robot_control
       pid_controllers_.at(TY).reset();
       pid_controllers_.at(TZ).reset();
 
-      // Leader / non-wrench-comp modules still receive the known task
-      // feedforward in LF mode; residual compensation is follower-only.
-      pid_controllers_.at(X).setPersistentFF(lf_task_ff_acc(0));
-      pid_controllers_.at(Y).setPersistentFF(lf_task_ff_acc(1));
-      pid_controllers_.at(Z).setPersistentFF(0.0);
-      pid_controllers_.at(X).setICompTerm(0.0);
-      pid_controllers_.at(Y).setICompTerm(0.0);
-      pid_controllers_.at(Z).setICompTerm(lf_task_ff_acc(2));
-      pid_controllers_.at(ROLL).setICompTerm(lf_task_ff_acc(3));
-      pid_controllers_.at(PITCH).setICompTerm(lf_task_ff_acc(4));
-      pid_controllers_.at(YAW).setICompTerm(lf_task_ff_acc(5));
+      if(module_state == SEPARATED){
+        // Independent task commands are direct, withdrawable feedforward.
+        // Do not use ICompTerm here: that API accumulates into PID err_i and
+        // would leave a residual after the command watchdog expires.
+        pid_controllers_.at(X).setPersistentFF(lf_task_ff_acc(0));
+        pid_controllers_.at(Y).setPersistentFF(lf_task_ff_acc(1));
+        pid_controllers_.at(Z).setPersistentFF(lf_task_ff_acc(2));
+        pid_controllers_.at(ROLL).setPersistentFF(lf_task_ff_acc(3));
+        pid_controllers_.at(PITCH).setPersistentFF(lf_task_ff_acc(4));
+        pid_controllers_.at(YAW).setPersistentFF(lf_task_ff_acc(5));
+        pid_controllers_.at(X).setICompTerm(0.0);
+        pid_controllers_.at(Y).setICompTerm(0.0);
+        pid_controllers_.at(Z).setICompTerm(0.0);
+        pid_controllers_.at(ROLL).setICompTerm(0.0);
+        pid_controllers_.at(PITCH).setICompTerm(0.0);
+        pid_controllers_.at(YAW).setICompTerm(0.0);
+      }else{
+        // Leader / non-wrench-comp formation modules still receive their
+        // decomposed task share; residual compensation is follower-only.
+        pid_controllers_.at(X).setPersistentFF(lf_task_ff_acc(0));
+        pid_controllers_.at(Y).setPersistentFF(lf_task_ff_acc(1));
+        pid_controllers_.at(X).setICompTerm(0.0);
+        pid_controllers_.at(Y).setICompTerm(0.0);
+        pid_controllers_.at(Z).setICompTerm(lf_task_ff_acc(2));
+        pid_controllers_.at(ROLL).setICompTerm(lf_task_ff_acc(3));
+        pid_controllers_.at(PITCH).setICompTerm(lf_task_ff_acc(4));
+        pid_controllers_.at(YAW).setICompTerm(lf_task_ff_acc(5));
+      }
     }
       
     GimbalrotorController::controlCore();
@@ -1101,6 +1164,9 @@ namespace aerial_robot_control
     pid_controllers_.at(X).setPersistentFF(0.0);
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
+    pid_controllers_.at(ROLL).setPersistentFF(0.0);
+    pid_controllers_.at(PITCH).setPersistentFF(0.0);
+    pid_controllers_.at(YAW).setPersistentFF(0.0);
 
     // Clear unified mode FOLLOWER state so that stale commands are not
     // forwarded when switching back to unified mode.
@@ -2606,6 +2672,39 @@ namespace aerial_robot_control
     est_wrench_task_list_[id] = wrench;
   }
 
+  void BeetleController::singleDesiredExternalWrenchCallback(
+    const geometry_msgs::WrenchStamped & msg)
+  {
+    const std::string & frame_id = msg.header.frame_id;
+    const bool body_frame =
+        frame_id == "fc" || frame_id == "body" ||
+        frame_id == "base_link" || frame_id == "cog";
+
+    Eigen::VectorXd desired = Eigen::VectorXd::Zero(6);
+    desired(0) = msg.wrench.force.x;
+    desired(1) = msg.wrench.force.y;
+    desired(2) = msg.wrench.force.z;
+    desired(3) = msg.wrench.torque.x;
+    desired(4) = msg.wrench.torque.y;
+    desired(5) = msg.wrench.torque.z;
+
+    std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
+    if(!body_frame || !desired.allFinite()){
+      single_desired_wrench_.setZero();
+      single_desired_wrench_timestamp_ = -1.0;
+      ROS_WARN_THROTTLE(
+          1.0,
+          "[BeetleController] rejecting single-UAV wrench: "
+          "expected finite CoG body-frame data, frame_id='%s'",
+          frame_id.c_str());
+      return;
+    }
+    single_desired_wrench_ = desired;
+    // Receipt time avoids cross-machine clock skew; the control path also
+    // rejects negative age after a simulation clock reset.
+    single_desired_wrench_timestamp_ = ros::Time::now().toSec();
+  }
+
   void BeetleController::desiredExternalWrenchCallback(const geometry_msgs::WrenchStamped & msg)
   {
     // Legacy topic alias for formation-level desired wrench.
@@ -3351,6 +3450,8 @@ namespace aerial_robot_control
     pid_controllers_.at(X).setPersistentFF(0.0);
     pid_controllers_.at(Y).setPersistentFF(0.0);
     pid_controllers_.at(Z).setPersistentFF(0.0);
+    pid_controllers_.at(ROLL).setPersistentFF(0.0);
+    pid_controllers_.at(PITCH).setPersistentFF(0.0);
     pid_controllers_.at(YAW).setPersistentFF(0.0);
 
     Eigen::VectorXd formation_wrench_cmd;

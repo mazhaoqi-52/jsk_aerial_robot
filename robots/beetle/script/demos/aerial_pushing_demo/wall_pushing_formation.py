@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Formation Wall Pushing - push a fixed wall from the current end-effector pose.
+Formation / single-UAV wall pushing from the current front contact pose.
 
-The task intentionally reuses the valve-rotation formation base and the towing
-demo's wrench-weight helpers. The pushing-specific logic is limited to wall
-pose/wrench observation, contact approach, force ramping, and retreat.
+Both entry points share wall observation, contact approach, wrench adaptation,
+safety guards, and retreat. Only pose/nav/wrench routing changes between the
+formation and independent-UAV backends.
 """
 
 import math
@@ -30,7 +30,7 @@ sys.path.insert(0, towing_demo_dir)
 sys.path.insert(0, os.path.join(current_dir, '../..'))
 sys.path.insert(0, os.path.join(current_dir, '..'))
 
-from beetle_interface import smoothstep01
+from beetle_interface import BeetleInterface, smoothstep01
 from adaptive_force_manager import AdaptiveForceManager
 from demo_common import normalize_angle_diff
 from load_towing_formation import (
@@ -49,6 +49,7 @@ from load_towing_formation import (
     build_towing_task_wrench_weights,
 )
 from valve_rotation_formation_clean import (
+    FormationAdapter,
     FormationSingleUAVStateBase,
     FormationUtils,
 )
@@ -126,6 +127,10 @@ PUSH_CONTACT_DZ_FROM_CP = 0.0
 PUSH_RETREAT_AFTER = True
 PUSH_RETREAT_DISTANCE = 0.20
 
+# Runtime backend selected by the entry point. Both backends execute the same
+# SMACH states and adaptive-force law; only pose/nav/wrench routing differs.
+PUSH_SINGLE_UAV_MODE = False
+
 
 def stop_xy_velocity_on_exit(execute):
     """Stop a velocity segment on success, failure, shutdown, or exception."""
@@ -155,6 +160,27 @@ def stop_xy_velocity_on_exit(execute):
                             "Failed to latch XY exit position: %s", exc)
             self._xy_velocity_guard = None
             self._xy_velocity_exit_hold = None
+
+    return guarded
+
+
+def clear_external_wrench_on_exit(execute):
+    """Immediately withdraw an active wrench if a push exits abnormally."""
+    def guarded(self, userdata):
+        try:
+            return execute(self, userdata)
+        finally:
+            if getattr(self.beetle, 'external_wrench_active', False):
+                rospy.logwarn(
+                    "[Pushing] Active wrench remained at state exit; "
+                    "publishing an immediate zero command")
+                try:
+                    self.beetle.clearExternalWrench()
+                except Exception as exc:
+                    # The controller-side freshness watchdog remains the final
+                    # fallback if ROS is already shutting down.
+                    rospy.logerr(
+                        "Failed to publish pushing wrench zero on exit: %s", exc)
 
     return guarded
 
@@ -316,9 +342,33 @@ class PushingStateBase(FormationSingleUAVStateBase):
     _shared_wall_interface = None
 
     def __init__(self, outcomes, input_keys=None, output_keys=None):
-        FormationSingleUAVStateBase.__init__(
-            self, outcomes=outcomes,
-            input_keys=input_keys or [], output_keys=output_keys or [])
+        self.single_uav_mode = PUSH_SINGLE_UAV_MODE
+        if self.single_uav_mode:
+            smach.State.__init__(
+                self, outcomes=outcomes,
+                input_keys=input_keys or [], output_keys=output_keys or [])
+
+            module_id = int(rospy.get_param("~module_id", 1))
+            if module_id <= 0:
+                raise ValueError("~module_id must be a positive integer")
+
+            # FormationAdapter with one module is used only for the already
+            # calibrated contact-point geometry and mocap pose. Commands go
+            # through a non-assembly BeetleInterface to /beetleN/uav/nav.
+            self.formation_adapter = FormationAdapter(str(module_id))
+            self.leader_id = module_id
+            self.beetle = BeetleInterface(
+                module_id=module_id, assembly_mode=False,
+                single_uav_wrench_mode=True)
+            if not self.formation_adapter.wait_for_formation_ready(timeout=15.0):
+                raise RuntimeError(
+                    "UAV%d mocap pose is unavailable" % module_id)
+            rospy.loginfo(
+                "Single-UAV pushing backend initialized for beetle%d", module_id)
+        else:
+            FormationSingleUAVStateBase.__init__(
+                self, outcomes=outcomes,
+                input_keys=input_keys or [], output_keys=output_keys or [])
 
         self._apply_pushing_end_effector_offset()
 
@@ -386,9 +436,15 @@ class PushingStateBase(FormationSingleUAVStateBase):
             return None, None, None
         return force_data
 
+    def get_control_rpy(self):
+        """Return the attitude belonging to the active control backend."""
+        if self.single_uav_mode:
+            return self.beetle.getUavRPY()
+        return self.beetle.getAssemblyRPY()
+
     def send_xy_velocity_from_end_effector(
             self, hold_end_effector_pos, hold_yaw, linear_vel):
-        """Command assembly XY velocity while holding EE height and yaw."""
+        """Command backend XY velocity while holding contact height and yaw."""
         assembly_hold = self.formation_adapter.transform_end_effector_to_assembly_command(
             hold_end_effector_pos, hold_yaw)
         self.beetle.targetXyVelocity(
@@ -444,6 +500,27 @@ class PushingInitializeState(PushingStateBase):
 
         if not self.wall_interface.wait_for_wall(timeout=10.0):
             rospy.logerr("Failed to initialize wall pose")
+            return 'failed'
+        if self.single_uav_mode and self.beetle.isUnifiedMode():
+            rospy.logerr(
+                "Single-UAV pushing requires independent (non-unified) control")
+            return 'failed'
+        if self.single_uav_mode and not self.beetle.hasFlightState():
+            rospy.logerr(
+                "Single-UAV pushing has not received /beetle%d/flight_state",
+                self.beetle.module_id)
+            return 'failed'
+        if (self.single_uav_mode and
+                self.beetle.getFlightState() != BeetleInterface.HOVER_STATE):
+            rospy.logerr(
+                "Single-UAV pushing requires HOVER_STATE=%d, current state=%d",
+                BeetleInterface.HOVER_STATE, self.beetle.getFlightState())
+            return 'failed'
+        if (self.single_uav_mode and PUSH_MOVE_DISTANCE > 1e-6 and
+                not self.wall_interface.position_received.is_set()):
+            rospy.logerr(
+                "Dynamic single-UAV validation requires wall pose feedback; "
+                "refusing the end-effector-motion fallback")
             return 'failed'
 
         rospy.sleep(1.0)
@@ -771,7 +848,7 @@ class PushWithFeedforwardState(PushingStateBase):
         return duration
 
     def _build_pushing_wrench_command(self, force_world, unified_mode):
-        if not unified_mode:
+        if not self.single_uav_mode and not unified_mode:
             return force_world, [0.0, 0.0, 0.0], "world_yaw"
 
         contact_offset_body = np.array([
@@ -779,15 +856,17 @@ class PushWithFeedforwardState(PushingStateBase):
             self.formation_adapter.contact_offset_y + PUSH_CONTACT_DY_FROM_CP,
             self.formation_adapter.contact_offset_z + PUSH_CONTACT_DZ_FROM_CP,
         ], dtype=float)
-        if PUSH_FEEDFORWARD_BODY_X:
-            force_body = np.array([float(np.linalg.norm(force_world)), 0.0, 0.0])
-            torque_body = np.cross(contact_offset_body, force_body).tolist()
-            return force_body.tolist(), torque_body, "fc"
 
-        force_body, torque_body = self.beetle.buildFormationCoGWrench(
-            force_world,
+        if PUSH_FEEDFORWARD_BODY_X:
+            input_force = [float(np.linalg.norm(force_world)), 0.0, 0.0]
+            input_frame = "fc"
+        else:
+            input_force = force_world
+            input_frame = "world_yaw"
+        force_body, torque_body = self.beetle.buildCoGWrench(
+            input_force,
             application_offset_body=contact_offset_body,
-            yaw_only=True)
+            frame_id=input_frame)
         return force_body, torque_body, "fc"
 
     def _clear_external_wrench(self, hold_pos=None, hold_yaw=None,
@@ -844,7 +923,8 @@ class PushWithFeedforwardState(PushingStateBase):
             self.beetle.addExternalWrench(zero, zero, frame_id="fc")
             rospy.sleep(0.04)
         self.beetle.clearExternalWrench()
-        self.beetle.setAttachModule(None)
+        if not self.single_uav_mode:
+            self.beetle.setAttachModule(None)
 
     def _finish_push_exit(self, userdata, reason, hold_pos, hold_yaw,
                           clear_duration=PUSH_UNLOAD_MIN_DURATION,
@@ -861,6 +941,7 @@ class PushWithFeedforwardState(PushingStateBase):
             "Pushing exit: reason=%s, pos=%s",
             reason, FormationUtils.format_vec(final_pos))
 
+    @clear_external_wrench_on_exit
     def execute(self, userdata):
         rospy.loginfo("=== Push With Feedforward State ===")
 
@@ -869,7 +950,11 @@ class PushWithFeedforwardState(PushingStateBase):
         maintain_yaw = userdata.push_yaw
         target_pos = contact_pos + push_dir * PUSH_POSITION_LEAD
 
-        control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
+        if self.single_uav_mode:
+            control_mode = 'single-uav'
+        else:
+            control_mode = (
+                'unified' if self.beetle.isUnifiedMode() else 'leader-follower')
         ramp_time = max(_effective_push_ramp_time(), 1e-3)
         effective_duration = max(
             PUSH_DURATION, ramp_time + PUSH_FULL_FORCE_HOLD_TIME)
@@ -886,16 +971,24 @@ class PushWithFeedforwardState(PushingStateBase):
                 effective_duration, PUSH_FORCE, PUSH_FULL_FORCE_HOLD_TIME)
         rospy.loginfo("Pushing hold target: %s", FormationUtils.format_vec(target_pos))
 
-        module_masses = rospy.get_param("~module_masses", None)
-        module_positions = rospy.get_param("~module_positions", None)
-        module_inertias_diag = rospy.get_param("~module_inertias_diag", None)
-        attach_ok = self.beetle.setAttachModule(
-            self.beetle.module_id,
-            module_masses=module_masses,
-            module_positions=module_positions,
-            module_inertias_diag=module_inertias_diag)
-        if not attach_ok and control_mode == 'leader-follower':
-            rospy.logwarn("[Pushing] LF task feedforward auto-publish is disabled")
+        if self.single_uav_mode:
+            if self.beetle.isUnifiedMode():
+                rospy.logerr(
+                    "[Pushing] Single-UAV backend requires unified mode off")
+                return 'failed'
+        else:
+            module_masses = rospy.get_param("~module_masses", None)
+            module_positions = rospy.get_param("~module_positions", None)
+            module_inertias_diag = rospy.get_param(
+                "~module_inertias_diag", None)
+            attach_ok = self.beetle.setAttachModule(
+                self.beetle.module_id,
+                module_masses=module_masses,
+                module_positions=module_positions,
+                module_inertias_diag=module_inertias_diag)
+            if not attach_ok and control_mode == 'leader-follower':
+                rospy.logwarn(
+                    "[Pushing] LF task feedforward auto-publish is disabled")
 
         self.formation_adapter.set_pitch_compensation(False)
 
@@ -1047,7 +1140,7 @@ class PushWithFeedforwardState(PushingStateBase):
                 target_lag = ee_advance - target_lead
                 target_pos = contact_pos + push_dir * target_lead
 
-            rpy = self.beetle.getAssemblyRPY()
+            rpy = self.get_control_rpy()
             if rpy is not None:
                 max_rp = max(abs(rpy[0]), abs(rpy[1]))
                 if max_rp > PUSH_MAX_ROLL_PITCH:
@@ -1105,9 +1198,19 @@ class PushWithFeedforwardState(PushingStateBase):
                 last_force_guard = force_guard
 
             unified_mode = self.beetle.isUnifiedMode()
-            if unified_mode:
+            if self.single_uav_mode and unified_mode:
+                rospy.logwarn(
+                    "Pushing abort: unified mode became active in single-UAV mode")
+                self._finish_push_exit(
+                    userdata, 'unexpected_unified_mode', current_pos,
+                    maintain_yaw,
+                    clear_duration=PUSH_EMERGENCY_UNLOAD_DURATION,
+                    emergency=True)
+                return 'timeout'
+            if not self.single_uav_mode and unified_mode:
                 unified_mode_seen = True
-            if unified_mode_seen and not unified_mode:
+            if (not self.single_uav_mode and
+                    unified_mode_seen and not unified_mode):
                 rospy.logwarn("Pushing abort: unified mode exited during pushing")
                 self._finish_push_exit(
                     userdata, 'unified_exit', current_pos, maintain_yaw,
@@ -1199,7 +1302,8 @@ class PushWithFeedforwardState(PushingStateBase):
                 f"ff_cmd=({ff_force[0]:.2f},{ff_force[1]:.2f},{ff_force[2]:.2f})N "
                 f"mag={np.linalg.norm(ff_world):.2f}N wall_force={wall_force_text} "
                 f"full_hold={full_force_hold:.1f}s "
-                f"mode={'unified' if unified_mode else 'LF'} frame={ff_frame} "
+                f"mode={('single' if self.single_uav_mode else ('unified' if unified_mode else 'LF'))} "
+                f"frame={ff_frame} "
                 f"tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm "
                 f"progress={progress*100:.0f}% source={advance_source} "
                 f"phase={phase_text} wall_adv={wall_advance_text} "
@@ -1321,7 +1425,7 @@ class RetreatFromWallState(PushingStateBase):
                 (delta + push_dir * progress)[:2]))
             z_error = abs(float(delta[2]))
             current_yaw = self.get_end_effector_yaw()
-            rpy = self.beetle.getAssemblyRPY()
+            rpy = self.get_control_rpy()
             if current_yaw is None or rpy is None:
                 self.hold_position_on_xy_exit(actual_pos)
                 rospy.logerr("Retreat safety stop: attitude is unavailable")
@@ -1361,15 +1465,18 @@ class RetreatFromWallState(PushingStateBase):
         return 'failed'
 
 
-def log_pushing_preflight(module_ids, real_machine, simulation):
+def log_pushing_preflight(module_ids, real_machine, simulation,
+                          single_uav_mode=False):
     """Log ROS readiness without changing task behavior."""
     master_uri = os.environ.get('ROS_MASTER_URI', '<unset>')
     ros_ip = os.environ.get('ROS_IP', '<unset>')
     ros_hostname = os.environ.get('ROS_HOSTNAME', '<unset>')
     rospy.loginfo("[PushingPreflight] ROS_MASTER_URI=%s ROS_IP=%s ROS_HOSTNAME=%s",
                   master_uri, ros_ip, ros_hostname)
-    rospy.loginfo("[PushingPreflight] module_ids=%s real_machine=%s simulation=%s",
-                  module_ids, real_machine, simulation)
+    rospy.loginfo(
+        "[PushingPreflight] mode=%s module_ids=%s real_machine=%s simulation=%s",
+        'single' if single_uav_mode else 'formation',
+        module_ids, real_machine, simulation)
 
     try:
         master = rosgraph.Master('/formation_wall_pushing_preflight')
@@ -1408,20 +1515,44 @@ def log_pushing_preflight(module_ids, real_machine, simulation):
     if use_wall_plane_contact:
         rospy.loginfo("[PushingPreflight] Wall-plane contact gate enabled")
 
-    nav_subscribers = _names_for_topic(subs, '/assembly/uav/nav')
+    nav_topic = (
+        f'/beetle{module_ids[0]}/uav/nav'
+        if single_uav_mode and module_ids else '/assembly/uav/nav')
+    nav_subscribers = _names_for_topic(subs, nav_topic)
     if nav_subscribers:
-        rospy.loginfo("[PushingPreflight] /assembly/uav/nav subscribers: %s", nav_subscribers)
+        rospy.loginfo(
+            "[PushingPreflight] %s subscribers: %s",
+            nav_topic, nav_subscribers)
     else:
-        rospy.logwarn("[PushingPreflight] No subscriber on /assembly/uav/nav")
+        rospy.logwarn("[PushingPreflight] No subscriber on %s", nav_topic)
 
-    missing_unified_services = [
-        f"/beetle{module_id}/controller/set_unified_mode"
-        for module_id in module_ids
-        if f"/beetle{module_id}/controller/set_unified_mode" not in service_names
-    ]
-    if missing_unified_services:
-        rospy.logwarn("[PushingPreflight] Missing set_unified_mode services: %s",
-                      missing_unified_services)
+    if single_uav_mode and module_ids:
+        wrench_topic = (
+            f'/beetle{module_ids[0]}/single_desired_external_wrench')
+        wrench_subscribers = _names_for_topic(subs, wrench_topic)
+        if wrench_subscribers:
+            rospy.loginfo(
+                "[PushingPreflight] %s subscribers: %s",
+                wrench_topic, wrench_subscribers)
+        else:
+            rospy.logwarn(
+                "[PushingPreflight] No subscriber on %s; feedforward will "
+                "not reach the controller", wrench_topic)
+        unified_param = f'/beetle{module_ids[0]}/controller/unified_control_mode'
+        if _as_bool(rospy.get_param(unified_param, False)):
+            rospy.logerr(
+                "[PushingPreflight] %s is true; single-UAV pushing requires "
+                "independent control", unified_param)
+    else:
+        missing_unified_services = [
+            f"/beetle{module_id}/controller/set_unified_mode"
+            for module_id in module_ids
+            if f"/beetle{module_id}/controller/set_unified_mode" not in service_names
+        ]
+        if missing_unified_services:
+            rospy.logwarn(
+                "[PushingPreflight] Missing set_unified_mode services: %s",
+                missing_unified_services)
 
 
 def _load_params():
@@ -1518,16 +1649,35 @@ def _load_params():
         0.0, float(rospy.get_param("~retreat_distance", PUSH_RETREAT_DISTANCE)))
 
 
-def main():
-    rospy.init_node('formation_wall_pushing')
+def main(single_uav_mode=False):
+    global PUSH_SINGLE_UAV_MODE
+    PUSH_SINGLE_UAV_MODE = bool(single_uav_mode)
+
+    node_name = (
+        'single_uav_wall_pushing'
+        if PUSH_SINGLE_UAV_MODE else 'formation_wall_pushing')
+    rospy.init_node(node_name)
     _load_params()
 
-    module_ids = _parse_module_ids(rospy.get_param("~module_ids", ""))
+    if PUSH_SINGLE_UAV_MODE:
+        module_id = int(rospy.get_param("~module_id", 1))
+        if module_id <= 0:
+            raise ValueError("~module_id must be a positive integer")
+        module_ids = [module_id]
+    else:
+        module_ids = _parse_module_ids(rospy.get_param("~module_ids", ""))
     real_machine = _as_bool(rospy.get_param("~real_machine", False))
     simulation = _as_bool(rospy.get_param("~simulation", True))
+    if PUSH_SINGLE_UAV_MODE and real_machine == simulation:
+        raise ValueError(
+            "single-UAV pushing requires exactly one of ~simulation and "
+            "~real_machine to be true")
 
     rospy.loginfo("=" * 60)
-    rospy.loginfo("Formation Wall Pushing Task")
+    task_label = (
+        "Single-UAV Wall Pushing Task"
+        if PUSH_SINGLE_UAV_MODE else "Formation Wall Pushing Task")
+    rospy.loginfo(task_label)
     rospy.loginfo("=" * 60)
     rospy.loginfo(
         "Wall: thickness=%.3fm, width=%.3fm, height=%.3fm",
@@ -1566,7 +1716,9 @@ def main():
         math.degrees(PUSH_FORCE_RELIEF_YAW_ERROR), PUSH_FORCE_RELIEF_LATERAL_ERROR,
         TOWING_UNLOAD_FORCE_RATE)
     rospy.loginfo("=" * 60)
-    log_pushing_preflight(module_ids, real_machine, simulation)
+    log_pushing_preflight(
+        module_ids, real_machine, simulation,
+        single_uav_mode=PUSH_SINGLE_UAV_MODE)
 
     try:
         sm = smach.StateMachine(outcomes=['success', 'failure'])
@@ -1603,9 +1755,9 @@ def main():
                 transitions={'succeeded': 'success',
                              'failed': 'failure'})
 
-        rospy.loginfo("Starting Formation Wall Pushing state machine...")
+        rospy.loginfo("Starting %s state machine...", task_label)
         outcome = sm.execute()
-        rospy.loginfo("Formation Wall Pushing completed with outcome: %s", outcome)
+        rospy.loginfo("%s completed with outcome: %s", task_label, outcome)
 
     except Exception as e:
         rospy.logerr("Error during wall pushing state machine execution: %s", e)

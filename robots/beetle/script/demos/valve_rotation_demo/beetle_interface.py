@@ -66,12 +66,19 @@ class BeetleInterface(object):
     HOVER_STATE = 5
     STOP_STATE = 6
 
-    def __init__(self, module_id=1, debug_view=False, assembly_mode=False, assembly_tf_calculator=None):
+    def __init__(self, module_id=1, debug_view=False, assembly_mode=False,
+                 assembly_tf_calculator=None,
+                 single_uav_wrench_mode=False):
         self.module_id = module_id
         self.debug_view = debug_view
         self.robot_name = f"beetle{module_id}"
         self.assembly_mode = assembly_mode
         self.assembly_tf_calculator = assembly_tf_calculator
+        self.single_uav_wrench_mode = (
+            bool(single_uav_wrench_mode) and not assembly_mode)
+        if single_uav_wrench_mode and assembly_mode:
+            rospy.logwarn(
+                "[BeetleInterface] single_uav_wrench_mode ignored in assembly mode")
 
         # Parameters
         self.mass = rospy.get_param('~robot_mass', 1.5)
@@ -88,6 +95,7 @@ class BeetleInterface(object):
         self.cog_odom_source_advanced_time = None
         self.valve_pose = None
         self.flight_state = self.ARM_OFF_STATE
+        self.flight_state_received = False
         self.target_pos = np.array([0, 0, 0])
         self.est_wrench = None
         self.control_pid = None
@@ -139,8 +147,16 @@ class BeetleInterface(object):
         # C++ beetle_navigation publishes assembly_leader_id to rosparam.
         wrench_target_id = rospy.get_param(f'/beetle{module_id}/assembly_leader_id', module_id) if assembly_mode else module_id
         self.wrench_target_id = wrench_target_id
-        self.desired_ext_wrench_pub = rospy.Publisher(f'/beetle{wrench_target_id}/desired_external_wrench', WrenchStamped, queue_size=1)
-        self.desired_ext_wrench_weights_pub = rospy.Publisher(f'/beetle{wrench_target_id}/desired_external_wrench_weights', Float32MultiArray, queue_size=1)
+        desired_wrench_topic = (
+            f'/beetle{wrench_target_id}/single_desired_external_wrench'
+            if self.single_uav_wrench_mode else
+            f'/beetle{wrench_target_id}/desired_external_wrench')
+        self.desired_ext_wrench_pub = rospy.Publisher(
+            desired_wrench_topic, WrenchStamped, queue_size=1)
+        if not self.single_uav_wrench_mode:
+            self.desired_ext_wrench_weights_pub = rospy.Publisher(
+                f'/beetle{wrench_target_id}/desired_external_wrench_weights',
+                Float32MultiArray, queue_size=1)
         if assembly_mode:
             self.formation_wrench_pub = rospy.Publisher(f'/beetle{wrench_target_id}/formation_desired_wrench', WrenchStamped, queue_size=1)
             self.formation_wrench_weights_pub = rospy.Publisher(f'/beetle{wrench_target_id}/formation_desired_wrench_weights', Float32MultiArray, queue_size=1)
@@ -203,7 +219,8 @@ class BeetleInterface(object):
         rospy.Subscriber(f'/beetle{module_id}/estimated_external_wrench', WrenchStamped, self._wrench_cb, queue_size=1)
         pid_topic = '/assemble/debug/pose/pid' if assembly_mode else f'/beetle{module_id}/debug/pose/pid'
         rospy.Subscriber(pid_topic, PoseControlPid, self._control_pid_cb, queue_size=1)
-        rospy.Subscriber('flight_state', UInt8, self._flight_state_cb, queue_size=1)
+        rospy.Subscriber(f'/beetle{module_id}/flight_state', UInt8,
+                         self._flight_state_cb, queue_size=1)
         rospy.Subscriber('joy', Joy, self._joy_cb, queue_size=1)
 
         valve_topic = '/valve/odom' if self.is_simulation else '/valve/mocap/pose'
@@ -249,6 +266,7 @@ class BeetleInterface(object):
 
     def _flight_state_cb(self, msg):
         self.flight_state = msg.data
+        self.flight_state_received = True
 
     def _joy_cb(self, msg):
         if len(msg.buttons) > 4 and msg.buttons[4] == 1 and self.prev_joy_state.buttons[4] == 0:
@@ -364,42 +382,49 @@ class BeetleInterface(object):
             return self.mass * max(1, len(self._inter_module_ids))
         return self.mass
 
-    def _worldToFormationBodyWrench(self, force, torque, yaw_only=False):
-        """Rotate a world-frame wrench into the formation body frame."""
-        rpy = self.getAssemblyRPY()
-        if rpy is None:
-            return force, torque
-        roll, pitch, yaw = rpy
-        if yaw_only:
-            roll = 0.0
-            pitch = 0.0
-        cr, sr = math.cos(roll), math.sin(roll)
-        cp, sp = math.cos(pitch), math.sin(pitch)
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        body_to_world = np.array([
-            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-            [-sp, cp * sr, cp * cr],
-        ])
-        world_to_body = body_to_world.T
-        return ((world_to_body @ np.asarray(force, dtype=float)).tolist(),
-                (world_to_body @ np.asarray(torque, dtype=float)).tolist())
+    def buildCoGWrench(self, force, torque=None, application_offset_body=None,
+                       frame_id="world"):
+        """Build a body-frame CoG wrench for a single UAV or formation.
 
-    def buildFormationCoGWrench(self, force_world, torque_world=None,
-                                application_offset_body=None,
-                                yaw_only=False):
-        """Build a formation-body CoG wrench from a world-frame point wrench."""
-        if torque_world is None:
-            torque_world = [0.0, 0.0, 0.0]
-        force_body, torque_body = self._worldToFormationBodyWrench(
-            force_world, torque_world, yaw_only=yaw_only)
+        ``frame_id`` accepts world/map/odom input (full attitude rotation),
+        ``world_yaw`` input (yaw-only rotation), or an already body-frame
+        wrench (fc/body/base_link/cog). A point force is shifted to the CoG
+        with ``application_offset_body x force_body``.
+        """
+        force_body = np.asarray(force, dtype=float)
+        torque_body = np.asarray(
+            [0.0, 0.0, 0.0] if torque is None else torque, dtype=float)
+        frame_key = str(frame_id).lower()
+        world_frames = ("world", "map", "odom", "world_yaw")
+        body_frames = (
+            "fc", "body", "base_link", "cog", "formation",
+            "formation_body")
+
+        if frame_key in world_frames:
+            roll, pitch, yaw = self.getUavRPY()
+            if frame_key == "world_yaw":
+                roll = 0.0
+                pitch = 0.0
+            cr, sr = math.cos(roll), math.sin(roll)
+            cp, sp = math.cos(pitch), math.sin(pitch)
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            body_to_world = np.array([
+                [cy * cp, cy * sp * sr - sy * cr,
+                 cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr,
+                 sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
+            ])
+            world_to_body = body_to_world.T
+            force_body = world_to_body @ force_body
+            torque_body = world_to_body @ torque_body
+        elif frame_key not in body_frames:
+            raise ValueError("unsupported wrench frame_id: %s" % frame_id)
+
         if application_offset_body is not None:
-            torque_body = (
-                np.asarray(torque_body, dtype=float) +
-                np.cross(np.asarray(application_offset_body, dtype=float),
-                         np.asarray(force_body, dtype=float))
-            ).tolist()
-        return force_body, torque_body
+            torque_body = torque_body + np.cross(
+                np.asarray(application_offset_body, dtype=float), force_body)
+        return force_body.tolist(), torque_body.tolist()
 
     def getEndEffectorPos(self):
         """Get end-effector position in world coordinates (pitch-aware)."""
@@ -443,6 +468,9 @@ class BeetleInterface(object):
 
     def getFlightState(self):
         return self.flight_state
+
+    def hasFlightState(self):
+        return self.flight_state_received
 
     def getEstimatedWrench(self):
         return self.est_wrench
@@ -581,6 +609,8 @@ class BeetleInterface(object):
     def _publishExternalWrenchWeights(self, weights):
         if weights is None:
             return
+        if self.single_uav_wrench_mode:
+            return  # Direct single-UAV feedforward has no QP task weights.
         vals = list(weights)
         if len(vals) != 6:
             rospy.logwarn_throttle(1.0, "[BeetleInterface] task_weights must have 6 values")
@@ -602,18 +632,26 @@ class BeetleInterface(object):
         Then routes to:
           - formation_desired_wrench  when isUnifiedMode() is True  (unified allocation)
           - desired_external_wrench   when isUnifiedMode() is False (lead-follower wrench_comp)
-        Outside assembly_mode: publishes to desired_external_wrench as-is.
+        Outside assembly_mode with ``single_uav_wrench_mode=True``: converts
+        world-frame input with the single-UAV attitude and publishes body-frame
+        data to the dedicated single_desired_external_wrench topic. The default
+        False preserves the legacy single-UAV behavior and cannot accidentally
+        activate the direct pushing feedforward path.
         """
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
 
-        # Both unified and lead-follower paths need formation-body data.
+        # Assembly and explicit single-UAV feedforward paths both consume body
+        # data. Legacy non-assembly callers keep their previous as-is routing.
         frame_key = str(frame_id).lower()
-        if self.assembly_mode and frame_key in ("world", "map", "odom", "world_yaw"):
-            force_list, torque_list = self._worldToFormationBodyWrench(
-                force_list, torque_list, yaw_only=(frame_key == "world_yaw"))
+        if ((self.assembly_mode or self.single_uav_wrench_mode) and
+                frame_key in ("world", "map", "odom", "world_yaw")):
+            force_list, torque_list = self.buildCoGWrench(
+                force_list, torque_list, frame_id=frame_key)
             frame_id = "fc"
-        elif frame_key in ("fc", "body", "formation", "formation_body"):
+        elif frame_key in (
+                "fc", "body", "base_link", "cog", "formation",
+                "formation_body"):
             frame_id = "fc"
 
         ff_msg = WrenchStamped()

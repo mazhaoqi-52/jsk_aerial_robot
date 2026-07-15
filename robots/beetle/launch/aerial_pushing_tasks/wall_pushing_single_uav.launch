@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<launch>
+  <!--
+    Single-UAV wrench-adaptive pushing validation.
+
+    Unlike the formation launch defaults, this wrapper starts a movable wall
+    and requests positive wall travel so the shared AdaptiveForceManager runs
+    through breakaway and velocity-feedback phases by default.
+  -->
+
+  ###########  UAV / environment  ###########
+  <arg name="module_id" default="1"/>
+  <arg name="real_machine" default="False"/>
+  <arg name="simulation" default="True"/>
+
+  ###########  Force sensor ground truth  ###########
+  <arg name="force_sensor_enabled" default="true"/>
+  <arg name="force_sensor" default="PFS055YA501U6"/>
+  <arg name="force_sensor_port" default="/dev/ttyACM0"/>
+  <arg name="force_sensor_auto_calib" default="true"/>
+  <arg name="force_sensor_auto_calib_delay" default="0.5"/>
+  <arg name="force_sensor_auto_calib_timeout" default="10.0"/>
+
+  ###########  Wall  ###########
+  <arg name="wall_id" default="55"/>
+  <arg name="wall_x" default="1.5"/>
+  <arg name="wall_y" default="0"/>
+  <arg name="wall_z" default="0"/>
+  <arg name="wall_yaw" default="0"/>
+  <arg name="wall_thickness" default="0.1"/>
+  <arg name="wall_width" default="2.0"/>
+  <arg name="wall_height" default="2.0"/>
+  <arg name="wall_mass" default="20.0"/>
+  <arg name="wall_static" default="false"
+       doc="false enables object motion required by wrench adaptation"/>
+  <arg name="wall_slide_friction" default="2.0"
+       doc="Kept below the conservative 5N single-UAV force default"/>
+  <arg name="wall_slide_damping" default="50.0"/>
+  <arg name="use_wall_mocap" default="true"
+       doc="Required on hardware for object-speed adaptive validation"/>
+  <arg name="use_wall_wrench" default="false"/>
+  <arg name="use_wall_plane_contact" default="true"/>
+
+  ###########  Contact / pushing  ###########
+  <arg name="push_direction" default="+x"/>
+  <arg name="auto_align" default="false"/>
+  <arg name="approach_distance" default="0.8"/>
+  <arg name="approach_speed" default="0.03"/>
+  <arg name="approach_overrun" default="0.12"/>
+  <arg name="min_approach_distance" default="0.04"/>
+  <arg name="contact_wrench_threshold" default="0.8"/>
+  <arg name="contact_stall_lead" default="0.06"/>
+  <arg name="contact_stall_velocity" default="0.004"/>
+  <arg name="contact_required_cycles" default="8"/>
+
+  <arg name="push_force" default="5.0"/>
+  <arg name="force_ramp_time" default="3.0"/>
+  <arg name="force_ramp_rate" default="3.0"/>
+  <arg name="push_duration" default="3.0"/>
+  <arg name="full_force_hold_time" default="10.0"/>
+  <arg name="full_force_try_time" default="10.0"/>
+  <arg name="force_guard_yaw_hold_deg" default="6.0"/>
+  <arg name="force_guard_yaw_relief_deg" default="10.0"/>
+  <arg name="force_guard_lateral_hold" default="0.05"/>
+  <arg name="force_guard_lateral_relief" default="0.10"/>
+  <arg name="push_position_lead" default="0.03"/>
+
+  ###########  Wrench adaptation  ###########
+  <arg name="push_target_velocity" default="0.05"/>
+  <arg name="velocity_force_gain" default="0.0"
+       doc="0 derives K from pre-breakaway ramp rate / target velocity"/>
+  <arg name="velocity_error_deadband" default="0.005"/>
+  <arg name="velocity_filter_time_constant" default="0.15"/>
+  <arg name="velocity_feedback_timeout" default="0.5"/>
+  <arg name="push_target_max_lag" default="0.03"/>
+  <arg name="push_body_x_feedforward" default="true"/>
+  <arg name="push_end_effector_offset_x" default="0.32"/>
+  <arg name="push_end_effector_offset_z" default="0.00053"/>
+  <arg name="push_move_distance" default="0.30"
+       doc="Positive distance selects the adaptive dynamic-push path"/>
+
+  <arg name="retreat_after_push" default="true"/>
+  <arg name="retreat_distance" default="0.20"/>
+
+  <!-- Reuse the formation launch's wall/sensor plumbing and complete parameter
+       mapping, replacing only the executable and its single module ID. -->
+  <include file="$(find beetle)/launch/aerial_pushing_tasks/wall_pushing_formation.launch"
+           pass_all_args="true">
+    <arg name="module_ids" value="$(arg module_id)"/>
+    <arg name="pushing_executable" value="wall_pushing_single_uav.py"/>
+    <arg name="pushing_node_name" value="single_uav_wall_pushing"/>
+  </include>
+</launch>

@@ -106,7 +106,7 @@ class BeetleInterface(object):
         self.current_ff_force = [0.0, 0.0, 0.0]
         self.current_ff_torque = [0.0, 0.0, 0.0]
 
-        # Task observer-prediction state (Level 2: spatial-inertia consistent).
+        # Legacy LF task-share state (Level 2: spatial-inertia consistent).
         # `attach_module_id` is retained only as an opt-in marker; the
         # decomposition formula is uniform across modules.
         self._inter_attach_module_id = None
@@ -125,7 +125,7 @@ class BeetleInterface(object):
         self._inter_m_total = 0.0
         self._inter_auto_publish = False
         self._est_wrench_task_pubs = {}
-        # Track last published y_hat^task per module so clearExternalWrench can
+        # Track the last published task share per module so clearExternalWrench can
         # zero them out cleanly.
         self._last_est_wrench_task = {}
 
@@ -164,22 +164,18 @@ class BeetleInterface(object):
             rospy.logwarn(f"[BeetleInterface] Wrench routed to C++ LEADER beetle{wrench_target_id} "
                           f"(Python EE module={module_id})")
 
-        # ----- Per-module task observer prediction (y_hat^task) publishers -----
-        # Theory: the per-module momentum observer outputs
-        #     y_hat_i = c_i + d_i + b_i   (joint force + direct external + parasitic)
-        # We publish a task-space prediction y_hat_i^task and the C++ controller
-        # subtracts it BEFORE the joint-cut recursion in calcInteractionWrench,
-        # so downstream inter_wrench_list_ is the task-subtracted residual
-        # (~parasitic if the model is accurate). Two decomposition models are
-        # supported:
-        #   Level 1 (mass ratio): y_hat_i^task = (m_i/m_tot) * W_ext
+        # ----- Legacy LF per-module task-wrench-share publishers -----
+        # These topics carry command-side mass/inertia shares used by the legacy
+        # leader-follower cascade. They are not momentum-observer predictions and
+        # unified mode does not consume them. Two decomposition models are kept:
+        #   Level 1 (mass ratio): W_i^task = (m_i/m_tot) * W_ext
         #     Only valid for pure-translational tasks (towing). Used when
         #     positions/inertias are not provided.
         #   Level 2 (spatial inertia): physically consistent decomposition
         #     F_i = m_i (a + alpha x r_i), tau_{i,Ci} = I_i alpha, where
         #     [a; alpha] = M_form^{-1} W_ext at formation CoG. Required when the
         #     task wrench has torque (e.g. valve rotation).
-        # Invariant: sum y_hat_i^task = W_ext (Newton 2nd + parallel-axis identity).
+        # Invariant: sum W_i^task = W_ext (Newton 2nd + parallel-axis identity).
         configured_ids = []
         if assembly_tf_calculator is not None and hasattr(assembly_tf_calculator, 'module_ids'):
             configured_ids = self._parse_module_ids(assembly_tf_calculator.module_ids)
@@ -631,14 +627,15 @@ class BeetleInterface(object):
         self.current_ff_force = force_list
         self.current_ff_torque = torque_list
         self._publishExternalWrenchWeights(task_weights)
-        if self.assembly_mode and hasattr(self, 'formation_wrench_pub') and self.isUnifiedMode():
+        unified_mode = self.assembly_mode and self.isUnifiedMode()
+        if unified_mode and hasattr(self, 'formation_wrench_pub'):
             self.formation_wrench_pub.publish(ff_msg)
         else:
             self.desired_ext_wrench_pub.publish(ff_msg)
 
-        # ----- Also drive per-module y_hat^task in lockstep, if enabled -----
-        # The body-frame force/torque is reused (same frame as the C++
-        # est_wrench_task_list_).
+        # Keep the legacy LF shares fresh across mode switches. Unified control
+        # does not consume them, but a later switch back to LF must not see the
+        # command that happened to be active when unified mode was entered.
         if self._inter_auto_publish:
             self._publishInternalWrenchFromExternal(force_list, torque_list, frame_id)
 
@@ -674,20 +671,19 @@ class BeetleInterface(object):
             self.external_wrench_active = False
             self.current_ff_force = [0.0, 0.0, 0.0]
             self.current_ff_torque = [0.0, 0.0, 0.0]
-        # Also zero per-module y_hat^task so the controller's residual
-        # subtraction no longer subtracts a stale task expectation.
+        # Also clear the legacy LF command shares to avoid stale subtraction.
         if self._inter_auto_publish:
             self._publishInternalWrenchRaw(
                 {mid: ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
                  for mid in self._inter_module_ids})
 
     # ------------------------------------------------------------------
-    # Task internal wrench API
+    # Legacy LF task-wrench-share API
     # ------------------------------------------------------------------
     def setAttachModule(self, module_id, module_masses=None,
                         module_positions=None, module_inertias_diag=None):
         """Declare an external load is bolted to one module and enable
-        per-module y_hat^task auto-publishing.
+        per-module LF task-wrench-share auto-publishing.
 
         Decomposition model is selected by the data provided:
           * mass-ratio (Level 1) if positions+inertias are both missing;
@@ -718,7 +714,7 @@ class BeetleInterface(object):
             self._inter_attach_module_id = None
             self._inter_auto_publish = False
             # Best-effort clear so a previously running auto-publish
-            # doesn't leave stale y_hat^task on the bus.
+            # doesn't leave stale task shares on the bus.
             self._publishInternalWrenchRaw(
                 {mid: ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
                  for mid in self._inter_module_ids})
@@ -755,7 +751,7 @@ class BeetleInterface(object):
         return True
 
     def setInternalWrenchPerModule(self, per_module, frame_id="fc"):
-        """Explicit advanced API: directly publish y_hat^task for each module.
+        """Explicit legacy LF API: publish a task-wrench share for each module.
 
         Parameters
         ----------
@@ -845,7 +841,7 @@ class BeetleInterface(object):
 
     def _publishInternalWrenchFromExternal(self, force_body, torque_body, frame_id):
         """Decompose the body-frame external wrench at formation CoG into
-        per-module observer task prediction y_hat^task and publish."""
+        legacy LF per-module command shares and publish."""
         per_module = self._decomposeTaskWrench(force_body, torque_body)
         if not per_module:
             return
@@ -866,7 +862,7 @@ class BeetleInterface(object):
         self._publishInternalWrenchRaw(per_module, frame_id=frame_id)
 
     def _publishInternalWrenchRaw(self, per_module, frame_id="fc"):
-        """Publish raw per-module y_hat^task and cache last values."""
+        """Publish and cache raw per-module legacy LF task shares."""
         stamp = rospy.Time.now()
         for mid, (f, t) in per_module.items():
             pub = self._est_wrench_task_pubs.get(mid)

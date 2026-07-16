@@ -95,13 +95,6 @@ public:
                                 const Eigen::VectorXd& observer_feedback_wrench = Eigen::VectorXd(),
                                 const Eigen::VectorXd& observer_feedback_wrench_weights = Eigen::VectorXd());
 
-  /** @brief Optional LF-style internal wrench compensation used only as a
-   *  secondary allocation reference. Gain 0 disables the effect. The input map
-   *  is keyed by module id and stores 6D body-frame compensation wrench. */
-  void setInternalWrenchSecondaryReference(const std::map<int, Eigen::VectorXd>& module_wrench_comp,
-                                           double gain);
-  void clearInternalWrenchSecondaryReference();
-
   /** @brief Send this module's torque_allocation_matrix_inv sub-block to its spinal.
    *  Called at mode switch / one-shot resend; not part of the control loop.
    *  @return true if matrix was sent, false if not yet computed. */
@@ -277,8 +270,6 @@ private:
   Eigen::MatrixXd integrated_map_inv_;    // pseudoinverse
   Eigen::MatrixXd integrated_map_inv_rot_; // last 3 cols of pseudoinverse (torque part)
   Eigen::VectorXd target_vectoring_f_;    // allocation result
-  std::map<int, Eigen::VectorXd> module_internal_wrench_comp_;
-  double internal_wrench_secondary_gain_;
 
   // Target yaw term for spinal cascade inner loop
   double candidate_yaw_term_;
@@ -360,10 +351,6 @@ private:
   Eigen::VectorXd alloc_task_wrench_weights_;  // 6D task residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
   double alloc_effort_weight_;        // optional total-effort penalty on vectoring force
   std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_
-  double alloc_interface_force_weight_;   // optional soft cost on interface force proxy [1/N^2]
-  double alloc_interface_torque_weight_;  // optional soft cost on interface torque proxy [1/(Nm)^2]
-  double alloc_interface_force_limit_;    // optional component-wise interface force proxy limit [N]
-  double alloc_interface_torque_limit_;   // optional component-wise interface torque proxy limit [Nm]
   double alloc_module_balance_weight_;    // optional soft penalty on per-module vertical-thrust spread
   bool alloc_priority_enabled_;       // hard-prioritize selected 6D wrench tracking rows
   Eigen::VectorXd alloc_priority_tolerances_;  // [Fx,Fy,Fz,Tx,Ty,Tz] acc-space bands; <=0 disables row
@@ -388,8 +375,8 @@ private:
    *   w_des = w_control + w_task + w_feedback
    *
    *   min_{f} ||W_eff^(1/2)(A*f - w_des)||^2
-   *           + ρ||f||^2
-   *           + λ||f - f_ref||^2 + ||Wi^(1/2)(D*f - d_ref)||^2
+   *           + ρ||f - f_ref||^2
+   *           + λ||f - f_ref||^2
    *           + smoothness terms
    *
    *   W_eff is a single per-axis wrench-tracking weight (alloc_wrench_weights_);
@@ -413,8 +400,7 @@ private:
    * @param w_feedback    6D low-priority observer residual-feedback wrench-acceleration vector
    * @param feedback_weights 6D low feedback residual weights
    * @param w_priority    6D wrench-acceleration vector used as the center of hard priority bands
-   * @param secondary_ref Preferred allocation in the nullspace / soft secondary objective
-   * @param interface_load_reference Preferred actuator-side cut-load proxy D*f.
+   * @param secondary_ref Balanced/task-consistent soft allocation reference
    * @param vectoring_f_out  Output: full vectoring force vector (n_cols)
    * @return true on success, false on failure (caller falls back to pseudoinverse)
    */
@@ -427,22 +413,18 @@ private:
                          const Eigen::VectorXd& w_priority,
                          const Eigen::VectorXd& secondary_ref,
                          const std::vector<int>& assembled_ids,
-                         const Eigen::MatrixXd& interface_load_matrix,
-                         const Eigen::VectorXd& interface_load_reference,
                          Eigen::VectorXd& vectoring_f_out);
 
   /** @brief Build the QP linear-constraint triplets and [lb, ub] bounds:
    *  gimbal-angle, thrust polygon, component bounds, optional rate / direction
-   *  / interface-limit rows, and task/priority hard bands. Returns false if the
+   *  rows, and task/priority hard bands. Returns false if the
    *  built row count disagrees with n_constraints. Pure assembly of the
    *  pre-counted constraints; no member state is modified. */
   bool buildAllocationConstraints(const Eigen::MatrixXd& alloc_matrix,
-                                  const Eigen::MatrixXd& interface_load_matrix,
                                   int n_cols, int n_rotors, int n_constraints,
                                   double thrust_limit,
                                   double cos_limit, double sin_limit, int thrust_poly_edges,
                                   bool use_rate_bound, bool use_direction_rate_bound,
-                                  int n_interface_rows,
                                   const std::vector<int>& task_priority_rows,
                                   const Eigen::VectorXd& task_priority_target,
                                   const std::vector<int>& priority_rows,
@@ -465,10 +447,8 @@ private:
   /** @brief Build the current secondary allocation reference f_ref.
    *  f_ref = balanced hover load
    *        + A^+ * task_wrench_acc          (cooperative min-norm task share)
-   *        + (I - A^+A) * internal bias     (observer-driven, gain-gated)
-   *  The task share keeps the effort/lambda terms and the interface-load
-   *  reference D*f_ref consistent with the inter-module load transfer the task
-   *  requires; joint capacity is bounded separately by the hard |D f| limits.
+   *  The task share keeps the effort/lambda terms consistent with the task
+   *  objective without adding observer-derived internal-wrench control.
    *  Pass a zero/empty task_wrench_acc for a hover-only reference. */
   Eigen::VectorXd buildSecondaryAllocationReference(
       const std::vector<int>& assembled_ids,
@@ -485,8 +465,7 @@ private:
 
   void publishInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_load_matrix,
                                        const std::vector<std::pair<int, int>>& interface_cuts,
-                                       const Eigen::VectorXd& vectoring_f,
-                                       const Eigen::VectorXd& interface_load_reference);
+                                       const Eigen::VectorXd& vectoring_f);
   void publishAllocationPwmPredictions(const Eigen::VectorXd& qp_vectoring_f,
                                        const Eigen::VectorXd& pinv_vectoring_f,
                                        const std::vector<int>& assembled_ids);

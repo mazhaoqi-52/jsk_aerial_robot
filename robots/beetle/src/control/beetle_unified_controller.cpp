@@ -35,7 +35,6 @@ BeetleUnifiedController::BeetleUnifiedController()
     external_formation_inertia_(Eigen::Matrix3d::Zero()),
     module_model_revision_(0),
     cached_module_model_revision_(0),
-    internal_wrench_secondary_gain_(0.0),
     candidate_yaw_term_(0),
     command_target_rpy_(0, 0, 0),
     cascade_alloc_sent_(false),
@@ -58,10 +57,6 @@ BeetleUnifiedController::BeetleUnifiedController()
 	    alloc_wrench_weights_(Eigen::VectorXd::Ones(6)),
 	    alloc_task_wrench_weights_(Eigen::VectorXd::Ones(6)),
 	    alloc_effort_weight_(0.0),
-	    alloc_interface_force_weight_(0.0),
-	    alloc_interface_torque_weight_(0.0),
-	    alloc_interface_force_limit_(0.0),
-	    alloc_interface_torque_limit_(0.0),
 	    alloc_module_balance_weight_(0.0),
 	    alloc_priority_enabled_(false),
 	    alloc_priority_tolerances_(Eigen::VectorXd::Zero(6)),
@@ -160,10 +155,6 @@ void BeetleUnifiedController::rosParamInit()
   control_nh.param<double>("alloc_direction_rate_limit_deg", direction_rate_limit_deg, 0.0);
   control_nh.param<double>("alloc_lateral_rate_weight", alloc_lateral_rate_weight_, 0.0);
   control_nh.param<double>("alloc_effort_weight", alloc_effort_weight_, 0.0);
-  control_nh.param<double>("alloc_interface_force_weight", alloc_interface_force_weight_, 0.0);
-  control_nh.param<double>("alloc_interface_torque_weight", alloc_interface_torque_weight_, 0.0);
-  control_nh.param<double>("alloc_interface_force_limit", alloc_interface_force_limit_, 0.0);
-  control_nh.param<double>("alloc_interface_torque_limit", alloc_interface_torque_limit_, 0.0);
   control_nh.param<double>("alloc_module_balance_weight", alloc_module_balance_weight_, 0.0);
   alloc_module_balance_weight_ = std::max(0.0, alloc_module_balance_weight_);
   control_nh.param<bool>("alloc_priority_enabled", alloc_priority_enabled_, false);
@@ -181,10 +172,6 @@ void BeetleUnifiedController::rosParamInit()
       std::max(0.0, direction_rate_limit_deg) * M_PI / 180.0;
   alloc_lateral_rate_weight_ = std::max(0.0, alloc_lateral_rate_weight_);
   alloc_effort_weight_ = std::max(0.0, alloc_effort_weight_);
-  alloc_interface_force_weight_ = std::max(0.0, alloc_interface_force_weight_);
-  alloc_interface_torque_weight_ = std::max(0.0, alloc_interface_torque_weight_);
-  alloc_interface_force_limit_ = std::max(0.0, alloc_interface_force_limit_);
-  alloc_interface_torque_limit_ = std::max(0.0, alloc_interface_torque_limit_);
   alloc_task_priority_min_weight_ = std::max(0.0, alloc_task_priority_min_weight_);
   pinv_pwm_pred_pub_interval_ = std::max(0.0, pinv_pwm_pred_pub_interval_);
 
@@ -299,20 +286,6 @@ void BeetleUnifiedController::rosParamInit()
       ROS_WARN("[UnifiedCtrl] alloc_module_weights must be a YAML list; ignoring it");
     }
   }
-}
-
-void BeetleUnifiedController::setInternalWrenchSecondaryReference(
-    const std::map<int, Eigen::VectorXd>& module_wrench_comp,
-    double gain)
-{
-  module_internal_wrench_comp_ = module_wrench_comp;
-  internal_wrench_secondary_gain_ = std::max(0.0, gain);
-}
-
-void BeetleUnifiedController::clearInternalWrenchSecondaryReference()
-{
-  module_internal_wrench_comp_.clear();
-  internal_wrench_secondary_gain_ = 0.0;
 }
 
 void BeetleUnifiedController::setModuleModelDescriptor(
@@ -630,13 +603,6 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       control_wrench_acc + task_wrench_acc + feedback_wrench_acc;
   Eigen::VectorXd secondary_ref =
       buildSecondaryAllocationReference(assembled_ids, task_wrench_acc);
-  Eigen::MatrixXd interface_load_matrix;
-  std::vector<std::pair<int, int>> interface_cuts;
-  buildInterfaceLoadMatrix(assembled_ids, interface_load_matrix, interface_cuts);
-  Eigen::VectorXd interface_load_reference = Eigen::VectorXd::Zero(interface_load_matrix.rows());
-  if (interface_load_matrix.cols() == secondary_ref.size()) {
-    interface_load_reference = interface_load_matrix * secondary_ref;
-  }
 
   // Allocate: active task axes are narrow hard bands; effort/rate/balancing
   // terms then choose the actuator-side solution inside that feasible set.
@@ -646,7 +612,6 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
                                    feedback_wrench_acc, effective_feedback_weights,
                                    priority_wrench_acc,
                                    secondary_ref, assembled_ids,
-                                   interface_load_matrix, interface_load_reference,
                                    target_vectoring_f_);
     if (!qp_ok && (has_desired_ext_wrench || has_feedback_ext_wrench)) {
       const double retry_task_scales[] = {0.7, 0.4, 0.0};
@@ -664,22 +629,15 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
         // cooperative task share in f_ref matches the retried objective.
         Eigen::VectorXd retry_secondary_ref =
             buildSecondaryAllocationReference(assembled_ids, retry_task_wrench_acc);
-        Eigen::VectorXd retry_interface_load_reference =
-            Eigen::VectorXd::Zero(interface_load_matrix.rows());
-        if (interface_load_matrix.cols() == retry_secondary_ref.size()) {
-          retry_interface_load_reference = interface_load_matrix * retry_secondary_ref;
-        }
 
         qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                   retry_task_wrench_acc, retry_task_weights,
                                   retry_feedback_wrench_acc, retry_feedback_weights,
                                   retry_priority_acc,
                                   retry_secondary_ref, assembled_ids,
-                                  interface_load_matrix, retry_interface_load_reference,
                                   target_vectoring_f_);
         if (qp_ok) {
           secondary_ref = retry_secondary_ref;
-          interface_load_reference = retry_interface_load_reference;
         }
         if (!qp_ok) continue;
 
@@ -752,8 +710,14 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
   publishGimbalTracking(assembled_ids);
-  publishInterfaceLoadDiagnostics(interface_load_matrix, interface_cuts,
-                                  target_vectoring_f_, interface_load_reference);
+  if (interface_load_pub_.getNumSubscribers() > 0) {
+    Eigen::MatrixXd interface_load_matrix;
+    std::vector<std::pair<int, int>> interface_cuts;
+    if (buildInterfaceLoadMatrix(assembled_ids, interface_load_matrix, interface_cuts)) {
+      publishInterfaceLoadDiagnostics(interface_load_matrix, interface_cuts,
+                                      target_vectoring_f_);
+    }
+  }
 
   ROS_INFO_THROTTLE(5.0, "[UnifiedCtrl] N=%d mass=%.3f cog_offset=(%.4f,%.4f,%.4f) "
                     "control_plus_task_acc=(%.3f,%.3f,%.3f,%.4f,%.4f,%.4f)",
@@ -816,12 +780,9 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
   }
 
   // Cooperative task share: distribute the explicit task wrench over ALL
-  // rotors with the formation pseudoinverse (min-norm sharing). With this,
-  // the effort term rho*||f - f_ref||^2, the lambda term, and the interface
-  // reference d_ref = D*f_ref are all consistent with the load transfer the
-  // task requires; without it they pull back toward a hover-only allocation
-  // and systematically discount inter-module cooperation. The joint capacity
-  // is bounded separately by the hard |D f| <= limit rows.
+  // rotors with the formation pseudoinverse (min-norm sharing). This keeps the
+  // effort and lambda references consistent with the task instead of pulling
+  // the solution back toward a hover-only allocation.
   const bool has_allocation_block =
       (integrated_map_.rows() == 6 && integrated_map_.cols() == ref.size());
   const bool inv_consistent =
@@ -833,68 +794,11 @@ Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
     ref += integrated_map_inv_ * task_wrench_acc;
   }
 
-  const int cols_per_module = motor_num_per_module_ * rotor_coef_;
-  const double delta_limit = 0.25 * alloc_t_max_;
-  Eigen::VectorXd internal_delta = Eigen::VectorXd::Zero(ref.size());
-
-  if (internal_wrench_secondary_gain_ > 0.0 && !module_internal_wrench_comp_.empty()) {
-    for (size_t m = 0; m < assembled_ids.size(); m++) {
-      auto it = module_internal_wrench_comp_.find(assembled_ids[m]);
-      if (it == module_internal_wrench_comp_.end() || it->second.size() < 6) continue;
-
-      const Eigen::VectorXd& comp = it->second;
-      if (!comp.allFinite()) continue;
-
-      const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
-      Eigen::VectorXd delta = Eigen::VectorXd::Zero(cols_per_module);
-
-      if (has_allocation_block) {
-        Eigen::VectorXd comp_acc = Eigen::VectorXd::Zero(6);
-        comp_acc.head(3) = comp.head(3) / formation_mass_;
-        comp_acc.tail(3) = formation_inertia_.inverse() * comp.tail(3);
-        const Eigen::MatrixXd module_map =
-            integrated_map_.middleCols(module_col, cols_per_module);
-        delta = aerial_robot_model::pseudoinverse(module_map) *
-                (internal_wrench_secondary_gain_ * comp_acc);
-      } else if (rotor_coef_ >= 2) {
-        // Fallback for early calls before the formation map is ready.
-        for (int r = 0; r < motor_num_per_module_; r++) {
-          delta(r * rotor_coef_) =
-              internal_wrench_secondary_gain_ * comp(0) / motor_num_per_module_;
-          delta(r * rotor_coef_ + rotor_coef_ - 1) =
-              internal_wrench_secondary_gain_ * comp(2) / motor_num_per_module_;
-        }
-      }
-
-      for (int r = 0; r < motor_num_per_module_; r++) {
-        const int base = module_col + r * rotor_coef_;
-        for (int c = 0; c < rotor_coef_; c++) {
-          const int idx = base + c;
-          internal_delta(idx) +=
-              std::max(-delta_limit, std::min(delta(r * rotor_coef_ + c), delta_limit));
-        }
-      }
-    }
-    if (has_allocation_block && internal_delta.size() == integrated_map_.cols()) {
-      // Reuse the member pseudoinverse already computed in
-      // computeUnifiedAllocation() for this same integrated_map_; only recompute
-      // if it is not dimensionally consistent (e.g. early/stale call).
-      const Eigen::MatrixXd recomputed_pinv =
-          inv_consistent ? Eigen::MatrixXd()
-                         : aerial_robot_model::pseudoinverse(integrated_map_);
-      const Eigen::MatrixXd& map_pinv =
-          inv_consistent ? integrated_map_inv_ : recomputed_pinv;
-      internal_delta =
-          (Eigen::MatrixXd::Identity(internal_delta.size(), internal_delta.size()) -
-           map_pinv * integrated_map_) * internal_delta;
-    }
-  }
-
   for (int idx = 0; idx < ref.size(); idx++) {
     if (rotor_coef_ == 2 && (idx % rotor_coef_) == rotor_coef_ - 1) {
-      ref(idx) = std::max(0.0, std::min(ref(idx) + internal_delta(idx), alloc_t_max_));
+      ref(idx) = std::max(0.0, std::min(ref(idx), alloc_t_max_));
     } else {
-      ref(idx) = std::max(-alloc_t_max_, std::min(ref(idx) + internal_delta(idx), alloc_t_max_));
+      ref(idx) = std::max(-alloc_t_max_, std::min(ref(idx), alloc_t_max_));
     }
   }
   return ref;
@@ -991,92 +895,34 @@ bool BeetleUnifiedController::buildInterfaceLoadMatrix(
 void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
     const Eigen::MatrixXd& interface_load_matrix,
     const std::vector<std::pair<int, int>>& interface_cuts,
-    const Eigen::VectorXd& vectoring_f,
-    const Eigen::VectorXd& interface_load_reference)
+    const Eigen::VectorXd& vectoring_f)
 {
-  if (interface_load_matrix.rows() == 0 ||
+  if (interface_load_pub_.getNumSubscribers() == 0 ||
+      interface_load_matrix.rows() == 0 ||
       interface_load_matrix.cols() != vectoring_f.size() ||
       static_cast<int>(interface_cuts.size()) * 6 != interface_load_matrix.rows()) {
     return;
   }
-  const bool interface_diag_enabled =
-      alloc_interface_force_weight_ > 0.0 ||
-      alloc_interface_torque_weight_ > 0.0 ||
-      alloc_interface_force_limit_ > 0.0 ||
-      alloc_interface_torque_limit_ > 0.0;
-  const bool has_subscriber = interface_load_pub_.getNumSubscribers() > 0;
-  if (!interface_diag_enabled && !has_subscriber) return;
 
-  Eigen::VectorXd load = interface_load_matrix * vectoring_f;
-  Eigen::VectorXd load_err = load;
-  const bool has_reference = (interface_load_reference.size() == load.size());
-  if (has_reference) load_err -= interface_load_reference;
+  const Eigen::VectorXd load = interface_load_matrix * vectoring_f;
   std_msgs::Float32MultiArray msg;
-  if (has_subscriber) msg.data.reserve(interface_cuts.size() * 10);
-
-  double max_force = 0.0;
-  double max_torque = 0.0;
-  double max_force_err = 0.0;
-  double max_torque_err = 0.0;
-  std::ostringstream ss;
-  ss << std::fixed << std::setprecision(2);
-
+  msg.data.reserve(interface_cuts.size() * 10);
   for (size_t i = 0; i < interface_cuts.size(); i++) {
     const Eigen::Vector3d force = load.segment<3>(6 * i);
     const Eigen::Vector3d torque = load.segment<3>(6 * i + 3);
-    Eigen::Vector3d force_err = Eigen::Vector3d::Zero();
-    Eigen::Vector3d torque_err = Eigen::Vector3d::Zero();
-    if (has_reference) {
-      force_err = load_err.segment<3>(6 * i);
-      torque_err = load_err.segment<3>(6 * i + 3);
-    }
-    const double fn = force.norm();
-    const double tn = torque.norm();
-    max_force = std::max(max_force, fn);
-    max_torque = std::max(max_torque, tn);
-    max_force_err = std::max(max_force_err, force_err.norm());
-    max_torque_err = std::max(max_torque_err, torque_err.norm());
-
-    if (has_subscriber) {
-      msg.data.push_back(static_cast<float>(interface_cuts[i].first));
-      msg.data.push_back(static_cast<float>(interface_cuts[i].second));
-      msg.data.push_back(static_cast<float>(force.x()));
-      msg.data.push_back(static_cast<float>(force.y()));
-      msg.data.push_back(static_cast<float>(force.z()));
-      msg.data.push_back(static_cast<float>(torque.x()));
-      msg.data.push_back(static_cast<float>(torque.y()));
-      msg.data.push_back(static_cast<float>(torque.z()));
-      msg.data.push_back(static_cast<float>(fn));
-      msg.data.push_back(static_cast<float>(tn));
-    }
-
-    if (interface_diag_enabled) {
-      if (i > 0) ss << " ";
-      ss << interface_cuts[i].first << "-" << interface_cuts[i].second
-         << ":F=(" << force.x() << "," << force.y() << "," << force.z()
-         << ")|F|=" << fn
-         << " T=(" << torque.x() << "," << torque.y() << "," << torque.z()
-         << ")|T|=" << tn;
-      if (has_reference) {
-        ss << " err|F/T|=" << force_err.norm() << "/" << torque_err.norm();
-      }
-    }
+    msg.data.push_back(static_cast<float>(interface_cuts[i].first));
+    msg.data.push_back(static_cast<float>(interface_cuts[i].second));
+    msg.data.push_back(static_cast<float>(force.x()));
+    msg.data.push_back(static_cast<float>(force.y()));
+    msg.data.push_back(static_cast<float>(force.z()));
+    msg.data.push_back(static_cast<float>(torque.x()));
+    msg.data.push_back(static_cast<float>(torque.y()));
+    msg.data.push_back(static_cast<float>(torque.z()));
+    msg.data.push_back(static_cast<float>(force.norm()));
+    msg.data.push_back(static_cast<float>(torque.norm()));
   }
-
-  if (has_subscriber) interface_load_pub_.publish(msg);
-  if (!interface_diag_enabled) return;
-
-  ROS_INFO_THROTTLE(
-      5.0,
-      "[UnifiedCtrl InterfaceLoad] actuator_cut_proxy max|F|=%.2fN max|T|=%.2fNm "
-      "max|errF|=%.2fN max|errT|=%.2fNm limits(F/T)=%.2f/%.2f "
-      "weights(F/T)=%.3g/%.3g cuts=[%s]",
-      max_force, max_torque, max_force_err, max_torque_err,
-      alloc_interface_force_limit_, alloc_interface_torque_limit_,
-      alloc_interface_force_weight_, alloc_interface_torque_weight_,
-      ss.str().c_str());
+  interface_load_pub_.publish(msg);
 }
-
 void BeetleUnifiedController::batteryVoltageCallback(const std_msgs::Float32ConstPtr& msg)
 {
   if (!msg || !std::isfinite(msg->data) || msg->data <= 0.0f) return;
@@ -1408,12 +1254,10 @@ void BeetleUnifiedController::publishAllocationPwmPredictions(
 
 bool BeetleUnifiedController::buildAllocationConstraints(
     const Eigen::MatrixXd& alloc_matrix,
-    const Eigen::MatrixXd& interface_load_matrix,
     int n_cols, int n_rotors, int n_constraints,
     double thrust_limit,
     double cos_limit, double sin_limit, int thrust_poly_edges,
     bool use_rate_bound, bool use_direction_rate_bound,
-    int n_interface_rows,
     const std::vector<int>& task_priority_rows,
     const Eigen::VectorXd& task_priority_target,
     const std::vector<int>& priority_rows,
@@ -1432,7 +1276,6 @@ bool BeetleUnifiedController::buildAllocationConstraints(
   C_trips.clear();
   C_trips.reserve(n_gimbal_rows * 2 + n_thrust_rows * 2 + n_bound_rows +
                   n_rate_rows + n_direction_rate_rows * 2 +
-                  n_interface_rows * n_cols +
                   (n_task_priority_rows + n_priority_rows) * n_cols);
   lb.resize(n_constraints);
   ub.resize(n_constraints);
@@ -1547,24 +1390,7 @@ bool BeetleUnifiedController::buildAllocationConstraints(
     }
   }
 
-  // (f) Optional component-wise interface cut-load proxy bounds.
-  if (n_interface_rows > 0) {
-    for (int r = 0; r < interface_load_matrix.rows(); r++) {
-      const bool force_row = (r % 6) < 3;
-      const double limit = force_row ? alloc_interface_force_limit_
-                                     : alloc_interface_torque_limit_;
-      if (limit <= 0.0) continue;
-      for (int c = 0; c < n_cols; c++) {
-        const double v = interface_load_matrix(r, c);
-        if (std::abs(v) > 1e-12) C_trips.emplace_back(row, c, v);
-      }
-      lb(row) = -limit;
-      ub(row) = limit;
-      row++;
-    }
-  }
-
-  // (g) Task hard bands: satisfy active feedforward wrench axes first, then let
+  // (f) Task hard bands: satisfy active feedforward wrench axes first, then let
   // effort/rate/balancing costs choose the actuator distribution.
   if (n_task_priority_rows > 0) {
     for (int i = 0; i < n_task_priority_rows; i++) {
@@ -1580,7 +1406,7 @@ bool BeetleUnifiedController::buildAllocationConstraints(
     }
   }
 
-  // (h) Optional hard priority bands for non-task high-output allocation.
+  // (g) Optional hard priority bands for non-task high-output allocation.
   // The band center can differ from the soft target so fast feedback artifacts
   // do not become hard constraints.
   if (n_priority_rows > 0) {
@@ -1615,8 +1441,6 @@ bool BeetleUnifiedController::solveFullVectorQP(
     const Eigen::VectorXd& w_priority,
     const Eigen::VectorXd& secondary_ref,
     const std::vector<int>& assembled_ids,
-    const Eigen::MatrixXd& interface_load_matrix,
-    const Eigen::VectorXd& interface_load_reference,
     Eigen::VectorXd& vectoring_f_out)
 {
   // Full-vector QP: decision variables are all force components f ∈ R^{n_cols}.
@@ -1626,17 +1450,15 @@ bool BeetleUnifiedController::solveFullVectorQP(
   //   where w_des = w_control + w_task + w_feedback,
   //         W_eff is a single per-axis wrench-tracking weight (alloc_wrench_weights_);
   //         task/feedback weights only select hard-band rows, not soft tracking.
-  //         P = A'W_eff A + effort + R + optional rate/lateral-rate/interface terms,
-  //         q = -A'W_eff*w_des - R*f_ref - D'Wi*d_ref - smoothness refs.
+  //         P = A'W_eff A + effort + R + optional rate/lateral-rate terms,
+  //         q = -A'W_eff*w_des - R*f_ref - smoothness refs.
   //         Active task-priority rows additionally get hard bands around
   //         w_control+w_task; they keep their W_eff soft tracking toward w_des,
   //         so the band acts as guaranteed rails while the soft term places the
   //         solution inside it (and w_feedback stays effective on those rows).
   //
   // This separates stabilization/control tracking, explicit task feedforward,
-  // and low-weight observer residual feedback. Optional interface terms are a
-  // model-based actuator-side cut-load proxy target, not a measured physical
-  // connector load.
+  // and low-weight formation-observer residual feedback.
   //
   // Constraints (all linear, OSQP-compatible):
   //   Per rotor i (rotor_coef=2, gimbal_dof=1):
@@ -1647,9 +1469,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
   //   Optional:
   //     (d) Optional component rate bounds: |f - f_prev| ≤ Δf_max
   //     (e) Optional gimbal direction bounds: θ ∈ [θ_prev - Δθ, θ_prev + Δθ]
-  //     (f) Interface cut-load component bounds: |D*f| ≤ load_max
-  //     (g) Task-priority bands: active task rows must remain near w_control+w_task
-  //     (h) Priority bands: selected 6D wrench rows must remain near target
+  //     (f) Task-priority bands: active task rows must remain near w_control+w_task
+  //     (g) Priority bands: selected 6D wrench rows must remain near target
 
   const int n_cols = alloc_matrix.cols();
   if (n_cols == 0 || rotor_coef_ == 0 || n_cols % rotor_coef_ != 0) {
@@ -1666,14 +1487,12 @@ bool BeetleUnifiedController::solveFullVectorQP(
       (feedback_weights.size() > 0 && !feedback_weights.allFinite()) ||
       (w_priority.size() > 0 && !w_priority.allFinite()) ||
       (secondary_ref.size() > 0 && !secondary_ref.allFinite()) ||
-      (interface_load_matrix.size() > 0 && !interface_load_matrix.allFinite()) ||
-      (interface_load_reference.size() > 0 && !interface_load_reference.allFinite()) ||
       !std::isfinite(alloc_t_max_) ||
       !std::isfinite(alloc_gimbal_limit_rad_)) {
     ROS_WARN_THROTTLE(
         1.0,
         "[UnifiedCtrl QP] reject non-finite or mismatched input: A=%dx%d wc=%d "
-        "wt=%d tw=%d wf=%d fw=%d pr=%d sec=%d D=%dx%d dref=%d",
+        "wt=%d tw=%d wf=%d fw=%d pr=%d sec=%d",
         static_cast<int>(alloc_matrix.rows()),
         static_cast<int>(alloc_matrix.cols()),
         static_cast<int>(w_control.size()),
@@ -1682,10 +1501,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
         static_cast<int>(w_feedback.size()),
         static_cast<int>(feedback_weights.size()),
         static_cast<int>(w_priority.size()),
-        static_cast<int>(secondary_ref.size()),
-        static_cast<int>(interface_load_matrix.rows()),
-        static_cast<int>(interface_load_matrix.cols()),
-        static_cast<int>(interface_load_reference.size()));
+        static_cast<int>(secondary_ref.size()));
     return false;
   }
 
@@ -1723,24 +1539,12 @@ bool BeetleUnifiedController::solveFullVectorQP(
       has_prev_alloc && rotor_coef_ == 2 && alloc_direction_rate_limit_rad_ > 0.0;
   const int n_rate_rows = use_rate_bound ? n_cols : 0;
   const int n_direction_rate_rows = use_direction_rate_bound ? 2 * n_rotors : 0;
-  const bool has_interface_map =
-      (interface_load_matrix.cols() == n_cols && interface_load_matrix.rows() > 0);
-  int n_interface_rows = 0;
-  if (has_interface_map &&
-      (alloc_interface_force_limit_ > 0.0 || alloc_interface_torque_limit_ > 0.0)) {
-    for (int r = 0; r < interface_load_matrix.rows(); r++) {
-      const bool force_row = (r % 6) < 3;
-      const double limit = force_row ? alloc_interface_force_limit_
-                                     : alloc_interface_torque_limit_;
-      if (limit > 0.0) n_interface_rows++;
-    }
-  }
   Eigen::VectorXd f_ref = Eigen::VectorXd::Zero(n_cols);
   if (secondary_ref.size() == n_cols) {
     f_ref = secondary_ref;
   }
 
-  // --- Build Hessian P = A'WA + effort + weighted secondary/rate/interface terms ---
+  // --- Build Hessian P = A'WA + effort + weighted secondary/rate terms ---
   Eigen::VectorXd wrench_weights = Eigen::VectorXd::Ones(alloc_matrix.rows());
   if (alloc_wrench_weights_.size() == alloc_matrix.rows()) {
     wrench_weights = alloc_wrench_weights_;
@@ -1796,8 +1600,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   const int n_task_priority_rows = static_cast<int>(task_priority_rows.size());
   const int n_priority_rows = static_cast<int>(priority_rows.size());
   int n_constraints = n_gimbal_rows + n_thrust_rows + n_bound_rows + n_rate_rows +
-                      n_direction_rate_rows + n_interface_rows +
-                      n_task_priority_rows + n_priority_rows;
+                      n_direction_rate_rows + n_task_priority_rows + n_priority_rows;
 
   // Single per-axis wrench-tracking weight on the composed target w_des.
   // Task/feedback weights only gate which rows are promoted to hard bands
@@ -1821,11 +1624,8 @@ bool BeetleUnifiedController::solveFullVectorQP(
           (tracking_weight_diag * desired_tracking_target);
 
   if (alloc_effort_weight_ > 0.0) {
-    // Center the effort penalty on the balanced+internal reference f_ref, not on
-    // zero. Penalizing ||f||^2 toward zero would fight any internal force (f_int
-    // in N(A) raises ||f|| without producing net wrench); centering on f_ref
-    // leaves the intended internal force unpenalized while still regularizing
-    // the wrench-producing part toward the balanced reference.
+    // Center the effort penalty on the balanced/task-consistent reference f_ref
+    // instead of biasing every actuator component toward zero.
     P_dense.diagonal().array() += alloc_effort_weight_;
     q_vec -= alloc_effort_weight_ * f_ref;
   }
@@ -1860,9 +1660,7 @@ bool BeetleUnifiedController::solveFullVectorQP(
   // Penalize the spread of per-module vertical-thrust sums s_m = sum_{r in m} f_z
   // about their mean:  beta * sum_m (s_m - mean)^2 = beta * ||M S f||^2, where S
   // sums each module's f_z and M = I - (1/N) 11^T centers them. Pure quadratic
-  // (the mean is intrinsic), so it only adds to the Hessian; the connector load
-  // is bounded separately by the hard interface limits, leaving cooperation free
-  // below those limits.
+  // (the mean is intrinsic), so it only adds to the Hessian.
   if (alloc_module_balance_weight_ > 0.0 && rotor_coef_ == 2) {
     const int n_modules = static_cast<int>(assembled_ids.size());
     if (n_modules > 1) {
@@ -1881,33 +1679,13 @@ bool BeetleUnifiedController::solveFullVectorQP(
     }
   }
 
-  if (has_interface_map &&
-      (alloc_interface_force_weight_ > 0.0 || alloc_interface_torque_weight_ > 0.0)) {
-    Eigen::VectorXd row_weights = Eigen::VectorXd::Zero(interface_load_matrix.rows());
-    Eigen::VectorXd interface_target = Eigen::VectorXd::Zero(interface_load_matrix.rows());
-    if (interface_load_reference.size() == interface_load_matrix.rows()) {
-      interface_target = interface_load_reference;
-    }
-    for (int r = 0; r < interface_load_matrix.rows(); r++) {
-      row_weights(r) = ((r % 6) < 3) ? alloc_interface_force_weight_
-                                     : alloc_interface_torque_weight_;
-    }
-    P_dense += interface_load_matrix.transpose()
-             * row_weights.asDiagonal()
-             * interface_load_matrix;
-    q_vec -= interface_load_matrix.transpose()
-           * row_weights.asDiagonal()
-           * interface_target;
-  }
-
   // --- Build constraint matrix C and bounds [lb, ub] (C * f in [lb, ub]) ---
   std::vector<Eigen::Triplet<double>> C_trips;
   Eigen::VectorXd lb, ub;
-  if (!buildAllocationConstraints(alloc_matrix, interface_load_matrix,
-                                  n_cols, n_rotors, n_constraints,
+  if (!buildAllocationConstraints(alloc_matrix, n_cols, n_rotors, n_constraints,
                                   thrust_limit,
                                   cos_limit, sin_limit, thrust_poly_edges,
-                                  use_rate_bound, use_direction_rate_bound, n_interface_rows,
+                                  use_rate_bound, use_direction_rate_bound,
                                   task_priority_rows, task_priority_target,
                                   priority_rows, priority_target,
                                   C_trips, lb, ub)) {

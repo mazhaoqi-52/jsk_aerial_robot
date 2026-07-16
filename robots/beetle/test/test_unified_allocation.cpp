@@ -95,9 +95,8 @@ protected:
   {
     const std::vector<int> ids = {1, 2};
     const Eigen::VectorXd empty;
-    const Eigen::MatrixXd empty_mat(0, 0);
     return ctrl_.solveFullVectorQP(A, w_control, empty, empty, empty, empty, empty,
-                                   secondary_ref, ids, empty_mat, empty, f_out);
+                                   secondary_ref, ids, f_out);
   }
 
   // Solve with an explicit task wrench whose active rows are promoted to hard
@@ -110,11 +109,10 @@ protected:
     ctrl_.alloc_priority_tolerances_ = tolerances;
     const std::vector<int> ids = {1, 2};
     const Eigen::VectorXd empty;
-    const Eigen::MatrixXd empty_mat(0, 0);
     return ctrl_.solveFullVectorQP(A, w_control, w_task, task_weights,
                                    empty, empty, empty,
                                    Eigen::VectorXd::Zero(kCols), ids,
-                                   empty_mat, empty, f_out);
+                                   f_out);
   }
 
   static double moduleFzSum(const Eigen::VectorXd& f, int m)

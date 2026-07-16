@@ -42,15 +42,6 @@ controller:
 
   yaw_alloc_weight: 0.5    # Scale wrench_acc(5) before allocation. 1.0=original, <1=reduce yaw→base_thrust coupling
 
-  # Unified internal wrench management. In sim we enable a small secondary gain
-  # for validation; control uses bias-corrected residuals only after hover bias
-  # initialization is ready.
-  unified_internal_wrench_diag: true
-  unified_internal_wrench_log: true
-  unified_internal_wrench_detail_log: false
-  unified_internal_wrench_log_period: 5.0
-  unified_internal_wrench_secondary_gain: 0.05  # observer-driven null-space internal-force trim; clamped <=0.2 in code
-
   # Leader-only compact log for aerial towing validation. Prints only while a
   # nonzero formation_desired_wrench is active.
   unified_towing_debug_log: true
@@ -60,11 +51,11 @@ controller:
 
   # Constrained QP allocation (F2) — off by default, pseudo-inverse fallback used when false
   use_constrained_alloc: true
-  alloc_lambda: 1.0e-2          # secondary objective weight toward balanced hover allocation
+  alloc_lambda: 1.0e-2          # secondary weight toward the balanced/task-consistent reference
   alloc_t_max: 21.0             # per-rotor thrust upper bound [N]
   alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid atan2 singularity at f_z≈0)
-  # Spidar-style secondary costs: keep the allocation close to balanced hover
-  # and penalize total thrust before using actuator margin.
+  # Spidar-style secondary costs: regularize around the balanced/task-consistent
+  # reference before using actuator margin.
   alloc_rate_weight: 2.0e-2     # soft penalty on |f[k] - f[k-1]|
   alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
   alloc_direction_rate_limit_deg: 0.0  # hard per-cycle gimbal direction band [deg]; soft fx-rate is preferred
@@ -74,12 +65,8 @@ controller:
   # Fallback weighted task residual [Fx,Fy,Fz,Tx,Ty,Tz]. Demo layers may publish
   # task-specific weights with each wrench command.
   alloc_task_wrench_weights: [1.00, 1.00, 0.40, 0.40, 0.40, 0.40]
-  alloc_effort_weight: 3.0e-3   # secondary min-energy cost on sum_i ||f_i||^2
+  alloc_effort_weight: 3.0e-3   # secondary cost on ||f - f_ref||^2
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
-  alloc_interface_force_weight: 1.0e-3   # soft tracking of actuator-side cut force proxy [1/N^2]
-  alloc_interface_torque_weight: 1.0e-2  # soft tracking of actuator-side cut torque proxy [1/(Nm)^2]
-  alloc_interface_force_limit: 70.0    # joint-capacity cap [N]: ~30% above 2026-07-03 peak (54N); replace with measured joint rating
-  alloc_interface_torque_limit: 18.0   # joint-capacity cap [Nm]: ~35% above 2026-07-03 peak (13.1Nm); replace with measured joint rating
   alloc_priority_enabled: false
   # Spidar-style task tracking: axes with nonzero desired wrench and task weight
   # >= min_weight are narrow hard bands; effort/rate/balance stay secondary.

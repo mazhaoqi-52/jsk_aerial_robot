@@ -1637,7 +1637,7 @@ class TowingWithFeedforwardState(TowingStateBase):
             self.beetle.addExternalWrench(zero, zero, frame_id="fc")
             rospy.sleep(0.04)
         self.beetle.clearExternalWrench()
-        # Disable internal-wrench auto-publish (also broadcasts a final zero).
+        # Disable legacy LF task-share auto-publish (also broadcasts a final zero).
         self.beetle.setAttachModule(None)
 
     def _build_unload_hold_position(self, current_pos, towing_dir):
@@ -1755,15 +1755,10 @@ class TowingWithFeedforwardState(TowingStateBase):
         control_mode = 'unified' if self.beetle.isUnifiedMode() else 'leader-follower'
         rospy.loginfo(f"Wrench feedforward via BeetleInterface (mode: {control_mode})")
 
-        # ---- Per-module observer task prediction auto-publish ----
-        # Declare which module physically carries the towing hook (= the EE
-        # module on which BeetleInterface is instantiated). BeetleInterface
-        # will then publish per-module y_hat^task = (m_i/m_total) * W_ext on
-        # /beetle{i}/est_wrench_task. The C++ controller subtracts this from
-        # the raw observer output BEFORE the inter-wrench recursion, so both
-        # unified-mode diff damping and LF wrench_comp cascade consume the
-        # parasitic residual only - the task-induced load distribution is
-        # not cancelled or fed back into formation acceleration.
+        # ---- Legacy LF per-module task-share setup ----
+        # BeetleInterface keeps these command-side shares fresh for a possible
+        # return to leader-follower mode. Unified allocation does not consume
+        # this legacy internal-wrench reconstruction input.
         module_masses = rospy.get_param("~module_masses", None)
         module_positions = rospy.get_param("~module_positions", None)
         module_inertias_diag = rospy.get_param("~module_inertias_diag", None)

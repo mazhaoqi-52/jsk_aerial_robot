@@ -1752,11 +1752,9 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                       f"deadband={yaw_velocity_thresh:.3f}rad/s, "
                       f"feedback_timeout={yaw_velocity_timeout:.2f}s")
 
-        # Enable per-module y_hat^task auto-publish for the duration of the
-        # rotation. The valve reaction wrench is applied at the EE module;
-        # BeetleInterface publishes y_hat_i^task = (m_i/m_total) * W_ext on
-        # /beetle{i}/est_wrench_task so the C++ controller can subtract the
-        # task component before forming inter_wrench_list_ (Step C).
+        # Configure the legacy LF per-module command shares for the rotation.
+        # BeetleInterface keeps these topics fresh for legacy mode switching;
+        # unified mode intentionally ignores the internal-wrench reconstruction.
         if ff_enabled:
             self._enable_task_wrench_prediction()
 

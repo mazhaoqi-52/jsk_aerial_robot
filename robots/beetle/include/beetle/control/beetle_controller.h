@@ -39,10 +39,9 @@ namespace aerial_robot_control
                     boost::shared_ptr<aerial_robot_navigation::BaseNavigator> navigator,
                     double ctrl_loop_rate
                     ) override;
-    // Inject per-module observer task prediction (ŷ_i^task). New semantic:
-    //   ŷ_i^task = predicted observer output for module i under the active
-    //   task model (sums to W_ext across modules). Retained as the public
-    //   setter for external controllers (e.g. NinjaController joint PID).
+    // Inject the legacy leader-follower per-module task-wrench share. Despite
+    // the historical est_wrench_task name, this is a decomposed command-side
+    // wrench, not a prediction produced by the momentum observer.
     void setTaskWrench(int id, Eigen::VectorXd y_task)
     {
       std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
@@ -82,11 +81,6 @@ namespace aerial_robot_control
     // the formation allocator receives only the slow PC I-term as a soft target.
 
     bool yaw_in_allocation_;   // true: yaw enters QP/allocation, false: yaw uses spinal-only channel
-    bool unified_internal_wrench_diag_;
-    bool unified_internal_wrench_log_;
-    bool unified_internal_wrench_detail_log_;
-    double unified_internal_wrench_log_period_;
-    double unified_internal_wrench_secondary_gain_;
     bool unified_towing_debug_log_;
     double unified_towing_debug_log_period_;
     bool unified_command_stall_debug_;
@@ -99,15 +93,6 @@ namespace aerial_robot_control
     double unified_debug_trace_until_time_;
     double unified_heartbeat_pub_interval_;
     double last_unified_heartbeat_pub_time_;
-    // Unified residual hover-bias estimator. The bias-corrected internal
-    // component is diagnostic when secondary_gain=0 and becomes a QP secondary
-    // reference when secondary_gain>0.
-    bool unified_residual_bias_ready_;
-    int unified_residual_bias_samples_;
-    int unified_residual_bias_module_num_;
-    Eigen::VectorXd unified_residual_common_bias_;
-    std::map<int, Eigen::VectorXd> unified_residual_bias_list_;
-
     /** @brief LEADER-only: send cascade gains + allocation matrix inverse to this
      *  module's spinal. Uses unified_controller_'s publishers. Also sends gimbal_dof=1
      *  to LEADER's own spinal. */
@@ -252,21 +237,15 @@ namespace aerial_robot_control
 
   protected:
     std::map<int, Eigen::VectorXd> est_wrench_list_;
-    // Per-module observer task prediction (ŷ_i^task). Set by demo layer via
-    // /<robot>{i}/est_wrench_task topic. SEMANTIC: predicted observer output
-    // under the active task model (NOT joint-on-module force). Sum invariant:
-    //   Σ est_wrench_task_list_[i] = W_ext  (Newton 2nd on whole formation)
-    // For uniform allocation + similar modules:
-    //   est_wrench_task_list_[i] ≈ (m_i / m_total) * W_ext   for ALL i
+    // Legacy leader-follower task-wrench shares, set by the demo layer through
+    // /<robot>{i}/est_wrench_task. These are command-side mass/inertia shares;
+    // they are not momentum-observer outputs and are not consumed by unified
+    // control.
     std::map<int, Eigen::VectorXd> est_wrench_task_list_;
-    // Per-module observer residual (parasitic) = est_wrench - est_wrench_task.
-    // Computed in calcInteractionWrench and consumed by the recursion so that
-    // inter_wrench_list_ and wrench_comp_list_ are naturally parasitic-only.
+    // Legacy leader-follower residual used only by calcInteractionWrench().
     std::map<int, Eigen::VectorXd> est_residual_list_;
     std::map<int, Eigen::VectorXd> inter_wrench_list_;
     std::map<int, Eigen::VectorXd> wrench_comp_list_;
-    // Bias-subtracted zero-sum compensation used by unified allocation secondary.
-    std::map<int, Eigen::VectorXd> wrench_comp_biascorr_list_;
     std::mutex unified_wrench_state_mutex_;
 
     /* external wrench compensation */

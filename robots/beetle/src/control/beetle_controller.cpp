@@ -48,11 +48,6 @@ namespace aerial_robot_control
     unified_torque_alloc_inv_pub_interval_(0.05),
     last_unified_torque_alloc_inv_pub_time_(-1.0),
     last_unified_command_pub_time_(-1.0),
-    unified_internal_wrench_diag_(false),
-    unified_internal_wrench_log_(false),
-    unified_internal_wrench_detail_log_(false),
-    unified_internal_wrench_log_period_(5.0),
-    unified_internal_wrench_secondary_gain_(0.0),
     unified_towing_debug_log_(true),
     unified_towing_debug_log_period_(1.0),
     unified_command_stall_debug_(true),
@@ -65,10 +60,6 @@ namespace aerial_robot_control
     unified_debug_trace_until_time_(-1.0),
     unified_heartbeat_pub_interval_(0.2),
     last_unified_heartbeat_pub_time_(-1.0),
-    unified_residual_bias_ready_(false),
-    unified_residual_bias_samples_(0),
-    unified_residual_bias_module_num_(0),
-    unified_residual_common_bias_(Eigen::VectorXd::Zero(6)),
     leader_target_pos_(0, 0, 0),
     leader_target_vel_(0, 0, 0),
     leader_target_acc_(0, 0, 0),
@@ -142,10 +133,8 @@ namespace aerial_robot_control
       est_wrench_list_.insert(make_pair(i+1, wrench));
       inter_wrench_list_.insert(make_pair(i+1, wrench));
       wrench_comp_list_.insert(make_pair(i+1, wrench));
-      wrench_comp_biascorr_list_.insert(make_pair(i+1, wrench));
       est_wrench_task_list_.insert(make_pair(i+1, wrench));
       est_residual_list_.insert(make_pair(i+1, wrench));
-      unified_residual_bias_list_.insert(make_pair(i+1, wrench));
       est_wrench_task_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/est_wrench_task"), 1, &BeetleController::estWrenchTaskCallback, this)));
       est_wrench_task_pubs_[i+1] = nh_.advertise<beetle::TaggedWrench>(module_name + string("/est_wrench_task"), 1);
       desired_ext_wrench_pubs_[i+1] = nh_.advertise<geometry_msgs::WrenchStamped>(module_name + string("/desired_external_wrench"), 1);
@@ -446,24 +435,15 @@ namespace aerial_robot_control
       for (auto& kv : est_residual_list_) kv.second = Eigen::VectorXd::Zero(6);
       for (auto& kv : inter_wrench_list_) kv.second = Eigen::VectorXd::Zero(6);
       for (auto& kv : wrench_comp_list_) kv.second = Eigen::VectorXd::Zero(6);
-      for (auto& kv : wrench_comp_biascorr_list_) kv.second = Eigen::VectorXd::Zero(6);
-      for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
       formation_desired_wrench_.setZero();
       formation_desired_wrench_weights_.setZero();
       formation_desired_wrench_timestamp_ = -1.0;
       formation_desired_wrench_weights_timestamp_ = -1.0;
       single_desired_wrench_.setZero();
       single_desired_wrench_timestamp_ = -1.0;
-      unified_residual_bias_ready_ = false;
-      unified_residual_bias_samples_ = 0;
-      unified_residual_bias_module_num_ = 0;
-      unified_residual_common_bias_ = Eigen::VectorXd::Zero(6);
       unified_external_wrench_feedback_bias_ready_ = false;
       unified_external_wrench_feedback_bias_samples_ = 0;
       unified_external_wrench_feedback_bias_ = Eigen::VectorXd::Zero(6);
-    }
-    if (unified_controller_) {
-      unified_controller_->clearInternalWrenchSecondaryReference();
     }
   }
 
@@ -778,10 +758,9 @@ namespace aerial_robot_control
       wrench_comp_term.head(3) = cog_rot * wrench_comp_term.head(3); // regarding world
 
       /* current version: I term reconfig method */
-      /* wrench_comp is the parasitic residual (task prediction already
-         subtracted upstream). The known task component itself is injected
-         separately from est_wrench_task_list_[my_id], so LF and unified
-         both receive the same task feedforward semantics. */
+      /* The legacy LF wrench_comp path subtracts the command-side task share
+         upstream. The same task share is injected separately here as LF task
+         feedforward; unified mode uses neither path. */
       Eigen::VectorXd I_reconfig_acc_cog_term = Eigen::VectorXd::Zero(6);
       I_reconfig_acc_cog_term.head(3) = mass_inv * wrench_comp_term.head(3);
       I_reconfig_acc_cog_term.tail(3) = inertia_inv * wrench_comp_term.tail(3); //inavailable
@@ -1179,7 +1158,6 @@ namespace aerial_robot_control
     unified_reference_leader_id_ = -1;
     unified_reference_warmup_count_ = 0;
     unified_controller_->clearFormationModelOverride();
-    unified_controller_->clearInternalWrenchSecondaryReference();
   }
 
   void BeetleController::ensureUnifiedReferenceSubscription()
@@ -1907,25 +1885,15 @@ namespace aerial_robot_control
   {
     std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
 
-    /* 1. Subtract per-module observer task prediction up-front.
+    /* 1. Legacy leader-follower task-share subtraction.
      *
      *    est_residual_list_[i] = est_wrench_list_[i] - est_wrench_task_list_[i]
      *
-     *    Theory: observer output ŷ_i = c_i + d_i + b_i (joint force + direct
-     *    external + parasitic). Task prediction ŷ_i^task models the c_i+d_i
-     *    induced by the active task. Their difference is the parasitic-only
-     *    component b_i (plus modelling error). All downstream products
-     *    (W_w, inter_wrench_list_, wrench_comp_list_) are computed from
-     *    est_residual_list_ so they are naturally parasitic by construction.
-     *
-     *    Sum invariant: Σ est_wrench_task_list_[i] = W_ext (Newton 2nd on
-     *    whole formation). With matching Σ est_wrench_list_[i] this gives
-     *    Σ est_residual_list_[i] ≈ 0, so the resulting damping correction
-     *    is naturally zero-sum and does not contaminate formation-level
-     *    wrench tracking.
-     *
-     *    When no task is active (demo publishes zeros), est_residual = est_wrench
-     *    and the rest of the function reduces to the pre-existing behaviour.
+     *    est_wrench_task_list_ is a command-side task share, while the momentum
+     *    observer already uses the realized actuator wrench as a known input.
+     *    It is therefore not a valid observer-output prediction for unified
+     *    internal-force control. Unified mode no longer calls this function;
+     *    this calculation is retained only to preserve legacy LF behaviour.
      */
     std::map<int, bool> assembly_flag = beetle_navigator_->getAssemblyFlags();
     const int max_modules_num = beetle_navigator_->getMaxModuleNum();
@@ -1980,9 +1948,7 @@ namespace aerial_robot_control
     wrench_msg.wrench.torque.z = W_w(5);
     whole_external_wrench_pub_.publish(wrench_msg);
 
-    /* 2. Recursion on the residual: inter_wrench_list_[i] is now the
-     *    PARASITIC joint-cut wrench across the boundary between module i
-     *    and module i+1 (along the leader→i traversal). */
+    /* 2. Legacy recursion on the task-share-subtracted residual. */
     Eigen::VectorXd left_inter_wrench = Eigen::VectorXd::Zero(6);
     for(int i = 1; i <= max_modules_num; i++){
       if(isAssembled(i)){
@@ -2044,10 +2010,7 @@ namespace aerial_robot_control
       diag_msg.data[3] = static_cast<float>(rms_t);
       inter_disagreement_pub_.publish(diag_msg);
     }
-    /* 3. Compute wrench_comp_list_[i] for the LF cascade. Since inter is now
-     *    the PARASITIC joint-cut wrench (task already subtracted at step 1),
-     *    wrench_comp_list_[i] is a simple cumulative sum of parasitic joint
-     *    wrenches between the leader and module i. */
+    /* 3. Compute the cumulative wrench_comp_list_[i] for the LF cascade. */
     /* 3.1. process from leader to left*/
     Eigen::VectorXd wrench_comp_sum_left = Eigen::VectorXd::Zero(6);
     for(int i = leader_id-1; i > 0; i--){
@@ -2071,323 +2034,6 @@ namespace aerial_robot_control
       }
     }
 
-    constexpr int kBiasReadySamples = 100;
-    constexpr double kBiasAlpha = 0.01;
-    constexpr double kQuietWrenchNorm = 1e-3;
-    bool task_quiet = true;
-    double task_norm_sum = 0.0;
-    for (int i = 1; i <= max_modules_num; ++i) {
-      if (!isAssembled(i)) continue;
-      Eigen::VectorXd task = getWrenchOrZero(est_wrench_task_list_, i);
-      task_norm_sum += task.norm();
-    }
-    task_quiet = (task_norm_sum < kQuietWrenchNorm);
-    const double desired_norm =
-        (formation_desired_wrench_.size() >= 6) ? formation_desired_wrench_.norm() : 0.0;
-    const bool desired_quiet = (desired_norm < kQuietWrenchNorm);
-    const bool hover_quiet_gate =
-        beetle_navigator_->getControlFlag() &&
-        navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
-        !navigator_->getForceLandingFlag() &&
-        task_quiet && desired_quiet;
-    const bool bias_gate =
-        hover_quiet_gate &&
-        (!unified_residual_bias_ready_ ||
-         unified_internal_wrench_secondary_gain_ <= 0.0);
-    const bool bias_module_changed =
-        unified_residual_bias_samples_ > 0 &&
-        unified_residual_bias_module_num_ != module_num;
-    if (bias_module_changed ||
-        (!hover_quiet_gate && !unified_residual_bias_ready_)) {
-      for (auto& kv : unified_residual_bias_list_) kv.second = Eigen::VectorXd::Zero(6);
-      unified_residual_common_bias_ = Eigen::VectorXd::Zero(6);
-      unified_residual_bias_samples_ = 0;
-      unified_residual_bias_ready_ = false;
-    }
-    if (bias_gate) {
-      if (unified_residual_bias_samples_ == 0) {
-        unified_residual_common_bias_ = W_w;
-        for (int i = 1; i <= max_modules_num; ++i) {
-          if (!isAssembled(i)) continue;
-          unified_residual_bias_list_[i] = getWrenchOrZero(est_residual_list_, i);
-        }
-        unified_residual_bias_module_num_ = module_num;
-      } else {
-        unified_residual_common_bias_ =
-            (1.0 - kBiasAlpha) * unified_residual_common_bias_ + kBiasAlpha * W_w;
-        for (int i = 1; i <= max_modules_num; ++i) {
-          if (!isAssembled(i)) continue;
-          unified_residual_bias_list_[i] =
-              (1.0 - kBiasAlpha) *
-              getWrenchOrZero(unified_residual_bias_list_, i) +
-              kBiasAlpha * getWrenchOrZero(est_residual_list_, i);
-        }
-      }
-      unified_residual_bias_samples_++;
-      unified_residual_bias_ready_ =
-          (unified_residual_bias_samples_ >= kBiasReadySamples);
-    }
-
-    auto computeCommonModeByModule =
-        [&](const std::map<int, Eigen::VectorXd>& residuals,
-            std::map<int, Eigen::VectorXd>& common_by_module,
-            Eigen::VectorXd& common_avg) {
-      common_by_module.clear();
-      common_avg = Eigen::VectorXd::Zero(6);
-
-      Eigen::Vector3d force_sum = Eigen::Vector3d::Zero();
-      Eigen::Vector3d torque_sum = Eigen::Vector3d::Zero();
-      Eigen::Matrix3d inertia_sum = Eigen::Matrix3d::Zero();
-      std::map<int, double> mass_by_module;
-      std::map<int, Eigen::Matrix3d> inertia_by_module;
-      double mass_sum = 0.0;
-      int active_num = 0;
-      bool all_model_ok = true;
-
-      for (int i = 1; i <= max_modules_num; ++i) {
-        if (!isAssembled(i)) continue;
-        Eigen::VectorXd residual = getWrenchOrZero(residuals, i);
-
-        double mass = 1.0;
-        Eigen::Matrix3d inertia = Eigen::Matrix3d::Identity();
-        double model_mass = 0.0;
-        Eigen::Matrix3d model_inertia = Eigen::Matrix3d::Zero();
-        if (unified_controller_ &&
-            unified_controller_->getModuleMassInertia(i, model_mass, model_inertia) &&
-            std::isfinite(model_mass) && model_mass > 1e-6 &&
-            model_inertia.allFinite() &&
-            std::abs(model_inertia.trace()) > 1e-9) {
-          mass = model_mass;
-          inertia = model_inertia;
-        } else {
-          all_model_ok = false;
-        }
-
-        mass_by_module[i] = mass;
-        inertia_by_module[i] = inertia;
-        mass_sum += mass;
-        inertia_sum += inertia;
-        force_sum += residual.head(3);
-        torque_sum += residual.tail(3);
-        active_num++;
-      }
-
-      if (active_num <= 0) return false;
-
-      auto useSimpleAverage = [&]() {
-        Eigen::VectorXd common = Eigen::VectorXd::Zero(6);
-        common.head(3) = force_sum / active_num;
-        common.tail(3) = torque_sum / active_num;
-        for (int i = 1; i <= max_modules_num; ++i) {
-          if (isAssembled(i)) common_by_module[i] = common;
-        }
-        common_avg = common;
-        return false;
-      };
-
-      if (mass_sum <= 1e-9 || !inertia_sum.allFinite()) return useSimpleAverage();
-
-      Eigen::LDLT<Eigen::Matrix3d> ldlt(inertia_sum);
-      if (ldlt.info() != Eigen::Success) return useSimpleAverage();
-      Eigen::Vector3d common_acc = force_sum / mass_sum;
-      Eigen::Vector3d common_alpha = ldlt.solve(torque_sum);
-      if (!common_acc.allFinite() || !common_alpha.allFinite()) return useSimpleAverage();
-
-      for (int i = 1; i <= max_modules_num; ++i) {
-        if (!isAssembled(i)) continue;
-        Eigen::VectorXd common = Eigen::VectorXd::Zero(6);
-        common.head(3) = mass_by_module[i] * common_acc;
-        common.tail(3) = inertia_by_module[i] * common_alpha;
-        common_by_module[i] = common;
-        common_avg += common;
-      }
-      common_avg /= active_num;
-      return all_model_ok;
-    };
-
-    std::map<int, Eigen::VectorXd> residual_biascorr_list;
-    std::map<int, Eigen::VectorXd> inter_biascorr_list;
-    std::map<int, Eigen::VectorXd> comp_biascorr_list;
-    std::map<int, Eigen::VectorXd> common_biascorr_list;
-    Eigen::VectorXd W_w_biascorr = Eigen::VectorXd::Zero(6);
-    double max_res_biascorr_f = 0.0, max_res_biascorr_t = 0.0;
-    double max_comp_biascorr_f = 0.0, max_comp_biascorr_t = 0.0;
-    bool biascorr_model_projected = false;
-    for (int i = 1; i <= max_modules_num; ++i) {
-      residual_biascorr_list[i] = Eigen::VectorXd::Zero(6);
-      inter_biascorr_list[i] = Eigen::VectorXd::Zero(6);
-      comp_biascorr_list[i] = Eigen::VectorXd::Zero(6);
-    }
-    if (unified_residual_bias_ready_) {
-      for (int i = 1; i <= max_modules_num; ++i) {
-        if (!isAssembled(i)) continue;
-        Eigen::VectorXd bias = getWrenchOrZero(unified_residual_bias_list_, i);
-        residual_biascorr_list[i] = getWrenchOrZero(est_residual_list_, i) - bias;
-        max_res_biascorr_f =
-            std::max(max_res_biascorr_f, residual_biascorr_list[i].head(3).norm());
-        max_res_biascorr_t =
-            std::max(max_res_biascorr_t, residual_biascorr_list[i].tail(3).norm());
-      }
-      biascorr_model_projected =
-          computeCommonModeByModule(residual_biascorr_list,
-                                    common_biascorr_list,
-                                    W_w_biascorr);
-
-      Eigen::VectorXd left_inter_wrench_bc = Eigen::VectorXd::Zero(6);
-      for (const auto& item : residual_biascorr_list) {
-        if (isAssembled(item.first)) {
-          Eigen::VectorXd common = common_biascorr_list.count(item.first)
-                                       ? common_biascorr_list[item.first]
-                                       : W_w_biascorr;
-          if (common.size() != 6) common = W_w_biascorr;
-          Eigen::VectorXd right_inter_wrench_bc =
-              item.second - common + left_inter_wrench_bc;
-          inter_biascorr_list[item.first] = right_inter_wrench_bc;
-          left_inter_wrench_bc = right_inter_wrench_bc;
-        }
-      }
-
-      Eigen::VectorXd wrench_comp_sum_left_bc = Eigen::VectorXd::Zero(6);
-      for (int i = leader_id - 1; i > 0; --i) {
-        if (isAssembled(i)) {
-          wrench_comp_sum_left_bc += getWrenchOrZero(inter_biascorr_list, i);
-          comp_biascorr_list[i] = wrench_comp_sum_left_bc;
-        }
-      }
-      int left_module_id_bc = leader_id;
-      Eigen::VectorXd wrench_comp_sum_right_bc = Eigen::VectorXd::Zero(6);
-      for (int i = leader_id + 1; i <= max_modules_num; ++i) {
-        if (isAssembled(i)) {
-          wrench_comp_sum_right_bc +=
-              -getWrenchOrZero(inter_biascorr_list, left_module_id_bc);
-          comp_biascorr_list[i] = wrench_comp_sum_right_bc;
-          left_module_id_bc = i;
-        }
-      }
-      comp_biascorr_list[leader_id] = Eigen::VectorXd::Zero(6);
-
-      for (int i = 1; i <= max_modules_num; ++i) {
-        if (!isAssembled(i)) continue;
-        Eigen::VectorXd comp_biascorr = getWrenchOrZero(comp_biascorr_list, i);
-        max_comp_biascorr_f =
-            std::max(max_comp_biascorr_f, comp_biascorr.head(3).norm());
-        max_comp_biascorr_t =
-            std::max(max_comp_biascorr_t, comp_biascorr.tail(3).norm());
-      }
-    }
-    wrench_comp_biascorr_list_ = comp_biascorr_list;
-
-    if (unified_control_mode_ && unified_internal_wrench_log_) {
-      auto fmtWrench = [](const Eigen::VectorXd& v) {
-        std::ostringstream os;
-        os << std::fixed << std::setprecision(3);
-        if (v.size() < 6) {
-          os << "[invalid:" << v.size() << "]";
-        } else {
-          os << "[" << v(0) << "," << v(1) << "," << v(2)
-             << ";" << v(3) << "," << v(4) << "," << v(5) << "]";
-        }
-        return os.str();
-      };
-      auto fmtVec3 = [](const Eigen::Vector3d& v) {
-        std::ostringstream os;
-        os << std::fixed << std::setprecision(3)
-           << "[" << v(0) << "," << v(1) << "," << v(2) << "]";
-        return os.str();
-      };
-
-      double max_res_f = 0.0, max_res_t = 0.0;
-      double max_comp_f = 0.0, max_comp_t = 0.0;
-      std::map<int, Eigen::VectorXd> realized_wrench_list;
-      Eigen::Vector3d realized_force_sum = Eigen::Vector3d::Zero();
-      for (int i = 1; i <= max_modules_num; ++i) {
-        if (!isAssembled(i)) continue;
-        Eigen::VectorXd residual = getWrenchOrZero(est_residual_list_, i);
-        Eigen::VectorXd comp = getWrenchOrZero(wrench_comp_list_, i);
-        max_res_f = std::max(max_res_f, residual.head(3).norm());
-        max_res_t = std::max(max_res_t, residual.tail(3).norm());
-        max_comp_f = std::max(max_comp_f, comp.head(3).norm());
-        max_comp_t = std::max(max_comp_t, comp.tail(3).norm());
-        Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
-        if (unified_controller_ &&
-            unified_controller_->getRealizedModuleWrenchBody(i, realized)) {
-          realized_wrench_list[i] = realized;
-          realized_force_sum += realized.head(3);
-        }
-      }
-
-      std::ostringstream ss;
-      ss << std::fixed << std::setprecision(3);
-      ss << "[UnifiedInternalWrench id=" << my_id
-         << " leader=" << leader_id
-         << " gain=" << unified_internal_wrench_secondary_gain_
-         << " src=single_module_observer"
-         << "] W_res_avg=" << fmtWrench(W_w)
-         << " maxRes=[F=" << max_res_f << ",T=" << max_res_t << "]"
-         << " maxComp=[F=" << max_comp_f << ",T=" << max_comp_t << "]";
-      ss << " biasDiag=[gate=" << (bias_gate ? 1 : 0)
-         << ",samples=" << unified_residual_bias_samples_
-         << ",ready=" << (unified_residual_bias_ready_ ? 1 : 0)
-         << ",biasAvg=" << fmtWrench(unified_residual_common_bias_);
-      if (unified_residual_bias_ready_) {
-        ss << ",resAvgCorr=" << fmtWrench(W_w_biascorr)
-           << ",proj=" << (biascorr_model_projected ? "mass_inertia" : "average")
-           << ",maxResCorr=[F=" << max_res_biascorr_f
-           << ",T=" << max_res_biascorr_t << "]"
-           << ",maxCompCorr=[F=" << max_comp_biascorr_f
-           << ",T=" << max_comp_biascorr_t << "]";
-      }
-      ss << "]";
-      if (is_diag_leader) {
-        ss << " disagree=[maxF=" << max_f
-           << ",maxT=" << max_t
-           << ",rmsF=" << rms_f
-           << ",rmsT=" << rms_t
-           << ",pairs=" << n_pairs << "]";
-        if (formation_observer_ && formation_observer_->isActive() &&
-            formation_observer_->isInitialized()) {
-          ss << " formObs=" << fmtWrench(formation_observer_->getEstExternalWrench6D());
-        }
-      }
-      if (!realized_wrench_list.empty() && unified_controller_) {
-        Eigen::VectorXd realized_formation = unified_controller_->getRealizedWrenchBody();
-        if (realized_formation.size() >= 6) {
-          Eigen::Vector3d force_err = realized_force_sum - realized_formation.head(3);
-          ss << " allocDiag=[moduleFsum=" << fmtVec3(realized_force_sum)
-             << ",formF=" << fmtVec3(realized_formation.head(3))
-             << ",errF=" << force_err.norm() << "]";
-        }
-      }
-      ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, ss.str());
-
-      if (unified_internal_wrench_detail_log_) {
-        std::ostringstream detail_ss;
-        detail_ss << ss.str() << " modules:";
-        for (int i = 1; i <= max_modules_num; ++i) {
-          if (!isAssembled(i)) continue;
-          auto realized_it = realized_wrench_list.find(i);
-          const Eigen::VectorXd realized =
-              (realized_it != realized_wrench_list.end())
-                  ? realized_it->second
-                  : Eigen::VectorXd::Zero(6);
-          detail_ss << " m" << i
-                    << "{real=" << fmtWrench(realized)
-                    << ",est=" << fmtWrench(getWrenchOrZero(est_wrench_list_, i))
-                    << ",task=" << fmtWrench(getWrenchOrZero(est_wrench_task_list_, i))
-                    << ",res=" << fmtWrench(getWrenchOrZero(est_residual_list_, i))
-                    << ",bias=" << fmtWrench(getWrenchOrZero(unified_residual_bias_list_, i));
-          if (unified_residual_bias_ready_) {
-            detail_ss << ",res_bc=" << fmtWrench(getWrenchOrZero(residual_biascorr_list, i))
-                      << ",inter_bc=" << fmtWrench(getWrenchOrZero(inter_biascorr_list, i))
-                      << ",comp_bc=" << fmtWrench(getWrenchOrZero(comp_biascorr_list, i));
-          }
-          detail_ss
-                    << ",inter=" << fmtWrench(getWrenchOrZero(inter_wrench_list_, i))
-                    << ",comp=" << fmtWrench(getWrenchOrZero(wrench_comp_list_, i)) << "}";
-        }
-        ROS_INFO_STREAM_THROTTLE(unified_internal_wrench_log_period_, detail_ss.str());
-      }
-    }
   }
 
   void BeetleController::rosParamInit()
@@ -2452,18 +2098,6 @@ namespace aerial_robot_control
                      unified_torque_alloc_inv_pub_interval_, 0.05);
     unified_torque_alloc_inv_pub_interval_ =
         std::max(0.0, unified_torque_alloc_inv_pub_interval_);
-    getParam<bool>(control_nh, "unified_internal_wrench_diag", unified_internal_wrench_diag_, false);
-    getParam<bool>(control_nh, "unified_internal_wrench_log", unified_internal_wrench_log_, false);
-    getParam<bool>(control_nh, "unified_internal_wrench_detail_log",
-                   unified_internal_wrench_detail_log_, false);
-    getParam<double>(control_nh, "unified_internal_wrench_log_period",
-                     unified_internal_wrench_log_period_, 5.0);
-    unified_internal_wrench_log_period_ =
-        std::max(0.1, unified_internal_wrench_log_period_);
-    getParam<double>(control_nh, "unified_internal_wrench_secondary_gain",
-                     unified_internal_wrench_secondary_gain_, 0.0);
-    unified_internal_wrench_secondary_gain_ =
-        std::min(0.2, std::max(0.0, unified_internal_wrench_secondary_gain_));
     getParam<bool>(control_nh, "unified_towing_debug_log",
                    unified_towing_debug_log_, true);
     getParam<double>(control_nh, "unified_towing_debug_log_period",
@@ -2545,10 +2179,9 @@ namespace aerial_robot_control
 
   void BeetleController::externalWrenchEstimate()
   {
-    // In unified mode this single-module observer is kept alive for short-term
-    // residual diagnostics. Its estimate is not injected into pose/attitude PID;
-    // calcInteractionWrench() only feeds the allocation secondary when the
-    // explicit unified_internal_wrench_secondary_gain is positive and HOVER-gated.
+    // The single-module observer remains available for external-wrench topics
+    // and diagnostics. Unified allocation does not consume its internal-wrench
+    // reconstruction; formation-level feedback uses FormationMomentumObserver.
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&
@@ -2714,10 +2347,9 @@ namespace aerial_robot_control
     //   Unified mode consumes it only in computeUnifiedAllocation(); it is not
     //   injected as PID persistent FF.
     //
-    // Per-module observer task prediction (est_wrench_task_list_) is published
-    // by the demo layer (BeetleInterface) on /<robot>{i}/est_wrench_task and
-    // arrives via estWrenchTaskCallback. The leader no longer derives or
-    // re-publishes those values here.
+    // Legacy LF per-module command shares (est_wrench_task_list_) are published
+    // by BeetleInterface on /<robot>{i}/est_wrench_task and arrive through
+    // estWrenchTaskCallback. Unified mode does not consume them.
 
     Eigen::VectorXd desired = Eigen::VectorXd::Zero(6);
     desired(0) = msg.wrench.force.x;
@@ -3402,47 +3034,6 @@ namespace aerial_robot_control
     double du = ros::Time::now().toSec() - control_timestamp_;
     if (du < 0.0) du = 0.0;
     if (du > 0.1) du = 0.1;  // clamp callback-stall gaps so PID-D and FF integrators stay sane
-
-    // Optional LF-style internal wrench processing in unified mode.
-    // With gain=0 this is diagnostic only: it publishes the same residual /
-    // inter-wrench signals as the legacy leader-follower path without feeding
-    // them back into the allocator. A positive gain biases the QP secondary
-    // reference after hover-bias initialization, not the primary formation
-    // wrench objective.
-    const bool unified_secondary_ready =
-        beetle_navigator_->getControlFlag() &&
-        navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
-        !navigator_->getForceLandingFlag();
-    const bool unified_secondary_requested =
-        unified_internal_wrench_secondary_gain_ > 0.0 && unified_secondary_ready;
-
-    if (beetle_navigator_->getControlFlag() &&
-        (unified_internal_wrench_diag_ || unified_secondary_requested)) {
-      markUnifiedDebugStage("internal_wrench_calc_enter");
-      calcInteractionWrench();
-      markUnifiedDebugStage("internal_wrench_calc_exit");
-    }
-    bool unified_secondary_active = false;
-    std::map<int, Eigen::VectorXd> wrench_comp_snapshot;
-    if (unified_secondary_requested) {
-      markUnifiedDebugStage("internal_wrench_secondary_lock_enter");
-      {
-        std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
-        if (unified_residual_bias_ready_) {
-          wrench_comp_snapshot = wrench_comp_biascorr_list_;
-          unified_secondary_active = true;
-        }
-      }
-      markUnifiedDebugStage("internal_wrench_secondary_lock_exit");
-    }
-    if (unified_secondary_active) {
-      unified_controller_->setInternalWrenchSecondaryReference(
-          wrench_comp_snapshot, unified_internal_wrench_secondary_gain_);
-    } else {
-      markUnifiedDebugStage("internal_wrench_secondary_clear_enter");
-      unified_controller_->clearInternalWrenchSecondaryReference();
-      markUnifiedDebugStage("internal_wrench_secondary_clear_exit");
-    }
 
     // Unified mode has a single task-wrench path: formation_desired_wrench_
     // is tracked as a weighted QP task objective. Keep PID persistent FF clear

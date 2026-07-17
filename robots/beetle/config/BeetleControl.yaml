@@ -75,6 +75,12 @@ controller:
   alloc_effort_weight: 3.0e-3   # secondary cost on ||f - f_ref||^2
   alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
   alloc_module_balance_weight: 1.0e-3  # soft penalty on per-module vertical-thrust spread
+  # Component-wise hard box on the model interface wrench w_I=d-Df for the
+  # standard positive-X terminal tool/contact topology.
+  # N / Nm; <=0 disables that half of the 6D bound. Keep disabled until the
+  # docking interface rating is measured (historical log peaks are not ratings).
+  alloc_interface_force_limit: 0.0
+  alloc_interface_torque_limit: 0.0
   alloc_priority_enabled: false
   # Spidar-style task tracking: axes with nonzero desired wrench and task weight
   # >= min_weight are narrow hard bands; effort/rate/balance stay secondary.

@@ -339,7 +339,7 @@ private:
   // Constraints:
   //   - Gimbal angle:  |f_x| ≤ tan(θ_max) * f_z  (linearized)
   //   - Thrust bound:  each component within the configured/dynamic T_max, f_z ≥ 0
-  bool use_constrained_alloc_;        // if true, use OsqpEigen QP; fallback to pseudoinverse
+  bool use_constrained_alloc_;        // if true, use OsqpEigen QP; reject command update on failure
   double alloc_lambda_;               // secondary objective weight toward balanced hover reference
   double alloc_t_max_;                // per-rotor thrust upper bound [N]
   double alloc_gimbal_limit_rad_;     // gimbal angle hard limit [rad]
@@ -351,6 +351,8 @@ private:
   Eigen::VectorXd alloc_task_wrench_weights_;  // 6D task residual weights [Fx,Fy,Fz,Tx,Ty,Tz]
   double alloc_effort_weight_;        // optional total-effort penalty on vectoring force
   std::vector<double> alloc_module_weights_;  // module-id indexed multiplier on alloc_lambda_
+  double alloc_interface_force_limit_;   // component-wise model interface-force bound [N]
+  double alloc_interface_torque_limit_;  // component-wise model interface-torque bound [Nm]
   double alloc_module_balance_weight_;    // optional soft penalty on per-module vertical-thrust spread
   bool alloc_priority_enabled_;       // hard-prioritize selected 6D wrench tracking rows
   Eigen::VectorXd alloc_priority_tolerances_;  // [Fx,Fy,Fz,Tx,Ty,Tz] acc-space bands; <=0 disables row
@@ -391,6 +393,7 @@ private:
    *   satisfy the task/balance rows first, then shape redundancy.
    *   s.t.  linear gimbal-angle constraints (per rotor)
    *         component bounds
+   *         optional model interface-wrench bounds
    *         optional task/6D wrench priority bands
    *
    * @param alloc_matrix  Formation allocation matrix A (6 x n_cols)
@@ -401,8 +404,10 @@ private:
    * @param feedback_weights 6D low feedback residual weights
    * @param w_priority    6D wrench-acceleration vector used as the center of hard priority bands
    * @param secondary_ref Balanced/task-consistent soft allocation reference
+   * @param interface_actuation_matrix D in w_I = d - D*f for all physical-chain cuts
+   * @param interface_required_wrench d in w_I = d - D*f, from commanded rigid-body dynamics
    * @param vectoring_f_out  Output: full vectoring force vector (n_cols)
-   * @return true on success, false on failure (caller falls back to pseudoinverse)
+   * @return true on success, false on failure (caller may retry, then rejects the command update)
    */
   bool solveFullVectorQP(const Eigen::MatrixXd& alloc_matrix,
                          const Eigen::VectorXd& w_control,
@@ -413,18 +418,23 @@ private:
                          const Eigen::VectorXd& w_priority,
                          const Eigen::VectorXd& secondary_ref,
                          const std::vector<int>& assembled_ids,
+                         const Eigen::MatrixXd& interface_actuation_matrix,
+                         const Eigen::VectorXd& interface_required_wrench,
                          Eigen::VectorXd& vectoring_f_out);
 
   /** @brief Build the QP linear-constraint triplets and [lb, ub] bounds:
    *  gimbal-angle, thrust polygon, component bounds, optional rate / direction
-   *  rows, and task/priority hard bands. Returns false if the
+   *  / interface rows, and task/priority hard bands. Returns false if the
    *  built row count disagrees with n_constraints. Pure assembly of the
    *  pre-counted constraints; no member state is modified. */
   bool buildAllocationConstraints(const Eigen::MatrixXd& alloc_matrix,
+                                  const Eigen::MatrixXd& interface_actuation_matrix,
+                                  const Eigen::VectorXd& interface_required_wrench,
                                   int n_cols, int n_rotors, int n_constraints,
                                   double thrust_limit,
                                   double cos_limit, double sin_limit, int thrust_poly_edges,
                                   bool use_rate_bound, bool use_direction_rate_bound,
+                                  int n_interface_rows,
                                   const std::vector<int>& task_priority_rows,
                                   const Eigen::VectorXd& task_priority_target,
                                   const std::vector<int>& priority_rows,
@@ -454,16 +464,38 @@ private:
       const std::vector<int>& assembled_ids,
       const Eigen::VectorXd& task_wrench_acc) const;
 
-  /** @brief Build actuator-side cut-load proxy rows for each adjacent module
-   *  boundary. Rows are ordered [Fx,Fy,Fz,Tx,Ty,Tz] per cut, with the cut placed
-   *  halfway between adjacent module CoGs in formation body coordinates. This is
-   *  a model-based allocation proxy D*f, not a measured connector load and not
-   *  gravity/inertia compensated. */
-  bool buildInterfaceLoadMatrix(const std::vector<int>& assembled_ids,
-                                Eigen::MatrixXd& interface_load_matrix,
-                                std::vector<std::pair<int, int>>& interface_cuts) const;
+  /** @brief Sort allocation IDs into the physical Beetle chain (increasing
+   *  leader-frame CoG x), while preserving the original ID-to-QP-column map. */
+  bool getPhysicalChainOrder(const std::vector<int>& allocation_ids,
+                             std::vector<int>& chain_ids,
+                             std::map<int, int>& allocation_indices) const;
 
-  void publishInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_load_matrix,
+  /** @brief Build the affine model interface wrench for every physical cut:
+   *
+   *    w_I,k(f) = d_k(a*, alpha*) - D_k f.
+   *
+   *  D_k maps negative-x-subchain rotor forces to actuator wrench about the
+   *  midpoint of the adjacent module CoGs. This subchain excludes Beetle's
+   *  standard positive-x-end task contact. d_k is the wrench required by the
+   *  commanded rigid-body specific acceleration, including gravity feedforward.
+   *  Rows are [Fx,Fy,Fz,Tx,Ty,Tz] per cut. This is a quasi-static/commanded-
+   *  dynamics model quantity, not a force-sensor measurement; unmodelled
+   *  contacts on the selected subchain and angular-rate terms are excluded. */
+  bool buildInterfaceLoadModel(const std::vector<int>& allocation_ids,
+                               const Eigen::VectorXd& control_wrench_acc,
+                               Eigen::MatrixXd& interface_actuation_matrix,
+                               Eigen::VectorXd& interface_required_wrench,
+                               std::vector<std::pair<int, int>>& interface_cuts) const;
+  bool buildInterfaceLoadModelWithMasks(
+      const std::vector<int>& allocation_ids,
+      const Eigen::VectorXd& control_wrench_acc,
+      const std::vector<Eigen::MatrixXd>& masked_rot_single,
+      Eigen::MatrixXd& interface_actuation_matrix,
+      Eigen::VectorXd& interface_required_wrench,
+      std::vector<std::pair<int, int>>& interface_cuts) const;
+
+  void publishInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_actuation_matrix,
+                                       const Eigen::VectorXd& interface_required_wrench,
                                        const std::vector<std::pair<int, int>>& interface_cuts,
                                        const Eigen::VectorXd& vectoring_f);
   void publishAllocationPwmPredictions(const Eigen::VectorXd& qp_vectoring_f,

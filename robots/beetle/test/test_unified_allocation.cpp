@@ -15,6 +15,7 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <vector>
 #include <beetle/control/beetle_unified_controller.h>
 
@@ -39,6 +40,8 @@ protected:
   double lambda_ = 1e-4;
   double balance_weight_ = 0.0;
   double wrench_weight_ = 10.0;
+  double interface_force_limit_ = 0.0;
+  double interface_torque_limit_ = 0.0;
 
   void SetUp() override
   {
@@ -56,6 +59,8 @@ protected:
     ctrl_.alloc_lambda_ = lambda_;
     ctrl_.alloc_effort_weight_ = 0.0;
     ctrl_.alloc_module_balance_weight_ = balance_weight_;
+    ctrl_.alloc_interface_force_limit_ = interface_force_limit_;
+    ctrl_.alloc_interface_torque_limit_ = interface_torque_limit_;
     ctrl_.alloc_wrench_weights_ = Eigen::VectorXd::Ones(6) * wrench_weight_;
     ctrl_.prev_vectoring_f_.resize(0);
     ctrl_.resetQPState();
@@ -95,8 +100,9 @@ protected:
   {
     const std::vector<int> ids = {1, 2};
     const Eigen::VectorXd empty;
+    const Eigen::MatrixXd empty_matrix;
     return ctrl_.solveFullVectorQP(A, w_control, empty, empty, empty, empty, empty,
-                                   secondary_ref, ids, f_out);
+                                   secondary_ref, ids, empty_matrix, empty, f_out);
   }
 
   // Solve with an explicit task wrench whose active rows are promoted to hard
@@ -109,10 +115,80 @@ protected:
     ctrl_.alloc_priority_tolerances_ = tolerances;
     const std::vector<int> ids = {1, 2};
     const Eigen::VectorXd empty;
+    const Eigen::MatrixXd empty_matrix;
     return ctrl_.solveFullVectorQP(A, w_control, w_task, task_weights,
                                    empty, empty, empty,
                                    Eigen::VectorXd::Zero(kCols), ids,
+                                   empty_matrix, empty,
                                    f_out);
+  }
+
+  bool solveWithInterfaceModel(const Eigen::MatrixXd& A,
+                               const Eigen::VectorXd& w_control,
+                               const Eigen::MatrixXd& D,
+                               const Eigen::VectorXd& d,
+                               Eigen::VectorXd& f_out)
+  {
+    const std::vector<int> ids = {1, 2};
+    const Eigen::VectorXd empty;
+    return ctrl_.solveFullVectorQP(A, w_control, empty, empty, empty, empty, empty,
+                                   Eigen::VectorXd::Zero(kCols), ids, D, d, f_out);
+  }
+
+  bool solveWithTaskAndInterfaceModel(const Eigen::MatrixXd& A,
+                                      const Eigen::VectorXd& w_control,
+                                      const Eigen::VectorXd& w_task,
+                                      const Eigen::VectorXd& task_weights,
+                                      const Eigen::VectorXd& tolerances,
+                                      const Eigen::MatrixXd& D,
+                                      const Eigen::VectorXd& d,
+                                      Eigen::VectorXd& f_out)
+  {
+    ctrl_.alloc_task_priority_enabled_ = true;
+    ctrl_.alloc_priority_tolerances_ = tolerances;
+    const std::vector<int> ids = {1, 2};
+    const Eigen::VectorXd empty;
+    return ctrl_.solveFullVectorQP(
+        A, w_control, w_task, task_weights, empty, empty, empty,
+        Eigen::VectorXd::Zero(kCols), ids, D, d, f_out);
+  }
+
+  bool physicalChainOrder(const std::vector<int>& allocation_ids,
+                          const std::map<int, Eigen::Vector3d>& offsets,
+                          std::vector<int>& chain_ids,
+                          std::map<int, int>& allocation_indices)
+  {
+    ctrl_.cached_module_offsets_from_leader_ = offsets;
+    return ctrl_.getPhysicalChainOrder(allocation_ids, chain_ids, allocation_indices);
+  }
+
+  bool buildThreeModuleInterfaceModel(const Eigen::VectorXd& control_wrench_acc,
+                                      Eigen::MatrixXd& D,
+                                      Eigen::VectorXd& d,
+                                      std::vector<std::pair<int, int>>& cuts)
+  {
+    const std::vector<int> allocation_ids = {1, 2, 3};
+    ctrl_.formation_cog_offset_.setZero();
+    ctrl_.cached_module_offsets_from_leader_ = {
+        {1, Eigen::Vector3d(1.0, 0.0, 0.0)},
+        {2, Eigen::Vector3d(-1.0, 0.0, 0.0)},
+        {3, Eigen::Vector3d(0.0, 0.0, 0.0)}};
+
+    BeetleUnifiedController::ModuleModelDescriptor model;
+    model.mass = 1.0;
+    model.inertia = 0.1 * Eigen::Matrix3d::Identity();
+    model.rotor_origins_from_cog.assign(kRotorsPerModule, Eigen::Vector3d::Zero());
+    model.mf_rate = 0.0;
+    for (int r = 0; r < kRotorsPerModule; r++) model.rotor_direction[r + 1] = 1;
+    for (int id : allocation_ids) ctrl_.setModuleModelDescriptor(id, model);
+
+    Eigen::MatrixXd mask(3, 2);
+    mask << 1.0, 0.0,
+            0.0, 0.0,
+            0.0, 1.0;
+    const std::vector<Eigen::MatrixXd> masks(kRotorsPerModule, mask);
+    return ctrl_.buildInterfaceLoadModelWithMasks(
+        allocation_ids, control_wrench_acc, masks, D, d, cuts);
   }
 
   static double moduleFzSum(const Eigen::VectorXd& f, int m)
@@ -236,6 +312,135 @@ TEST_F(BeetleUnifiedAllocTest, HandlesVerticalGimbalLimit)
     EXPECT_GE(fz, -1e-6) << "rotor " << i;
     EXPECT_LE(std::sqrt(fx * fx + fz * fz), t_max_ + 1e-3) << "rotor " << i;
   }
+}
+
+// (6) The affine interface constraint is centered on the model demand d, not
+//     on raw actuator wrench D*f. This is the discrete QP form of
+//     -F_bar <= d - D*f <= F_bar.
+TEST_F(BeetleUnifiedAllocTest, InterfaceForceBoundUsesAffineDemand)
+{
+  interface_force_limit_ = 0.02;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  D(0, 0) = 1.0;
+  Eigen::VectorXd d = Eigen::VectorXd::Zero(6);
+  d(0) = 0.4;
+
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solveWithInterfaceModel(A, w, D, d, f));
+  EXPECT_LE(std::abs(d(0) - (D * f)(0)), interface_force_limit_ + 1e-4);
+}
+
+// (7) Force and torque limits gate different rows of each 6D interface block.
+TEST_F(BeetleUnifiedAllocTest, InterfaceTorqueBoundUsesTorqueRowsOnly)
+{
+  interface_torque_limit_ = 0.015;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  D(3, 0) = 1.0;
+  Eigen::VectorXd d = Eigen::VectorXd::Zero(6);
+  d(3) = 0.3;
+
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solveWithInterfaceModel(A, w, D, d, f));
+  EXPECT_LE(std::abs(d(3) - (D * f)(3)), interface_torque_limit_ + 1e-4);
+}
+
+// (8) A task hard band must not bypass an incompatible structural hard bound.
+TEST_F(BeetleUnifiedAllocTest, InfeasibleTaskAndInterfaceBoundsReturnFalse)
+{
+  interface_force_limit_ = 0.05;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w_control(6), w_task(6), task_weights(6);
+  w_control << 0.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+  w_task << 2.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+  task_weights << 1.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+  Eigen::VectorXd tolerances = Eigen::VectorXd::Zero(6);
+  tolerances(0) = 0.1;
+
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  D.row(0) = A.row(0);
+  const Eigen::VectorXd d = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd f;
+  EXPECT_FALSE(solveWithTaskAndInterfaceModel(
+      A, w_control, w_task, task_weights, tolerances, D, d, f));
+}
+
+// (9) Navigator assembly IDs are numerically sorted, but the physical chain is
+//     defined by increasing body-X position (e.g. the real formation 2-3-1).
+TEST_F(BeetleUnifiedAllocTest, PhysicalChainOrderDoesNotFollowNumericIds)
+{
+  const std::map<int, Eigen::Vector3d> offsets = {
+      {1, Eigen::Vector3d(1.0, 0.0, 0.0)},
+      {2, Eigen::Vector3d(-1.0, 0.0, 0.0)},
+      {3, Eigen::Vector3d(0.0, 0.0, 0.0)}};
+  std::vector<int> chain_ids;
+  std::map<int, int> allocation_indices;
+  ASSERT_TRUE(physicalChainOrder({1, 2, 3}, offsets,
+                                 chain_ids, allocation_indices));
+  ASSERT_EQ(chain_ids.size(), 3u);
+  EXPECT_EQ(chain_ids[0], 2);
+  EXPECT_EQ(chain_ids[1], 3);
+  EXPECT_EQ(chain_ids[2], 1);
+  EXPECT_EQ(allocation_indices.at(1), 0);
+  EXPECT_EQ(allocation_indices.at(2), 1);
+  EXPECT_EQ(allocation_indices.at(3), 2);
+}
+
+// (10) The actual cut model must use the contact-free negative-X subtree. For
+//      allocation columns [id1,id2,id3] and physical chain 2-3-1, the two cuts
+//      contain {2} and {2,3}; hover cancels d-Df, while equal task shares create
+//      one and two units of transmitted interface load respectively.
+TEST_F(BeetleUnifiedAllocTest, InterfaceModelUsesContactFreePhysicalSubtree)
+{
+  Eigen::VectorXd control = Eigen::VectorXd::Zero(6);
+  control(2) = aerial_robot_estimation::G;
+  Eigen::MatrixXd D;
+  Eigen::VectorXd d;
+  std::vector<std::pair<int, int>> cuts;
+  ASSERT_TRUE(buildThreeModuleInterfaceModel(control, D, d, cuts));
+  ASSERT_EQ(D.rows(), 12);
+  ASSERT_EQ(D.cols(), 24);
+  ASSERT_EQ(cuts.size(), 2u);
+  EXPECT_EQ(cuts[0], std::make_pair(2, 3));
+  EXPECT_EQ(cuts[1], std::make_pair(3, 1));
+
+  // Allocation block order remains numeric [1,2,3]. Cut 2-3 contains only id2;
+  // cut 3-1 contains id2 and id3, never the +X contact module id1.
+  EXPECT_NEAR(D.block(0, 0, 6, 8).norm(), 0.0, 1e-12);
+  EXPECT_GT(D.block(0, 8, 6, 8).norm(), 0.0);
+  EXPECT_NEAR(D.block(0, 16, 6, 8).norm(), 0.0, 1e-12);
+  EXPECT_NEAR(D.block(6, 0, 6, 8).norm(), 0.0, 1e-12);
+  EXPECT_GT(D.block(6, 8, 6, 16).norm(), 0.0);
+
+  Eigen::VectorXd f_hover = Eigen::VectorXd::Zero(24);
+  for (int module = 0; module < 3; module++) {
+    for (int rotor = 0; rotor < kRotorsPerModule; rotor++) {
+      f_hover((module * kRotorsPerModule + rotor) * kRotorCoef + 1) =
+          aerial_robot_estimation::G / kRotorsPerModule;
+    }
+  }
+  EXPECT_NEAR((d - D * f_hover).norm(), 0.0, 1e-10);
+
+  Eigen::VectorXd f_push = f_hover;
+  for (int module = 0; module < 3; module++) {
+    for (int rotor = 0; rotor < kRotorsPerModule; rotor++) {
+      f_push((module * kRotorsPerModule + rotor) * kRotorCoef) =
+          1.0 / kRotorsPerModule;
+    }
+  }
+  const Eigen::VectorXd interface_wrench = d - D * f_push;
+  EXPECT_NEAR(interface_wrench(0), -1.0, 1e-10);
+  EXPECT_NEAR(interface_wrench(6), -2.0, 1e-10);
 }
 
 }  // namespace aerial_robot_control

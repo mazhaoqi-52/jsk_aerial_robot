@@ -89,6 +89,7 @@ class BeetleInterface(object):
         # State variables
         self.uav_odom = Odometry()
         self.assembly_odom = Odometry()
+        self.assembly_odom_source_stamp = None
         self.cog_odom = Odometry()
         self.cog_odom_received_time = None
         self.cog_odom_source_stamp = None
@@ -96,9 +97,13 @@ class BeetleInterface(object):
         self.valve_pose = None
         self.flight_state = self.ARM_OFF_STATE
         self.flight_state_received = False
+        self.flight_state_received_time = None
         self.target_pos = np.array([0, 0, 0])
         self.est_wrench = None
         self.control_pid = None
+        self.control_pid_received_time = None
+        self.control_pid_source_stamp = None
+        self.control_pid_source_advanced_time = None
 
         # External wrench state
         self.external_wrench_active = False
@@ -235,15 +240,21 @@ class BeetleInterface(object):
         self.uav_odom.pose.pose.orientation = msg.pose.orientation
 
     def _assembly_cb(self, msg):
-        self.assembly_odom = msg
+        stamp = msg.header.stamp.to_sec()
+        if (math.isfinite(stamp) and stamp > 0.0 and
+                (self.assembly_odom_source_stamp is None or
+                 stamp > self.assembly_odom_source_stamp)):
+            self.assembly_odom = msg
+            self.assembly_odom_source_stamp = stamp
 
     def _cog_odom_cb(self, msg):
-        self.cog_odom = msg
         now = rospy.get_time()
-        self.cog_odom_received_time = now
         source_stamp = msg.header.stamp.to_sec()
-        if (source_stamp > 0.0 and
-                source_stamp != self.cog_odom_source_stamp):
+        if (math.isfinite(source_stamp) and source_stamp > 0.0 and
+                (self.cog_odom_source_stamp is None or
+                 source_stamp > self.cog_odom_source_stamp)):
+            self.cog_odom = msg
+            self.cog_odom_received_time = now
             self.cog_odom_source_stamp = source_stamp
             self.cog_odom_source_advanced_time = now
 
@@ -258,17 +269,33 @@ class BeetleInterface(object):
         self.est_wrench = msg.wrench
 
     def _control_pid_cb(self, msg):
-        self.control_pid = msg
+        now = rospy.get_time()
+        stamp = msg.header.stamp.to_sec()
+        if (math.isfinite(stamp) and stamp > 0.0 and
+                (self.control_pid_source_stamp is None or
+                 stamp > self.control_pid_source_stamp)):
+            self.control_pid = msg
+            self.control_pid_received_time = now
+            self.control_pid_source_stamp = stamp
+            self.control_pid_source_advanced_time = now
 
     def _flight_state_cb(self, msg):
         self.flight_state = msg.data
         self.flight_state_received = True
+        self.flight_state_received_time = rospy.get_time()
 
     def _joy_cb(self, msg):
-        if len(msg.buttons) > 4 and msg.buttons[4] == 1 and self.prev_joy_state.buttons[4] == 0:
+        halt_pressed = len(msg.buttons) > 4 and msg.buttons[4] == 1
+        # Halt is a level-triggered latch: starting while LB is already held,
+        # or resetting the flag while it remains held, must still stop a task.
+        if halt_pressed and not self.halt_task:
             self.halt_task = True
             rospy.loginfo('Halt Task!')
-        if len(msg.buttons) > 5 and msg.buttons[5] == 1 and self.prev_joy_state.buttons[5] == 0:
+        skip_pressed = len(msg.buttons) > 5 and msg.buttons[5] == 1
+        skip_was_pressed = (
+            len(self.prev_joy_state.buttons) > 5 and
+            self.prev_joy_state.buttons[5] == 1)
+        if skip_pressed and not skip_was_pressed:
             self.force_skip = True
             rospy.loginfo('Force skip')
         self.prev_joy_state = msg
@@ -371,6 +398,22 @@ class BeetleInterface(object):
     def getControlPid(self):
         return self.control_pid
 
+    def getFreshControlPid(self, max_age=0.5):
+        if (self.control_pid is None or
+                self.control_pid_received_time is None or
+                self.control_pid_source_advanced_time is None):
+            return None
+        now = rospy.get_time()
+        ages = (
+            now - self.control_pid_received_time,
+            now - self.control_pid_source_advanced_time)
+        timeout = max(0.0, float(max_age))
+        if not all(
+                math.isfinite(age) and 0.0 <= age <= timeout
+                for age in ages):
+            return None
+        return self.control_pid
+
     def getFormationMass(self):
         if self._inter_m_total > 1e-6:
             return self._inter_m_total
@@ -379,7 +422,7 @@ class BeetleInterface(object):
         return self.mass
 
     def buildCoGWrench(self, force, torque=None, application_offset_body=None,
-                       frame_id="world"):
+                       frame_id="world", orientation_quaternion=None):
         """Build a body-frame CoG wrench for a single UAV or formation.
 
         ``frame_id`` accepts world/map/odom input (full attitude rotation),
@@ -397,20 +440,36 @@ class BeetleInterface(object):
             "formation_body")
 
         if frame_key in world_frames:
-            roll, pitch, yaw = self.getUavRPY()
-            if frame_key == "world_yaw":
-                roll = 0.0
-                pitch = 0.0
-            cr, sr = math.cos(roll), math.sin(roll)
-            cp, sp = math.cos(pitch), math.sin(pitch)
-            cy, sy = math.cos(yaw), math.sin(yaw)
-            body_to_world = np.array([
-                [cy * cp, cy * sp * sr - sy * cr,
-                 cy * sp * cr + sy * sr],
-                [sy * cp, sy * sp * sr + cy * cr,
-                 sy * sp * cr - cy * sr],
-                [-sp, cp * sr, cp * cr],
-            ])
+            if orientation_quaternion is not None:
+                quaternion = np.asarray(
+                    orientation_quaternion, dtype=float).flatten()
+                if (quaternion.size != 4 or
+                        not np.all(np.isfinite(quaternion)) or
+                        np.linalg.norm(quaternion) < 1e-6):
+                    raise ValueError("orientation_quaternion must be finite")
+                quaternion /= np.linalg.norm(quaternion)
+                if frame_key == "world_yaw":
+                    yaw = euler_from_quaternion(quaternion)[2]
+                    body_to_world = quaternion_matrix(
+                        [0.0, 0.0, math.sin(0.5 * yaw),
+                         math.cos(0.5 * yaw)])[:3, :3]
+                else:
+                    body_to_world = quaternion_matrix(quaternion)[:3, :3]
+            else:
+                roll, pitch, yaw = self.getUavRPY()
+                if frame_key == "world_yaw":
+                    roll = 0.0
+                    pitch = 0.0
+                cr, sr = math.cos(roll), math.sin(roll)
+                cp, sp = math.cos(pitch), math.sin(pitch)
+                cy, sy = math.cos(yaw), math.sin(yaw)
+                body_to_world = np.array([
+                    [cy * cp, cy * sp * sr - sy * cr,
+                     cy * sp * cr + sy * sr],
+                    [sy * cp, sy * sp * sr + cy * cr,
+                     sy * sp * cr - cy * sr],
+                    [-sp, cp * sr, cp * cr],
+                ])
             world_to_body = body_to_world.T
             force_body = world_to_body @ force_body
             torque_body = world_to_body @ torque_body
@@ -467,6 +526,12 @@ class BeetleInterface(object):
 
     def hasFlightState(self):
         return self.flight_state_received
+
+    def hasFreshFlightState(self, max_age=0.5):
+        if not self.flight_state_received or self.flight_state_received_time is None:
+            return False
+        age = rospy.get_time() - self.flight_state_received_time
+        return (math.isfinite(age) and 0.0 <= age <= max(0.0, float(max_age)))
 
     def getEstimatedWrench(self):
         return self.est_wrench
@@ -565,7 +630,7 @@ class BeetleInterface(object):
         leader_id = self.wrench_target_id if hasattr(self, 'wrench_target_id') else self.module_id
         return rospy.get_param(f'/beetle{leader_id}/controller/unified_control_mode', False)
 
-    def _publishExternalWrenchWeights(self, weights):
+    def _publishExternalWrenchWeights(self, weights, route_unified=None):
         if weights is None:
             return
         if self.single_uav_wrench_mode:
@@ -576,12 +641,18 @@ class BeetleInterface(object):
             return
         msg = Float32MultiArray()
         msg.data = [max(0.0, float(v)) for v in vals]
-        if self.assembly_mode and hasattr(self, 'formation_wrench_weights_pub') and self.isUnifiedMode():
+        unified_mode = (
+            self.isUnifiedMode() if route_unified is None
+            else bool(route_unified))
+        if (self.assembly_mode and
+                hasattr(self, 'formation_wrench_weights_pub') and
+                unified_mode):
             self.formation_wrench_weights_pub.publish(msg)
         else:
             self.desired_ext_wrench_weights_pub.publish(msg)
 
-    def addExternalWrench(self, force, torque, frame_id="world", task_weights=None):
+    def addExternalWrench(self, force, torque, frame_id="world",
+                          task_weights=None, route_unified=None):
         """Apply desired external wrench.
 
         In assembly_mode, frame_id="world" rotates full RPY world-frame input
@@ -596,6 +667,12 @@ class BeetleInterface(object):
         data to the dedicated single_desired_external_wrench topic. The default
         False preserves the legacy single-UAV behavior and cannot accidentally
         activate the direct pushing feedforward path.
+
+        ``route_unified`` normally remains ``None`` so legacy callers follow
+        the live controller mode. Safety-critical experiments may pass the
+        mode captured at preflight; this pins wrench and weight publication to
+        the same alias even if the mode changes between a guard check and this
+        publish call.
         """
         force_list = self._to_list3(force) or [0.0, 0.0, 0.0]
         torque_list = self._to_list3(torque) or [0.0, 0.0, 0.0]
@@ -626,8 +703,11 @@ class BeetleInterface(object):
         self.external_wrench_active = True
         self.current_ff_force = force_list
         self.current_ff_torque = torque_list
-        self._publishExternalWrenchWeights(task_weights)
-        unified_mode = self.assembly_mode and self.isUnifiedMode()
+        unified_mode = self.assembly_mode and (
+            self.isUnifiedMode() if route_unified is None
+            else bool(route_unified))
+        self._publishExternalWrenchWeights(
+            task_weights, route_unified=unified_mode)
         if unified_mode and hasattr(self, 'formation_wrench_pub'):
             self.formation_wrench_pub.publish(ff_msg)
         else:

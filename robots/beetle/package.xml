@@ -31,11 +31,19 @@
   <run_depend>aerial_robot_base</run_depend>
   <run_depend>gimbalrotor</run_depend>
   <run_depend>roscpp</run_depend>
+  <run_depend>rospy</run_depend>
+  <run_depend>rospkg</run_depend>
   <run_depend>pluginlib</run_depend>
   <run_depend>diagnostic_msgs</run_depend>
   <run_depend>geometry_msgs</run_depend>
+  <run_depend>nav_msgs</run_depend>
+  <run_depend>sensor_msgs</run_depend>
   <run_depend>std_msgs</run_depend>
   <run_depend>std_srvs</run_depend>
+  <run_depend>tf</run_depend>
+  <run_depend>smach</run_depend>
+  <run_depend>smach_ros</run_depend>
+  <run_depend>python3-numpy</run_depend>
   <run_depend>message_runtime</run_depend>
 
   <export>

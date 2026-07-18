@@ -11,16 +11,43 @@ import rospy
 import math
 
 class NModuleTFCalculator:
-    def __init__(self, module_ids_str = rospy.get_param("~module_ids", "1,2")):
+    def __init__(self, module_ids_str=None, end_effector_module_id=None):
+        # Resolve ROS parameters at construction time, after rospy.init_node().
+        # Evaluating get_param in the function signature made merely importing
+        # this reusable geometry module contact the ROS master.
+        if module_ids_str is None:
+            module_ids_str = rospy.get_param("~module_ids", "1,2")
         # Parse module IDs and determine assembly parameters
-        self.module_ids = [int(x.strip()) for x in module_ids_str.split(',')]
+        self.module_ids = [
+            int(x.strip()) for x in str(module_ids_str).split(',')
+            if x.strip()]
+        if not self.module_ids or any(module_id <= 0
+                                      for module_id in self.module_ids):
+            raise ValueError("module_ids must contain positive integers")
+        if len(set(self.module_ids)) != len(self.module_ids):
+            raise ValueError("module_ids must not contain duplicates")
         self.number_of_modules = len(self.module_ids)
-        self.leader_id = self.module_ids[-1]  # Leader is the last in the chain (carries end-effector)
+        if end_effector_module_id in (None, "", "auto"):
+            end_effector_module_id = self.module_ids[-1]
+        try:
+            self.end_effector_module_id = int(end_effector_module_id)
+        except (TypeError, ValueError):
+            raise ValueError("end_effector_module_id must be an integer")
+        if self.end_effector_module_id not in self.module_ids:
+            raise ValueError(
+                "end_effector_module_id %d is not in module_ids %s" % (
+                    self.end_effector_module_id, self.module_ids))
+
+        # Legacy valve/towing code calls this Python-side EE carrier the
+        # "leader".  Keep the alias, but do not confuse it with the C++
+        # assembly leader that receives formation wrench commands.
+        self.leader_id = self.end_effector_module_id
         
         rospy.loginfo(f"Initialized NModuleTFCalculator:")
         rospy.loginfo(f"  Module IDs: {self.module_ids}")
         rospy.loginfo(f"  Number of modules: {self.number_of_modules}")
-        rospy.loginfo(f"  Leader ID: {self.leader_id}")
+        rospy.loginfo(
+            f"  End-effector module ID: {self.end_effector_module_id}")
         
         # Physical parameters for valve rotation task
         self.claw_separation = 0.150  # Distance between left and right claws (updated from 168.8mm to 150mm)
@@ -41,12 +68,13 @@ class NModuleTFCalculator:
         self.contact_point_offset_x = 0.26
         self.contact_point_offset_z = 0.0
         
-    def calculate_assembly_to_leader_transform(self):
+    def calculate_assembly_to_end_effector_host_transform(self):
         """
-        Calculate transformation from assembly CoG to leader UAV CoG.
+        Calculate transformation from assembly CoG to the EE-host UAV CoG.
         
         Assembly arrangement: UAVs are arranged linearly with module_distance spacing
-        The leader (highest ID) is positioned at the furthest end from valve center.
+        in the physical X order given by module_ids. The selected host may be
+        the first, a middle, or the final module; numeric ID ordering is irrelevant.
         Assembly CoG is at the geometric center of all UAVs.
         
         Returns:
@@ -56,26 +84,30 @@ class NModuleTFCalculator:
             # Single UAV case - no assembly offset
             return {'offset_x': 0.0, 'offset_y': 0.0, 'offset_z': 0.0}
         
-        # Calculate leader's position relative to assembly center
+        # Calculate the selected host's position relative to assembly center.
         # For n modules: positions are at -d*(n-1)/2, -d*(n-3)/2, ..., +d*(n-1)/2
         # where d = module_distance
         
-        # Use input order as physical arrangement (X-axis small to large)
-        leader_index = self.module_ids.index(self.leader_id)
+        # Use input order as physical arrangement (X-axis small to large).
+        host_index = self.module_ids.index(self.end_effector_module_id)
         
-        # Leader's position relative to assembly center
+        # Host position relative to assembly center.
         # Assembly center is at index position (n-1)/2
         assembly_center_index = (self.number_of_modules - 1) / 2.0
-        leader_offset_index = leader_index - assembly_center_index
+        host_offset_index = host_index - assembly_center_index
         
         # Convert index offset to physical distance (X-axis in body frame)
-        offset_x = leader_offset_index * self.module_distance
+        offset_x = host_offset_index * self.module_distance
         
         return {
             'offset_x': offset_x,
             'offset_y': 0.0,  # No Y offset for linear arrangement
             'offset_z': 0.0   # No Z offset for planar arrangement
         }
+
+    def calculate_assembly_to_leader_transform(self):
+        """Legacy alias for the assembly-to-EE-host transform."""
+        return self.calculate_assembly_to_end_effector_host_transform()
     
     def calculate_leader_to_end_effector_transform(self, leader_yaw=0.0, leader_pitch=0.0):
         """
@@ -166,8 +198,12 @@ class NModuleTFCalculator:
         return (end_effector_x, end_effector_y, end_effector_z)
     
     def get_leader_id(self):
-        """Return the leader UAV ID (carries end-effector)"""
+        """Legacy alias: return the module carrying the end-effector."""
         return self.leader_id
+
+    def get_end_effector_module_id(self):
+        """Return the explicitly selected end-effector carrier module."""
+        return self.end_effector_module_id
     
     def get_follower_ids(self):
         """Return list of follower UAV IDs"""
@@ -184,13 +220,16 @@ class NModuleTFCalculator:
             rospy.logerr("No modules specified!")
             return False
             
-        if self.leader_id not in self.module_ids:
-            rospy.logerr(f"Leader ID {self.leader_id} not in module list {self.module_ids}")
+        if self.end_effector_module_id not in self.module_ids:
+            rospy.logerr(
+                "End-effector module ID %d not in module list %s",
+                self.end_effector_module_id, self.module_ids)
             return False
             
         rospy.loginfo(f"Module configuration validated:")
         rospy.loginfo(f"  Total modules: {self.number_of_modules}")
-        rospy.loginfo(f"  Leader (end-effector carrier): {self.leader_id}")
+        rospy.loginfo(
+            f"  End-effector carrier: {self.end_effector_module_id}")
         rospy.loginfo(f"  Followers: {self.get_follower_ids()}")
         
         return True

@@ -1,18 +1,48 @@
 <launch>
   <!-- External configurable arguments -->
   <arg name="module_ids" default="1,2,3" />
-  <arg name="dx" default="1.0" />
+  <arg name="dx" default="1.0"
+       doc="Initial Gazebo spawn spacing before assembly (m)" />
   <arg name="spawn_y" default="0.0" />
   <arg name="spawn_yaw" default="0.0" />
   <arg name="center_formation" default="true" />
   <arg name="base_x" default="0.0" />
   <arg name="headless" default="true" />
   <arg name="launch_gazebo_for_first" default="true" />
+  <arg name="leader_model" default="beetle_fang"
+       doc="Deprecated compatibility alias for end_effector_model" />
+  <arg name="end_effector_model" default="$(arg leader_model)"
+       doc="Model loaded only on end_effector_module_id" />
+  <arg name="end_effector_module_id"
+       default="$(eval str(arg('module_ids')).replace(' ', '').split(',')[-1])"
+       doc="Module ID carrying the selected end-effector model" />
+
+  <!-- Optional environment for the two-launch downward-valve test workflow. -->
+  <arg name="spawn_downward_valve" default="false" />
+  <arg name="valve_x" default="3.0" />
+  <arg name="valve_y" default="0.0" />
+  <arg name="valve_z" default="0.0" />
+  <arg name="valve_yaw" default="0.0" />
+  <arg name="valve_support_height" default="1.5" />
+
+  <!-- Persist launch selection so a separately started static test can use
+       exactly the same ordered formation and EE host. -->
+  <param name="/beetle/n_module_test/module_ids" type="str"
+         value="$(arg module_ids)" />
+  <param name="/beetle/n_module_test/end_effector_module_id" type="int"
+         value="$(arg end_effector_module_id)" />
+  <!-- This expression is intentionally not a public arg: .index() both
+       validates membership and prevents a CLI override from placing the
+       model on a different module than the recorded EE host. -->
+  <param name="/beetle/n_module_test/end_effector_module_index" type="int"
+         value="$(eval str(arg('module_ids')).replace(' ', '').split(',').index(str(arg('end_effector_module_id'))))" />
+  <param name="/beetle/n_module_test/end_effector_model" type="str"
+         value="$(arg end_effector_model)" />
   
   <!-- for 1st Beetle (leftmost) -->
   <group if="$(eval len(arg('module_ids').split(',')) > 0)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[0])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[0].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -21,14 +51,14 @@
       <arg name="spawn_x"       value="$(eval ( (0 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-0)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 1)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[0].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
 
   <!-- for 2nd Beetle (middle) -->
   <group if="$(eval len(arg('module_ids').split(',')) > 1)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[1])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[1].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -37,14 +67,14 @@
       <arg name="spawn_x"       value="$(eval ( (1 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-1)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 2)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[1].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
 
   <!-- for 3rd Beetle (rightmost) -->
   <group if="$(eval len(arg('module_ids').split(',')) > 2)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[2])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[2].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -53,14 +83,14 @@
       <arg name="spawn_x"       value="$(eval ( (2 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-2)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 3)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[2].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
 
   <!-- for 4th Beetle -->
   <group if="$(eval len(arg('module_ids').split(',')) > 3)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[3])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[3].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -69,14 +99,14 @@
       <arg name="spawn_x"       value="$(eval ( (3 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-3)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 4)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[3].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
 
   <!-- for 5th Beetle -->
   <group if="$(eval len(arg('module_ids').split(',')) > 4)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[4])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[4].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -85,14 +115,14 @@
       <arg name="spawn_x"       value="$(eval ( (4 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-4)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 5)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[4].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
 
   <!-- for 6th Beetle -->
   <group if="$(eval len(arg('module_ids').split(',')) > 5)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[5])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[5].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -101,14 +131,14 @@
       <arg name="spawn_x"       value="$(eval ( (5 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-5)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 6)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[5].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
 
   <!-- for 7th Beetle -->
   <group if="$(eval len(arg('module_ids').split(',')) > 6)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[6])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[6].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -117,14 +147,14 @@
       <arg name="spawn_x"       value="$(eval ( (6 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-6)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 7)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[6].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
 
   <!-- for 8th Beetle -->
   <group if="$(eval len(arg('module_ids').split(',')) > 7)">
     <include file="$(find beetle)/launch/bringup.launch">
-      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[7])"/>
+      <arg name="robot_id"      value="$(eval arg('module_ids').split(',')[7].strip())"/>
       <arg name="real_machine"  value="false"/>
       <arg name="simulation"    value="true"/>
       <arg name="headless"      value="$(arg headless)"/>
@@ -133,9 +163,21 @@
       <arg name="spawn_x"       value="$(eval ( (7 - (len(arg('module_ids').split(','))-1)/2.0) * float(arg('dx')) ) if str(arg('center_formation')).lower()=='true' else ( float(arg('base_x')) - (len(arg('module_ids').split(','))-1-7)*float(arg('dx')) ))"/>
       <arg name="spawn_y"       value="$(arg spawn_y)"/>
       <arg name="spawn_yaw"     value="$(arg spawn_yaw)"/>
-      <arg name="leader_fang"   value="$(eval len(arg('module_ids').split(',')) == 8)"/>
+      <arg name="beetle_model"  value="$(eval arg('end_effector_model') if arg('module_ids').split(',')[7].strip() == str(arg('end_effector_module_id')) else 'beetle')"/>
     </include>
   </group>
+
+  <include if="$(arg spawn_downward_valve)"
+           file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
+    <arg name="real_machine" value="false" />
+    <arg name="simulation" value="true" />
+    <arg name="valve_model" value="valve_downward" />
+    <arg name="valve_support_height" value="$(arg valve_support_height)" />
+    <arg name="valve_x" value="$(arg valve_x)" />
+    <arg name="valve_y" value="$(arg valve_y)" />
+    <arg name="valve_z" value="$(arg valve_z)" />
+    <arg name="valve_yaw" value="$(arg valve_yaw)" />
+  </include>
 
 <!-- just copy more Beetle as needed -->
 </launch>

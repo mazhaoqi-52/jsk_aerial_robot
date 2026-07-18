@@ -8,6 +8,9 @@
   <arg name="valve_x" default="3"/>
   <arg name="valve_y" default="0"/>
   <arg name="valve_yaw" default="0"/>
+  <arg name="valve_model" default="valve"
+       doc="valve keeps the legacy upward demo; valve_downward selects the new model"/>
+  <arg name="valve_support_height" default="1.5"/>
 
   <include file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
     <arg name="real_machine" value="$(arg real_machine)" />
@@ -17,6 +20,8 @@
     <arg name="valve_x" value="$(arg valve_x)" />
     <arg name="valve_y" value="$(arg valve_y)" />
     <arg name="valve_yaw" value="$(arg valve_yaw)" />
+    <arg name="valve_model" value="$(arg valve_model)" />
+    <arg name="valve_support_height" value="$(arg valve_support_height)" />
   </include>
 
   <!-- <node pkg="beetle" type="valve_rotation_smach_test.py" name="valve_rotation_smach_test" output="screen"> -->

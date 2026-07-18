@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro"
+       name="beetle_hyper_fang_upward">
+
+  <xacro:include filename="$(find beetle)/robots/beetle.urdf.xacro"/>
+
+  <!--
+    Upward dual-pin end-effector used by the downward-valve torque test.
+    Pin centres are 20 mm inboard of the +X top-deck edge (x=0.260 m).
+    Their bottom faces sit on the top-deck collision plane at fc z=0.11053 m.
+    Coordinates use the project's nominal host-CoG/body convention: the fc
+    baselink used by the controller and by the torque-test offsets.
+    fc is a fixed body frame, not the joint-dependent inertial barycentre.
+    This preserves the specified symmetry about the body X axis.  The base
+    model is already mass-calibrated, so this link uses negligible inertia and
+    adds only contact/visual geometry.  Radius and length reuse the existing
+    beetle_fang contact dimensions.
+  -->
+  <material name="upward_fang_grey">
+    <color rgba="0.25 0.25 0.25 1"/>
+  </material>
+
+  <link name="beetle_hyper_fang_upward_link">
+    <inertial>
+      <origin xyz="0.240 0 0.13259" rpy="0 0 0"/>
+      <mass value="0.0001"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0"
+               iyy="0.000001" iyz="0" izz="0.000001"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0.240 0.075 0.13259" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.006" length="0.04412"/>
+      </geometry>
+      <material name="upward_fang_grey"/>
+    </visual>
+    <visual>
+      <origin xyz="0.240 -0.075 0.13259" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.006" length="0.04412"/>
+      </geometry>
+      <material name="upward_fang_grey"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0.240 0.075 0.13259" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.006" length="0.04412"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.240 -0.075 0.13259" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.006" length="0.04412"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="beetle_hyper_fang_upward_joint" type="fixed">
+    <parent link="fc"/>
+    <child link="beetle_hyper_fang_upward_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <gazebo reference="beetle_hyper_fang_upward_link">
+    <mu1>10.0</mu1>
+    <mu2>10.0</mu2>
+    <kp>1000000.0</kp>
+    <kd>100.0</kd>
+    <minDepth>0.001</minDepth>
+    <maxVel>0.5</maxVel>
+  </gazebo>
+
+</robot>

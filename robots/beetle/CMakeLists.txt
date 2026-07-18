@@ -64,7 +64,7 @@ install(TARGETS beetle_sensor_pluginlib beetle_robot_model beetle_controller bee
   DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
 )
 
-install(DIRECTORY config plugins launch urdf
+install(DIRECTORY config plugins launch robots urdf
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
   USE_SOURCE_PERMISSIONS
   )
@@ -91,6 +91,7 @@ catkin_install_python(PROGRAMS
 )
 catkin_install_python(PROGRAMS
   script/demos/valve_rotation_demo/valve_rotation_formation_clean.py
+  script/demos/valve_rotation_demo/static_downward_valve_torque.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 catkin_install_python(PROGRAMS

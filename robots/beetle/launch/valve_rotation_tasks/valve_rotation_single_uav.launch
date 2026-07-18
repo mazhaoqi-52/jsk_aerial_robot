@@ -17,6 +17,9 @@
   <arg name="valve_y" default="0"/>
   <arg name="valve_z" default="0"/>
   <arg name="valve_yaw" default="0"/>
+  <arg name="valve_model" default="valve"
+       doc="valve keeps the legacy upward demo; valve_downward selects the new model"/>
+  <arg name="valve_support_height" default="1.5"/>
   
   <!-- Debug mode -->
   <arg name="debug" default="false" />
@@ -36,6 +39,8 @@
     <arg name="valve_y" value="$(arg valve_y)" />
     <arg name="valve_z" value="$(arg valve_z)" />
     <arg name="valve_yaw" value="$(arg valve_yaw)" />
+    <arg name="valve_model" value="$(arg valve_model)" />
+    <arg name="valve_support_height" value="$(arg valve_support_height)" />
   </include>
   
   <!-- Single UAV valve rotation node -->

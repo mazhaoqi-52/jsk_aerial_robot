@@ -127,24 +127,36 @@ class FormationUtils:
 class FormationAdapter:
     """Dynamic adapter for multi-UAV formation with configurable module_ids"""
 
-    def __init__(self, module_ids_str=None):
+    def __init__(self, module_ids_str=None, end_effector_module_id=None):
         if module_ids_str is None:
             module_ids_str = rospy.get_param("~module_ids", "2,3")
+        if end_effector_module_id is None:
+            end_effector_module_id = rospy.get_param(
+                "~end_effector_module_id", "auto")
 
-        rospy.loginfo(f"Initializing FormationAdapter with module_ids: {module_ids_str}")
+        rospy.loginfo(
+            "Initializing FormationAdapter with module_ids=%s, "
+            "end_effector_module_id=%s",
+            module_ids_str, end_effector_module_id)
 
         rospy.set_param("~module_ids", module_ids_str)
-        self.tf_calculator = NModuleTFCalculator(module_ids_str)
+        self.tf_calculator = NModuleTFCalculator(
+            module_ids_str, end_effector_module_id=end_effector_module_id)
 
         if not self.tf_calculator.validate_module_configuration():
             raise ValueError(f"Invalid module configuration: {module_ids_str}")
 
         self.module_ids = self.tf_calculator.module_ids
-        self.leader_id = self.tf_calculator.get_leader_id()
+        self.end_effector_module_id = (
+            self.tf_calculator.get_end_effector_module_id())
+        self.leader_id = self.end_effector_module_id  # legacy alias
         self.follower_ids = self.tf_calculator.get_follower_ids()
         self.number_of_modules = len(self.module_ids)
 
-        rospy.loginfo(f"Formation: Leader={self.leader_id}, Followers={self.follower_ids}, Total={self.number_of_modules} modules")
+        rospy.loginfo(
+            "Formation: EE host=%d, other modules=%s, total=%d",
+            self.end_effector_module_id, self.follower_ids,
+            self.number_of_modules)
 
         self.uav_positions = {}
         self.uav_orientations = {}
@@ -304,8 +316,12 @@ class FormationAdapter:
         return (assembly_target_x, assembly_target_y, assembly_target_z)
 
     def get_leader_id(self):
-        """Get leader UAV ID"""
+        """Legacy alias: get the end-effector carrier module ID."""
         return self.leader_id
+
+    def get_end_effector_module_id(self):
+        """Get the explicitly selected end-effector carrier module ID."""
+        return self.end_effector_module_id
 
     def get_follower_ids(self):
         """Get follower UAV IDs"""
@@ -409,19 +425,24 @@ class FormationSingleUAVStateBase(smach.State):
 
     _shared_target_z = None
 
-    def __init__(self, outcomes, input_keys=None, output_keys=None):
+    def __init__(self, outcomes, input_keys=None, output_keys=None,
+                 end_effector_module_id=None):
         smach.State.__init__(self, outcomes=outcomes, input_keys=input_keys or [], output_keys=output_keys or [])
 
         module_ids_str = rospy.get_param("~module_ids", "2,3")
 
-        self.formation_adapter = FormationAdapter(module_ids_str)
-        self.leader_id = self.formation_adapter.get_leader_id()
+        self.formation_adapter = FormationAdapter(
+            module_ids_str,
+            end_effector_module_id=end_effector_module_id)
+        self.end_effector_module_id = (
+            self.formation_adapter.get_end_effector_module_id())
+        self.leader_id = self.end_effector_module_id  # legacy alias
 
         if not self.formation_adapter.wait_for_formation_ready(timeout=15.0):
             raise RuntimeError("Formation not ready - cannot initialize state")
 
         self.beetle = BeetleInterface(
-            module_id=self.leader_id,
+            module_id=self.end_effector_module_id,
             assembly_mode=True,
             assembly_tf_calculator=self.formation_adapter.tf_calculator
         )
@@ -432,7 +453,9 @@ class FormationSingleUAVStateBase(smach.State):
         self.average_linear_velocity = 0.16
         self.max_angular_velocity = 0.02
 
-        rospy.loginfo(f"FormationState initialized for leader UAV{self.leader_id}")
+        rospy.loginfo(
+            "FormationState initialized for end-effector host UAV%d",
+            self.end_effector_module_id)
 
     def get_assembly_position(self):
         return self.formation_adapter.get_assembly_position()

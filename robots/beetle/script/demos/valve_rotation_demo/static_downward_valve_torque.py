@@ -21,8 +21,11 @@ sys.path.insert(0, package_script_dir)
 sys.path.insert(0, os.path.join(package_script_dir, "demos"))
 sys.path.insert(0, os.path.join(
     package_script_dir, "demos", "valve_rotation_demo"))
+sys.path.insert(0, os.path.join(
+    package_script_dir, "demos", "aerial_pushing_demo"))
 
 from beetle_interface import smoothstep01  # noqa: E402
+from force_sensor_auto_calib import calibrate_force_sensor  # noqa: E402
 from valve_rotation_formation_clean import FormationRotateValveState  # noqa: E402
 
 
@@ -67,6 +70,13 @@ def _positive_float_param(name, default):
     value = _finite_float_param(name, default)
     if value <= 0.0:
         raise ValueError("%s must be positive" % name)
+    return value
+
+
+def _nonnegative_float_param(name, default):
+    value = _finite_float_param(name, default)
+    if value < 0.0:
+        raise ValueError("%s must be nonnegative" % name)
     return value
 
 
@@ -146,6 +156,11 @@ class DirectedAngularStallDetector(object):
 
 
 def read_config():
+    real_machine = bool(rospy.get_param("~real_machine", False))
+    simulation = bool(rospy.get_param("~simulation", True))
+    force_sensor_enabled = (
+        bool(rospy.get_param("~force_sensor_enabled", True)) and
+        real_machine and not simulation)
     direction, direction_label = parse_rotation_direction(
         rospy.get_param("~rotation_direction", "cw"),
         rospy.get_param("~rotation_view", "below"))
@@ -180,6 +195,19 @@ def read_config():
             _finite_float_param("~tool_center_y", 0.0),
             _finite_float_param("~tool_center_z", 0.11053),
         ]),
+        force_sensor_enabled=force_sensor_enabled,
+        force_sensor_auto_calib=bool(rospy.get_param(
+            "~force_sensor_auto_calib", True)),
+        force_sensor_topic=str(rospy.get_param(
+            "~force_sensor_topic", "cfs/data")),
+        force_sensor_calib_service=str(rospy.get_param(
+            "~force_sensor_calib_service", "cfs_sensor_calib")),
+        force_sensor_auto_calib_delay=_nonnegative_float_param(
+            "~force_sensor_auto_calib_delay", 0.5),
+        force_sensor_auto_calib_timeout=_positive_float_param(
+            "~force_sensor_auto_calib_timeout", 10.0),
+        force_sensor_data_max_age=_positive_float_param(
+            "~force_sensor_data_max_age", 0.5),
         ramp_time=_positive_float_param("~wrench_ramp_time", 3.0),
         hold_time=_positive_float_param("~full_torque_hold_time", 3.0),
         unload_min_duration=_positive_float_param(
@@ -211,10 +239,15 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
             "~application_wrench", WrenchStamped, queue_size=1)
         self.cog_wrench_pub = rospy.Publisher(
             "~cog_wrench", WrenchStamped, queue_size=1)
-        self.valve_wrench_sub = rospy.Subscriber(
-            "/valve/wrench", WrenchStamped, self._valve_wrench_cb,
+        self.measured_wrench = None
+        self.measured_wrench_received_time = None
+        self.measured_wrench_topic = (
+            config.force_sensor_topic
+            if config.force_sensor_enabled else "/valve/wrench")
+        self.measured_wrench_sub = rospy.Subscriber(
+            self.measured_wrench_topic, WrenchStamped,
+            self._measured_wrench_cb,
             queue_size=1)
-        self.valve_wrench = None
         self.hold_position = None
         self.hold_yaw = None
         self.last_application_force = np.zeros(3)
@@ -226,12 +259,60 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
         self.phase_pub.publish(String(data=phase))
         rospy.loginfo("[StaticValveTorque] phase=%s", phase)
 
-    def _valve_wrench_cb(self, message):
-        self.valve_wrench = np.array([
+    def _measured_wrench_cb(self, message):
+        measured_wrench = np.array([
             message.wrench.force.x, message.wrench.force.y,
             message.wrench.force.z, message.wrench.torque.x,
             message.wrench.torque.y, message.wrench.torque.z,
         ], dtype=float)
+        if not np.all(np.isfinite(measured_wrench)):
+            rospy.logwarn_throttle(
+                1.0, "Ignoring non-finite wrench from %s",
+                self.measured_wrench_topic)
+            return
+        self.measured_wrench = measured_wrench
+        self.measured_wrench_received_time = rospy.get_time()
+
+    def _measured_wrench_is_fresh(self):
+        if (self.measured_wrench is None or
+                self.measured_wrench_received_time is None):
+            return False
+        age = rospy.get_time() - self.measured_wrench_received_time
+        return (math.isfinite(age) and
+                0.0 <= age <= self.config.force_sensor_data_max_age)
+
+    def _prepare_force_sensor(self):
+        if not self.config.force_sensor_enabled:
+            return True
+
+        self._set_phase("force_sensor_calibration")
+        if self.config.force_sensor_auto_calib:
+            if not calibrate_force_sensor(
+                    service_name=self.config.force_sensor_calib_service,
+                    topic_name=self.config.force_sensor_topic,
+                    service_timeout=self.config.force_sensor_auto_calib_timeout,
+                    topic_timeout=self.config.force_sensor_auto_calib_timeout,
+                    startup_delay=self.config.force_sensor_auto_calib_delay,
+                    wait_for_sample=True):
+                return False
+
+        try:
+            sample = rospy.wait_for_message(
+                self.config.force_sensor_topic, WrenchStamped,
+                timeout=self.config.force_sensor_auto_calib_timeout)
+        except rospy.ROSException as exc:
+            rospy.logerr("No post-calibration CFS sample: %s", exc)
+            return False
+        self._measured_wrench_cb(sample)
+        if not self._measured_wrench_is_fresh():
+            rospy.logerr("Post-calibration CFS sample is not fresh")
+            return False
+        rospy.loginfo(
+            "CFS ready on %s: F=(%.3f, %.3f, %.3f)N "
+            "tau=(%.4f, %.4f, %.4f)Nm",
+            self.config.force_sensor_topic,
+            *self.measured_wrench.tolist())
+        return True
 
     @staticmethod
     def _wrench_message(force, torque, frame_id):
@@ -323,6 +404,10 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
             if self.beetle.getTaskHaltFlag():
                 rospy.logerr("Contact search stopped by operator")
                 return False
+            if (self.config.force_sensor_enabled and
+                    not self._measured_wrench_is_fresh()):
+                rospy.logerr("CFS data became stale during contact search")
+                return False
             elapsed = rospy.get_time() - start_time
             progress = min(
                 self.config.max_search_angle,
@@ -398,6 +483,10 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
             if self.beetle.getTaskHaltFlag():
                 rospy.logerr("Wrench profile stopped by operator")
                 return False
+            if (self.config.force_sensor_enabled and
+                    not self._measured_wrench_is_fresh()):
+                rospy.logerr("CFS data became stale during wrench profile")
+                return False
             elapsed = rospy.get_time() - start_time
             scale = smoothstep01(elapsed / ramp_time)
             application_force = scale * self.config.target_force
@@ -415,7 +504,9 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
                     *(self.config.target_force.tolist() +
                       self.config.target_torque.tolist() +
                       [self.config.hold_time]))
-            measured = self.valve_wrench
+            measured = (
+                self.measured_wrench
+                if self._measured_wrench_is_fresh() else None)
             measured_text = (
                 "unavailable" if measured is None else
                 "F=(%.2f,%.2f,%.2f)N tau=(%.2f,%.2f,%.2f)Nm" %
@@ -423,7 +514,7 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
             rospy.loginfo_throttle(
                 1.0,
                 "[StaticValveWrench] t=%.1f/%.1fs scale=%.2f "
-                "Tz=%.3fNm valve=%s" % (
+                "Tz=%.3fNm sensor=%s" % (
                     elapsed, total_duration, scale,
                     application_torque[2], measured_text))
             if elapsed >= total_duration:
@@ -471,6 +562,8 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
     def execute(self, userdata=None):
         normal_completion = False
         try:
+            if not self._prepare_force_sensor():
+                return "failed"
             feedback = self._wait_for_feedback()
             if feedback is None:
                 return "failed"

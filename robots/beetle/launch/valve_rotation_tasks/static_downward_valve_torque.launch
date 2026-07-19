@@ -20,6 +20,30 @@
     <arg name="valve_id" value="$(arg valve_id)"/>
   </include>
 
+  <!-- Hardware CFS ground truth. Calibration is performed synchronously by
+       the static task before it is allowed to start the contact search. -->
+  <arg name="force_sensor_enabled" default="true"/>
+  <arg name="force_sensor" default="PFS055YA501U6"/>
+  <arg name="force_sensor_port" default="/dev/ttyACM0"/>
+  <arg name="force_sensor_auto_calib" default="true"/>
+  <arg name="force_sensor_auto_calib_delay" default="0.5"/>
+  <arg name="force_sensor_auto_calib_timeout" default="10.0"/>
+  <arg name="force_sensor_data_max_age" default="0.5"/>
+  <arg name="force_sensor_topic" default="cfs/data"/>
+  <arg name="force_sensor_calib_service" default="cfs_sensor_calib"/>
+
+  <group if="$(arg force_sensor_enabled)">
+    <group if="$(arg real_machine)">
+      <include unless="$(arg simulation)"
+               file="$(find beetle)/launch/aerial_pushing_tasks/force_sensor_test.launch">
+        <arg name="force_sensor" value="$(arg force_sensor)"/>
+        <arg name="force_sensor_port" value="$(arg force_sensor_port)"/>
+        <!-- The task owns calibration sequencing; do not race a second helper. -->
+        <arg name="force_sensor_auto_calib" value="false"/>
+      </include>
+    </group>
+  </group>
+
   <arg name="rotation_direction" default="cw" doc="cw or ccw"/>
   <arg name="rotation_view" default="below" doc="above or below"/>
 
@@ -63,6 +87,13 @@
     <param name="tool_center_x" value="$(arg tool_center_x)"/>
     <param name="tool_center_y" value="$(arg tool_center_y)"/>
     <param name="tool_center_z" value="$(arg tool_center_z)"/>
+    <param name="force_sensor_enabled" value="$(arg force_sensor_enabled)"/>
+    <param name="force_sensor_auto_calib" value="$(arg force_sensor_auto_calib)"/>
+    <param name="force_sensor_auto_calib_delay" value="$(arg force_sensor_auto_calib_delay)"/>
+    <param name="force_sensor_auto_calib_timeout" value="$(arg force_sensor_auto_calib_timeout)"/>
+    <param name="force_sensor_data_max_age" value="$(arg force_sensor_data_max_age)"/>
+    <param name="force_sensor_topic" value="$(arg force_sensor_topic)"/>
+    <param name="force_sensor_calib_service" value="$(arg force_sensor_calib_service)"/>
     <param name="contact_search_speed_deg_s" value="$(arg contact_search_speed_deg_s)"/>
     <param name="contact_search_max_angle_deg" value="$(arg contact_search_max_angle_deg)"/>
     <param name="contact_min_search_angle_deg" value="$(arg contact_min_search_angle_deg)"/>

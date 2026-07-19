@@ -29,6 +29,75 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
             config.end_effector_offset_body.tolist(),
             [0.240, 0.0, 0.11053])
 
+    def test_cfs_is_required_only_for_real_hardware(self):
+        hardware_params = {
+            "~real_machine": True,
+            "~simulation": False,
+            "~force_sensor_enabled": True,
+        }
+        with mock.patch.object(
+                static_torque.rospy, "get_param",
+                side_effect=lambda name, default: hardware_params.get(
+                    name, default)):
+            hardware_config = static_torque.read_config()
+        self.assertTrue(hardware_config.force_sensor_enabled)
+
+        with mock.patch.object(
+                static_torque.rospy, "get_param",
+                side_effect=lambda name, default: default):
+            simulation_config = static_torque.read_config()
+        self.assertFalse(simulation_config.force_sensor_enabled)
+
+    def test_cfs_calibration_completes_before_task_can_start(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            force_sensor_enabled=True,
+            force_sensor_auto_calib=True,
+            force_sensor_calib_service="cfs_sensor_calib",
+            force_sensor_topic="cfs/data",
+            force_sensor_auto_calib_timeout=10.0,
+            force_sensor_auto_calib_delay=0.5,
+            force_sensor_data_max_age=0.5)
+        state.measured_wrench_topic = "cfs/data"
+        state.measured_wrench = None
+        state.measured_wrench_received_time = None
+        state._set_phase = mock.Mock()
+        sample = static_torque.WrenchStamped()
+        sample.wrench.force.z = 0.02
+        sample.wrench.torque.z = -0.01
+
+        with mock.patch.object(
+                static_torque, "calibrate_force_sensor",
+                return_value=True) as calibrate, mock.patch.object(
+                    static_torque.rospy, "wait_for_message",
+                    return_value=sample), mock.patch.object(
+                        static_torque.rospy, "get_time", return_value=1.0):
+            self.assertTrue(state._prepare_force_sensor())
+
+        calibrate.assert_called_once()
+        state._set_phase.assert_called_once_with("force_sensor_calibration")
+        self.assertAlmostEqual(state.measured_wrench[2], 0.02)
+        self.assertAlmostEqual(state.measured_wrench[5], -0.01)
+
+    def test_cfs_calibration_failure_blocks_task(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            force_sensor_enabled=True,
+            force_sensor_auto_calib=True,
+            force_sensor_calib_service="cfs_sensor_calib",
+            force_sensor_topic="cfs/data",
+            force_sensor_auto_calib_timeout=10.0,
+            force_sensor_auto_calib_delay=0.5)
+        state._set_phase = mock.Mock()
+        with mock.patch.object(
+                static_torque, "calibrate_force_sensor",
+                return_value=False), mock.patch.object(
+                    static_torque.rospy, "wait_for_message") as wait:
+            self.assertFalse(state._prepare_force_sensor())
+        wait.assert_not_called()
+
     def test_downward_view_reverses_visual_direction(self):
         self.assertEqual(parse_rotation_direction("cw", "below")[0], 1)
         self.assertEqual(parse_rotation_direction("ccw", "below")[0], -1)
@@ -150,6 +219,8 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         state = static_torque.StaticDownwardValveTorqueTest.__new__(
             static_torque.StaticDownwardValveTorqueTest)
         state.beetle = FakeBeetle()
+        state._prepare_force_sensor = lambda: (
+            calls.append("cfs_ready") or True)
         state._wait_for_feedback = lambda: (
             calls.append("feedback") or
             ([0.0, 0.0, 1.0], [0.1, 0.0, 1.0], 0.0))
@@ -163,7 +234,7 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         self.assertEqual(state.execute(), "succeeded")
         self.assertEqual(
             calls,
-            ["feedback", "contact", "ramp_hold", "unload", "complete",
+            ["cfs_ready", "feedback", "contact", "ramp_hold", "unload", "complete",
              ("detach", None)])
 
     def test_abnormal_exit_immediately_clears_active_wrench(self):
@@ -182,6 +253,7 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         state = static_torque.StaticDownwardValveTorqueTest.__new__(
             static_torque.StaticDownwardValveTorqueTest)
         state.beetle = FakeBeetle()
+        state._prepare_force_sensor = lambda: True
         state._wait_for_feedback = lambda: (
             [0.0, 0.0, 1.0], [0.1, 0.0, 1.0], 0.0)
         state._search_contact = lambda *args: False

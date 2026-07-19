@@ -30,6 +30,7 @@
   <run_depend>aerial_robot_simulation</run_depend>
   <run_depend>aerial_robot_base</run_depend>
   <run_depend>gimbalrotor</run_depend>
+  <run_depend>cfs_sensor</run_depend>
   <run_depend>roscpp</run_depend>
   <run_depend>rospy</run_depend>
   <run_depend>rospkg</run_depend>

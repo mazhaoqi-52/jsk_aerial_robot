@@ -4,7 +4,6 @@
 
   <xacro:arg name="support_height" default="1.5"/>
   <xacro:arg name="valve_pitch_angle" default="180"/>
-  <xacro:arg name="valve_friction" default="0.8"/>
   <xacro:arg name="no_collision" default="false"/>
 
   <material name="red">
@@ -21,8 +20,8 @@
   <xacro:property name="main_pipe_mass" value="10.0"/>
   <xacro:property name="pipe_radius" value="0.05"/>
 
-  <!-- Keep the support as a repeatable reaction-torque reference while the
-       handle remains free to rotate about valve_joint. -->
+  <!-- Keep the complete support and handle fixed as a repeatable
+       reaction-torque reference. -->
   <link name="world"/>
 
   <xacro:macro name="pipe_model"
@@ -143,21 +142,20 @@
     <origin xyz="0 0 ${pipe_radius * 2.0}" rpy="0 0 0"/>
   </joint>
 
-  <joint name="valve_joint" type="continuous">
-    <dynamics damping="0.0" friction="$(arg valve_friction)"/>
+  <joint name="valve_joint" type="fixed">
     <parent link="stem"/>
     <child link="handle"/>
     <!-- The replacement holder starts at local +Z=0 after Rx(+90), so place
          its mounting face directly on the stem end instead of retaining the
          legacy beetle_valve.STL 20 mm offset. -->
     <origin xyz="0 0 ${stem_length * 0.5}" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
   </joint>
 
   <link name="handle">
     <visual>
-      <!-- CAD +Y is the 74 mm holder depth; Rx(+90) maps it to local +Z. -->
-      <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      <!-- CAD +Y is the 74 mm holder depth; Rx(+90) maps it to local +Z.
+           Rz(+45) sets the holder's initial yaw about the valve axis. -->
+      <origin xyz="0 0 0" rpy="${pi/2} 0 ${pi/4}"/>
       <geometry>
         <mesh filename="package://beetle/urdf/mesh/force_sensor_holder_hyper.STL"
               scale="0.001 0.001 0.001"/>
@@ -166,7 +164,7 @@
     </visual>
     <xacro:unless value="$(arg no_collision)">
       <collision>
-        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 ${pi/4}"/>
         <geometry>
           <mesh filename="package://beetle/urdf/mesh/force_sensor_holder_hyper.STL"
                 scale="0.001 0.001 0.001"/>
@@ -195,17 +193,6 @@
   <gazebo reference="stem"><material>Gazebo/Black</material></gazebo>
   <gazebo reference="handle"><material>Gazebo/Black</material></gazebo>
 
-  <transmission name="valve_joint_tran">
-    <type>transmission_interface/SimpleTransmission</type>
-    <joint name="valve_joint">
-      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
-    </joint>
-    <actuator name="valve_joint">
-      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
-      <mechanicalReduction>1</mechanicalReduction>
-    </actuator>
-  </transmission>
-
   <gazebo>
     <plugin name="p3d_base_controller" filename="libgazebo_ros_p3d.so">
       <alwaysOn>true</alwaysOn>
@@ -220,6 +207,7 @@
   </gazebo>
 
   <gazebo reference="valve_joint">
+    <preserveFixedJoint>true</preserveFixedJoint>
     <provideFeedback>true</provideFeedback>
   </gazebo>
   <gazebo>

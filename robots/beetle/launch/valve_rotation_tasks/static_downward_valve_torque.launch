@@ -1,130 +1,37 @@
 <?xml version="1.0"?>
 <launch>
-  <!-- Physical, manually inserted, fixed downward-valve torque-limit test. -->
-  <arg name="real_machine" default="true"/>
-  <arg name="simulation" default="false"/>
-  <arg name="module_ids" default="auto"
-       doc="Ordered formation IDs; auto reuses the running n_module_test session"/>
-  <arg name="end_effector_module_id" default="auto"
-       doc="EE carrier ID; auto reuses n_module_test, otherwise defaults to the final ID"/>
-  <arg name="require_hover_state" default="true"/>
-  <arg name="auto_enable_unified" default="false"
-       doc="Simulation only: switch all assembled HOVER modules through set_unified_mode services"/>
-  <arg name="experiment_armed" default="false"
-       doc="Explicit hardware torque-output gate; must be set true for a run"/>
+  <!-- Static valve test: circular contact search, 6D wrench ramp/hold/unload. -->
+  <arg name="real_machine" default="false"/>
+  <arg name="simulation" default="true"/>
+  <arg name="module_ids" default="1,2"/>
+  <arg name="end_effector_module_id"
+       default="$(eval str(arg('module_ids')).replace(' ', '').split(',')[-1])"/>
 
-  <!-- The supplied coordinates are interpreted relative to the EE host UAV CoG
-       by default. Select formation_cog if the measurements already use the
-       assembled CoG. Signed +Z is upward in the body/formation convention. -->
-  <arg name="tool_offset_reference" default="host_cog"
-       doc="host_cog or formation_cog"/>
-  <arg name="tool_center_x" default="0.240"
-       doc="Midpoint of the two pin-bottom centres, X (m)"/>
-  <arg name="tool_half_spacing_y" default="0.075"
-       doc="Pin centres are at midpoint Y +/- this value (m)"/>
-  <arg name="tool_center_z" default="0.11053"
-       doc="Signed midpoint Z relative to the selected CoG (m); +Z is upward"/>
-  <arg name="tool_model_tolerance" default="0.005"
-       doc="Maximum physical tool vs nominal formation-transform error (m)"/>
-  <arg name="assembly_centroid_tolerance" default="0.015"
-       doc="Maximum mocap module centroid vs assembly odom CoG error (m)"/>
-  <arg name="host_assembly_yaw_tolerance_deg" default="2.0"/>
-
-  <!-- For a downward-facing valve, below means the operator/tool-side view.
-       Thus visual CW below is positive world-Z yaw. Use above to retain the
-       existing upward-valve launch convention. -->
   <arg name="rotation_direction" default="cw" doc="cw or ccw"/>
   <arg name="rotation_view" default="below" doc="above or below"/>
 
-  <arg name="control_rate" default="25.0"/>
-  <arg name="feedback_timeout" default="0.5"/>
-  <arg name="startup_delay" default="3.0"
-       doc="Hands-off delay before capturing the manually inserted pose (s)"/>
-  <arg name="capture_duration" default="0.6"/>
-  <arg name="capture_max_position_span" default="0.010"/>
-  <arg name="capture_max_yaw_span_deg" default="1.0"/>
-  <arg name="initial_rp_max_deg" default="1.0"
-       doc="Strict inserted-tool startup roll/pitch limit"/>
-
-  <!-- Bounded angular contact search about the captured dual-pin midpoint. -->
+  <!-- Only the quantities required to define angular stall contact. -->
   <arg name="contact_search_speed_deg_s" default="3.0"/>
   <arg name="contact_search_max_angle_deg" default="45.0"/>
-  <arg name="contact_search_timeout" default="20.0"/>
   <arg name="contact_min_search_angle_deg" default="2.0"/>
   <arg name="contact_stall_lead_deg" default="3.0"/>
-  <arg name="contact_stall_rate_deg_s" default="0.5"/>
+  <arg name="contact_stall_velocity_deg_s" default="0.5"/>
   <arg name="contact_velocity_window" default="0.4"/>
   <arg name="contact_required_cycles" default="8"/>
-  <arg name="contact_confirmation_mode" default="stall_and_torque"
-       doc="stall_and_torque, stall_only, torque_only, or either"/>
-  <arg name="allow_unsafe_contact_mode" default="false"
-       doc="Required on real hardware to use anything except stall_and_torque"/>
-  <arg name="contact_observer_baseline_duration" default="0.5"/>
-  <arg name="contact_observer_baseline_span" default="0.08"
-       doc="Maximum stable formation-observer Tz baseline span (Nm)"/>
-  <arg name="contact_estimated_torque_threshold" default="0.10"
-       doc="Directed formation reaction Tz contact threshold (Nm)"/>
-  <arg name="contact_estimated_torque_cycles" default="3"/>
-  <arg name="contact_reference_lead_deg" default="0.0"
-       doc="0 resets yaw target to measured contact yaw, removing yaw-PID preload"/>
-  <arg name="contact_settle_time" default="1.0"/>
 
-  <!-- Full application-point 6D wrench. Tz is direction*target_torque and is
-       ramped only after contact. For the pictured upward pins against a
-       downward-facing valve, +Fz supplies axial preload. -->
+  <!-- Application-point wrench in world coordinates. Tz receives the visual
+       rotation sign; all six components are shifted to the formation CoG. -->
   <arg name="feedforward_force_x" default="0.0"/>
   <arg name="feedforward_force_y" default="0.0"/>
   <arg name="feedforward_force_z" default="5.0"/>
   <arg name="feedforward_torque_x" default="0.0"/>
   <arg name="feedforward_torque_y" default="0.0"/>
-  <arg name="target_torque" default="1.0" doc="Positive torque magnitude (Nm)"/>
-  <arg name="preload_ramp_time" default="2.0"/>
-  <arg name="force_ramp_rate" default="3.0" doc="Application force slew limit (N/s)"/>
-  <arg name="preload_cog_torque_rate" default="1.0"
-       doc="CoG torque slew limit for preload, including r cross F (Nm/s)"/>
-  <arg name="torque_ramp_time" default="5.0"/>
-  <arg name="torque_ramp_rate" default="0.25" doc="Tz slew limit (Nm/s)"/>
+  <arg name="target_torque" default="1.0"/>
+  <arg name="wrench_ramp_time" default="3.0"/>
   <arg name="full_torque_hold_time" default="3.0"/>
   <arg name="unload_min_duration" default="2.0"/>
-  <arg name="unload_force_rate" default="3.0"/>
-  <arg name="unload_torque_rate" default="0.5"/>
-
-  <!-- Unified-QP weights in [Fx,Fy,Fz,Tx,Ty,Tz] order. -->
-  <arg name="wrench_weight_fx" default="0.4"/>
-  <arg name="wrench_weight_fy" default="0.4"/>
-  <arg name="wrench_weight_fz" default="0.8"/>
-  <arg name="wrench_weight_tx" default="0.4"/>
-  <arg name="wrench_weight_ty" default="0.8"/>
-  <arg name="wrench_weight_tz" default="2.0"/>
-
-  <!-- Soft thresholds pause the torque ramp; relief thresholds unload it. -->
-  <arg name="guard_rp_hold_deg" default="8.0"/>
-  <arg name="guard_rp_relief_deg" default="12.0"/>
-  <arg name="guard_center_xy_hold" default="0.020"/>
-  <arg name="guard_center_xy_relief" default="0.050"/>
-  <arg name="guard_center_z_hold" default="0.015"/>
-  <arg name="guard_center_z_relief" default="0.040"/>
-  <arg name="guard_hold_timeout" default="3.0"/>
-  <arg name="max_static_slip_angle_deg" default="3.0"/>
-  <arg name="max_estimated_torque" default="4.0"
-       doc="Mandatory absolute formation-observer Tz hard limit (Nm)"/>
-  <arg name="require_realized_wrench" default="true"
-       doc="Gate successful hold on min realized Tz ratio; freshness/hard cap remain mandatory"/>
-  <arg name="min_realized_torque_ratio" default="0.80"/>
-  <arg name="max_realized_torque" default="5.0"
-       doc="Mandatory unified realized total-torque norm limit (Nm)"/>
-  <arg name="yaw_reference_error_max_deg" default="0.5"
-       doc="Maximum yaw pose-PID error allowed during FF torque loading"/>
-  <arg name="max_yaw_pid_command" default="0.10"
-       doc="Maximum absolute raw yaw PID command during FF torque loading"/>
-  <arg name="max_controller_wrench_timeout" default="0.75"
-       doc="Every module watchdog must be positive and no larger than this (s)"/>
-
-  <!-- Independent command envelopes. They cannot be disabled with zero. -->
-  <arg name="max_application_force" default="10.0"/>
-  <arg name="max_application_torque" default="3.5"/>
-  <arg name="max_cog_force" default="15.0"/>
-  <arg name="max_cog_torque" default="5.0"/>
+  <arg name="wrench_force_rate" default="3.0"/>
+  <arg name="wrench_torque_rate" default="0.5"/>
 
   <node name="static_downward_valve_torque" pkg="beetle"
         type="static_downward_valve_torque.py" output="screen">
@@ -132,86 +39,25 @@
     <param name="simulation" value="$(arg simulation)"/>
     <param name="module_ids" value="$(arg module_ids)"/>
     <param name="end_effector_module_id" value="$(arg end_effector_module_id)"/>
-    <param name="require_hover_state" value="$(arg require_hover_state)"/>
-    <param name="auto_enable_unified" value="$(arg auto_enable_unified)"/>
-    <param name="experiment_armed" value="$(arg experiment_armed)"/>
-
-    <param name="tool_offset_reference" value="$(arg tool_offset_reference)"/>
-    <param name="tool_center_x" value="$(arg tool_center_x)"/>
-    <param name="tool_half_spacing_y" value="$(arg tool_half_spacing_y)"/>
-    <param name="tool_center_z" value="$(arg tool_center_z)"/>
-    <param name="tool_model_tolerance" value="$(arg tool_model_tolerance)"/>
-    <param name="assembly_centroid_tolerance" value="$(arg assembly_centroid_tolerance)"/>
-    <param name="host_assembly_yaw_tolerance_deg" value="$(arg host_assembly_yaw_tolerance_deg)"/>
     <param name="rotation_direction" value="$(arg rotation_direction)"/>
     <param name="rotation_view" value="$(arg rotation_view)"/>
-
-    <param name="control_rate" value="$(arg control_rate)"/>
-    <param name="feedback_timeout" value="$(arg feedback_timeout)"/>
-    <param name="startup_delay" value="$(arg startup_delay)"/>
-    <param name="capture_duration" value="$(arg capture_duration)"/>
-    <param name="capture_max_position_span" value="$(arg capture_max_position_span)"/>
-    <param name="capture_max_yaw_span_deg" value="$(arg capture_max_yaw_span_deg)"/>
-    <param name="initial_rp_max_deg" value="$(arg initial_rp_max_deg)"/>
-
     <param name="contact_search_speed_deg_s" value="$(arg contact_search_speed_deg_s)"/>
     <param name="contact_search_max_angle_deg" value="$(arg contact_search_max_angle_deg)"/>
-    <param name="contact_search_timeout" value="$(arg contact_search_timeout)"/>
     <param name="contact_min_search_angle_deg" value="$(arg contact_min_search_angle_deg)"/>
     <param name="contact_stall_lead_deg" value="$(arg contact_stall_lead_deg)"/>
-    <param name="contact_stall_rate_deg_s" value="$(arg contact_stall_rate_deg_s)"/>
+    <param name="contact_stall_velocity_deg_s" value="$(arg contact_stall_velocity_deg_s)"/>
     <param name="contact_velocity_window" value="$(arg contact_velocity_window)"/>
     <param name="contact_required_cycles" value="$(arg contact_required_cycles)"/>
-    <param name="contact_confirmation_mode" value="$(arg contact_confirmation_mode)"/>
-    <param name="allow_unsafe_contact_mode" value="$(arg allow_unsafe_contact_mode)"/>
-    <param name="contact_observer_baseline_duration" value="$(arg contact_observer_baseline_duration)"/>
-    <param name="contact_observer_baseline_span" value="$(arg contact_observer_baseline_span)"/>
-    <param name="contact_estimated_torque_threshold" value="$(arg contact_estimated_torque_threshold)"/>
-    <param name="contact_estimated_torque_cycles" value="$(arg contact_estimated_torque_cycles)"/>
-    <param name="contact_reference_lead_deg" value="$(arg contact_reference_lead_deg)"/>
-    <param name="contact_settle_time" value="$(arg contact_settle_time)"/>
-
     <param name="feedforward_force_x" value="$(arg feedforward_force_x)"/>
     <param name="feedforward_force_y" value="$(arg feedforward_force_y)"/>
     <param name="feedforward_force_z" value="$(arg feedforward_force_z)"/>
     <param name="feedforward_torque_x" value="$(arg feedforward_torque_x)"/>
     <param name="feedforward_torque_y" value="$(arg feedforward_torque_y)"/>
     <param name="target_torque" value="$(arg target_torque)"/>
-    <param name="preload_ramp_time" value="$(arg preload_ramp_time)"/>
-    <param name="force_ramp_rate" value="$(arg force_ramp_rate)"/>
-    <param name="preload_cog_torque_rate" value="$(arg preload_cog_torque_rate)"/>
-    <param name="torque_ramp_time" value="$(arg torque_ramp_time)"/>
-    <param name="torque_ramp_rate" value="$(arg torque_ramp_rate)"/>
+    <param name="wrench_ramp_time" value="$(arg wrench_ramp_time)"/>
     <param name="full_torque_hold_time" value="$(arg full_torque_hold_time)"/>
     <param name="unload_min_duration" value="$(arg unload_min_duration)"/>
-    <param name="unload_force_rate" value="$(arg unload_force_rate)"/>
-    <param name="unload_torque_rate" value="$(arg unload_torque_rate)"/>
-
-    <param name="wrench_weight_fx" value="$(arg wrench_weight_fx)"/>
-    <param name="wrench_weight_fy" value="$(arg wrench_weight_fy)"/>
-    <param name="wrench_weight_fz" value="$(arg wrench_weight_fz)"/>
-    <param name="wrench_weight_tx" value="$(arg wrench_weight_tx)"/>
-    <param name="wrench_weight_ty" value="$(arg wrench_weight_ty)"/>
-    <param name="wrench_weight_tz" value="$(arg wrench_weight_tz)"/>
-
-    <param name="guard_rp_hold_deg" value="$(arg guard_rp_hold_deg)"/>
-    <param name="guard_rp_relief_deg" value="$(arg guard_rp_relief_deg)"/>
-    <param name="guard_center_xy_hold" value="$(arg guard_center_xy_hold)"/>
-    <param name="guard_center_xy_relief" value="$(arg guard_center_xy_relief)"/>
-    <param name="guard_center_z_hold" value="$(arg guard_center_z_hold)"/>
-    <param name="guard_center_z_relief" value="$(arg guard_center_z_relief)"/>
-    <param name="guard_hold_timeout" value="$(arg guard_hold_timeout)"/>
-    <param name="max_static_slip_angle_deg" value="$(arg max_static_slip_angle_deg)"/>
-    <param name="max_estimated_torque" value="$(arg max_estimated_torque)"/>
-    <param name="require_realized_wrench" value="$(arg require_realized_wrench)"/>
-    <param name="min_realized_torque_ratio" value="$(arg min_realized_torque_ratio)"/>
-    <param name="max_realized_torque" value="$(arg max_realized_torque)"/>
-    <param name="yaw_reference_error_max_deg" value="$(arg yaw_reference_error_max_deg)"/>
-    <param name="max_yaw_pid_command" value="$(arg max_yaw_pid_command)"/>
-    <param name="max_controller_wrench_timeout" value="$(arg max_controller_wrench_timeout)"/>
-    <param name="max_application_force" value="$(arg max_application_force)"/>
-    <param name="max_application_torque" value="$(arg max_application_torque)"/>
-    <param name="max_cog_force" value="$(arg max_cog_force)"/>
-    <param name="max_cog_torque" value="$(arg max_cog_torque)"/>
+    <param name="wrench_force_rate" value="$(arg wrench_force_rate)"/>
+    <param name="wrench_torque_rate" value="$(arg wrench_torque_rate)"/>
   </node>
 </launch>

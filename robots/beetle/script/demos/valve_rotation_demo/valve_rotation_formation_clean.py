@@ -1535,9 +1535,6 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         selected_spoke = spoke_angles[angle_diffs.index(min(angle_diffs))]
         rospy.loginfo(f"Spoke selection: approach={math.degrees(ee_start_angle):.1f} deg, selected={math.degrees(selected_spoke):.1f} deg")
 
-        if ee_radius > 0.025:
-            rospy.logwarn(f"Distance to valve center too large: {ee_radius*1000:.1f}mm")
-
         self.valve_center = valve_pos
         self.initial_valve_yaw = valve_yaw
 
@@ -1760,8 +1757,6 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         yaw_velocity_timeout = max(
             0.0, float(rospy.get_param(
                 "controller/valve_rotation_feedforward/yaw_velocity_timeout", 0.2)))
-        rp_guard = rospy.get_param("controller/valve_rotation_feedforward/rp_guard", math.radians(12.0))
-
         torque_z = getattr(self, '_contact_final_torque_z',
                            torque_min * self.rotation_direction)
         torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
@@ -1859,12 +1854,6 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
                             -max_yaw_adjust,
                             min(max_yaw_adjust, yaw_rate_adjust))
                 torque_z += roll_adjust + yaw_rate_adjust
-                rpy = self.beetle.getAssemblyRPY()
-                if rpy is not None and max(abs(rpy[0]), abs(rpy[1])) > rp_guard:
-                    torque_z *= 0.8
-                    rospy.logwarn_throttle(
-                        1.0, "Valve FF roll/pitch guard active: roll=%.1f deg, pitch=%.1f deg",
-                        math.degrees(rpy[0]), math.degrees(rpy[1]))
                 torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
                 ff_force = self._centripetal_force_world(radius, angular_vel, angle)
                 ff_force[2] += ff_force_z

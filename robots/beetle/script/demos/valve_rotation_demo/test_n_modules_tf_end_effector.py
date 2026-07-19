@@ -14,10 +14,11 @@ from n_modules_tf import NModuleTFCalculator
 
 class EndEffectorModuleSelectionTest(unittest.TestCase):
 
-    def _calculator(self, module_ids, host=None):
+    def _calculator(self, module_ids, host=None, end_effector_offset_body=None):
         with mock.patch.object(n_modules_tf.rospy, "loginfo"):
             return NModuleTFCalculator(
-                module_ids, end_effector_module_id=host)
+                module_ids, end_effector_module_id=host,
+                end_effector_offset_body=end_effector_offset_body)
 
     def test_default_remains_final_module(self):
         calculator = self._calculator("8,2,5")
@@ -41,17 +42,33 @@ class EndEffectorModuleSelectionTest(unittest.TestCase):
                 calculator.calculate_assembly_to_leader_transform())
 
     def test_two_module_host_changes_application_point_moment_arm(self):
-        first = self._calculator("1,2", 1)
-        final = self._calculator("1,2", 2)
-        first_x = (first.calculate_assembly_to_end_effector_host_transform()
-                   ["offset_x"] + 0.240)
-        final_x = (final.calculate_assembly_to_end_effector_host_transform()
-                   ["offset_x"] + 0.240)
-        self.assertAlmostEqual(first_x, -0.020)
-        self.assertAlmostEqual(final_x, 0.500)
+        downward_offset = [0.240, 0.0, 0.11053]
+        first = self._calculator("1,2", 1, downward_offset)
+        final = self._calculator("1,2", 2, downward_offset)
+        first_point = first.transform_assembly_to_end_effector(
+            (0.0, 0.0, 0.0), 0.0)
+        final_point = final.transform_assembly_to_end_effector(
+            (0.0, 0.0, 0.0), 0.0)
+        self.assertAlmostEqual(first_point[0], -0.020)
+        self.assertAlmostEqual(final_point[0], 0.500)
+        self.assertAlmostEqual(first_point[2], 0.11053)
+        self.assertAlmostEqual(final_point[2], 0.11053)
         # For Fz=5 N, (r x F)y = -rx*Fz.
-        self.assertAlmostEqual(-first_x * 5.0, 0.10)
-        self.assertAlmostEqual(-final_x * 5.0, -2.50)
+        self.assertAlmostEqual(-first_point[0] * 5.0, 0.10)
+        self.assertAlmostEqual(-final_point[0] * 5.0, -2.50)
+
+    def test_task_specific_offset_does_not_change_legacy_default(self):
+        legacy = self._calculator("2,3", 3)
+        downward = self._calculator(
+            "2,3", 3, [0.240, 0.0, 0.11053])
+        self.assertEqual(
+            legacy.transform_assembly_to_end_effector(
+                (0.0, 0.0, 0.0), 0.0),
+            (0.506, 0.0, 0.074382))
+        self.assertEqual(
+            downward.transform_assembly_to_end_effector(
+                (0.0, 0.0, 0.0), 0.0),
+            (0.5, 0.0, 0.11053))
 
     def test_invalid_configurations_fail_closed(self):
         with self.assertRaises(ValueError):
@@ -62,6 +79,8 @@ class EndEffectorModuleSelectionTest(unittest.TestCase):
             self._calculator("0,2", 2)
         with self.assertRaises(ValueError):
             self._calculator("1,2", "not-an-id")
+        with self.assertRaises(ValueError):
+            self._calculator("1,2", 2, [0.24, 0.0])
 
 
 if __name__ == "__main__":

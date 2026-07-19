@@ -175,6 +175,11 @@ def read_config():
             _finite_float_param("~feedforward_torque_y", 0.0),
             direction * _positive_float_param("~target_torque", 1.0),
         ]),
+        end_effector_offset_body=np.array([
+            _finite_float_param("~tool_center_x", 0.240),
+            _finite_float_param("~tool_center_y", 0.0),
+            _finite_float_param("~tool_center_z", 0.11053),
+        ]),
         ramp_time=_positive_float_param("~wrench_ramp_time", 3.0),
         hold_time=_positive_float_param("~full_torque_hold_time", 3.0),
         unload_min_duration=_positive_float_param(
@@ -198,7 +203,8 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
     def __init__(self, config):
         FormationRotateValveState.__init__(
             self, rotation_direction=config.direction,
-            target_rotation=config.max_search_angle)
+            target_rotation=config.max_search_angle,
+            end_effector_offset_body=config.end_effector_offset_body)
         self.config = config
         self.phase_pub = rospy.Publisher("~phase", String, queue_size=1, latch=True)
         self.application_wrench_pub = rospy.Publisher(

@@ -11,7 +11,8 @@ import rospy
 import math
 
 class NModuleTFCalculator:
-    def __init__(self, module_ids_str=None, end_effector_module_id=None):
+    def __init__(self, module_ids_str=None, end_effector_module_id=None,
+                 end_effector_offset_body=None):
         # Resolve ROS parameters at construction time, after rospy.init_node().
         # Evaluating get_param in the function signature made merely importing
         # this reusable geometry module contact the ROS master.
@@ -38,6 +39,18 @@ class NModuleTFCalculator:
                 "end_effector_module_id %d is not in module_ids %s" % (
                     self.end_effector_module_id, self.module_ids))
 
+        if end_effector_offset_body is None:
+            end_effector_offset_body = (0.246, 0.0, 0.074382)
+        try:
+            end_effector_offset_body = tuple(
+                float(value) for value in end_effector_offset_body)
+        except (TypeError, ValueError):
+            raise ValueError("end_effector_offset_body must contain 3 numbers")
+        if (len(end_effector_offset_body) != 3 or
+                not all(math.isfinite(value)
+                        for value in end_effector_offset_body)):
+            raise ValueError("end_effector_offset_body must contain 3 finite numbers")
+
         # Legacy valve/towing code calls this Python-side EE carrier the
         # "leader".  Keep the alias, but do not confuse it with the C++
         # assembly leader that receives formation wrench commands.
@@ -57,9 +70,12 @@ class NModuleTFCalculator:
         self.claw_insertion_depth = 0.030  # Insertion depth of the claw into the valve
         self.module_distance = 0.52  # Distance between neighboring modules in assemble state
         
-        # End-effector offset parameters (from single UAV version)
-        self.dual_fang_center_offset = 0.246  # Distance from UAV CoG to end-effector center
-        self.end_effector_offset_z = 0.074382  # Z-axis offset of end-effector
+        # Host-UAV body/fc -> end-effector application point. Callers may
+        # supply task-specific geometry; legacy valve/towing callers retain
+        # their historical default above.
+        self.dual_fang_center_offset = end_effector_offset_body[0]
+        self.end_effector_offset_y = end_effector_offset_body[1]
+        self.end_effector_offset_z = end_effector_offset_body[2]
 
         # Contact point from URDF (beetle_fang.urdf.xacro cp_base_joint:
         # contact_point at xyz="0.26 0 0" relative to base_link). This is the
@@ -133,8 +149,10 @@ class NModuleTFCalculator:
         arm_body_z = -self.dual_fang_center_offset * sin_pitch
         
         # Rotate body-frame horizontal component into world frame via yaw
-        end_effector_x = arm_body_x * cos_yaw
-        end_effector_y = arm_body_x * sin_yaw
+        end_effector_x = (arm_body_x * cos_yaw -
+                          self.end_effector_offset_y * sin_yaw)
+        end_effector_y = (arm_body_x * sin_yaw +
+                          self.end_effector_offset_y * cos_yaw)
         end_effector_z = self.end_effector_offset_z + arm_body_z
         
         return {

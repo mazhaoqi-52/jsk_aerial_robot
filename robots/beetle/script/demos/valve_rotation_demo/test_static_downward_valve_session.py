@@ -20,6 +20,15 @@ from valve_rotation_formation_clean import FormationRotateValveState
 
 class StaticDownwardValveRotationTest(unittest.TestCase):
 
+    def test_downward_task_has_its_own_host_to_tool_offset(self):
+        with mock.patch.object(
+                static_torque.rospy, "get_param",
+                side_effect=lambda name, default: default):
+            config = static_torque.read_config()
+        self.assertEqual(
+            config.end_effector_offset_body.tolist(),
+            [0.240, 0.0, 0.11053])
+
     def test_downward_view_reverses_visual_direction(self):
         self.assertEqual(parse_rotation_direction("cw", "below")[0], 1)
         self.assertEqual(parse_rotation_direction("ccw", "below")[0], -1)

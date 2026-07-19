@@ -127,7 +127,8 @@ class FormationUtils:
 class FormationAdapter:
     """Dynamic adapter for multi-UAV formation with configurable module_ids"""
 
-    def __init__(self, module_ids_str=None, end_effector_module_id=None):
+    def __init__(self, module_ids_str=None, end_effector_module_id=None,
+                 end_effector_offset_body=None):
         if module_ids_str is None:
             module_ids_str = rospy.get_param("~module_ids", "2,3")
         if end_effector_module_id is None:
@@ -141,7 +142,9 @@ class FormationAdapter:
 
         rospy.set_param("~module_ids", module_ids_str)
         self.tf_calculator = NModuleTFCalculator(
-            module_ids_str, end_effector_module_id=end_effector_module_id)
+            module_ids_str,
+            end_effector_module_id=end_effector_module_id,
+            end_effector_offset_body=end_effector_offset_body)
 
         if not self.tf_calculator.validate_module_configuration():
             raise ValueError(f"Invalid module configuration: {module_ids_str}")
@@ -426,14 +429,15 @@ class FormationSingleUAVStateBase(smach.State):
     _shared_target_z = None
 
     def __init__(self, outcomes, input_keys=None, output_keys=None,
-                 end_effector_module_id=None):
+                 end_effector_module_id=None, end_effector_offset_body=None):
         smach.State.__init__(self, outcomes=outcomes, input_keys=input_keys or [], output_keys=output_keys or [])
 
         module_ids_str = rospy.get_param("~module_ids", "2,3")
 
         self.formation_adapter = FormationAdapter(
             module_ids_str,
-            end_effector_module_id=end_effector_module_id)
+            end_effector_module_id=end_effector_module_id,
+            end_effector_offset_body=end_effector_offset_body)
         self.end_effector_module_id = (
             self.formation_adapter.get_end_effector_module_id())
         self.leader_id = self.end_effector_module_id  # legacy alias
@@ -1489,12 +1493,14 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 class FormationRotateValveState(FormationSingleUAVStateBase):
     """Formation valve contact and rotation using streaming circular trajectory."""
 
-    def __init__(self, rotation_direction=1, target_rotation=math.radians(90.0)):
+    def __init__(self, rotation_direction=1, target_rotation=math.radians(90.0),
+                 end_effector_offset_body=None):
         FormationSingleUAVStateBase.__init__(
             self,
             outcomes=['succeeded', 'failed', 'emergency'],
             input_keys=['valve_position', 'valve_yaw', 'phase4_contact_pose', 'phase4_contact_yaw'],
-            output_keys=['trajectory_state', 'contact_final_torque']
+            output_keys=['trajectory_state', 'contact_final_torque'],
+            end_effector_offset_body=end_effector_offset_body
         )
         self.rotation_direction = rotation_direction
         self.target_rotation = abs(target_rotation)

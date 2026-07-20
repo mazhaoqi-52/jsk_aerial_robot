@@ -39,7 +39,7 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         self.assertEqual(config.valve_feedback_timeout, 10.0)
         self.assertEqual(config.pose_feedback_max_age, 0.5)
         self.assertEqual(config.search_ramp_time, 2.0)
-        self.assertEqual(config.zero_radius_tolerance, 0.030)
+        self.assertEqual(config.center_tolerance, 0.100)
 
     def test_cfs_is_required_only_for_real_hardware(self):
         hardware_params = {
@@ -232,7 +232,7 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
             required_cycles=8,
             search_speed=math.radians(3.0),
             search_ramp_time=2.0,
-            zero_radius_tolerance=0.030,
+            center_tolerance=0.100,
             direction_label="CCW viewed from above",
             force_sensor_enabled=False)
         state._set_phase = mock.Mock()
@@ -251,7 +251,7 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
 
         state._end_effector_feedback_is_fresh.assert_called_once_with()
 
-    def test_contact_search_starts_at_actual_pose_with_small_radius(self):
+    def test_contact_search_is_valve_centered_and_starts_at_actual_pose(self):
         state = static_torque.StaticDownwardValveTorqueTest.__new__(
             static_torque.StaticDownwardValveTorqueTest)
         state.config = static_torque.SimpleNamespace(
@@ -264,7 +264,7 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
             required_cycles=8,
             search_speed=math.radians(3.0),
             search_ramp_time=2.0,
-            zero_radius_tolerance=0.030,
+            center_tolerance=0.100,
             direction_label="CCW viewed from below",
             force_sensor_enabled=False)
         state._set_phase = mock.Mock()
@@ -299,16 +299,55 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
             first_command.kwargs["linear_vel"], [0.0, 0.0, 0.0])
         self.assertAlmostEqual(first_command.kwargs["angular_vel"], 0.0)
 
-        np.testing.assert_allclose(second_command.args[0], start_position)
+        directed_progress = -math.radians(3.0)
+        cos_progress = math.cos(directed_progress)
+        sin_progress = math.sin(directed_progress)
+        start_offset = start_position[:2] - valve_center[:2]
+        expected_offset = np.array([
+            cos_progress * start_offset[0] -
+            sin_progress * start_offset[1],
+            sin_progress * start_offset[0] +
+            cos_progress * start_offset[1],
+        ])
+        expected_position = np.array([
+            valve_center[0] + expected_offset[0],
+            valve_center[1] + expected_offset[1],
+            start_position[2],
+        ])
+        np.testing.assert_allclose(second_command.args[0], expected_position)
         self.assertAlmostEqual(
             second_command.args[1], start_yaw - math.radians(3.0))
-        np.testing.assert_allclose(
-            second_command.kwargs["linear_vel"], [0.0, 0.0, 0.0])
+        signed_speed = -math.radians(3.0)
+        np.testing.assert_allclose(second_command.kwargs["linear_vel"], [
+            -signed_speed * expected_offset[1],
+            signed_speed * expected_offset[0],
+            0.0,
+        ])
         self.assertAlmostEqual(
             second_command.kwargs["angular_vel"], -math.radians(3.0))
         np.testing.assert_allclose(stop_command.args[0], start_position)
         self.assertAlmostEqual(stop_command.args[1], start_yaw)
         self.assertEqual(stop_command.kwargs, {})
+
+    def test_contact_search_rejects_manual_insertion_outside_tolerance(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            center_tolerance=0.100)
+        state._set_phase = mock.Mock()
+        state._end_effector_feedback_is_fresh = mock.Mock(
+            return_value=True)
+        state.get_end_effector_position = mock.Mock(
+            return_value=[0.101, 0.0, 1.0])
+        state.get_end_effector_yaw = mock.Mock(return_value=0.0)
+        state.send_assembly_command_from_end_effector = mock.Mock()
+
+        with mock.patch.object(static_torque.rospy, "logerr") as logerr:
+            self.assertFalse(state._search_contact(
+                np.array([0.0, 0.0, 1.0])))
+
+        self.assertTrue(logerr.called)
+        state.send_assembly_command_from_end_effector.assert_not_called()
 
     def test_contact_search_speed_uses_smoothstep_ramp(self):
         target_speed = math.radians(3.0)
@@ -341,7 +380,7 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         self.assertAlmostEqual(target[2], 1.1)
         self.assertAlmostEqual(yaw, -math.pi / 2.0)
 
-    def test_zero_radius_fallback_starts_from_current_yaw(self):
+    def test_zero_radius_search_starts_from_current_yaw(self):
         center = np.array([0.2, -0.1, 1.0])
         current_yaw = -0.7
         start_angle = circular_start_angle(

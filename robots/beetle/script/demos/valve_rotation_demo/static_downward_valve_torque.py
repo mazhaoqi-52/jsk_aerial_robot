@@ -199,8 +199,8 @@ def read_config():
             "~contact_search_speed_deg_s", 3.0)),
         search_ramp_time=_nonnegative_float_param(
             "~contact_search_ramp_time", 2.0),
-        zero_radius_tolerance=_nonnegative_float_param(
-            "~contact_zero_radius_tolerance", 0.030),
+        center_tolerance=_positive_float_param(
+            "~contact_center_tolerance", 0.100),
         max_search_angle=math.radians(_positive_float_param(
             "~contact_search_max_angle_deg", 45.0)),
         min_search_angle=math.radians(_positive_float_param(
@@ -480,20 +480,19 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
                 "End-effector pose is invalid at contact-search start")
             return False
 
-        measured_radius = float(np.linalg.norm(
+        # The downward dual-pin task needs only the valve centre in XY;
+        # valve orientation is intentionally absent from the trajectory.
+        radius = float(np.linalg.norm(
             start_ee_position[:2] - valve_center[:2]))
-        search_center = valve_center
-        radius = measured_radius
-        if measured_radius <= self.config.zero_radius_tolerance:
-            search_center = start_ee_position.copy()
-            radius = 0.0
-            rospy.loginfo(
-                "EE/valve center offset %.1fmm is within the %.1fmm "
-                "zero-radius tolerance; holding the inserted EE center fixed",
-                measured_radius * 1000.0,
-                self.config.zero_radius_tolerance * 1000.0)
+        if radius > self.config.center_tolerance:
+            rospy.logerr(
+                "EE/valve center offset %.1fmm exceeds the %.1fmm manual-"
+                "insertion tolerance; refusing to start contact search",
+                radius * 1000.0,
+                self.config.center_tolerance * 1000.0)
+            return False
         start_angle = circular_start_angle(
-            search_center, start_ee_position, start_ee_yaw)
+            valve_center, start_ee_position, start_ee_yaw)
         detector = DirectedAngularStallDetector(
             self.config.direction, self.config.min_search_angle,
             self.config.stall_lead, self.config.stall_rate,
@@ -503,10 +502,11 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
         rate = rospy.Rate(CONTROL_RATE_HZ)
 
         rospy.loginfo(
-            "Contact search: valve=(%.3f, %.3f), center=(%.3f, %.3f), "
-            "radius=%.1fmm, direction=%s, speed=%.1fdeg/s, ramp=%.1fs",
-            valve_center[0], valve_center[1],
-            search_center[0], search_center[1], radius * 1000.0,
+            "Valve-centred contact search: center=(%.3f, %.3f), "
+            "radius=%.1fmm (limit %.1fmm), direction=%s, speed=%.1fdeg/s, "
+            "ramp=%.1fs",
+            valve_center[0], valve_center[1], radius * 1000.0,
+            self.config.center_tolerance * 1000.0,
             self.config.direction_label,
             math.degrees(self.config.direction * self.config.search_speed),
             self.config.search_ramp_time)
@@ -538,7 +538,7 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
             signed_speed = self.config.direction * current_speed
             angle = start_angle + self.config.direction * progress
             target_position, _ = self._circular_ee_target(
-                search_center, radius, angle, start_ee_position[2])
+                valve_center, radius, angle, start_ee_position[2])
             target_yaw = normalize_angle(
                 start_ee_yaw + self.config.direction * progress)
             target_velocity = self._circular_ee_velocity(

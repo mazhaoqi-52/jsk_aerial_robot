@@ -61,8 +61,8 @@
   <arg name="contact_search_speed_deg_s" default="3.0"/>
   <arg name="contact_search_ramp_time" default="2.0"
        doc="Seconds to smoothstep the circular-search angular speed from zero to its target"/>
-  <arg name="contact_zero_radius_tolerance" default="0.030"
-       doc="EE-to-valve XY offset in metres accepted as an inserted zero-radius configuration"/>
+  <arg name="contact_center_tolerance" default="0.100"
+       doc="Maximum EE-to-valve XY offset in metres accepted after manual insertion"/>
   <arg name="contact_search_max_angle_deg" default="45.0"/>
   <arg name="contact_min_search_angle_deg" default="2.0"/>
   <arg name="contact_stall_lead_deg" default="3.0"/>
@@ -106,7 +106,7 @@
     <param name="force_sensor_calib_service" value="$(arg force_sensor_calib_service)"/>
     <param name="contact_search_speed_deg_s" value="$(arg contact_search_speed_deg_s)"/>
     <param name="contact_search_ramp_time" value="$(arg contact_search_ramp_time)"/>
-    <param name="contact_zero_radius_tolerance" value="$(arg contact_zero_radius_tolerance)"/>
+    <param name="contact_center_tolerance" value="$(arg contact_center_tolerance)"/>
     <param name="contact_search_max_angle_deg" value="$(arg contact_search_max_angle_deg)"/>
     <param name="contact_min_search_angle_deg" value="$(arg contact_min_search_angle_deg)"/>
     <param name="contact_stall_lead_deg" value="$(arg contact_stall_lead_deg)"/>

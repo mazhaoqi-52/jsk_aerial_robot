@@ -95,6 +95,7 @@ class BeetleInterface(object):
         self.cog_odom_source_stamp = None
         self.cog_odom_source_advanced_time = None
         self.valve_pose = None
+        self.valve_pose_received_time = None
         self.flight_state = self.ARM_OFF_STATE
         self.flight_state_received = False
         self.flight_state_received_time = None
@@ -260,10 +261,12 @@ class BeetleInterface(object):
 
     def _valve_cb(self, msg):
         self.valve_pose = msg.pose
+        self.valve_pose_received_time = rospy.get_time()
 
     def _valve_sim_cb(self, msg):
         if hasattr(msg, 'child_frame_id') and msg.child_frame_id == "handle":
             self.valve_pose = msg.pose.pose
+            self.valve_pose_received_time = rospy.get_time()
 
     def _wrench_cb(self, msg):
         self.est_wrench = msg.wrench
@@ -508,6 +511,16 @@ class BeetleInterface(object):
             return None
         p = self.valve_pose.position
         return np.array([p.x, p.y, p.z])
+
+    def getFreshValvePos(self, max_age=0.5):
+        """Get valve position only while its pose topic is still updating."""
+        if self.valve_pose_received_time is None:
+            return None
+        age = rospy.get_time() - self.valve_pose_received_time
+        if not (math.isfinite(age) and
+                0.0 <= age <= max(0.0, float(max_age))):
+            return None
+        return self.getValvePos()
 
     def getValveRot(self):
         """Get valve orientation quaternion."""

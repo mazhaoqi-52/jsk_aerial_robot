@@ -7,15 +7,22 @@ import sys
 import unittest
 from unittest import mock
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import static_downward_valve_torque as static_torque
+from beetle_interface import BeetleInterface
 from static_downward_valve_torque import (
     DirectedAngularStallDetector,
+    circular_start_angle,
     minimum_smoothstep_duration,
     parse_rotation_direction,
 )
-from valve_rotation_formation_clean import FormationRotateValveState
+from valve_rotation_formation_clean import (
+    FormationAdapter,
+    FormationRotateValveState,
+)
 
 
 class StaticDownwardValveRotationTest(unittest.TestCase):
@@ -28,6 +35,8 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         self.assertEqual(
             config.end_effector_offset_body.tolist(),
             [0.240, 0.0, 0.11053])
+        self.assertEqual(config.valve_feedback_timeout, 10.0)
+        self.assertEqual(config.pose_feedback_max_age, 0.5)
 
     def test_cfs_is_required_only_for_real_hardware(self):
         hardware_params = {
@@ -104,6 +113,140 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         self.assertEqual(parse_rotation_direction("cw", "above")[0], -1)
         self.assertEqual(parse_rotation_direction("ccw", "above")[0], 1)
 
+    def test_feedback_prefers_valid_valve_mocap(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            valve_feedback_timeout=10.0,
+            pose_feedback_max_age=0.5)
+        state._set_phase = mock.Mock()
+        state.beetle = mock.Mock()
+        state.beetle.getFreshValvePos.return_value = [3.0, 2.0, 1.5]
+        state.formation_adapter = mock.Mock()
+        state.formation_adapter.has_fresh_end_effector_feedback.return_value = True
+        state.get_end_effector_position = mock.Mock(
+            return_value=[0.2, -0.1, 1.0])
+        state.get_end_effector_yaw = mock.Mock(return_value=0.3)
+
+        with mock.patch.object(
+                static_torque.rospy, "get_time", return_value=5.0), \
+                mock.patch.object(static_torque.rospy, "Rate"), \
+                mock.patch.object(
+                    static_torque.rospy, "is_shutdown", return_value=False):
+            valve_center, ee_position, ee_yaw = state._wait_for_feedback()
+
+        np.testing.assert_allclose(valve_center, [3.0, 2.0, 1.5])
+        np.testing.assert_allclose(ee_position, [0.2, -0.1, 1.0])
+        self.assertAlmostEqual(ee_yaw, 0.3)
+
+    def test_feedback_uses_current_end_effector_center_after_timeout(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            valve_feedback_timeout=10.0,
+            pose_feedback_max_age=0.5)
+        state._set_phase = mock.Mock()
+        state.beetle = mock.Mock()
+        state.beetle.getFreshValvePos.return_value = None
+        state.formation_adapter = mock.Mock()
+        state.formation_adapter.has_fresh_end_effector_feedback.return_value = True
+        state.get_end_effector_position = mock.Mock(
+            return_value=[0.2, -0.1, 1.0])
+        state.get_end_effector_yaw = mock.Mock(return_value=0.3)
+
+        with mock.patch.object(
+                static_torque.rospy, "get_time",
+                side_effect=[5.0, 15.0]), mock.patch.object(
+                    static_torque.rospy, "logwarn") as logwarn, \
+                mock.patch.object(static_torque.rospy, "Rate"), \
+                mock.patch.object(
+                    static_torque.rospy, "is_shutdown", return_value=False):
+            valve_center, ee_position, ee_yaw = state._wait_for_feedback()
+
+        np.testing.assert_allclose(valve_center, ee_position)
+        np.testing.assert_allclose(valve_center, [0.2, -0.1, 1.0])
+        self.assertAlmostEqual(ee_yaw, 0.3)
+        self.assertTrue(logwarn.called)
+
+    def test_feedback_timeout_rejects_stale_end_effector(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            valve_feedback_timeout=10.0,
+            pose_feedback_max_age=0.5)
+        state._set_phase = mock.Mock()
+        state.beetle = mock.Mock()
+        state.beetle.getFreshValvePos.return_value = None
+        state.formation_adapter = mock.Mock()
+        state.formation_adapter.has_fresh_end_effector_feedback.return_value = False
+        state.get_end_effector_position = mock.Mock(
+            return_value=[0.2, -0.1, 1.0])
+        state.get_end_effector_yaw = mock.Mock(return_value=0.3)
+
+        with mock.patch.object(
+                static_torque.rospy, "get_time",
+                side_effect=[5.0, 15.0]), mock.patch.object(
+                    static_torque.rospy, "logerr") as logerr, \
+                mock.patch.object(static_torque.rospy, "Rate"), \
+                mock.patch.object(
+                    static_torque.rospy, "is_shutdown", return_value=False):
+            self.assertIsNone(state._wait_for_feedback())
+
+        self.assertTrue(logerr.called)
+
+    def test_valve_and_module_pose_freshness_expires(self):
+        valve = BeetleInterface.__new__(BeetleInterface)
+        valve.valve_pose_received_time = 10.0
+        valve.valve_pose = static_torque.SimpleNamespace(
+            position=static_torque.SimpleNamespace(x=1.0, y=2.0, z=3.0))
+        formation = FormationAdapter.__new__(FormationAdapter)
+        formation.module_ids = [1, 3]
+        formation.uav_pose_received_times = {1: 10.0, 3: 10.0}
+
+        with mock.patch.object(
+                static_torque.rospy, "get_time", return_value=10.4):
+            np.testing.assert_allclose(
+                valve.getFreshValvePos(0.5), [1.0, 2.0, 3.0])
+            self.assertTrue(
+                formation.has_fresh_end_effector_feedback(0.5))
+
+        with mock.patch.object(
+                static_torque.rospy, "get_time", return_value=10.6):
+            self.assertIsNone(valve.getFreshValvePos(0.5))
+            self.assertFalse(
+                formation.has_fresh_end_effector_feedback(0.5))
+
+    def test_stale_module_pose_blocks_contact_search(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            direction=1,
+            min_search_angle=math.radians(2.0),
+            max_search_angle=math.radians(45.0),
+            stall_lead=math.radians(3.0),
+            stall_rate=math.radians(0.5),
+            velocity_window=0.4,
+            required_cycles=8,
+            search_speed=math.radians(3.0),
+            direction_label="CCW viewed from above",
+            force_sensor_enabled=False)
+        state._set_phase = mock.Mock()
+        state._end_effector_feedback_is_fresh = mock.Mock(
+            return_value=False)
+        state.beetle = mock.Mock()
+        state.beetle.getTaskHaltFlag.return_value = False
+
+        with mock.patch.object(
+                static_torque.rospy, "get_time", return_value=5.0), \
+                mock.patch.object(static_torque.rospy, "Rate"), \
+                mock.patch.object(
+                    static_torque.rospy, "is_shutdown", return_value=False):
+            self.assertFalse(state._search_contact(
+                np.array([0.0, 0.0, 1.0]),
+                np.array([0.1, 0.0, 1.0]), 0.0))
+
+        state._end_effector_feedback_is_fresh.assert_called_once_with()
+
     def test_existing_circular_target_is_valve_centered(self):
         state = FormationRotateValveState.__new__(FormationRotateValveState)
         target, yaw = state._circular_ee_target(
@@ -112,6 +255,23 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
         self.assertAlmostEqual(target[1], 2.1)
         self.assertAlmostEqual(target[2], 1.1)
         self.assertAlmostEqual(yaw, -math.pi / 2.0)
+
+    def test_zero_radius_fallback_starts_from_current_yaw(self):
+        center = np.array([0.2, -0.1, 1.0])
+        current_yaw = -0.7
+        start_angle = circular_start_angle(
+            center, center.copy(), current_yaw)
+        state = FormationRotateValveState.__new__(FormationRotateValveState)
+        target, target_yaw = state._circular_ee_target(
+            center, 0.0, start_angle, center[2])
+        next_target, next_yaw = state._circular_ee_target(
+            center, 0.0, start_angle + 0.1, center[2])
+
+        np.testing.assert_allclose(target, center)
+        np.testing.assert_allclose(next_target, center)
+        self.assertAlmostEqual(target_yaw, current_yaw)
+        self.assertAlmostEqual(
+            static_torque.normalize_angle(next_yaw - target_yaw), 0.1)
 
     def test_angular_stall_detects_fixed_valve_contact_across_wrap(self):
         detector = DirectedAngularStallDetector(

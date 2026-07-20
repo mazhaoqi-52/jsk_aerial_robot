@@ -164,6 +164,7 @@ class FormationAdapter:
         self.uav_positions = {}
         self.uav_orientations = {}
         self.uav_pitches = {}
+        self.uav_pose_received_times = {}
         self.assembly_pos = None
         self.assembly_yaw = 0.0
         self.assembly_pitch = 0.0
@@ -219,6 +220,7 @@ class FormationAdapter:
         _, pitch, yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
         self.uav_orientations[module_id] = yaw
         self.uav_pitches[module_id] = pitch
+        self.uav_pose_received_times[module_id] = rospy.get_time()
 
         self._update_assembly_position()
 
@@ -291,6 +293,16 @@ class FormationAdapter:
         return self.tf_calculator.transform_assembly_to_end_effector(
             self.assembly_pos, self.assembly_yaw, pitch
         )
+
+    def has_fresh_end_effector_feedback(self, max_age=0.5):
+        """Return whether every module pose used by the EE is still fresh."""
+        now = rospy.get_time()
+        timeout = max(0.0, float(max_age))
+        return all(
+            module_id in self.uav_pose_received_times and
+            math.isfinite(now - self.uav_pose_received_times[module_id]) and
+            0.0 <= now - self.uav_pose_received_times[module_id] <= timeout
+            for module_id in self.module_ids)
 
     def transform_end_effector_to_assembly_command(self, target_end_effector_pos, target_yaw=None):
         """Transform end-effector target to assembly CoG command"""

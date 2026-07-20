@@ -37,6 +37,16 @@ def normalize_angle(angle):
     return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def circular_start_angle(valve_center, end_effector_position,
+                         end_effector_yaw):
+    """Choose a continuous circular angle, including the zero-radius case."""
+    dx = float(end_effector_position[0] - valve_center[0])
+    dy = float(end_effector_position[1] - valve_center[1])
+    if math.hypot(dx, dy) <= 1e-9:
+        return normalize_angle(float(end_effector_yaw) - math.pi)
+    return math.atan2(dy, dx)
+
+
 def parse_rotation_direction(value, view="below"):
     """Return signed world-Z rotation for a visual CW/CCW request."""
     key = str(value).strip().lower()
@@ -195,6 +205,10 @@ def read_config():
             _finite_float_param("~tool_center_y", 0.0),
             _finite_float_param("~tool_center_z", 0.11053),
         ]),
+        valve_feedback_timeout=_positive_float_param(
+            "~valve_feedback_timeout", 10.0),
+        pose_feedback_max_age=_positive_float_param(
+            "~pose_feedback_max_age", 0.5),
         force_sensor_enabled=force_sensor_enabled,
         force_sensor_auto_calib=bool(rospy.get_param(
             "~force_sensor_auto_calib", True)),
@@ -356,24 +370,52 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
         self.send_assembly_command_from_end_effector(
             self.hold_position, self.hold_yaw)
 
+    def _end_effector_feedback_is_fresh(self):
+        return self.formation_adapter.has_fresh_end_effector_feedback(
+            self.config.pose_feedback_max_age)
+
     def _wait_for_feedback(self):
         self._set_phase("wait_for_feedback")
+        deadline = rospy.get_time() + self.config.valve_feedback_timeout
         rate = rospy.Rate(10.0)
         while not rospy.is_shutdown():
-            valve_position = self.beetle.getValvePos()
+            valve_position = self.beetle.getFreshValvePos(
+                self.config.pose_feedback_max_age)
             ee_position = self.get_end_effector_position()
             ee_yaw = self.get_end_effector_yaw()
-            if all(value is not None for value in (
-                    valve_position, ee_position, ee_yaw)):
-                valve_position = np.asarray(valve_position, dtype=float)
+            ee_valid = False
+            if ee_position is not None and ee_yaw is not None:
                 ee_position = np.asarray(ee_position, dtype=float)
-                if (valve_position.size == 3 and ee_position.size == 3 and
-                        np.all(np.isfinite(valve_position)) and
-                        np.all(np.isfinite(ee_position)) and
-                        math.isfinite(float(ee_yaw))):
+                ee_valid = (
+                    self._end_effector_feedback_is_fresh() and
+                    ee_position.size == 3 and
+                    np.all(np.isfinite(ee_position)) and
+                    math.isfinite(float(ee_yaw)))
+
+            if valve_position is not None and ee_valid:
+                valve_position = np.asarray(valve_position, dtype=float)
+                if (valve_position.size == 3 and
+                        np.all(np.isfinite(valve_position))):
                     return valve_position, ee_position, float(ee_yaw)
+
+            if rospy.get_time() >= deadline:
+                if not ee_valid:
+                    rospy.logerr(
+                        "Valve feedback timed out and end-effector feedback "
+                        "is unavailable; refusing to start contact search")
+                    return None
+                valve_position = ee_position.copy()
+                rospy.logwarn(
+                    "Valve feedback timed out after %.1fs; using current "
+                    "end-effector centre (%.3f, %.3f, %.3f)m as the fixed "
+                    "rotation centre",
+                    self.config.valve_feedback_timeout,
+                    *valve_position.tolist())
+                return valve_position, ee_position, float(ee_yaw)
             rospy.loginfo_throttle(
-                2.0, "Waiting for valve centre and end-effector feedback")
+                2.0, "Waiting for valve centre and end-effector feedback "
+                "(fallback after %.1fs)",
+                self.config.valve_feedback_timeout)
             rate.sleep()
         return None
 
@@ -381,9 +423,8 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
         self._set_phase("circular_contact_search")
         radius = float(np.linalg.norm(
             start_ee_position[:2] - valve_center[:2]))
-        start_angle = math.atan2(
-            start_ee_position[1] - valve_center[1],
-            start_ee_position[0] - valve_center[0])
+        start_angle = circular_start_angle(
+            valve_center, start_ee_position, start_ee_yaw)
         _, initial_target_yaw = self._circular_ee_target(
             valve_center, radius, start_angle, start_ee_position[2])
         detector = DirectedAngularStallDetector(
@@ -403,6 +444,10 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
         while not rospy.is_shutdown():
             if self.beetle.getTaskHaltFlag():
                 rospy.logerr("Contact search stopped by operator")
+                return False
+            if not self._end_effector_feedback_is_fresh():
+                rospy.logerr(
+                    "Module pose feedback became stale during contact search")
                 return False
             if (self.config.force_sensor_enabled and
                     not self._measured_wrench_is_fresh()):
@@ -482,6 +527,10 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
         while not rospy.is_shutdown():
             if self.beetle.getTaskHaltFlag():
                 rospy.logerr("Wrench profile stopped by operator")
+                return False
+            if not self._end_effector_feedback_is_fresh():
+                rospy.logerr(
+                    "Module pose feedback became stale during wrench profile")
                 return False
             if (self.config.force_sensor_enabled and
                     not self._measured_wrench_is_fresh()):

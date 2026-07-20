@@ -11,6 +11,10 @@
        spawned by n_module_test.launch, avoiding a duplicate Gazebo model. -->
   <arg name="valve_ns" default="valve"/>
   <arg name="valve_id" default="85"/>
+  <arg name="valve_feedback_timeout" default="10.0"
+       doc="Seconds to wait for valve mocap before using the current end-effector centre"/>
+  <arg name="pose_feedback_max_age" default="0.5"
+       doc="Maximum age of valve and module pose feedback accepted at initialization"/>
 
   <include if="$(arg real_machine)"
            file="$(find beetle)/launch/valve_rotation_tasks/valve_pos.launch">
@@ -82,6 +86,8 @@
     <param name="simulation" value="$(arg simulation)"/>
     <param name="module_ids" value="$(arg module_ids)"/>
     <param name="end_effector_module_id" value="$(arg end_effector_module_id)"/>
+    <param name="valve_feedback_timeout" value="$(arg valve_feedback_timeout)"/>
+    <param name="pose_feedback_max_age" value="$(arg pose_feedback_max_age)"/>
     <param name="rotation_direction" value="$(arg rotation_direction)"/>
     <param name="rotation_view" value="$(arg rotation_view)"/>
     <param name="tool_center_x" value="$(arg tool_center_x)"/>

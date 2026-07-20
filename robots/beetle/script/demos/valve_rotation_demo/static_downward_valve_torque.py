@@ -101,6 +101,24 @@ def minimum_smoothstep_duration(force, torque, minimum,
         1.5 * torque_norm / float(torque_rate))
 
 
+def smooth_start_angular_motion(elapsed, target_speed, ramp_time):
+    """Return progress and speed for a smoothstep angular-velocity ramp."""
+    elapsed = max(0.0, float(elapsed))
+    target_speed = float(target_speed)
+    ramp_time = float(ramp_time)
+    if ramp_time <= 0.0:
+        return target_speed * elapsed, target_speed
+
+    ratio = min(1.0, elapsed / ramp_time)
+    speed = target_speed * smoothstep01(ratio)
+    if ratio < 1.0:
+        progress = target_speed * ramp_time * (
+            ratio ** 3 - 0.5 * ratio ** 4)
+    else:
+        progress = target_speed * (elapsed - 0.5 * ramp_time)
+    return progress, speed
+
+
 class DirectedAngularStallDetector(object):
     """Angular counterpart of aerial pushing's command-lead stall detector."""
 
@@ -179,6 +197,10 @@ def read_config():
         direction_label=direction_label,
         search_speed=math.radians(_positive_float_param(
             "~contact_search_speed_deg_s", 3.0)),
+        search_ramp_time=_nonnegative_float_param(
+            "~contact_search_ramp_time", 2.0),
+        zero_radius_tolerance=_nonnegative_float_param(
+            "~contact_zero_radius_tolerance", 0.030),
         max_search_angle=math.radians(_positive_float_param(
             "~contact_search_max_angle_deg", 45.0)),
         min_search_angle=math.radians(_positive_float_param(
@@ -370,6 +392,24 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
         self.send_assembly_command_from_end_effector(
             self.hold_position, self.hold_yaw)
 
+    def _stop_contact_search_motion(self, fallback_position, fallback_yaw):
+        """Replace the streaming velocity command with a pose-only hold."""
+        hold_position = self.get_end_effector_position()
+        hold_yaw = self.get_end_effector_yaw()
+        if hold_position is None or hold_yaw is None:
+            hold_position = fallback_position
+            hold_yaw = fallback_yaw
+        else:
+            hold_position = np.asarray(hold_position, dtype=float)
+            hold_yaw = float(hold_yaw)
+            if (hold_position.size != 3 or
+                    not np.all(np.isfinite(hold_position)) or
+                    not math.isfinite(hold_yaw)):
+                hold_position = fallback_position
+                hold_yaw = fallback_yaw
+        self.send_assembly_command_from_end_effector(
+            hold_position, hold_yaw)
+
     def _end_effector_feedback_is_fresh(self):
         return self.formation_adapter.has_fresh_end_effector_feedback(
             self.config.pose_feedback_max_age)
@@ -419,52 +459,95 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
             rate.sleep()
         return None
 
-    def _search_contact(self, valve_center, start_ee_position, start_ee_yaw):
+    def _search_contact(self, valve_center):
         self._set_phase("circular_contact_search")
-        radius = float(np.linalg.norm(
+        if not self._end_effector_feedback_is_fresh():
+            rospy.logerr(
+                "Module pose feedback is stale at contact-search start")
+            return False
+        start_ee_position = self.get_end_effector_position()
+        start_ee_yaw = self.get_end_effector_yaw()
+        if start_ee_position is None or start_ee_yaw is None:
+            rospy.logerr(
+                "End-effector pose is unavailable at contact-search start")
+            return False
+        start_ee_position = np.asarray(start_ee_position, dtype=float)
+        start_ee_yaw = float(start_ee_yaw)
+        if (start_ee_position.size != 3 or
+                not np.all(np.isfinite(start_ee_position)) or
+                not math.isfinite(start_ee_yaw)):
+            rospy.logerr(
+                "End-effector pose is invalid at contact-search start")
+            return False
+
+        measured_radius = float(np.linalg.norm(
             start_ee_position[:2] - valve_center[:2]))
+        search_center = valve_center
+        radius = measured_radius
+        if measured_radius <= self.config.zero_radius_tolerance:
+            search_center = start_ee_position.copy()
+            radius = 0.0
+            rospy.loginfo(
+                "EE/valve center offset %.1fmm is within the %.1fmm "
+                "zero-radius tolerance; holding the inserted EE center fixed",
+                measured_radius * 1000.0,
+                self.config.zero_radius_tolerance * 1000.0)
         start_angle = circular_start_angle(
-            valve_center, start_ee_position, start_ee_yaw)
-        _, initial_target_yaw = self._circular_ee_target(
-            valve_center, radius, start_angle, start_ee_position[2])
+            search_center, start_ee_position, start_ee_yaw)
         detector = DirectedAngularStallDetector(
             self.config.direction, self.config.min_search_angle,
             self.config.stall_lead, self.config.stall_rate,
             self.config.velocity_window, self.config.required_cycles)
         start_time = rospy.get_time()
-        detector.reset(initial_target_yaw, start_ee_yaw, start_time)
-        signed_speed = self.config.direction * self.config.search_speed
+        detector.reset(start_ee_yaw, start_ee_yaw, start_time)
         rate = rospy.Rate(CONTROL_RATE_HZ)
 
         rospy.loginfo(
-            "Valve-centred contact search: center=(%.3f, %.3f), radius=%.1fmm, "
-            "direction=%s, speed=%.1fdeg/s",
-            valve_center[0], valve_center[1], radius * 1000.0,
-            self.config.direction_label, math.degrees(signed_speed))
+            "Contact search: valve=(%.3f, %.3f), center=(%.3f, %.3f), "
+            "radius=%.1fmm, direction=%s, speed=%.1fdeg/s, ramp=%.1fs",
+            valve_center[0], valve_center[1],
+            search_center[0], search_center[1], radius * 1000.0,
+            self.config.direction_label,
+            math.degrees(self.config.direction * self.config.search_speed),
+            self.config.search_ramp_time)
+        last_target_position = start_ee_position
+        last_target_yaw = start_ee_yaw
         while not rospy.is_shutdown():
             if self.beetle.getTaskHaltFlag():
                 rospy.logerr("Contact search stopped by operator")
+                self._stop_contact_search_motion(
+                    last_target_position, last_target_yaw)
                 return False
             if not self._end_effector_feedback_is_fresh():
                 rospy.logerr(
                     "Module pose feedback became stale during contact search")
+                self._stop_contact_search_motion(
+                    last_target_position, last_target_yaw)
                 return False
             if (self.config.force_sensor_enabled and
                     not self._measured_wrench_is_fresh()):
                 rospy.logerr("CFS data became stale during contact search")
+                self._stop_contact_search_motion(
+                    last_target_position, last_target_yaw)
                 return False
             elapsed = rospy.get_time() - start_time
-            progress = min(
-                self.config.max_search_angle,
-                elapsed * self.config.search_speed)
+            progress, current_speed = smooth_start_angular_motion(
+                elapsed, self.config.search_speed,
+                self.config.search_ramp_time)
+            progress = min(self.config.max_search_angle, progress)
+            signed_speed = self.config.direction * current_speed
             angle = start_angle + self.config.direction * progress
-            target_position, target_yaw = self._circular_ee_target(
-                valve_center, radius, angle, start_ee_position[2])
+            target_position, _ = self._circular_ee_target(
+                search_center, radius, angle, start_ee_position[2])
+            target_yaw = normalize_angle(
+                start_ee_yaw + self.config.direction * progress)
             target_velocity = self._circular_ee_velocity(
                 radius, signed_speed, angle)
             self.send_assembly_command_from_end_effector(
                 target_position, target_yaw,
                 linear_vel=target_velocity, angular_vel=signed_speed)
+            last_target_position = target_position
+            last_target_yaw = target_yaw
 
             actual_position = self.get_end_effector_position()
             actual_yaw = self.get_end_effector_yaw()
@@ -474,6 +557,7 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
                 if observation["contact"]:
                     self.hold_position = np.asarray(actual_position, dtype=float)
                     self.hold_yaw = float(actual_yaw)
+                    self._hold_contact_pose()
                     rospy.loginfo(
                         "Static valve contact detected: command=%.1fdeg, "
                         "actual=%.1fdeg, lead=%.1fdeg, rate=%.2fdeg/s",
@@ -499,6 +583,8 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
                 rospy.logerr(
                     "No angular stall contact within %.1fdeg",
                     math.degrees(self.config.max_search_angle))
+                self._stop_contact_search_motion(
+                    last_target_position, last_target_yaw)
                 return False
             rate.sleep()
         return False
@@ -616,9 +702,8 @@ class StaticDownwardValveTorqueTest(FormationRotateValveState):
             feedback = self._wait_for_feedback()
             if feedback is None:
                 return "failed"
-            valve_center, ee_position, ee_yaw = feedback
-            if not self._search_contact(
-                    valve_center, ee_position, ee_yaw):
+            valve_center, _, _ = feedback
+            if not self._search_contact(valve_center):
                 return "failed"
             if not self._run_wrench_profile():
                 return "failed"

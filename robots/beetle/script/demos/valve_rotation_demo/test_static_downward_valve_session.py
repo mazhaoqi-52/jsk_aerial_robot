@@ -18,6 +18,7 @@ from static_downward_valve_torque import (
     circular_start_angle,
     minimum_smoothstep_duration,
     parse_rotation_direction,
+    smooth_start_angular_motion,
 )
 from valve_rotation_formation_clean import (
     FormationAdapter,
@@ -37,6 +38,8 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
             [0.240, 0.0, 0.11053])
         self.assertEqual(config.valve_feedback_timeout, 10.0)
         self.assertEqual(config.pose_feedback_max_age, 0.5)
+        self.assertEqual(config.search_ramp_time, 2.0)
+        self.assertEqual(config.zero_radius_tolerance, 0.030)
 
     def test_cfs_is_required_only_for_real_hardware(self):
         hardware_params = {
@@ -228,6 +231,8 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
             velocity_window=0.4,
             required_cycles=8,
             search_speed=math.radians(3.0),
+            search_ramp_time=2.0,
+            zero_radius_tolerance=0.030,
             direction_label="CCW viewed from above",
             force_sensor_enabled=False)
         state._set_phase = mock.Mock()
@@ -242,10 +247,90 @@ class StaticDownwardValveRotationTest(unittest.TestCase):
                 mock.patch.object(
                     static_torque.rospy, "is_shutdown", return_value=False):
             self.assertFalse(state._search_contact(
-                np.array([0.0, 0.0, 1.0]),
-                np.array([0.1, 0.0, 1.0]), 0.0))
+                np.array([0.0, 0.0, 1.0])))
 
         state._end_effector_feedback_is_fresh.assert_called_once_with()
+
+    def test_contact_search_starts_at_actual_pose_with_small_radius(self):
+        state = static_torque.StaticDownwardValveTorqueTest.__new__(
+            static_torque.StaticDownwardValveTorqueTest)
+        state.config = static_torque.SimpleNamespace(
+            direction=-1,
+            min_search_angle=math.radians(2.0),
+            max_search_angle=math.radians(3.0),
+            stall_lead=math.radians(3.0),
+            stall_rate=math.radians(0.5),
+            velocity_window=0.4,
+            required_cycles=8,
+            search_speed=math.radians(3.0),
+            search_ramp_time=2.0,
+            zero_radius_tolerance=0.030,
+            direction_label="CCW viewed from below",
+            force_sensor_enabled=False)
+        state._set_phase = mock.Mock()
+        state._end_effector_feedback_is_fresh = mock.Mock(
+            return_value=True)
+        state.beetle = mock.Mock()
+        state.beetle.getTaskHaltFlag.return_value = False
+        start_position = np.array([0.503, -0.844, 1.0])
+        valve_center = np.array([0.526, -0.854, 1.0])
+        start_yaw = math.radians(-1.0)
+        state.get_end_effector_position = mock.Mock(
+            return_value=start_position)
+        state.get_end_effector_yaw = mock.Mock(return_value=start_yaw)
+        state.send_assembly_command_from_end_effector = mock.Mock()
+
+        with mock.patch.object(
+                static_torque.rospy, "get_time",
+                side_effect=[10.0, 10.0, 10.0, 12.0, 12.0]), \
+                mock.patch.object(
+                    static_torque.rospy, "Rate"), mock.patch.object(
+                        static_torque.rospy, "is_shutdown",
+                        side_effect=[False, False, True]), mock.patch.object(
+                            static_torque.rospy, "loginfo_throttle"):
+            self.assertFalse(state._search_contact(
+                valve_center))
+
+        first_command, second_command, stop_command = (
+            state.send_assembly_command_from_end_effector.call_args_list)
+        np.testing.assert_allclose(first_command.args[0], start_position)
+        self.assertAlmostEqual(first_command.args[1], start_yaw)
+        np.testing.assert_allclose(
+            first_command.kwargs["linear_vel"], [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(first_command.kwargs["angular_vel"], 0.0)
+
+        np.testing.assert_allclose(second_command.args[0], start_position)
+        self.assertAlmostEqual(
+            second_command.args[1], start_yaw - math.radians(3.0))
+        np.testing.assert_allclose(
+            second_command.kwargs["linear_vel"], [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(
+            second_command.kwargs["angular_vel"], -math.radians(3.0))
+        np.testing.assert_allclose(stop_command.args[0], start_position)
+        self.assertAlmostEqual(stop_command.args[1], start_yaw)
+        self.assertEqual(stop_command.kwargs, {})
+
+    def test_contact_search_speed_uses_smoothstep_ramp(self):
+        target_speed = math.radians(3.0)
+        ramp_time = 2.0
+
+        start_progress, start_speed = smooth_start_angular_motion(
+            0.0, target_speed, ramp_time)
+        half_progress, half_speed = smooth_start_angular_motion(
+            1.0, target_speed, ramp_time)
+        end_progress, end_speed = smooth_start_angular_motion(
+            2.0, target_speed, ramp_time)
+        later_progress, later_speed = smooth_start_angular_motion(
+            3.0, target_speed, ramp_time)
+
+        self.assertAlmostEqual(start_progress, 0.0)
+        self.assertAlmostEqual(start_speed, 0.0)
+        self.assertAlmostEqual(half_progress, 0.1875 * target_speed)
+        self.assertAlmostEqual(half_speed, 0.5 * target_speed)
+        self.assertAlmostEqual(end_progress, target_speed)
+        self.assertAlmostEqual(end_speed, target_speed)
+        self.assertAlmostEqual(later_progress, 2.0 * target_speed)
+        self.assertAlmostEqual(later_speed, target_speed)
 
     def test_existing_circular_target_is_valve_centered(self):
         state = FormationRotateValveState.__new__(FormationRotateValveState)

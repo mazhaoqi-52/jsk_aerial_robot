@@ -350,6 +350,12 @@ bool BeetleUnifiedController::getModuleMassInertia(
   return true;
 }
 
+bool BeetleUnifiedController::getModuleBodyOffsetFromLeader(
+    int module_id, Eigen::Vector3d& offset) const
+{
+  return getCachedModuleOffsetFromLeader(module_id, offset);
+}
+
 bool BeetleUnifiedController::lookupModuleOffsetFromLeader(
     int module_id, Eigen::Vector3d& offset) const
 {
@@ -362,9 +368,17 @@ bool BeetleUnifiedController::lookupModuleOffsetFromLeader(
     std::string module_cog_frame = navigator_->getMyName() + std::to_string(module_id) + "/cog";
     geometry_msgs::TransformStamped tf_stamped =
         navigator_->getTfBuffer().lookupTransform(leader_cog_frame, module_cog_frame, ros::Time(0));
-    offset << tf_stamped.transform.translation.x,
-              tf_stamped.transform.translation.y,
-              tf_stamped.transform.translation.z;
+    // The TF translation is expressed in the leader's virtual CoG axes.  All
+    // formation/allocation geometry is rigid-body geometry, so convert it to
+    // the common physical baselink axes before latching it.  RobotModel uses
+    // R_world_cog = R_world_baselink * R_desire^-1, hence
+    // r_baselink = R_desire^-1 * r_cog.
+    const KDL::Vector offset_cog(tf_stamped.transform.translation.x,
+                                 tf_stamped.transform.translation.y,
+                                 tf_stamped.transform.translation.z);
+    const KDL::Vector offset_body =
+        robot_model_->getCogDesireOrientation<KDL::Rotation>().Inverse() * offset_cog;
+    offset << offset_body.x(), offset_body.y(), offset_body.z();
     return true;
   } catch (tf2::TransformException& ex) {
     ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl] TF lookup for module offset failed: %s", ex.what());

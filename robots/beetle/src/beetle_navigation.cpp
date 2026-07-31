@@ -607,12 +607,10 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
       setTargetVelZ(0);
     }
 
-    /* pitch/roll target for formation: in unified mode the physical tilt is
-     * realised via gimbal/vectoring allocation driven by
-     * final_target_baselink_rot_. Do NOT also write target_rpy_ — the outer
-     * R/P PID has no actuator to track it in this mode and its I-term would
-     * wind up unboundedly (verified failure: pitch=0.4 -> pitch_i +11.6 Nm in
-     * 10 s, eating Z thrust until auto-land). */
+    /* Physical baselink roll/pitch target for the assembled formation. Keep
+     * this separate from target_rpy_: the latter stabilizes the virtual CoG
+     * frame while desire_coordinate moves the physical baselink equilibrium.
+     * Writing both applies the same attitude twice and winds up the R/P I-term. */
     if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE ||
        msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE) {
       setFinalTargetBaselinkRPY(final_target_baselink_rpy);
@@ -835,6 +833,24 @@ void BeetleNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavCons
       setTargetPosCandZ(msg->target_pos_z);
       setTargetVelZ(msg->target_vel_z);
     }
+
+  /* Physical baselink attitude. Match the unified-mode interpretation of
+   * assembly FlightNav commands; target_rpy_ remains the virtual CoG attitude
+   * target used by the independent module controllers. */
+  tf::Vector3 final_target_baselink_rpy = getFinalTargetBaselinkRPY();
+  bool update_final_target_baselink_rpy = false;
+  if(msg->pitch_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      final_target_baselink_rpy.setY(msg->target_pitch);
+      update_final_target_baselink_rpy = true;
+    }
+  if(msg->roll_nav_mode == aerial_robot_msgs::FlightNav::POS_MODE)
+    {
+      final_target_baselink_rpy.setX(msg->target_roll);
+      update_final_target_baselink_rpy = true;
+    }
+  if(update_final_target_baselink_rpy)
+    setFinalTargetBaselinkRPY(final_target_baselink_rpy);
 }
 
 

@@ -2473,9 +2473,6 @@ namespace aerial_robot_control
     if (assembled_ids.empty() || !unified_controller_) return false;
 
     const std::string robot_name = beetle_navigator_->getMyName();
-    const int leader_id = beetle_navigator_->getLeaderID();
-    const std::string leader_cog_frame =
-        robot_name + std::to_string(leader_id) + "/cog";
     const Eigen::Vector3d formation_cog_offset =
         unified_controller_->getFormationCogOffset();
 
@@ -2496,12 +2493,9 @@ namespace aerial_robot_control
           robot_name + std::to_string(module_id) + "/cog";
 
       geometry_msgs::TransformStamped world_tf;
-      geometry_msgs::TransformStamped leader_tf;
       try {
         world_tf = beetle_navigator_->getTfBuffer().lookupTransform(
             "world", module_cog_frame, ros::Time(0));
-        leader_tf = beetle_navigator_->getTfBuffer().lookupTransform(
-            leader_cog_frame, module_cog_frame, ros::Time(0));
       } catch (tf2::TransformException& ex) {
         ROS_WARN_THROTTLE(
             1.0,
@@ -2510,10 +2504,11 @@ namespace aerial_robot_control
         return false;
       }
 
-      Eigen::Vector3d module_offset(
-          leader_tf.transform.translation.x,
-          leader_tf.transform.translation.y,
-          leader_tf.transform.translation.z);
+      Eigen::Vector3d module_offset;
+      if (!unified_controller_->getModuleBodyOffsetFromLeader(
+              module_id, module_offset)) {
+        return false;
+      }
       Eigen::Vector3d d = module_offset - formation_cog_offset;
       Eigen::Matrix3d inertia_about_form =
           module_inertia +
@@ -2878,8 +2873,10 @@ namespace aerial_robot_control
 
     tf::Quaternion cog2baselink_rot;
     tf::quaternionKDLToTF(robot_model_->getCogDesireOrientation<KDL::Rotation>(), cog2baselink_rot);
-    tf::Matrix3x3 cog_rot = estimator_->getOrientation(Frame::BASELINK, estimate_mode_)
-                          * tf::Matrix3x3(cog2baselink_rot).inverse();
+    const tf::Matrix3x3 baselink_rot =
+        estimator_->getOrientation(Frame::BASELINK, estimate_mode_);
+    tf::Matrix3x3 cog_rot =
+        baselink_rot * tf::Matrix3x3(cog2baselink_rot).inverse();
     double r, p, y_angle; cog_rot.getRPY(r, p, y_angle);
     rpy_.setValue(r, p, y_angle);
     omega_ = estimator_->getAngularVel(Frame::COG, estimate_mode_);
@@ -2929,27 +2926,22 @@ namespace aerial_robot_control
       // Rigid assembly ⇒ all modules share the same body orientation, so the
       // formation CoG offset expressed in this module's frame is simply
       // (leader→formation_CoG) − (leader→my_CoG), all in the common orientation.
-      // NOTE: tf2 frame_ids MUST NOT start with '/' (same convention as
-      // BeetleUnifiedController::updateFormationGeometry).
       markUnifiedDebugStage("follower_tf_lookup_enter");
-      try {
-        std::string leader_cog_frame = beetle_navigator_->getMyName()
-                                      + std::to_string(leader_id) + "/cog";
-        std::string my_cog_frame = beetle_navigator_->getMyName()
-                                  + std::to_string(my_id) + "/cog";
-        geometry_msgs::TransformStamped tf_stamped =
-            beetle_navigator_->getTfBuffer().lookupTransform(leader_cog_frame, my_cog_frame, ros::Time(0));
-        cog_offset_self.x() -= tf_stamped.transform.translation.x;
-        cog_offset_self.y() -= tf_stamped.transform.translation.y;
-        cog_offset_self.z() -= tf_stamped.transform.translation.z;
+      Eigen::Vector3d module_offset_from_leader;
+      if (unified_controller_->getModuleBodyOffsetFromLeader(
+              my_id, module_offset_from_leader)) {
+        cog_offset_self -= module_offset_from_leader;
         markUnifiedDebugStage("follower_tf_lookup_ok");
-      } catch (tf2::TransformException& ex) {
+      } else {
         // Soft fallback: keep leader-frame offset. One-frame positional bias is
         // vastly safer than a full thrust drop-out from early-return. The next
         // frame will retry.
         markUnifiedDebugStage("follower_tf_lookup_failed");
-        ROS_WARN_THROTTLE(1.0, "[UnifiedCtrl FOLLOWER id=%d] cog_offset_self TF failed (%s), falling back to leader-frame offset",
-                          my_id, ex.what());
+        ROS_WARN_THROTTLE(
+            1.0,
+            "[UnifiedCtrl FOLLOWER id=%d] body-frame module offset unavailable; "
+            "falling back to leader-frame formation offset",
+            my_id);
       }
     }
     markUnifiedDebugStage("formation_offset_ready");
@@ -3005,7 +2997,10 @@ namespace aerial_robot_control
       markUnifiedDebugStage("follower_reference_ready");
     }
     tf::Vector3 offset_body(cog_offset_self.x(), cog_offset_self.y(), cog_offset_self.z());
-    tf::Vector3 offset_world = cog_rot * offset_body;
+    // The formation geometry is rigidly attached to the physical baselink.
+    // cog_rot is the virtual control-frame attitude and intentionally remains
+    // near level while desire_coordinate tilts the assembled body.
+    tf::Vector3 offset_world = baselink_rot * offset_body;
     tf::Vector3 formation_pos = pos_ + offset_world;
     tf::Vector3 omega_world = cog_rot * omega_;
     tf::Vector3 formation_vel = vel_ + omega_world.cross(offset_world);

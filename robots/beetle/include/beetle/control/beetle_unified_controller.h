@@ -204,6 +204,10 @@ public:
   double getFormationMass() const { return formation_mass_; }
   int getMotorNumPerModule() const { return motor_num_per_module_; }
   bool getModuleMassInertia(int module_id, double& mass, Eigen::Matrix3d& inertia) const;
+  /** @brief Return the latched leader-to-module offset in the common physical
+   *  baselink/body frame. Falls back to a frame-corrected TF lookup before the
+   *  formation geometry has been latched. */
+  bool getModuleBodyOffsetFromLeader(int module_id, Eigen::Vector3d& offset) const;
   double getCandidateYawTerm() const { return candidate_yaw_term_; }
   Eigen::VectorXd getTargetVectoringForce() const;
   std::map<int, ModuleCommand> getModuleCommands() const;

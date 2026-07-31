@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 """
-Trajectory tracking test node for beetle unified / leader-follower modes.
+Trajectory tracking test node for assembled Beetle unified / leader-follower modes.
 
 Publishes FlightNav to /assembly/uav/nav at 40 Hz, sampling from a selected
-trajectory class. Suitable for comparing unified vs leader-follower performance
-on the same trajectory.
+trajectory class so both controller modes receive the same reference.
 
 Usage:
   rosrun beetle unified_traj_test.py _traj:=lemniscate _loops:=2
@@ -21,7 +20,9 @@ Params (private):
   ~a            : lemniscate amplitude [m] (default 0.8)
   ~z_center     : base altitude [m] (default 1.0)
   ~z_range      : z oscillation amplitude [m] (default 0.2)
-  ~a_ori        : orientation amplitude for omni [rad] (default 0.5)
+  ~yaw_center   : yaw oscillation center [rad] (default pi/2)
+  ~yaw_amp      : yaw oscillation amplitude [rad] (default pi/2)
+  ~a_ori        : orientation amplitude for omni [rad] (default 0.1)
   ~t_converge   : setpoint convergence time [s] (default 8.0)
   ~settle_time  : hover time before/after trajectory [s] (default 3.0)
 """
@@ -29,6 +30,7 @@ import sys
 import rospy
 import numpy as np
 from aerial_robot_msgs.msg import FlightNav
+from std_msgs.msg import String
 
 # Allow running from the script directory without installing the package
 import os
@@ -57,14 +59,23 @@ def build_traj(name, loops, params):
             period=params.get('period', 20.0),
             z=params.get('z_center', 0.8),
         )
-    elif name in ('lemniscate', 'lemniscate_yaw'):
-        cls = LemniscateTrajYaw if name == 'lemniscate_yaw' else LemniscateTraj
-        return cls(
+    elif name == 'lemniscate':
+        return LemniscateTraj(
             loop_num=loops,
             a=params.get('a', 0.8),
             z_range=params.get('z_range', 0.2),
             period=params.get('period', 20.0),
             z_center=params.get('z_center', 1.0),
+        )
+    elif name == 'lemniscate_yaw':
+        return LemniscateTrajYaw(
+            loop_num=loops,
+            a=params.get('a', 0.8),
+            z_range=params.get('z_range', 0.2),
+            period=params.get('period', 20.0),
+            z_center=params.get('z_center', 1.0),
+            yaw_center=params.get('yaw_center', np.pi / 2),
+            yaw_amp=params.get('yaw_amp', np.pi / 2),
         )
     elif name == 'lemniscate_omni':
         return LemniscateTrajOmni(
@@ -73,7 +84,9 @@ def build_traj(name, loops, params):
             z_range=params.get('z_range', 0.2),
             period=params.get('period', 20.0),
             z_center=params.get('z_center', 1.0),
-            a_orientation=params.get('a_ori', 0.5),
+            a_orientation=params.get('a_ori', 0.1),
+            yaw_center=params.get('yaw_center', np.pi / 2),
+            yaw_amp=params.get('yaw_amp', np.pi / 2),
         )
     elif name == 'setpoint':
         return SetPointTraj(
@@ -121,12 +134,12 @@ def make_nav_msg(traj, t):
 
     # Roll / Pitch
     roll, pitch = traj.get_rp(t)
-    if roll != 0.0:
-        msg.roll_nav_mode = FlightNav.POS_MODE
-        msg.target_roll = roll
-    if pitch != 0.0:
-        msg.pitch_nav_mode = FlightNav.POS_MODE
-        msg.target_pitch = pitch
+    # Keep POS_MODE asserted through the sinusoid's exact zero crossings.  A
+    # zero value is still a valid command and must clear the previous target.
+    msg.roll_nav_mode = FlightNav.POS_MODE
+    msg.target_roll = roll
+    msg.pitch_nav_mode = FlightNav.POS_MODE
+    msg.target_pitch = pitch
 
     msg.target = FlightNav.COG
     msg.control_frame = FlightNav.WORLD_FRAME
@@ -134,11 +147,21 @@ def make_nav_msg(traj, t):
     return msg
 
 
-def make_stay_msg():
-    """Build a STAY_HERE FlightNav message."""
-    msg = FlightNav()
-    msg.header.stamp = rospy.Time.now()
-    msg.pos_xy_nav_mode = FlightNav.STAY_HERE_MODE
+def make_static_nav_msg(traj, t):
+    """Hold one trajectory sample with all velocity feedforward disabled."""
+    msg = make_nav_msg(traj, t)
+    msg.pos_xy_nav_mode = FlightNav.POS_MODE
+    msg.target_vel_x = 0.0
+    msg.target_vel_y = 0.0
+    msg.pos_z_nav_mode = FlightNav.POS_MODE
+    msg.target_vel_z = 0.0
+    msg.yaw_nav_mode = FlightNav.POS_MODE
+    msg.target_omega_z = 0.0
+    roll, pitch = traj.get_rp(t)
+    msg.roll_nav_mode = FlightNav.POS_MODE
+    msg.target_roll = roll
+    msg.pitch_nav_mode = FlightNav.POS_MODE
+    msg.target_pitch = pitch
     return msg
 
 
@@ -151,28 +174,34 @@ def main():
 
     # Collect optional overrides
     params = {}
-    for key in ('period', 'radius', 'a', 'z_center', 'z_range', 'a_ori', 't_converge'):
+    for key in (
+            'period', 'radius', 'a', 'z_center', 'z_range', 'yaw_center',
+            'yaw_amp', 'a_ori', 't_converge'):
         if rospy.has_param('~' + key):
             params[key] = rospy.get_param('~' + key)
 
     traj = build_traj(traj_name, loops, params)
 
     nav_pub = rospy.Publisher('/assembly/uav/nav', FlightNav, queue_size=1)
+    phase_pub = rospy.Publisher(
+        '/beetle_pid_tuning/phase', String, queue_size=1, latch=True)
     rate = rospy.Rate(40)
 
     rospy.loginfo('=== Trajectory test: %s  loops=%d  T=%.1fs ===', traj_name, loops, traj.T)
     rospy.loginfo('Settling for %.1f s ...', settle)
 
     # --- Settle phase: send starting position ---
+    phase_pub.publish(String(data='trajectory_pre_settle'))
     t_settle_start = rospy.Time.now()
     while not rospy.is_shutdown():
         elapsed = (rospy.Time.now() - t_settle_start).to_sec()
         if elapsed >= settle:
             break
-        nav_pub.publish(make_nav_msg(traj, 0.0))
+        nav_pub.publish(make_static_nav_msg(traj, 0.0))
         rate.sleep()
 
     rospy.loginfo('Starting trajectory ...')
+    phase_pub.publish(String(data='trajectory_run:' + traj_name))
     t0 = rospy.Time.now()
     while not rospy.is_shutdown():
         t = (rospy.Time.now() - t0).to_sec()
@@ -181,17 +210,20 @@ def main():
         nav_pub.publish(make_nav_msg(traj, t))
         rate.sleep()
 
-    # --- Post-trajectory: stay here ---
-    rospy.loginfo('Trajectory complete — holding position for %.1f s', settle)
+    # --- Post-trajectory: hold the final sample with zero feedforward ---
+    rospy.loginfo('Trajectory complete — holding endpoint for %.1f s', settle)
+    phase_pub.publish(String(data='trajectory_post_settle'))
     t_end = rospy.Time.now()
+    final_t = traj.T * loops
     while not rospy.is_shutdown():
         elapsed = (rospy.Time.now() - t_end).to_sec()
         if elapsed >= settle:
             break
-        nav_pub.publish(make_stay_msg())
+        nav_pub.publish(make_static_nav_msg(traj, final_t))
         rate.sleep()
 
     rospy.loginfo('Done.')
+    phase_pub.publish(String(data='trajectory_complete'))
 
 
 if __name__ == '__main__':

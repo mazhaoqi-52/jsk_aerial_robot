@@ -37,5 +37,7 @@ navigation:
   gps_waypoint_check_du: 1.0
 
   # desire tilt
-  baselink_rot_pub_interval: 0.5
-  baselink_rot_change_thresh: 0.01 # 0.2 hz -> 0.04; 0.01 hz-> 0.02
+  # 0.01 rad per 0.1 s permits 0.1 rad/s, above the 0.047 rad/s combined
+  # roll/pitch peak of the tested a_ori=0.1 rad, period=30 s trajectory.
+  baselink_rot_pub_interval: 0.1
+  baselink_rot_change_thresh: 0.01

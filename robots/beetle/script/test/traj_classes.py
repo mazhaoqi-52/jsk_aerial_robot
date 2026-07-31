@@ -8,8 +8,6 @@ FlightNav commands for the assembled formation.
 Based on trajectory library by li-jinjie (24-1-5), adapted for beetle assembly.
 """
 import numpy as np
-from typing import Tuple
-import tf_conversions as tf
 
 
 class BaseTraj:
@@ -69,7 +67,10 @@ class LemniscateTraj(BaseTraj):
 
         vx = -self.a * self.omega * np.sin(self.omega * t)
         vy = self.a * self.omega * np.cos(2 * self.omega * t)
-        vz = 2 * self.z_range * self.omega * np.cos(2 * self.omega * t + np.pi)
+        vz = (
+            2 * self.z_range * self.omega *
+            np.cos(2 * self.omega * t + np.pi / 2)
+        )
 
         return x, y, z, vx, vy, vz
 
@@ -77,24 +78,48 @@ class LemniscateTraj(BaseTraj):
 class LemniscateTrajYaw(LemniscateTraj):
     """Lemniscate trajectory with simultaneous yaw rotation."""
 
+    def __init__(
+            self, loop_num=1, a=0.8, z_range=0.2, period=20.0,
+            z_center=1.0, yaw_center=np.pi / 2, yaw_amp=np.pi / 2):
+        super().__init__(loop_num, a, z_range, period, z_center)
+        self.yaw_center = yaw_center
+        self.yaw_amp = yaw_amp
+
     def get_yaw(self, t):
         t = t + self.T / 4
-        yaw = np.pi / 2 * np.sin(self.omega * t + np.pi) + np.pi / 2
-        yaw_rate = np.pi / 2 * self.omega * np.cos(self.omega * t + np.pi / 2)
+        yaw = (
+            self.yaw_amp * np.sin(self.omega * t + np.pi) +
+            self.yaw_center
+        )
+        yaw_rate = (
+            self.yaw_amp * self.omega *
+            np.cos(self.omega * t + np.pi)
+        )
         return yaw, yaw_rate
 
 
 class LemniscateTrajOmni(LemniscateTraj):
     """Lemniscate trajectory with simultaneous roll/pitch/yaw variation (omnidirectional)."""
 
-    def __init__(self, loop_num=1, a=0.8, z_range=0.2, period=20.0, z_center=1.0, a_orientation=0.5):
+    def __init__(
+            self, loop_num=1, a=0.8, z_range=0.2, period=20.0,
+            z_center=1.0, a_orientation=0.1, yaw_center=np.pi / 2,
+            yaw_amp=np.pi / 2):
         super().__init__(loop_num, a, z_range, period, z_center)
         self.a_ori = a_orientation
+        self.yaw_center = yaw_center
+        self.yaw_amp = yaw_amp
 
     def get_yaw(self, t):
         t = t + self.T / 4
-        yaw = np.pi / 2 * np.sin(self.omega * t + np.pi) + np.pi / 2
-        yaw_rate = np.pi / 2 * self.omega * np.cos(self.omega * t + np.pi / 2)
+        yaw = (
+            self.yaw_amp * np.sin(self.omega * t + np.pi) +
+            self.yaw_center
+        )
+        yaw_rate = (
+            self.yaw_amp * self.omega *
+            np.cos(self.omega * t + np.pi)
+        )
         return yaw, yaw_rate
 
     def get_rp(self, t):

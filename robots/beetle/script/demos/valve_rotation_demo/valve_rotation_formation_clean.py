@@ -1648,10 +1648,9 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         ]
 
     def _build_valve_wrench_command(self, force_world, torque_world):
-        if not self.beetle.isUnifiedMode():
-            return force_world, torque_world, "world_yaw"
         force_body, torque_body = self.beetle.buildCoGWrench(
-            force_world, torque_world, application_offset_body=self._ee_offset_body())
+            force_world, torque_world,
+            application_offset_body=self._ee_offset_body(), frame_id="world")
         return force_body, torque_body, "fc"
 
     # ------------------------------------------------------------------

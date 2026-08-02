@@ -1367,9 +1367,20 @@ namespace aerial_robot_control
 
     BeetleUnifiedController::ModuleModelDescriptor model;
     model.mass = beetle_robot_model_->getMass();
-    model.inertia = beetle_robot_model_->getInertia<Eigen::Matrix3d>();
+    // RobotModel exposes inertia/origins in its attitude-dependent virtual CoG
+    // axes. ModuleModel is a latched rigid-body description, so normalize the
+    // snapshot back to physical baselink axes before caching/broadcasting it.
+    const Eigen::Matrix3d cog_from_body =
+        beetle_robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
+    const Eigen::Matrix3d inertia_cog =
+        beetle_robot_model_->getInertia<Eigen::Matrix3d>();
+    model.inertia =
+        cog_from_body.transpose() * inertia_cog * cog_from_body;
     model.rotor_origins_from_cog =
         beetle_robot_model_->getRotorsOriginFromCog<Eigen::Vector3d>();
+    for (auto& origin : model.rotor_origins_from_cog) {
+      origin = cog_from_body.transpose() * origin;
+    }
     model.rotor_direction = beetle_robot_model_->getRotorDirection();
     model.mf_rate = beetle_robot_model_->getMFRate();
 
@@ -1408,7 +1419,7 @@ namespace aerial_robot_control
     msg.mf_rate = model.mf_rate;
     module_model_pub_.publish(msg);
     ROS_INFO_THROTTLE(5.0,
-                      "[UnifiedCtrl] Published ModuleModel snapshot id=%d mass=%.3f rotors=%zu dirs=%zu mf_rate=%.6f",
+                      "[UnifiedCtrl] Published body-fixed ModuleModel snapshot id=%d mass=%.3f rotors=%zu dirs=%zu mf_rate=%.6f",
                       my_id, msg.mass, msg.rotor_origin_from_cog.size(),
                       msg.rotor_direction.size(), msg.mf_rate);
   }
@@ -2475,6 +2486,8 @@ namespace aerial_robot_control
     const std::string robot_name = beetle_navigator_->getMyName();
     const Eigen::Vector3d formation_cog_offset =
         unified_controller_->getFormationCogOffset();
+    const Eigen::Matrix3d cog_from_body =
+        robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
 
     double roll_err_sum = 0.0;
     double pitch_err_sum = 0.0;
@@ -2514,6 +2527,8 @@ namespace aerial_robot_control
           module_inertia +
           module_mass * (d.dot(d) * Eigen::Matrix3d::Identity() -
                          d * d.transpose());
+      inertia_about_form =
+          cog_from_body * inertia_about_form * cog_from_body.transpose();
 
       const double roll_weight = inertia_about_form(0, 0);
       const double pitch_weight = inertia_about_form(1, 1);
@@ -3099,6 +3114,15 @@ namespace aerial_robot_control
         formation_wrench_cmd.size() == 6 &&
         formation_wrench_cmd.allFinite() &&
         formation_wrench_cmd.norm() > 1e-3;
+    Eigen::VectorXd formation_wrench_cmd_cog = formation_wrench_cmd;
+    if (explicit_task_wrench_active) {
+      const Eigen::Matrix3d cog_from_body =
+          robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
+      formation_wrench_cmd_cog.head(3) =
+          cog_from_body * formation_wrench_cmd.head(3);
+      formation_wrench_cmd_cog.tail(3) =
+          cog_from_body * formation_wrench_cmd.tail(3);
+    }
 
     const int observer_feedback_nav_state = navigator_->getNaviState();
     const bool observer_feedback_nav_ready =
@@ -3213,7 +3237,7 @@ namespace aerial_robot_control
           // produced res ~ -(reaction + command) ~ -1.8*ff and a positive
           // push-harder feedback of ~ +0.36*ff (2026-07-03 bag, t=66.4:
           // est_x=-33.0, cmd_x=+39.2, res_x=-70.2 -> fb_x=+14N).
-          feedback_est_wrench += formation_wrench_cmd;
+          feedback_est_wrench += formation_wrench_cmd_cog;
         }
         observer_feedback_wrench_cmd =
             -unified_external_wrench_feedback_gain_ *
@@ -3249,12 +3273,12 @@ namespace aerial_robot_control
             unified_external_wrench_feedback_bias_(3),
             unified_external_wrench_feedback_bias_(4),
             unified_external_wrench_feedback_bias_(5),
-            explicit_task_wrench_active ? formation_wrench_cmd(0) : 0.0,
-            explicit_task_wrench_active ? formation_wrench_cmd(1) : 0.0,
-            explicit_task_wrench_active ? formation_wrench_cmd(2) : 0.0,
-            explicit_task_wrench_active ? formation_wrench_cmd(3) : 0.0,
-            explicit_task_wrench_active ? formation_wrench_cmd(4) : 0.0,
-            explicit_task_wrench_active ? formation_wrench_cmd(5) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd_cog(0) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd_cog(1) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd_cog(2) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd_cog(3) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd_cog(4) : 0.0,
+            explicit_task_wrench_active ? formation_wrench_cmd_cog(5) : 0.0,
             feedback_est_wrench(0), feedback_est_wrench(1),
             feedback_est_wrench(2), feedback_est_wrench(3),
             feedback_est_wrench(4), feedback_est_wrench(5),
@@ -3520,9 +3544,15 @@ namespace aerial_robot_control
                 observer_nav_state == aerial_robot_navigation::HOVER_STATE;
             formation_observer_->setFfArmed(observer_feedback_gate_ready);
             if (observer_update_nav_ready) {
+              const Eigen::Matrix3d observer_cog_from_body =
+                  robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
+              const Eigen::Matrix3d formation_inertia_cog =
+                  observer_cog_from_body *
+                  unified_controller_->getFormationInertia() *
+                  observer_cog_from_body.transpose();
               formation_observer_->update(
                   unified_controller_->getFormationMass(),
-                  unified_controller_->getFormationInertia(),
+                  formation_inertia_cog,
                   cog_rot_eigen, vel_formation_w, omega_body,
                   realized_wrench, du);
             }

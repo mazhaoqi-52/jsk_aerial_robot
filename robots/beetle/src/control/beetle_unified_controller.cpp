@@ -35,6 +35,7 @@ BeetleUnifiedController::BeetleUnifiedController()
     external_formation_inertia_(Eigen::Matrix3d::Zero()),
     module_model_revision_(0),
     cached_module_model_revision_(0),
+    allocation_cog_from_body_(Eigen::Matrix3d::Identity()),
     candidate_yaw_term_(0),
     command_target_rpy_(0, 0, 0),
     cascade_alloc_sent_(false),
@@ -544,9 +545,17 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // all modules' QP copies.
   publishSharedThrustLimit();
 
-  // Build formation-wide allocation matrix (6 x rotor_coef*total_rotors)
-  integrated_map_ = buildFormationAllocationMatrix(assembled_ids, formation_mass_,
-                                                    formation_inertia_, formation_cog_offset_);
+  // Freeze the virtual-CoG frame and rotor masks for this solve. Formation
+  // geometry is stored in the physical baselink frame; the allocation target
+  // and live thrust masks are expressed in the virtual CoG control frame.
+  allocation_cog_from_body_ =
+      robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
+  const std::vector<Eigen::MatrixXd> masked_rot_cog = buildRotorMask();
+
+  // Build formation-wide allocation matrix (6 x rotor_coef*total_rotors).
+  integrated_map_ = buildFormationAllocationMatrix(
+      assembled_ids, formation_mass_, formation_inertia_, formation_cog_offset_,
+      allocation_cog_from_body_, masked_rot_cog);
 
   // Pseudoinverse
   integrated_map_inv_ = aerial_robot_model::pseudoinverse(integrated_map_);
@@ -581,14 +590,22 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
        observer_feedback_wrench.norm() > 1e-6 &&
        effective_feedback_weights.maxCoeff() > 0.0);
   double mass_inv = 1.0 / formation_mass_;
-  Eigen::Matrix3d inertia_inv = formation_inertia_.inverse();
+  const Eigen::Matrix3d formation_inertia_cog =
+      allocation_cog_from_body_ * formation_inertia_ *
+      allocation_cog_from_body_.transpose();
+  const Eigen::Matrix3d inertia_cog_inv = formation_inertia_cog.inverse();
   if (has_desired_ext_wrench) {
-    task_wrench_acc.head(3) = mass_inv * desired_ext_wrench.head(3);
-    task_wrench_acc.tail(3) = inertia_inv * desired_ext_wrench.tail(3);
+    // External task commands use the physical formation-body convention.
+    task_wrench_acc.head(3) = allocation_cog_from_body_ *
+                              (mass_inv * desired_ext_wrench.head(3));
+    task_wrench_acc.tail(3) = inertia_cog_inv *
+                              (allocation_cog_from_body_ * desired_ext_wrench.tail(3));
   }
   if (has_feedback_ext_wrench) {
+    // FormationMomentumObserver already reports in the virtual CoG frame.
     feedback_wrench_acc.head(3) = mass_inv * observer_feedback_wrench.head(3);
-    feedback_wrench_acc.tail(3) = inertia_inv * observer_feedback_wrench.tail(3);
+    feedback_wrench_acc.tail(3) =
+        inertia_cog_inv * observer_feedback_wrench.tail(3);
   }
   if (has_desired_ext_wrench || has_feedback_ext_wrench) {
     ROS_INFO_THROTTLE(
@@ -622,7 +639,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   Eigen::VectorXd desired_wrench_acc =
       control_wrench_acc + task_wrench_acc + feedback_wrench_acc;
   Eigen::VectorXd secondary_ref =
-      buildSecondaryAllocationReference(assembled_ids, task_wrench_acc);
+      buildSecondaryAllocationReference(assembled_ids, desired_wrench_acc);
 
   Eigen::MatrixXd interface_actuation_matrix;
   Eigen::VectorXd interface_required_wrench;
@@ -639,6 +656,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   if (interface_constraints_enabled || interface_load_pub_.getNumSubscribers() > 0) {
     const bool interface_model_ok =
         buildInterfaceLoadModel(assembled_ids, control_wrench_acc,
+                                allocation_cog_from_body_, masked_rot_cog,
                                 interface_actuation_matrix,
                                 interface_required_wrench, interface_cuts);
     if (!interface_model_ok && interface_constraints_enabled) {
@@ -676,10 +694,14 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
           retry_priority_acc = target_wrench_acc_cog;
         }
 
-        // Rebuild the secondary reference with the scaled task so the
-        // cooperative task share in f_ref matches the retried objective.
+        // Rebuild the secondary reference around the complete retried target.
+        // The null-space load-sharing term must never bias any wrench row.
+        const Eigen::VectorXd retry_desired_wrench_acc =
+            control_wrench_acc + retry_task_wrench_acc +
+            retry_feedback_wrench_acc;
         Eigen::VectorXd retry_secondary_ref =
-            buildSecondaryAllocationReference(assembled_ids, retry_task_wrench_acc);
+            buildSecondaryAllocationReference(assembled_ids,
+                                              retry_desired_wrench_acc);
 
         qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                   retry_task_wrench_acc, retry_task_weights,
@@ -813,38 +835,54 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
 Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
     const std::vector<int>& assembled_ids,
-    const Eigen::VectorXd& task_wrench_acc) const
+    const Eigen::VectorXd& desired_wrench_acc) const
 {
   const int n_rotors = static_cast<int>(assembled_ids.size()) * motor_num_per_module_;
-  Eigen::VectorXd ref = Eigen::VectorXd::Zero(rotor_coef_ * n_rotors);
-  if (n_rotors <= 0 || rotor_coef_ <= 0 || formation_mass_ <= 0.0) return ref;
+  Eigen::VectorXd balanced_hover =
+      Eigen::VectorXd::Zero(rotor_coef_ * n_rotors);
+  if (n_rotors <= 0 || rotor_coef_ <= 0 || formation_mass_ <= 0.0) {
+    return balanced_hover;
+  }
 
   for (size_t m = 0; m < assembled_ids.size(); m++) {
     ModuleModelDescriptor model;
-    if (!getModuleModelDescriptor(assembled_ids[m], model)) return ref;
+    if (!getModuleModelDescriptor(assembled_ids[m], model)) {
+      return balanced_hover;
+    }
     const double hover_per_rotor = model.mass * aerial_robot_estimation::G / motor_num_per_module_;
     const double bounded_hover = std::max(0.0, std::min(hover_per_rotor, alloc_t_max_));
     const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
     for (int r = 0; r < motor_num_per_module_; r++) {
-      ref(module_col + r * rotor_coef_ + rotor_coef_ - 1) = bounded_hover;
+      balanced_hover(module_col + r * rotor_coef_ + rotor_coef_ - 1) =
+          bounded_hover;
     }
   }
 
-  // Cooperative task share: distribute the explicit task wrench over ALL
-  // rotors with the formation pseudoinverse (min-norm sharing). This keeps the
-  // effort and lambda references consistent with the task instead of pulling
-  // the solution back toward a hover-only allocation.
+  Eigen::VectorXd ref = balanced_hover;
   const bool has_allocation_block =
       (integrated_map_.rows() == 6 && integrated_map_.cols() == ref.size());
   const bool inv_consistent =
       (integrated_map_inv_.rows() == integrated_map_.cols() &&
        integrated_map_inv_.cols() == integrated_map_.rows());
   if (has_allocation_block && inv_consistent &&
-      task_wrench_acc.size() == integrated_map_.rows() &&
-      task_wrench_acc.allFinite() && task_wrench_acc.norm() > 1e-9) {
-    ref += integrated_map_inv_ * task_wrench_acc;
+      desired_wrench_acc.size() == integrated_map_.rows() &&
+      desired_wrench_acc.allFinite()) {
+    // balanced_hover is body/actuator-fixed. At nonzero physical roll/pitch it
+    // no longer realizes a vertical virtual-CoG wrench. Keep only its null-space
+    // component, then add the exact minimum-norm solution of the complete
+    // control + task + observer target. Therefore A*f_ref equals the requested
+    // wrench (up to numerical rank tolerance) for every virtual-CoG rotation.
+    const Eigen::MatrixXd nullspace_projector =
+        Eigen::MatrixXd::Identity(ref.size(), ref.size()) -
+        integrated_map_inv_ * integrated_map_;
+    ref = integrated_map_inv_ * desired_wrench_acc +
+          nullspace_projector * balanced_hover;
   }
 
+  // Keep a pathological/infeasible soft center numerically bounded. Nominal
+  // feasible references (including the attitude-tracking case guarded by the
+  // unit test) do not clip and retain A*ref == desired_wrench_acc. The QP's
+  // actuator constraints remain authoritative for the actual command.
   for (int idx = 0; idx < ref.size(); idx++) {
     if (rotor_coef_ == 2 && (idx % rotor_coef_) == rotor_coef_ - 1) {
       ref(idx) = std::max(0.0, std::min(ref(idx), alloc_t_max_));
@@ -917,7 +955,9 @@ bool BeetleUnifiedController::getPhysicalChainOrder(
 
 bool BeetleUnifiedController::buildInterfaceLoadModel(
     const std::vector<int>& allocation_ids,
-    const Eigen::VectorXd& control_wrench_acc,
+    const Eigen::VectorXd& control_wrench_acc_cog,
+    const Eigen::Matrix3d& cog_from_body,
+    const std::vector<Eigen::MatrixXd>& masked_rot_cog,
     Eigen::MatrixXd& interface_actuation_matrix,
     Eigen::VectorXd& interface_required_wrench,
     std::vector<std::pair<int, int>>& interface_cuts) const
@@ -928,15 +968,34 @@ bool BeetleUnifiedController::buildInterfaceLoadModel(
     interface_cuts.clear();
     return true;
   }
+  if (control_wrench_acc_cog.size() != 6 ||
+      !control_wrench_acc_cog.allFinite() ||
+      !cog_from_body.allFinite()) {
+    return false;
+  }
+
+  // Interface geometry and limits are physical body-frame quantities. Convert
+  // the virtual-CoG control acceleration and live masks before constructing
+  // the cut-balance model.
+  Eigen::VectorXd control_wrench_acc_body = Eigen::VectorXd::Zero(6);
+  control_wrench_acc_body.head(3) =
+      cog_from_body.transpose() * control_wrench_acc_cog.head(3);
+  control_wrench_acc_body.tail(3) =
+      cog_from_body.transpose() * control_wrench_acc_cog.tail(3);
+  std::vector<Eigen::MatrixXd> masked_rot_body;
+  masked_rot_body.reserve(masked_rot_cog.size());
+  for (const auto& mask_cog : masked_rot_cog) {
+    masked_rot_body.push_back(cog_from_body.transpose() * mask_cog);
+  }
   return buildInterfaceLoadModelWithMasks(
-      allocation_ids, control_wrench_acc, buildRotorMask(),
+      allocation_ids, control_wrench_acc_body, masked_rot_body,
       interface_actuation_matrix, interface_required_wrench, interface_cuts);
 }
 
 bool BeetleUnifiedController::buildInterfaceLoadModelWithMasks(
     const std::vector<int>& allocation_ids,
-    const Eigen::VectorXd& control_wrench_acc,
-    const std::vector<Eigen::MatrixXd>& masked_rot_single,
+    const Eigen::VectorXd& control_wrench_acc_body,
+    const std::vector<Eigen::MatrixXd>& masked_rot_body,
     Eigen::MatrixXd& interface_actuation_matrix,
     Eigen::VectorXd& interface_required_wrench,
     std::vector<std::pair<int, int>>& interface_cuts) const
@@ -949,10 +1008,11 @@ bool BeetleUnifiedController::buildInterfaceLoadModelWithMasks(
   if (n_modules < 2 || rotor_coef_ <= 0 || motor_num_per_module_ <= 0) {
     return true;
   }
-  if (control_wrench_acc.size() != 6 || !control_wrench_acc.allFinite()) {
+  if (control_wrench_acc_body.size() != 6 ||
+      !control_wrench_acc_body.allFinite()) {
     ROS_WARN_THROTTLE(1.0,
                       "[UnifiedCtrl Interface] invalid control wrench acceleration size=%d",
-                      static_cast<int>(control_wrench_acc.size()));
+                      static_cast<int>(control_wrench_acc_body.size()));
     return false;
   }
 
@@ -965,15 +1025,15 @@ bool BeetleUnifiedController::buildInterfaceLoadModelWithMasks(
   interface_required_wrench = Eigen::VectorXd::Zero(6 * (n_modules - 1));
   interface_cuts.reserve(n_modules - 1);
 
-  if (static_cast<int>(masked_rot_single.size()) < motor_num_per_module_) {
+  if (static_cast<int>(masked_rot_body.size()) < motor_num_per_module_) {
     interface_actuation_matrix.resize(0, 0);
     interface_required_wrench.resize(0);
     return false;
   }
   for (int r = 0; r < motor_num_per_module_; r++) {
-    if (masked_rot_single[r].rows() != 3 ||
-        masked_rot_single[r].cols() != rotor_coef_ ||
-        !masked_rot_single[r].allFinite()) {
+    if (masked_rot_body[r].rows() != 3 ||
+        masked_rot_body[r].cols() != rotor_coef_ ||
+        !masked_rot_body[r].allFinite()) {
       interface_actuation_matrix.resize(0, 0);
       interface_required_wrench.resize(0);
       return false;
@@ -1021,9 +1081,10 @@ bool BeetleUnifiedController::buildInterfaceLoadModelWithMasks(
 
       const Eigen::Vector3d module_offset_from_formation_cog =
           module_offsets.at(module_id) - formation_cog_offset_;
-      const Eigen::Vector3d angular_acc = control_wrench_acc.tail<3>();
+      const Eigen::Vector3d angular_acc =
+          control_wrench_acc_body.tail<3>();
       const Eigen::Vector3d required_force =
-          model.mass * (control_wrench_acc.head<3>() +
+          model.mass * (control_wrench_acc_body.head<3>() +
                         angular_acc.cross(module_offset_from_formation_cog));
       interface_required_wrench.segment<3>(row_start) += required_force;
       interface_required_wrench.segment<3>(row_start + 3) +=
@@ -1046,7 +1107,7 @@ bool BeetleUnifiedController::buildInterfaceLoadModelWithMasks(
 
         const int col_start = module_col + r * rotor_coef_;
         interface_actuation_matrix.block(row_start, col_start, 6, rotor_coef_) =
-            wrench_map * masked_rot_single[r];
+            wrench_map * masked_rot_body[r];
       }
     }
   }
@@ -2400,15 +2461,19 @@ bool BeetleUnifiedController::getRealizedModuleWrenchBody(
   ModuleModelDescriptor model;
   if (!getModuleModelDescriptor(module_id, model)) return false;
 
-  std::vector<Eigen::MatrixXd> masked_rot_single = buildRotorMask();
-  if (static_cast<int>(masked_rot_single.size()) < motor_num_per_module_) return false;
+  const Eigen::Matrix3d cog_from_body =
+      robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
+  std::vector<Eigen::MatrixXd> masked_rot_cog = buildRotorMask();
+  if (static_cast<int>(masked_rot_cog.size()) < motor_num_per_module_) return false;
 
   for (int r = 0; r < motor_num_per_module_; r++) {
     int block_start = col_start + r * rotor_coef_;
     Eigen::Vector3d f_i =
-        masked_rot_single[r] * target_vectoring_f_.segment(block_start, rotor_coef_);
+        masked_rot_cog[r] * target_vectoring_f_.segment(block_start, rotor_coef_);
+    const Eigen::Vector3d rotor_origin_cog =
+        cog_from_body * model.rotor_origins_from_cog.at(r);
     realized.head(3) += f_i;
-    realized.tail(3) += aerial_robot_model::skew(model.rotor_origins_from_cog.at(r)) * f_i
+    realized.tail(3) += aerial_robot_model::skew(rotor_origin_cog) * f_i
                         + model.rotor_direction.at(r + 1) * model.mf_rate * f_i;
   }
 
@@ -2447,15 +2512,16 @@ bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInvLocked(
 
 Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
 {
-  // Compute realized wrench from allocation: w_acc = A * f, then scale back to force/torque.
+  // Compute realized wrench in the virtual CoG control frame from the same
+  // frame snapshot used to construct the allocation matrix.
   //
   // integrated_map_ is in "acc-space":
   //   top 3 rows: (1/M) * force_allocation
   //   bottom 3 rows: I^{-1} * torque_allocation
   //
   // So: w_acc = integrated_map_ * target_vectoring_f_
-  //     F = M * w_acc.head(3)
-  //     T = I * w_acc.tail(3)
+  //     F_cog = M * w_acc.head(3)
+  //     T_cog = I_cog * w_acc.tail(3)
 
   Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
   std::lock_guard<std::mutex> lock(allocation_mutex_);
@@ -2475,11 +2541,11 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   // w_acc = A * f  (6D acceleration-space wrench)
   Eigen::VectorXd w_acc = integrated_map_ * target_vectoring_f_;
 
-  // Convert from acc-space back to force/torque:
-  //   F_body = M * w_acc.head(3)
-  //   T_body = I * w_acc.tail(3)
+  const Eigen::Matrix3d formation_inertia_cog =
+      allocation_cog_from_body_ * formation_inertia_ *
+      allocation_cog_from_body_.transpose();
   realized.head(3) = formation_mass_ * w_acc.head(3);
-  realized.tail(3) = formation_inertia_ * w_acc.tail(3);
+  realized.tail(3) = formation_inertia_cog * w_acc.tail(3);
 
   return realized;
 }
@@ -2585,13 +2651,17 @@ void BeetleUnifiedController::cacheCascadeGains(
 Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
     const std::vector<int>& assembled_ids,
     double formation_mass,
-    const Eigen::Matrix3d& formation_inertia,
-    const Eigen::Vector3d& formation_cog_offset)
+    const Eigen::Matrix3d& formation_inertia_body,
+    const Eigen::Vector3d& formation_cog_offset_body,
+    const Eigen::Matrix3d& cog_from_body,
+    const std::vector<Eigen::MatrixXd>& masked_rot_cog)
 {
   int N = assembled_ids.size();
   int total_rotors = N * motor_num_per_module_;
   double mass_inv = 1.0 / formation_mass;
-  Eigen::Matrix3d inertia_inv = formation_inertia.inverse();
+  const Eigen::Matrix3d formation_inertia_cog =
+      cog_from_body * formation_inertia_body * cog_from_body.transpose();
+  Eigen::Matrix3d inertia_inv = formation_inertia_cog.inverse();
 
   Eigen::MatrixXd full_q_mat = Eigen::MatrixXd::Zero(6, 3 * total_rotors);
 
@@ -2613,11 +2683,14 @@ Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
     }
 
     for (int r = 0; r < motor_num_per_module_; r++) {
-      Eigen::Vector3d rotor_pos =
-          module_offset - formation_cog_offset + model.rotor_origins_from_cog.at(r);
+      const Eigen::Vector3d rotor_pos_body =
+          module_offset - formation_cog_offset_body +
+          model.rotor_origins_from_cog.at(r);
+      const Eigen::Vector3d rotor_pos_cog = cog_from_body * rotor_pos_body;
       int dir = model.rotor_direction.at(r + 1);
       wrench_map.block(3, 0, 3, 3) =
-          aerial_robot_model::skew(rotor_pos) + dir * model.mf_rate * Eigen::Matrix3d::Identity();
+          aerial_robot_model::skew(rotor_pos_cog) +
+          dir * model.mf_rate * Eigen::Matrix3d::Identity();
       full_q_mat.middleCols(col, 3) = wrench_map;
       col += 3;
     }
@@ -2627,8 +2700,6 @@ Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
   full_q_mat.topRows(3) = mass_inv * full_q_mat.topRows(3);
   full_q_mat.bottomRows(3) = inertia_inv * full_q_mat.bottomRows(3);
 
-  std::vector<Eigen::MatrixXd> masked_rot_single = buildRotorMask();
-
   // Block-diagonal integrated_rot
   int total_cols = rotor_coef_ * total_rotors;
   Eigen::MatrixXd integrated_rot = Eigen::MatrixXd::Zero(3 * total_rotors, total_cols);
@@ -2636,7 +2707,7 @@ Eigen::MatrixXd BeetleUnifiedController::buildFormationAllocationMatrix(
     for (int r = 0; r < motor_num_per_module_; r++) {
       int rotor_idx = m * motor_num_per_module_ + r;
       integrated_rot.block(3 * rotor_idx, rotor_coef_ * rotor_idx,
-                           3, rotor_coef_) = masked_rot_single[r];
+                           3, rotor_coef_) = masked_rot_cog[r];
     }
   }
 

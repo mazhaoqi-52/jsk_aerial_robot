@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <ros/ros.h>
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -189,6 +190,50 @@ protected:
     const std::vector<Eigen::MatrixXd> masks(kRotorsPerModule, mask);
     return ctrl_.buildInterfaceLoadModelWithMasks(
         allocation_ids, control_wrench_acc, masks, D, d, cuts);
+  }
+
+  Eigen::MatrixXd buildSingleModuleAllocation(
+      const BeetleUnifiedController::ModuleModelDescriptor& model,
+      const std::vector<Eigen::MatrixXd>& masks_body,
+      const Eigen::Matrix3d& cog_from_body)
+  {
+    ctrl_.cached_module_offsets_from_leader_ = {
+        {1, Eigen::Vector3d::Zero()}};
+    ctrl_.setModuleModelDescriptor(1, model);
+    std::vector<Eigen::MatrixXd> masks_cog;
+    masks_cog.reserve(masks_body.size());
+    for (const auto& mask_body : masks_body) {
+      masks_cog.push_back(cog_from_body * mask_body);
+    }
+    return ctrl_.buildFormationAllocationMatrix(
+        {1}, model.mass, model.inertia, Eigen::Vector3d::Zero(),
+        cog_from_body, masks_cog);
+  }
+
+  Eigen::VectorXd buildSingleModuleSecondaryReference(
+      const BeetleUnifiedController::ModuleModelDescriptor& model,
+      const std::vector<Eigen::MatrixXd>& masks_body,
+      const Eigen::Matrix3d& cog_from_body,
+      const Eigen::VectorXd& desired_wrench_acc,
+      Eigen::MatrixXd& allocation)
+  {
+    allocation = buildSingleModuleAllocation(model, masks_body, cog_from_body);
+    ctrl_.formation_mass_ = model.mass;
+    ctrl_.integrated_map_ = allocation;
+    ctrl_.integrated_map_inv_ =
+        aerial_robot_model::pseudoinverse(allocation);
+    return ctrl_.buildSecondaryAllocationReference(
+        {1}, desired_wrench_acc);
+  }
+
+  static Eigen::Matrix<double, 6, 6> spatialRotation(
+      const Eigen::Matrix3d& rotation)
+  {
+    Eigen::Matrix<double, 6, 6> result =
+        Eigen::Matrix<double, 6, 6>::Zero();
+    result.topLeftCorner<3, 3>() = rotation;
+    result.bottomRightCorner<3, 3>() = rotation;
+    return result;
   }
 
   static double moduleFzSum(const Eigen::VectorXd& f, int m)
@@ -441,6 +486,141 @@ TEST_F(BeetleUnifiedAllocTest, InterfaceModelUsesContactFreePhysicalSubtree)
   const Eigen::VectorXd interface_wrench = d - D * f_push;
   EXPECT_NEAR(interface_wrench(0), -1.0, 1e-10);
   EXPECT_NEAR(interface_wrench(6), -2.0, 1e-10);
+}
+
+// (11) A physical roll/pitch command rotates the virtual CoG axes but must not
+//      change the body wrench represented by a fixed actuator vector. This
+//      guards against mixing body-fixed lever arms/inertia with CoG-frame
+//      thrust masks in the formation allocation matrix.
+TEST_F(BeetleUnifiedAllocTest, BodyWrenchIsInvariantUnderVirtualCogRotation)
+{
+  BeetleUnifiedController::ModuleModelDescriptor model;
+  model.mass = 2.7;
+  model.inertia <<
+      0.31,  0.02, -0.01,
+      0.02,  0.47,  0.03,
+     -0.01,  0.03,  0.62;
+  model.rotor_origins_from_cog = {
+      Eigen::Vector3d( 0.23, -0.17,  0.04),
+      Eigen::Vector3d(-0.19, -0.21, -0.03),
+      Eigen::Vector3d(-0.24,  0.16,  0.02),
+      Eigen::Vector3d( 0.18,  0.22, -0.05)};
+  model.rotor_direction = {{1, 1}, {2, -1}, {3, 1}, {4, -1}};
+  model.mf_rate = 0.015;
+
+  std::vector<Eigen::MatrixXd> masks_body;
+  for (double angle : {0.0, 0.35, -0.42, 0.21}) {
+    const Eigen::Matrix3d rotor_from_nominal =
+        Eigen::AngleAxisd(angle, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    Eigen::MatrixXd nominal_mask(3, 2);
+    nominal_mask << 1.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 1.0;
+    masks_body.push_back(rotor_from_nominal * nominal_mask);
+  }
+
+  Eigen::VectorXd actuator(8);
+  actuator << 0.8, 2.7, -0.5, 3.1, 1.2, 2.2, -0.9, 3.7;
+
+  Eigen::VectorXd expected_wrench = Eigen::VectorXd::Zero(6);
+  for (int r = 0; r < kRotorsPerModule; r++) {
+    const Eigen::Vector3d force_body =
+        masks_body[r] * actuator.segment<2>(2 * r);
+    expected_wrench.head<3>() += force_body;
+    expected_wrench.tail<3>() +=
+        model.rotor_origins_from_cog[r].cross(force_body) +
+        model.rotor_direction.at(r + 1) * model.mf_rate * force_body;
+  }
+
+  const Eigen::MatrixXd allocation_body =
+      buildSingleModuleAllocation(model, masks_body, Eigen::Matrix3d::Identity());
+  const std::vector<Eigen::Matrix3d> rotations = {
+      Eigen::Matrix3d::Identity(),
+      (Eigen::AngleAxisd(0.41, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(-0.27, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(0.19, Eigen::Vector3d::UnitX())).toRotationMatrix(),
+      (Eigen::AngleAxisd(-0.33, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(0.24, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(-0.37, Eigen::Vector3d::UnitX())).toRotationMatrix()};
+
+  for (const auto& cog_from_body : rotations) {
+    const Eigen::MatrixXd allocation_cog =
+        buildSingleModuleAllocation(model, masks_body, cog_from_body);
+    const Eigen::Matrix<double, 6, 6> spatial_rot =
+        spatialRotation(cog_from_body);
+    EXPECT_LT((allocation_cog - spatial_rot * allocation_body).norm(), 1e-11);
+
+    const Eigen::VectorXd acceleration_body =
+        spatial_rot.transpose() * (allocation_cog * actuator);
+    Eigen::VectorXd realized_wrench = Eigen::VectorXd::Zero(6);
+    realized_wrench.head<3>() = model.mass * acceleration_body.head<3>();
+    realized_wrench.tail<3>() = model.inertia * acceleration_body.tail<3>();
+    EXPECT_LT((realized_wrench - expected_wrench).norm(), 1e-10);
+  }
+}
+
+// (12) The secondary hover/load-sharing reference must not compete with the
+//      commanded wrench. A raw body-fixed hover vector produces horizontal
+//      acceleration when the virtual CoG frame is tilted; only its null-space
+//      component may be retained in f_ref.
+TEST_F(BeetleUnifiedAllocTest, SecondaryReferencePreservesDesiredWrenchWhenCogIsTilted)
+{
+  BeetleUnifiedController::ModuleModelDescriptor model;
+  model.mass = 2.7;
+  model.inertia <<
+      0.31,  0.02, -0.01,
+      0.02,  0.47,  0.03,
+     -0.01,  0.03,  0.62;
+  model.rotor_origins_from_cog = {
+      Eigen::Vector3d( 0.23, -0.17,  0.04),
+      Eigen::Vector3d(-0.19, -0.21, -0.03),
+      Eigen::Vector3d(-0.24,  0.16,  0.02),
+      Eigen::Vector3d( 0.18,  0.22, -0.05)};
+  model.rotor_direction = {{1, 1}, {2, -1}, {3, 1}, {4, -1}};
+  model.mf_rate = 0.015;
+
+  std::vector<Eigen::MatrixXd> masks_body;
+  for (double angle : {0.0, 0.35, -0.42, 0.21}) {
+    const Eigen::Matrix3d rotor_from_nominal =
+        Eigen::AngleAxisd(angle, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    Eigen::MatrixXd nominal_mask(3, 2);
+    nominal_mask << 1.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 1.0;
+    masks_body.push_back(rotor_from_nominal * nominal_mask);
+  }
+
+  const Eigen::Matrix3d cog_from_body =
+      (Eigen::AngleAxisd(-0.25, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(0.20, Eigen::Vector3d::UnitX())).toRotationMatrix();
+  Eigen::VectorXd desired_wrench_acc = Eigen::VectorXd::Zero(6);
+  desired_wrench_acc(2) = aerial_robot_estimation::G;
+
+  Eigen::MatrixXd allocation;
+  const Eigen::VectorXd reference = buildSingleModuleSecondaryReference(
+      model, masks_body, cog_from_body, desired_wrench_acc, allocation);
+  ASSERT_EQ(allocation.fullPivLu().rank(), 6);
+  ASSERT_EQ(reference.size(), kRotorsPerModule * kRotorCoef);
+  ASSERT_TRUE(reference.allFinite());
+
+  Eigen::VectorXd raw_balanced_hover =
+      Eigen::VectorXd::Zero(kRotorsPerModule * kRotorCoef);
+  const double hover_per_rotor =
+      model.mass * aerial_robot_estimation::G / kRotorsPerModule;
+  for (int r = 0; r < kRotorsPerModule; r++) {
+    raw_balanced_hover(r * kRotorCoef + kRotorCoef - 1) = hover_per_rotor;
+  }
+
+  // This is the old failure mode: the physical-body hover reference itself
+  // asks the tilted virtual frame for a large horizontal acceleration.
+  EXPECT_GT((allocation * raw_balanced_hover).head<2>().norm(), 1.0);
+
+  // The corrected reference keeps the load-sharing preference only in null(A),
+  // so every soft regularizer is centered on the same requested 6D wrench.
+  EXPECT_LT((allocation * reference - desired_wrench_acc).norm(), 1e-9);
+  const Eigen::VectorXd minimum_norm =
+      aerial_robot_model::pseudoinverse(allocation) * desired_wrench_acc;
+  EXPECT_LT((allocation * (reference - minimum_norm)).norm(), 1e-9);
 }
 
 }  // namespace aerial_robot_control

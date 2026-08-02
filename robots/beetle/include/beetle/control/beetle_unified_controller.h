@@ -83,7 +83,8 @@ public:
    *                                center is approximately zero are kept soft-only.
    * @param task_wrench_weights    Optional 6D task soft tracking weights. When empty, controller
    *                               parameters choose the task weighting.
-   * @param observer_feedback_wrench Optional 6D residual-feedback wrench at formation CoG.
+   * @param observer_feedback_wrench Optional 6D residual-feedback wrench in the virtual
+   *                                 CoG control frame (the formation observer's native frame).
    * @param observer_feedback_wrench_weights Optional low weights paired with observer_feedback_wrench.
    * @return true if allocation succeeded, false otherwise.
    */
@@ -171,6 +172,9 @@ public:
 
   struct ModuleModelDescriptor {
     double mass = 0.0;
+    // Body-fixed model. The legacy member/message name is retained for wire
+    // compatibility, but inertia and rotor origins are expressed in the
+    // physical baselink axes, not the attitude-dependent virtual CoG axes.
     Eigen::Matrix3d inertia = Eigen::Matrix3d::Zero();
     std::vector<Eigen::Vector3d> rotor_origins_from_cog;
     std::map<int, int> rotor_direction;
@@ -217,19 +221,22 @@ public:
   bool buildModuleTorqueAllocationMatrixInv(int module_id, spinal::TorqueAllocationMatrixInv& msg) const;
 
   /**
-   * @brief Compute the realized 6D wrench in body (CoG) frame from the allocation result.
+   * @brief Compute the realized 6D wrench in the virtual CoG control frame.
    *
    * This is the allocation-model wrench commanded by the PC-side allocator:
    *   w_realized_acc = A * f   (integrated_map_ * target_vectoring_f_)
    * then converted from acc-space to force/torque space:
    *   F = M * w_realized_acc.head(3)
-   *   T = I * w_realized_acc.tail(3)
+   *   T = I_cog * w_realized_acc.tail(3)
    *
    * In cascade mode this does not include spinal-side P/D increments, motor
    * dynamics, or thrust/gimbal tracking errors. Treat it as a diagnostic
    * model input, not a measured actuator wrench.
    *
-   * @return 6D wrench [Fx,Fy,Fz,Tx,Ty,Tz] in body frame (N, N·m).
+   * The legacy method name uses "Body" for the controller's CoG frame. This
+   * is not the tilted physical baselink frame when desire_coordinate is active.
+   *
+   * @return 6D wrench [Fx,Fy,Fz,Tx,Ty,Tz] in virtual CoG frame (N, N·m).
    *         Returns zero vector if allocation has not been computed yet.
    */
   Eigen::VectorXd getRealizedWrenchBody() const;
@@ -250,8 +257,8 @@ private:
 
   // Formation state
   double formation_mass_;
-  Eigen::Vector3d formation_cog_offset_;
-  Eigen::Matrix3d formation_inertia_;
+  Eigen::Vector3d formation_cog_offset_;  // physical baselink/body frame
+  Eigen::Matrix3d formation_inertia_;     // physical baselink/body frame
   bool use_external_formation_model_;
   double external_formation_mass_;
   Eigen::Vector3d external_formation_cog_offset_;
@@ -270,6 +277,10 @@ private:
   mutable std::mutex allocation_mutex_;
 
   // Allocation matrices
+  // integrated_map_ maps actuator coordinates to acceleration in the virtual
+  // CoG control frame. Keep the exact body->CoG rotation paired with the map
+  // so realized-wrench diagnostics use the same frame snapshot.
+  Eigen::Matrix3d allocation_cog_from_body_;
   Eigen::MatrixXd integrated_map_;        // 6 x (rotor_coef * total_rotors)
   Eigen::MatrixXd integrated_map_inv_;    // pseudoinverse
   Eigen::MatrixXd integrated_map_inv_rot_; // last 3 cols of pseudoinverse (torque part)
@@ -319,8 +330,10 @@ private:
   Eigen::MatrixXd buildFormationAllocationMatrix(
       const std::vector<int>& assembled_ids,
       double formation_mass,
-      const Eigen::Matrix3d& formation_inertia,
-      const Eigen::Vector3d& formation_cog_offset);
+      const Eigen::Matrix3d& formation_inertia_body,
+      const Eigen::Vector3d& formation_cog_offset_body,
+      const Eigen::Matrix3d& cog_from_body,
+      const std::vector<Eigen::MatrixXd>& masked_rot_cog);
 
   Eigen::Matrix3d computeFormationInertia(
       const std::vector<int>& assembled_ids,
@@ -458,15 +471,20 @@ private:
                         double thrust_limit,
                         int n_rotors);
 
-  /** @brief Build the current secondary allocation reference f_ref.
-   *  f_ref = balanced hover load
-   *        + A^+ * task_wrench_acc          (cooperative min-norm task share)
-   *  The task share keeps the effort/lambda terms consistent with the task
-   *  objective without adding observer-derived internal-wrench control.
-   *  Pass a zero/empty task_wrench_acc for a hover-only reference. */
+  /** @brief Build a wrench-consistent secondary allocation reference.
+   *
+   *    f_ref = A^+ * desired_wrench_acc
+   *          + (I - A^+ A) * balanced_hover_load
+   *
+   *  The balanced per-module hover load is expressed in actuator coordinates,
+   *  so using it directly would tilt the QP reference with the physical body
+   *  when the virtual CoG frame changes. Projecting it into null(A) preserves
+   *  its load-sharing preference without changing a reachable requested 6D
+   *  wrench. The final component guard may relax that equality only if this
+   *  soft reference itself lies outside the configured actuator bounds. */
   Eigen::VectorXd buildSecondaryAllocationReference(
       const std::vector<int>& assembled_ids,
-      const Eigen::VectorXd& task_wrench_acc) const;
+      const Eigen::VectorXd& desired_wrench_acc) const;
 
   /** @brief Sort allocation IDs into the physical Beetle chain (increasing
    *  leader-frame CoG x), while preserving the original ID-to-QP-column map. */
@@ -486,14 +504,17 @@ private:
    *  dynamics model quantity, not a force-sensor measurement; unmodelled
    *  contacts on the selected subchain and angular-rate terms are excluded. */
   bool buildInterfaceLoadModel(const std::vector<int>& allocation_ids,
-                               const Eigen::VectorXd& control_wrench_acc,
+                               const Eigen::VectorXd& control_wrench_acc_cog,
+                               const Eigen::Matrix3d& cog_from_body,
+                               const std::vector<Eigen::MatrixXd>& masked_rot_cog,
                                Eigen::MatrixXd& interface_actuation_matrix,
                                Eigen::VectorXd& interface_required_wrench,
                                std::vector<std::pair<int, int>>& interface_cuts) const;
+  // Pure body-frame core used by the runtime wrapper and offline tests.
   bool buildInterfaceLoadModelWithMasks(
       const std::vector<int>& allocation_ids,
-      const Eigen::VectorXd& control_wrench_acc,
-      const std::vector<Eigen::MatrixXd>& masked_rot_single,
+      const Eigen::VectorXd& control_wrench_acc_body,
+      const std::vector<Eigen::MatrixXd>& masked_rot_body,
       Eigen::MatrixXd& interface_actuation_matrix,
       Eigen::VectorXd& interface_required_wrench,
       std::vector<std::pair<int, int>>& interface_cuts) const;

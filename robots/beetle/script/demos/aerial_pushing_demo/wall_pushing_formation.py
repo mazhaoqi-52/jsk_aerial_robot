@@ -830,10 +830,8 @@ class PushWithFeedforwardState(PushingStateBase):
             force_norm, TOWING_UNLOAD_FORCE_RATE, duration)
         return duration
 
-    def _build_pushing_wrench_command(self, force_world, unified_mode):
-        if not self.single_uav_mode and not unified_mode:
-            return force_world, [0.0, 0.0, 0.0], "world_yaw"
-
+    def _build_pushing_wrench_command(self, force_world):
+        """Build the common formation-CoG wrench used by LF and unified."""
         contact_offset_body = np.array([
             self.formation_adapter.contact_offset_x + PUSH_CONTACT_DX_FROM_CP,
             self.formation_adapter.contact_offset_y + PUSH_CONTACT_DY_FROM_CP,
@@ -1255,8 +1253,8 @@ class PushWithFeedforwardState(PushingStateBase):
                 push_exit_reason = 'full_force_timeout'
                 push_outcome = 'timeout'
                 break
-            ff_force, ff_torque, ff_frame = self._build_pushing_wrench_command(
-                ff_world, unified_mode)
+            ff_force, ff_torque, ff_frame = (
+                self._build_pushing_wrench_command(ff_world))
             task_scale = PUSH_TASK_WEIGHT_SCALE * force_guard_task_scale
             task_weights = (
                 build_pushing_task_wrench_weights(ff_force, task_scale)

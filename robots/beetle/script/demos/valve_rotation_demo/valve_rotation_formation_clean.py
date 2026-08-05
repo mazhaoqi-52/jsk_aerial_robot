@@ -21,7 +21,7 @@ from task.assembly_motion import AssemblyDemo
 from n_modules_tf import NModuleTFCalculator
 from insertion_optimizer import InsertionOptimizer
 from trajectory import PolynomialTrajectory
-from beetle_interface import BeetleInterface
+from beetle_interface import BeetleInterface, smoothstep01
 import demo_common
 
 
@@ -67,6 +67,33 @@ class FormationUtils:
     def normalize_angle(angle):
         """Normalize angle to [-pi, pi]"""
         return demo_common.normalize_angle(angle)
+
+    @staticmethod
+    def limit_phase_progress(nominal_progress, measured_progress, max_lead,
+                             current_progress=0.0, max_step=float("inf"),
+                             slowdown_width=0.0):
+        """Bound valve phase lead and smoothly slow the command near it."""
+        nominal_progress = max(0.0, float(nominal_progress))
+        measured_progress = max(0.0, float(measured_progress))
+        max_lead = max(0.0, float(max_lead))
+        current_progress = max(0.0, float(current_progress))
+        max_step = max(0.0, float(max_step))
+        slowdown_width = min(
+            max_lead, max(0.0, float(slowdown_width)))
+        if slowdown_width > 0.0 and math.isfinite(max_step):
+            current_lead = max(
+                0.0, current_progress - measured_progress)
+            lead_remaining = max(0.0, max_lead - current_lead)
+            max_step *= smoothstep01(
+                lead_remaining / slowdown_width)
+        # Never snap the command forward to a discontinuous valve measurement.
+        # The nominal trajectory is already rate limited; measured progress only
+        # caps how far that trajectory may lead the physical valve.
+        desired_progress = min(
+            nominal_progress, measured_progress + max_lead)
+        return max(
+            current_progress,
+            min(desired_progress, current_progress + max_step))
 
     @staticmethod
     def get_valve_yaw_safe(beetle_interface, fallback):
@@ -225,7 +252,7 @@ class FormationAdapter:
         self._update_assembly_position()
 
     def _update_assembly_position(self):
-        """Calculate assembly CoG position from all participating UAVs"""
+        """Calculate the module-base geometric center used for EE feedback."""
         if len(self.uav_positions) < self.number_of_modules:
             return
 
@@ -233,7 +260,8 @@ class FormationAdapter:
             if module_id not in self.uav_positions or module_id not in self.uav_orientations:
                 return
 
-        # Calculate assembly CoG as average of all UAV positions
+        # Average mocap/base poses describe the geometric formation center, not
+        # necessarily the CoG target frame consumed by FlightNav.COG.
         avg_x = sum(self.uav_positions[mid][0] for mid in self.module_ids) / self.number_of_modules
         avg_y = sum(self.uav_positions[mid][1] for mid in self.module_ids) / self.number_of_modules
         avg_z = sum(self.uav_positions[mid][2] for mid in self.module_ids) / self.number_of_modules
@@ -264,7 +292,7 @@ class FormationAdapter:
             self.position_received.set()
 
     def get_assembly_position(self):
-        """Get current assembly CoG position"""
+        """Get the current module-base geometric center."""
         return self.assembly_pos
 
     def get_assembly_yaw(self):
@@ -305,7 +333,7 @@ class FormationAdapter:
             for module_id in self.module_ids)
 
     def transform_end_effector_to_assembly_command(self, target_end_effector_pos, target_yaw=None):
-        """Transform end-effector target to assembly CoG command"""
+        """Transform an EE target to a nominal geometric-center target."""
         if target_yaw is None:
             target_yaw = self.assembly_yaw if self.assembly_yaw is not None else 0.0
 
@@ -464,6 +492,8 @@ class FormationSingleUAVStateBase(smach.State):
         )
 
         self.optimizer = InsertionOptimizer()
+        self._assembly_cog_offset_body = None
+        self._assembly_cog_offset_stamp = None
 
         self.max_linear_velocity = 0.24
         self.average_linear_velocity = 0.16
@@ -485,21 +515,36 @@ class FormationSingleUAVStateBase(smach.State):
     def get_end_effector_yaw(self):
         return self.formation_adapter.get_end_effector_yaw()
 
-    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, yaw_only=False):
+    def _formation_feedback_is_fresh(self, max_age=0.5):
+        checker = getattr(
+            self.formation_adapter, 'has_fresh_end_effector_feedback', None)
+        return not callable(checker) or bool(checker(max_age))
+
+    def active_position_convergence(self, target_pos, target_yaw, pos_thresh=0.025, yaw_thresh=0.0175, timeout=15.0, max_yaw_step=None, max_linear_vel=None, max_angular_vel=None, yaw_only=False, position_feedforward_deadband=None):
         """Active convergence: repeatedly send target and wait for position/yaw to settle.
 
         Args:
             yaw_only: If True, only check yaw convergence (ignore position error)
+            position_feedforward_deadband: Optional position error above which
+                linear velocity feedforward is enabled.
         """
         start_time = rospy.get_time()
         self.last_convergence_failure_reason = None
 
         max_angular_vel_limit = max_angular_vel if max_angular_vel is not None else 0.05
         max_linear_vel_limit = max_linear_vel if max_linear_vel is not None else 0.16
-        near_target_pos_only_radius = min(0.08, max(pos_thresh * 2.0, 0.06))
+        if position_feedforward_deadband is None:
+            near_target_pos_only_radius = min(
+                0.08, max(pos_thresh * 2.0, 0.06))
+        else:
+            near_target_pos_only_radius = max(
+                0.0, float(position_feedforward_deadband))
 
         consecutive_good_readings = 0
         required_consecutive = 8
+        received_valid_feedback = False
+        pos_error = float('inf')
+        yaw_error = float('inf')
 
         rospy.loginfo(f"Active convergence: target={FormationUtils.format_vec(target_pos)}, yaw={math.degrees(target_yaw):.1f} deg, thresh={pos_thresh*1000:.1f}mm/{math.degrees(yaw_thresh):.1f} deg")
 
@@ -513,6 +558,8 @@ class FormationSingleUAVStateBase(smach.State):
             if current_yaw is None:
                 rospy.sleep(0.1)
                 continue
+
+            received_valid_feedback = True
 
             xy_error = math.sqrt((current_pos[0] - target_pos[0])**2 + (current_pos[1] - target_pos[1])**2)
             z_error = abs(current_pos[2] - target_pos[2])
@@ -559,7 +606,9 @@ class FormationSingleUAVStateBase(smach.State):
                 max_angular_vel_limit = max_angular_vel if max_angular_vel is not None else 0.05
                 max_linear_vel_limit = max_linear_vel if max_linear_vel is not None else 0.08
 
-                actual_yaw_error = abs(FormationUtils.normalize_angle(command_yaw - current_yaw))
+                signed_yaw_error = FormationUtils.normalize_angle(
+                    command_yaw - current_yaw)
+                actual_yaw_error = abs(signed_yaw_error)
 
                 if actual_yaw_error > 0.52:
                     angular_divisor = 2.0
@@ -568,7 +617,13 @@ class FormationSingleUAVStateBase(smach.State):
                 else:
                     angular_divisor = 4.0
 
-                smooth_angular_vel = min(actual_yaw_error / angular_divisor, max_angular_vel_limit) if actual_yaw_error > 0.005 else 0.0
+                angular_speed = min(
+                    actual_yaw_error / angular_divisor,
+                    max_angular_vel_limit
+                ) if actual_yaw_error > 0.005 else 0.0
+                smooth_angular_vel = (
+                    math.copysign(angular_speed, signed_yaw_error)
+                    if angular_speed > 0.0 else 0.0)
 
                 if pos_error > near_target_pos_only_radius:
                     speed_magnitude = min(pos_error / 4.0, max_linear_vel_limit)
@@ -599,17 +654,101 @@ class FormationSingleUAVStateBase(smach.State):
 
             rospy.sleep(0.04)
 
+        if not received_valid_feedback:
+            self.last_convergence_failure_reason = "invalid_feedback"
+            rospy.logwarn(
+                "Formation active convergence stopped without valid "
+                "end-effector feedback")
+            return False
+
         self.last_convergence_failure_reason = "timeout"
         rospy.logwarn(f"Formation active convergence timeout after {timeout:.1f}s: "
                      f"pos_err={pos_error*1000:.1f}mm, yaw_err={math.degrees(yaw_error):.1f} deg")
         return False
 
+    def _control_cog_target(self, geometric_center_target, target_yaw):
+        """Convert a geometric-center target to the FlightNav.COG origin."""
+        source_stamp = getattr(
+            self.beetle, 'assembly_odom_source_stamp', None)
+        stamp_is_numeric = isinstance(
+            source_stamp, (int, float, np.integer, np.floating))
+        offset_body = getattr(self, '_assembly_cog_offset_body', None)
+        previous_stamp = getattr(self, '_assembly_cog_offset_stamp', None)
+        source_advanced = (
+            previous_stamp is None or
+            (stamp_is_numeric and float(source_stamp) > previous_stamp))
+
+        if stamp_is_numeric and source_advanced:
+            now = rospy.get_time()
+            age = now - float(source_stamp)
+            feedback_fresh = getattr(
+                self.formation_adapter,
+                'has_fresh_end_effector_feedback',
+                lambda max_age: False)(0.5)
+            if math.isfinite(age) and -0.1 <= age <= 0.5 and feedback_fresh:
+                geometric_center = self.formation_adapter.get_assembly_position()
+                control_cog = self.beetle.getAssemblyPos()
+                current_yaw = self.formation_adapter.get_assembly_yaw()
+                if (geometric_center is not None and control_cog is not None and
+                        current_yaw is not None):
+                    geometric_center = np.asarray(
+                        geometric_center, dtype=float).reshape(-1)
+                    control_cog = np.asarray(control_cog, dtype=float).reshape(-1)
+                    if (geometric_center.size == 3 and control_cog.size == 3 and
+                            np.all(np.isfinite(geometric_center)) and
+                            np.all(np.isfinite(control_cog)) and
+                            math.isfinite(float(current_yaw))):
+                        offset_world = control_cog - geometric_center
+                        cos_yaw = math.cos(current_yaw)
+                        sin_yaw = math.sin(current_yaw)
+                        candidate = np.array([
+                            cos_yaw * offset_world[0] + sin_yaw * offset_world[1],
+                            -sin_yaw * offset_world[0] + cos_yaw * offset_world[1],
+                            offset_world[2],
+                        ])
+                        if np.linalg.norm(candidate) <= 0.30:
+                            first_sample = offset_body is None
+                            offset_body = (
+                                candidate if first_sample else
+                                0.8 * offset_body + 0.2 * candidate)
+                            self._assembly_cog_offset_body = offset_body
+                            self._assembly_cog_offset_stamp = float(source_stamp)
+                            if first_sample:
+                                rospy.loginfo(
+                                    "Initialized geometric-center -> control-CoG "
+                                    "offset in body frame: "
+                                    "(%.1f, %.1f, %.1f)mm",
+                                    *(offset_body * 1000.0))
+
+        if offset_body is None:
+            rospy.logwarn_once(
+                "Assembly CoG offset is not available yet; using the nominal "
+                "geometric-center command")
+            return tuple(geometric_center_target)
+
+        command_yaw = target_yaw
+        if command_yaw is None:
+            command_yaw = self.formation_adapter.get_assembly_yaw()
+        command_yaw = float(command_yaw) if command_yaw is not None else 0.0
+        cos_yaw = math.cos(command_yaw)
+        sin_yaw = math.sin(command_yaw)
+        offset_target_world = np.array([
+            cos_yaw * offset_body[0] - sin_yaw * offset_body[1],
+            sin_yaw * offset_body[0] + cos_yaw * offset_body[1],
+            offset_body[2],
+        ])
+        return tuple(
+            np.asarray(geometric_center_target, dtype=float) +
+            offset_target_world)
+
     def send_assembly_command_from_end_effector(self, target_end_effector_pos, target_yaw=None,
                                                linear_vel=None, angular_vel=None):
-        """Send assembly command by transforming end-effector target to assembly CoG"""
-        assembly_target = self.formation_adapter.transform_end_effector_to_assembly_command(
+        """Send an EE target using the actual FlightNav.COG control origin."""
+        geometric_center_target = self.formation_adapter.transform_end_effector_to_assembly_command(
             target_end_effector_pos, target_yaw
         )
+        assembly_target = self._control_cog_target(
+            geometric_center_target, target_yaw)
 
         ee_target_vec = np.array(target_end_effector_pos, dtype=float)
         assembly_target_vec = np.array(assembly_target, dtype=float)
@@ -655,15 +794,193 @@ class FormationSingleUAVStateBase(smach.State):
             angular_vel=angular_vel_cmd
         )
 
+    def _dual_fang_insertion_geometry(self, control_ee_pos, ee_yaw,
+                                      valve_pos):
+        """Return the actual two-pin clearance to the valve's inner rim."""
+        try:
+            ee_xy = np.asarray(control_ee_pos, dtype=float).reshape(-1)[:2]
+            valve_xy = np.asarray(valve_pos, dtype=float).reshape(-1)[:2]
+            yaw = float(ee_yaw)
+        except (TypeError, ValueError):
+            return None
+        if (ee_xy.size != 2 or valve_xy.size != 2 or
+                not np.all(np.isfinite(ee_xy)) or
+                not np.all(np.isfinite(valve_xy)) or
+                not math.isfinite(yaw)):
+            return None
+
+        optimizer = getattr(self, 'optimizer', None)
+        adapter = getattr(self, 'formation_adapter', None)
+        calculator = getattr(adapter, 'tf_calculator', None)
+        if optimizer is None or calculator is None:
+            return None
+        midpoint_dx = (
+            optimizer.dual_fang_center_offset -
+            calculator.dual_fang_center_offset)
+        midpoint_dy = -calculator.end_effector_offset_y
+        half_separation = optimizer.half_claw_separation
+        # The two URDF collision cylinders are 0.52 mm apart in X; their
+        # midpoint is the optimizer's 253.46 mm fang-center definition.
+        pin_offsets_body = (
+            (midpoint_dx - 0.00026, midpoint_dy + half_separation),
+            (midpoint_dx + 0.00026, midpoint_dy - half_separation),
+        )
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        pin_centers = []
+        for pin_x, pin_y in pin_offsets_body:
+            pin_centers.append(np.array([
+                ee_xy[0] + cos_yaw * pin_x - sin_yaw * pin_y,
+                ee_xy[1] + sin_yaw * pin_x + cos_yaw * pin_y,
+            ]))
+
+        pin_center_radii = [
+            float(np.linalg.norm(pin - valve_xy)) for pin in pin_centers]
+        fang_collision_radius = 0.006
+        valve_inner_collision_radius = 0.0975
+        required_clearance = 0.005
+        clearance = (
+            valve_inner_collision_radius -
+            (max(pin_center_radii) + fang_collision_radius))
+        midpoint = 0.5 * (pin_centers[0] + pin_centers[1])
+        return {
+            'safe': clearance >= required_clearance,
+            'clearance': clearance,
+            'required_clearance': required_clearance,
+            'midpoint': midpoint,
+            'pin_center_radii': pin_center_radii,
+        }
+
+    def _log_dual_fang_insertion_geometry(self, geometry, phase_name):
+        if geometry is None:
+            rospy.logwarn(
+                "[%s] Dual-fang geometry unavailable; clearance cannot be "
+                "verified", phase_name)
+            return
+        log = rospy.loginfo if geometry['safe'] else rospy.logwarn
+        log(
+            "[%s] Dual-fang midpoint=(%.3f, %.3f), pin radii=(%.1f, %.1f)mm, "
+            "rim clearance=%.1fmm (required %.1fmm)%s",
+            phase_name,
+            geometry['midpoint'][0], geometry['midpoint'][1],
+            geometry['pin_center_radii'][0] * 1000.0,
+            geometry['pin_center_radii'][1] * 1000.0,
+            geometry['clearance'] * 1000.0,
+            geometry['required_clearance'] * 1000.0,
+            "" if geometry['safe'] else "; correction is recommended")
+
+    def _dual_fang_clearance_allows_handoff(self, geometry):
+        """Allow positive-clearance simulation handoff below the 5 mm margin."""
+        if geometry is None:
+            return False
+        if geometry['safe']:
+            return True
+        return (
+            not getattr(self, 'real_hardware_mode', False) and
+            geometry['clearance'] >= 0.0)
+
+    def _wait_for_stable_descent_pose(self, hold_pos, hold_yaw, valve_pos,
+                                      description):
+        """Hold one pose until both feedback motion and fang geometry settle."""
+        hold_pos = tuple(float(value) for value in hold_pos)
+        hold_yaw = float(hold_yaw)
+        previous_pos = np.asarray(
+            self.get_end_effector_position(), dtype=float).reshape(-1)
+        previous_yaw = self.get_end_effector_yaw()
+        last_pos = hold_pos
+        last_yaw = hold_yaw
+        settle_duration = 1.0
+
+        while not rospy.is_shutdown():
+            halt_checker = getattr(
+                getattr(self, 'beetle', None), 'getTaskHaltFlag', None)
+            if callable(halt_checker) and halt_checker():
+                rospy.logwarn(
+                    "[%s] Task halt requested while waiting for a stable pose",
+                    description)
+                return False, last_pos, last_yaw
+
+            self.active_stabilization_wait(
+                hold_pos, hold_yaw, settle_duration, description)
+            current_pos = self.get_end_effector_position()
+            current_yaw = self.get_end_effector_yaw()
+            current_array = (
+                np.asarray(current_pos, dtype=float).reshape(-1)
+                if current_pos is not None else np.array([]))
+            feedback_valid = (
+                current_array.size == 3 and
+                np.all(np.isfinite(current_array)) and
+                current_yaw is not None and
+                math.isfinite(float(current_yaw)) and
+                self._formation_feedback_is_fresh())
+            if not feedback_valid:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s] Holding: end-effector feedback is invalid or stale",
+                    description)
+                continue
+
+            current_yaw = float(current_yaw)
+            last_pos = tuple(current_array)
+            last_yaw = current_yaw
+            previous_valid = (
+                previous_pos.size == 3 and
+                np.all(np.isfinite(previous_pos)) and
+                previous_yaw is not None and
+                math.isfinite(float(previous_yaw)))
+            position_motion = (
+                float(np.linalg.norm(current_array - previous_pos))
+                if previous_valid else float('inf'))
+            yaw_motion = (
+                abs(FormationUtils.normalize_angle(
+                    current_yaw - float(previous_yaw)))
+                if previous_valid else float('inf'))
+            position_delta = (
+                current_array - np.asarray(hold_pos, dtype=float))
+            xy_error = float(np.linalg.norm(position_delta[:2]))
+            z_error = abs(float(position_delta[2]))
+            yaw_error = abs(FormationUtils.normalize_angle(
+                current_yaw - hold_yaw))
+            geometry = self._dual_fang_insertion_geometry(
+                current_array, current_yaw, valve_pos)
+            geometry_ok = valve_pos is None or (
+                geometry is not None and geometry['safe'])
+
+            if (position_motion <= self.vel_threshold * settle_duration and
+                    yaw_motion <= self.max_angular_velocity * settle_duration and
+                    xy_error <= self.pos_threshold and
+                    z_error <= self.vel_threshold * settle_duration and
+                    yaw_error <= 0.044 and geometry_ok):
+                return True, last_pos, last_yaw
+
+            clearance = (
+                geometry['clearance'] * 1000.0
+                if geometry is not None else float('nan'))
+            rospy.logwarn_throttle(
+                2.0,
+                "[%s] Holding for another %.1fs: motion=%.1fmm, "
+                "yaw_motion=%.1fdeg, XY_error=%.1fmm, Z_error=%.1fmm, "
+                "yaw_error=%.1fdeg, fang_clearance=%.1fmm",
+                description, settle_duration,
+                position_motion * 1000.0, math.degrees(yaw_motion),
+                xy_error * 1000.0, z_error * 1000.0,
+                math.degrees(yaw_error), clearance)
+            previous_pos = current_array
+            previous_yaw = current_yaw
+
+        return False, last_pos, last_yaw
+
 
     def streaming_z_descent(self, start_pos, final_target, final_yaw,
-                             descent_speed=0.05, contact_detection_remaining=None):
+                             descent_speed=0.05, contact_detection_remaining=None,
+                             xy_pause_near=0.050, valve_pos=None):
         """Streaming Z descent with inline contact detection at 25Hz.
 
         Uses polynomial trajectory for smooth continuous descent while monitoring
         actual Z motion each cycle. If Z stops moving (contact), locks height.
         When contact_detection_remaining is set, contact is only accepted near
         the target Z so command/plant lag at high clearance is ignored.
+        Valve-specific fang geometry guards run only when valve_pos is provided.
 
         Returns:
             (success, achieved_position)
@@ -682,14 +999,13 @@ class FormationSingleUAVStateBase(smach.State):
         start_z = start_pos[2]
         total_descent = start_z - target_z
 
-        if total_descent <= 0.01:
-            rospy.loginfo(f"[Z Descent] Small descent, direct convergence{debug_suffix()}")
-            self.send_assembly_command_from_end_effector(final_target, final_yaw)
-            success = self.active_position_convergence(
-                final_target, target_yaw=final_yaw,
-                pos_thresh=0.080, yaw_thresh=0.087, timeout=10.0)
-            achieved = self.get_end_effector_position() or final_target
-            return success, achieved
+        initial_actual_pos = self.get_end_effector_position()
+        if initial_actual_pos is None:
+            rospy.logerr("[Z Descent] Missing initial measured pose")
+            self.send_assembly_command_from_end_effector(
+                start_pos, final_yaw)
+            return False, start_pos
+        last_actual_pos = initial_actual_pos
 
         rospy.loginfo(f"[Z Descent] {total_descent*1000:.1f}mm at "
                       f"{descent_speed*1000:.0f}mm/s{debug_suffix()}")
@@ -713,23 +1029,109 @@ class FormationSingleUAVStateBase(smach.State):
 
         # XY adaptive pause: threshold narrows linearly with descent progress
         xy_pause_far = 0.120   # 120mm at start (loose)
-        xy_pause_near = 0.050  # 50mm near valve (tight)
-        xy_resume_ratio = 0.6  # resume when error < 60% of pause threshold
         xy_diverge_limit = 0.300  # absolute abort
         paused = False
         pause_z = None         # frozen cmd_z while paused
         pause_elapsed = 0.0    # accumulated pause time
         pause_timeout = 5.0    # max pause before abort
         traj_time = 0.0        # trajectory time (freezes during pause)
+        geometry_recovery_z = None
 
         rate = rospy.Rate(25)
         t0 = rospy.get_time()
         dt = 1.0 / 25.0
 
         while not rospy.is_shutdown():
-            wall_t = rospy.get_time() - t0
             if traj_time >= duration:
                 break
+
+            # Validate feedback and geometry before publishing the next lower-Z
+            # command.  Missing or unsafe feedback must never advance descent.
+            actual_pos = self.get_end_effector_position()
+            if actual_pos is None:
+                self.send_assembly_command_from_end_effector(
+                    last_actual_pos, final_yaw)
+                rospy.logwarn(
+                    "[Z Descent] End-effector feedback unavailable; holding "
+                    "the latest measured pose")
+                return False, last_actual_pos
+            last_actual_pos = actual_pos
+            if valve_pos is not None:
+                actual_yaw = self.get_end_effector_yaw()
+                geometry = self._dual_fang_insertion_geometry(
+                    actual_pos, actual_yaw, valve_pos)
+                feedback_fresh = self._formation_feedback_is_fresh()
+                if (geometry is None or not feedback_fresh):
+                    hold_yaw = (
+                        float(actual_yaw)
+                        if actual_yaw is not None and
+                        math.isfinite(float(actual_yaw)) else final_yaw)
+                    self.send_assembly_command_from_end_effector(
+                        actual_pos, hold_yaw)
+                    self._log_dual_fang_insertion_geometry(
+                        geometry, "Z Descent guard")
+                    rospy.logwarn(
+                        "[Z Descent] Geometry or feedback unavailable; "
+                        "holding the measured pose and stopping descent")
+                    return False, actual_pos
+
+                if not self._dual_fang_clearance_allows_handoff(geometry):
+                    hold_yaw = (
+                        float(actual_yaw)
+                        if actual_yaw is not None and
+                        math.isfinite(float(actual_yaw)) else final_yaw)
+                    remaining_to_target = actual_pos[2] - target_z
+                    recovery_boundary = (
+                        contact_detection_remaining
+                        if contact_detection_remaining is not None else 0.060)
+                    self._log_dual_fang_insertion_geometry(
+                        geometry, "Z Descent guard")
+
+                    if remaining_to_target <= recovery_boundary:
+                        self.send_assembly_command_from_end_effector(
+                            actual_pos, hold_yaw)
+                        rospy.logwarn(
+                            "[Z Descent] Dual-fang overlap inside the final "
+                            "%.0fmm insertion region; freezing the measured "
+                            "pose and stopping descent",
+                            recovery_boundary * 1000.0)
+                        return False, actual_pos
+
+                    if geometry_recovery_z is None:
+                        geometry_recovery_z = actual_pos[2]
+                    recovery_target = (
+                        target_x, target_y, geometry_recovery_z)
+                    recovery_start = rospy.get_time()
+                    rospy.logwarn(
+                        "[Z Descent] Dual-fang overlap detected %.0fmm above "
+                        "the target; freezing Z=%.3fm and restoring the "
+                        "locked pre-descent XY/yaw",
+                        remaining_to_target * 1000.0, geometry_recovery_z)
+                    recovered, recovered_pos, _ = (
+                        self._wait_for_stable_descent_pose(
+                            recovery_target, final_yaw, valve_pos,
+                            "high-clearance Z-descent realignment"))
+                    recovery_end = rospy.get_time()
+                    if not recovered:
+                        return False, recovered_pos
+                    if paused:
+                        pause_elapsed += max(
+                            0.0, recovery_end - pause_start)
+                        paused = False
+                        pause_z = None
+                    else:
+                        pause_elapsed += max(
+                            0.0, recovery_end - recovery_start)
+                    last_actual_pos = recovered_pos
+                    prev_actual_z = recovered_pos[2]
+                    consecutive_small = 0
+                    rospy.loginfo(
+                        "[Z Descent] Locked XY/yaw recovered with stable fang "
+                        "clearance; resuming vertical descent")
+                    rate.sleep()
+                    continue
+
+            wall_t = rospy.get_time() - t0
 
             # Commanded Z from trajectory (frozen when paused)
             if not paused:
@@ -747,12 +1149,7 @@ class FormationSingleUAVStateBase(smach.State):
             vel = [0.0, 0.0, vel_z]
 
             self.send_assembly_command_from_end_effector(cmd_pos, final_yaw, linear_vel=vel)
-
-            # Read actual position
-            actual_pos = self.get_end_effector_position()
-            if actual_pos is None:
-                rate.sleep()
-                continue
+            geometry_recovery_z = None
 
             actual_z = actual_pos[2]
             xy_error = math.sqrt((actual_pos[0] - target_x)**2 + (actual_pos[1] - target_y)**2)
@@ -768,7 +1165,7 @@ class FormationSingleUAVStateBase(smach.State):
             if total_descent > 0:
                 progress = max(0.0, min((start_z - actual_z) / total_descent, 1.0))
             xy_pause_thresh = xy_pause_far + (xy_pause_near - xy_pause_far) * progress
-            xy_resume_thresh = xy_pause_thresh * xy_resume_ratio
+            xy_resume_thresh = 0.030  # fixed 30mm recovery tolerance
 
             if paused:
                 if xy_error < xy_resume_thresh:
@@ -778,7 +1175,7 @@ class FormationSingleUAVStateBase(smach.State):
                                  f"(thresh={xy_resume_thresh*1000:.0f}mm)")
                 elif rospy.get_time() - pause_start > pause_timeout:
                     rospy.logwarn(f"[Z Descent] XY pause timeout {pause_timeout}s, "
-                                 f"XY_err={xy_error*1000:.0f}mm, aborting{debug_suffix()}")
+                                 f"XY_err={xy_error*1000:.0f}mm, stopping descent{debug_suffix()}")
                     return False, actual_pos
             else:
                 if xy_error > xy_pause_thresh:
@@ -835,7 +1232,10 @@ class FormationSingleUAVStateBase(smach.State):
             rate.sleep()
 
         # Determine achieved position
-        achieved = contact_pos or self.get_end_effector_position() or final_target
+        achieved = contact_pos or self.get_end_effector_position()
+        if achieved is None:
+            rospy.logerr("[Z Descent] No measured pose available at completion")
+            return False, None
         descended = start_z - achieved[2]
         remaining = achieved[2] - target_z
 
@@ -939,7 +1339,7 @@ class FormationSingleUAVStateBase(smach.State):
             'duration': trajectory_duration,
         }
 
-    def execute_polynomial_trajectory(self, traj_desc):
+    def execute_polynomial_trajectory(self, traj_desc, pos_thresh=0.050):
         """Stream polynomial trajectory at 25Hz, then brief final convergence."""
         traj_x = traj_desc['traj_x']
         traj_y = traj_desc['traj_y']
@@ -990,7 +1390,7 @@ class FormationSingleUAVStateBase(smach.State):
         rospy.loginfo("Streaming complete, final convergence")
         return self.active_position_convergence(
             target_pos, target_yaw,
-            pos_thresh=0.050, yaw_thresh=0.087, timeout=15.0
+            pos_thresh=pos_thresh, yaw_thresh=0.087, timeout=15.0
         )
 
 
@@ -1056,10 +1456,19 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             input_keys=['valve_position', 'valve_yaw'],
             output_keys=['phase4_contact_pose', 'phase4_contact_yaw'])
 
-        # Convergence thresholds (based on single UAV proven values)
-        self.pos_threshold = 0.02         # 20mm position threshold (same as single)
+        # Keep the proven real-hardware tolerance, but require simulation to
+        # converge tightly enough for collision-free insertion.
+        simulation = bool(rospy.get_param("~simulation", True))
+        real_machine = bool(rospy.get_param("~real_machine", False))
+        self.real_hardware_mode = real_machine and not simulation
+        self.pos_threshold = 0.050 if self.real_hardware_mode else 0.030
         self.yaw_threshold = 0.05         # ~2.9 deg yaw threshold (same as single)
         self.vel_threshold = 0.01         # 10mm/s velocity threshold (same as single)
+
+        rospy.loginfo(
+            "Valve insertion XY tolerance: %.0fmm (%s)",
+            self.pos_threshold * 1000.0,
+            "real hardware" if self.real_hardware_mode else "simulation")
 
         # Final positioning accuracy
         self.final_pos_threshold = 0.015  # 15mm final accuracy (slightly relaxed from single's 10mm)
@@ -1070,6 +1479,50 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
         # Formation-specific safety margins (more conservative than single)
         self.formation_safety_factor = 0.8  # 20% safety margin for formation coordination
+
+    def _fang_midpoint_to_control_ee(self, fang_midpoint, yaw):
+        """Express the optimizer fang-midpoint target in the control EE frame."""
+        optimizer_offset = np.array([
+            self.optimizer.dual_fang_center_offset,
+            0.0,
+            self.optimizer.end_effector_offset_z,
+        ])
+        control_offset = np.array([
+            self.formation_adapter.tf_calculator.dual_fang_center_offset,
+            self.formation_adapter.tf_calculator.end_effector_offset_y,
+            self.formation_adapter.tf_calculator.end_effector_offset_z,
+        ])
+        body_delta = control_offset - optimizer_offset
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        world_delta = np.array([
+            body_delta[0] * cos_yaw - body_delta[1] * sin_yaw,
+            body_delta[0] * sin_yaw + body_delta[1] * cos_yaw,
+            body_delta[2],
+        ])
+        return tuple(np.asarray(fang_midpoint, dtype=float) + world_delta)
+
+    def _can_continue_after_convergence_timeout(self, phase_name):
+        """Treat a finite-pose convergence timeout as a best-effort result."""
+        if getattr(self, 'last_convergence_failure_reason', None) != "timeout":
+            return False
+
+        current_pos = self.get_end_effector_position()
+        current_yaw = self.get_end_effector_yaw()
+        if (current_pos is None or current_yaw is None or
+                len(current_pos) != 3 or
+                not np.all(np.isfinite(np.asarray(current_pos, dtype=float))) or
+                not math.isfinite(float(current_yaw))):
+            rospy.logerr(
+                f"[{phase_name}] Cannot continue after timeout: "
+                "end-effector feedback is invalid")
+            return False
+
+        rospy.logwarn(
+            f"[{phase_name}] Setpoint convergence incomplete after the "
+            "positioning attempt; continuing to the next phase with the "
+            "latest valid feedback")
+        return True
 
     def execute(self, userdata):
         """Execute 4-phase movement using optimizer-driven targets (single UAV logic)"""
@@ -1097,37 +1550,40 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         # Cache for later states (descend/contact, etc.)
         FormationMoveToValveState._shared_optimizer_strategy = strategy
 
-        safe_ee_pos = strategy.get('safe_end_effector_center')
-        if safe_ee_pos is None:
-            fallback_pos = strategy.get('safe_uav_position')
-            if fallback_pos is not None:
-                rospy.logwarn_once("Optimizer strategy missing safe_end_effector_center; using safe_uav_position as fallback")
-                safe_ee_pos = fallback_pos
-            else:
-                rospy.logwarn_once("Optimizer strategy missing end-effector target; using current EE pose")
-                safe_ee_pos = current_ee_pos
         safe_ee_yaw = strategy['safe_uav_yaw'] if 'safe_uav_yaw' in strategy else valve_yaw
-        safe_ee_pos = tuple(safe_ee_pos)
+        safe_fang_midpoint = strategy.get('safe_end_effector_center')
+        if safe_fang_midpoint is None:
+            rospy.logerr("Optimizer strategy missing safe_end_effector_center")
+            return 'failed'
+        safe_fang_midpoint = tuple(safe_fang_midpoint)
+        safe_ee_pos = self._fang_midpoint_to_control_ee(
+            safe_fang_midpoint, safe_ee_yaw)
+        rospy.loginfo(
+            "Optimizer fang midpoint %s -> control EE %s",
+            FormationUtils.format_vec(safe_fang_midpoint),
+            FormationUtils.format_vec(safe_ee_pos))
 
         # Optional Z offset compensation (disabled by default)
         formation_z_offset = rospy.get_param("~formation_phase4_z_offset", 0.0)
         if abs(formation_z_offset) > 1e-4:
             compensated_z = safe_ee_pos[2] + formation_z_offset
             rospy.loginfo(
-                f"[Phase4] Apply Z compensation {formation_z_offset*1000:.0f}mm -> {compensated_z:.3f}m"
+                f"[Phase4] Apply control-EE Z compensation "
+                f"{formation_z_offset*1000:.0f}mm -> {compensated_z:.3f}m"
             )
             safe_ee_pos = (safe_ee_pos[0], safe_ee_pos[1], compensated_z)
         else:
-            rospy.loginfo(f"[Phase4] Using optimizer target: {safe_ee_pos[2]:.3f}m (valve height)")
+            rospy.loginfo(
+                f"[Phase4] Control EE target Z={safe_ee_pos[2]:.3f}m "
+                f"for fang midpoint Z={safe_fang_midpoint[2]:.3f}m")
 
-        # Validate target height matches valve height
-        expected_valve_height = valve_pos[2]
-        actual_target_height = safe_ee_pos[2]
-        height_difference = abs(actual_target_height - expected_valve_height)
-        if height_difference > 0.01:
-            rospy.logwarn(f"Phase4 target {actual_target_height:.3f}m differs from valve {expected_valve_height:.3f}m by {height_difference*1000:.1f}mm")
-        else:
-            rospy.loginfo(f"Phase4 target {actual_target_height:.3f}m matches valve {expected_valve_height:.3f}m (diff: {height_difference*1000:.1f}mm)")
+        actual_target_height = safe_fang_midpoint[2] + formation_z_offset
+        rospy.loginfo(
+            "[Phase4] Fang midpoint target Z=%.3fm includes %.1fmm "
+            "configured insertion offset from valve Z=%.3fm",
+            actual_target_height,
+            (actual_target_height - valve_pos[2]) * 1000.0,
+            valve_pos[2])
 
         # Share target Z for Contact phase consistency
         FormationSingleUAVStateBase._shared_target_z = safe_ee_pos[2]
@@ -1149,10 +1605,14 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
         xy_target_ee_pos = (safe_ee_pos[0], safe_ee_pos[1], phase1_ee_pos[2])
         rospy.loginfo(f"[Phase 2] Move to safe XY: Target {FormationUtils.format_vec(xy_target_ee_pos)}")
-        if not self._execute_formation_phase2_xy_movement(xy_target_ee_pos, current_yaw_for_phase2):
-            rospy.logerr("Phase 2 failed: XY movement unsuccessful")
-            return 'failed'
-        rospy.loginfo("Phase 2 completed: Reached optimizer XY position")
+        phase2_converged = self._execute_formation_phase2_xy_movement(
+            xy_target_ee_pos, current_yaw_for_phase2)
+        if not phase2_converged:
+            if not self._can_continue_after_convergence_timeout("Phase 2"):
+                rospy.logerr("Phase 2 failed: XY movement unsuccessful")
+                return 'failed'
+        else:
+            rospy.loginfo("Phase 2 completed: Reached optimizer XY position")
 
         # PHASE 3: PRECISION XY & YAW (spoke alignment)
         phase2_ee_pos = self.get_end_effector_position()
@@ -1164,10 +1624,14 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         # PHASE 3A: XY precision positioning (keep Z, do not descend yet)
         phase3a_target_pos = (safe_ee_pos[0], safe_ee_pos[1], phase2_ee_pos[2])
         rospy.loginfo(f"[Phase 3A] Precision XY: Lock Z {phase3a_target_pos[2]:.3f}m")
-        if not self._execute_formation_phase3a_xy_positioning(phase3a_target_pos, phase2_yaw):
-            rospy.logerr("Phase 3A failed")
-            return 'failed'
-        rospy.loginfo("Phase 3A complete: XY precision achieved")
+        phase3a_converged = self._execute_formation_phase3a_xy_positioning(
+            phase3a_target_pos, phase2_yaw)
+        if not phase3a_converged:
+            if not self._can_continue_after_convergence_timeout("Phase 3A"):
+                rospy.logerr("Phase 3A failed")
+                return 'failed'
+        else:
+            rospy.loginfo("Phase 3A complete: XY precision achieved")
 
         # PHASE 3B: Spoke-aligned yaw
         phase3a_ee_pos = self.get_end_effector_position()
@@ -1176,18 +1640,21 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             return 'failed'
 
         optimal_spoke_yaw = self.calculate_shortest_yaw_path(phase2_yaw, safe_ee_yaw)
-        if not self._execute_formation_phase3b_spoke_alignment(phase3a_ee_pos, optimal_spoke_yaw, phase3a_target_pos):
+        if not self._execute_formation_phase3b_spoke_alignment(
+                phase3a_ee_pos, optimal_spoke_yaw, phase3a_target_pos,
+                valve_pos):
             rospy.logerr("Phase 3B failed")
             return 'failed'
-        rospy.loginfo("Phase 3B complete: Spoke alignment achieved")
+        rospy.loginfo("Phase 3B complete: proceeding to Z descent")
 
         # PHASE 4: Z DESCENT TO OPTIMIZER HEIGHT
         final_target_pos = (safe_ee_pos[0], safe_ee_pos[1], safe_ee_pos[2])
 
         final_yaw = optimal_spoke_yaw
 
-        if not self._execute_formation_phase4_z_descent(final_target_pos, final_yaw):
-            rospy.logerr("Phase 4 failed: Z descent unsuccessful")
+        if not self._execute_formation_phase4_z_descent(
+                final_target_pos, final_yaw, valve_pos):
+            rospy.logerr("Phase 4 failed: insertion descent/handoff unsuccessful")
             return 'failed'
         rospy.loginfo("Phase 4 complete: insertion height reached")
 
@@ -1196,7 +1663,11 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         if phase4_pose is None:
             phase4_pose = self.get_end_effector_position() or final_target_pos
         userdata.phase4_contact_pose = phase4_pose
-        userdata.phase4_contact_yaw = self.get_end_effector_yaw() or final_yaw
+        phase4_yaw = getattr(self, '_last_phase4_contact_yaw', None)
+        if phase4_yaw is None:
+            phase4_yaw = self.get_end_effector_yaw()
+        userdata.phase4_contact_yaw = (
+            phase4_yaw if phase4_yaw is not None else final_yaw)
 
         # Debug: Log Phase4 completion state (use logdebug to reduce verbosity)
         if rospy.get_param("~debug_verbose", False):
@@ -1210,26 +1681,12 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.logdebug(f"  Current Assembly CoG: {FormationUtils.format_vec(current_assembly_pos) if current_assembly_pos else 'None'}")
             rospy.logdebug(f"  Current yaw: {math.degrees(current_ee_yaw):.1f} deg" if current_ee_yaw is not None else "  Current yaw: None")
             rospy.logdebug(f"  Passed to Contact phase: {FormationUtils.format_vec(phase4_pose)}")
-            contact_yaw = self.get_end_effector_yaw() or final_yaw
+            contact_yaw = userdata.phase4_contact_yaw
             rospy.logdebug(f"  Contact phase yaw: {math.degrees(contact_yaw):.1f} deg" if contact_yaw is not None else "  Contact yaw: None")
             if current_ee_pos and current_assembly_pos:
                 ee_assembly_diff = [(current_ee_pos[i] - current_assembly_pos[i]) * 1000 for i in range(3)]
                 rospy.logdebug(f"  EE-Assembly offset: ({ee_assembly_diff[0]:.1f}, {ee_assembly_diff[1]:.1f}, {ee_assembly_diff[2]:.1f})mm")
             rospy.logdebug("=" * 80)
-
-        # Post-insertion stabilization
-        if hasattr(self, '_last_phase4_contact_position') and self._last_phase4_contact_position is not None:
-            rospy.loginfo(f"5s stabilization at {FormationUtils.format_vec(self._last_phase4_contact_position)}, yaw={math.degrees(final_yaw):.1f} deg")
-            self.active_stabilization_wait(self._last_phase4_contact_position, final_yaw, 5.0, "Post-insertion")
-        else:
-            rospy.logwarn("Phase4 position not found, using current position")
-            current_ee_pos = self.get_end_effector_position()
-            current_ee_yaw = self.get_end_effector_yaw()
-            if current_ee_pos and current_ee_yaw is not None:
-                self.active_stabilization_wait(current_ee_pos, current_ee_yaw, 5.0, "Post-insertion")
-            else:
-                rospy.logwarn("Cannot get position, passive wait")
-                rospy.sleep(5.0)
 
         rospy.loginfo("=== Formation move-to-valve complete ===")
         return 'succeeded'
@@ -1255,6 +1712,7 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
         yaw_ok = True
         yaw_error = None
         if target_yaw is not None and yaw_thresh is not None:
+            yaw_ok = False
             current_yaw = self.get_end_effector_yaw()
             if current_yaw is not None:
                 yaw_error = abs(FormationUtils.normalize_angle(target_yaw - current_yaw))
@@ -1264,7 +1722,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
 
     def _execute_xy_positioning(self, target_pos, target_yaw, phase_name="XY",
                                 use_trajectory=True, pos_thresh=0.050, yaw_thresh=0.087,
-                                timeout=15.0):
+                                timeout=15.0,
+                                position_feedforward_deadband=None):
         """
         Generic XY positioning method used by Phase 2, 3A, 3B
         Reduces code duplication by parametrizing behavior
@@ -1284,7 +1743,8 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.loginfo(f"[{phase_name}] Using direct convergence")
             return self.active_position_convergence(
                 target_pos=target_pos, target_yaw=target_yaw,
-                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout
+                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout,
+                position_feedforward_deadband=position_feedforward_deadband
             )
 
         # Streaming trajectory execution (includes final convergence)
@@ -1298,17 +1758,19 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             rospy.logwarn(f"[{phase_name}] Trajectory generation failed, using direct convergence")
             return self.active_position_convergence(
                 target_pos=target_pos, target_yaw=target_yaw,
-                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh, timeout=timeout * 1.5
+                pos_thresh=pos_thresh, yaw_thresh=yaw_thresh,
+                timeout=timeout * 1.5,
+                position_feedforward_deadband=position_feedforward_deadband
             )
 
-        return self.execute_polynomial_trajectory(traj_desc)
+        return self.execute_polynomial_trajectory(traj_desc, pos_thresh=pos_thresh)
 
     def _execute_formation_phase2_xy_movement(self, xy_target_ee_pos, maintain_yaw):
         """Phase 2: Pure XY movement using streaming polynomial trajectory (Formation version)"""
         return self._execute_xy_positioning(
             target_pos=xy_target_ee_pos, target_yaw=maintain_yaw,
             phase_name="Phase2", use_trajectory=True,
-            pos_thresh=0.050, yaw_thresh=0.087, timeout=15.0
+            pos_thresh=self.pos_threshold, yaw_thresh=0.087, timeout=15.0
         )
 
     def _calculate_spoke_alignment_yaw(self, current_ee_pos, valve_pos):
@@ -1358,144 +1820,357 @@ class FormationMoveToValveState(FormationSingleUAVStateBase):
             success = self._execute_xy_positioning(
                 target_pos=xy_target, target_yaw=maintain_yaw,
                 phase_name=f"Phase3A-{attempt}", use_trajectory=False,
-                pos_thresh=0.050, yaw_thresh=0.087, timeout=5.0
+                pos_thresh=self.pos_threshold, yaw_thresh=0.087, timeout=5.0
             )
 
             if success:
                 pos_ok, _, xy_error, z_error, _ = self._check_positioning_error(
-                    (xy_target[0], xy_target[1], locked_z), pos_thresh=0.050
+                    (xy_target[0], xy_target[1], locked_z), pos_thresh=self.pos_threshold
                 )
                 if pos_ok:
                     rospy.loginfo(f"Phase 3A successful: XY={xy_error*1000:.1f}mm, Z={z_error*1000:.1f}mm")
                     return True
 
-        rospy.logerr("Phase 3A failed after 3 attempts")
+        rospy.logwarn("Phase 3A did not converge after 3 attempts")
         return False
 
-    def _execute_formation_phase3b_spoke_alignment(self, current_ee_pos, spoke_yaw, target_pos=None):
+    def _execute_formation_phase3b_spoke_alignment(
+            self, current_ee_pos, spoke_yaw, target_pos=None,
+            valve_pos=None):
         """Phase 3B: Spoke yaw alignment with XY/Z locked"""
         reference_xy = (target_pos[0], target_pos[1]) if target_pos else (current_ee_pos[0], current_ee_pos[1])
         reference_z = target_pos[2] if target_pos else current_ee_pos[2]
         locked_pos = (reference_xy[0], reference_xy[1], reference_z)
 
+        yaw_aligned = False
         for attempt in range(1, 4):
             rospy.loginfo(f"[Phase3B] Attempt {attempt}/3 - Yaw to {math.degrees(spoke_yaw):.1f} deg")
 
-            # Strict: try 2.5 deg with full timeout (large rotation needs time)
             success = self.active_position_convergence(
                 target_pos=locked_pos, target_yaw=spoke_yaw,
-                pos_thresh=0.050, yaw_thresh=0.044, timeout=10.0,
-                max_yaw_step=math.radians(10.0)
+                pos_thresh=self.pos_threshold, yaw_thresh=0.044,
+                timeout=35.0,
+                max_yaw_step=math.radians(3.0),
+                max_angular_vel=self.max_angular_velocity,
+                position_feedforward_deadband=0.020
             )
 
             if success:
-                pos_ok, yaw_ok, xy_error, z_error, yaw_error = self._check_positioning_error(
-                    locked_pos, spoke_yaw, pos_thresh=0.050, yaw_thresh=0.044
-                )
-                if pos_ok and yaw_ok:
-                    rospy.loginfo(f"Phase 3B successful (strict 2.5 deg): XY={xy_error*1000:.1f}mm, yaw={math.degrees(yaw_error):.1f} deg")
+                yaw_aligned = True
+                break
+
+            if getattr(self, 'last_convergence_failure_reason', None) == "diverged":
+                rospy.logerr(
+                    "[Phase3B] Position diverged during yaw alignment; "
+                    "not treating this safety abort as a correctable residual")
+                return False
+
+            _, yaw_ok, _, _, yaw_error = self._check_positioning_error(
+                locked_pos, spoke_yaw,
+                pos_thresh=self.pos_threshold, yaw_thresh=0.087)
+            if yaw_ok:
+                rospy.logwarn(
+                    f"[Phase3B] Strict convergence not reached; "
+                    f"yaw={math.degrees(yaw_error):.1f} deg < 5 deg - accepting")
+                yaw_aligned = True
+                break
+
+        if not yaw_aligned:
+            if not self._can_continue_after_convergence_timeout(
+                    "Phase 3B yaw alignment"):
+                rospy.logerr("Phase 3B yaw alignment failed after 3 attempts")
+                return False
+            rospy.logwarn(
+                "[Phase3B] Yaw alignment remains outside tolerance; "
+                "performing the configured XY realignment before descent")
+
+        geometry = None
+        pos_ok = yaw_ok = False
+        for check_index in range(3):
+            pos_ok, yaw_ok, xy_error, _, yaw_error = \
+                self._check_positioning_error(
+                    locked_pos, spoke_yaw,
+                    pos_thresh=self.final_pos_threshold, yaw_thresh=0.044)
+            measured_pos = self.get_end_effector_position()
+            measured_yaw = self.get_end_effector_yaw()
+            if (measured_pos is None or measured_yaw is None or
+                    len(measured_pos) != 3 or
+                    not np.all(np.isfinite(
+                        np.asarray(measured_pos, dtype=float))) or
+                    not math.isfinite(float(measured_yaw))):
+                rospy.logerr(
+                    "[Phase3B] Cannot continue without a valid measured pose")
+                return False
+
+            if valve_pos is not None:
+                geometry = self._dual_fang_insertion_geometry(
+                    measured_pos, measured_yaw, valve_pos)
+                phase_name = (
+                    "Phase3B pre-descent" if check_index == 0 else
+                    f"Phase3B correction {check_index}/2")
+                self._log_dual_fang_insertion_geometry(
+                    geometry, phase_name)
+
+            feedback_fresh = (
+                valve_pos is None or
+                (geometry is not None and geometry['safe'] and
+                 self._formation_feedback_is_fresh()))
+            geometry_ok = (
+                valve_pos is None or
+                (geometry is not None and geometry['safe'] and
+                 feedback_fresh))
+            if pos_ok and yaw_ok and geometry_ok:
+                rospy.loginfo(
+                    "[Phase3B] Pre-descent pose and dual-fang geometry are safe")
+                break
+            if check_index == 2:
+                break
+
+            correction_reasons = []
+            if not (pos_ok and yaw_ok):
+                correction_reasons.append("pose residual")
+            if geometry is not None and not geometry['safe']:
+                correction_reasons.append("dual-fang rim clearance")
+            elif valve_pos is not None and geometry is None:
+                correction_reasons.append("dual-fang geometry unavailable")
+            elif not feedback_fresh:
+                correction_reasons.append("stale end-effector feedback")
+            xy_error_mm = (
+                xy_error * 1000.0 if xy_error is not None else float('inf'))
+            yaw_error_deg = (
+                math.degrees(yaw_error)
+                if yaw_error is not None else float('inf'))
+            rospy.logwarn(
+                "[Phase3B] Pre-descent correction %d/2 requested (%s): "
+                "XY=%.1fmm, yaw=%.1fdeg; applying a pose-only hold",
+                check_index + 1, ", ".join(correction_reasons),
+                xy_error_mm, yaw_error_deg)
+            self.active_stabilization_wait(
+                locked_pos, spoke_yaw, 5.0,
+                f"Phase3B pre-descent pose correction {check_index + 1}/2")
+
+        if valve_pos is not None and not geometry_ok:
+            rospy.logwarn(
+                "[Phase3B] Two pose-only corrections did not produce safe "
+                "dual-fang clearance. Holding the optimizer pose above the "
+                "valve until measured geometry is safe; the state machine "
+                "will not fail or start descent")
+            rate = rospy.Rate(10)
+            while not rospy.is_shutdown():
+                halt_checker = getattr(
+                    getattr(self, 'beetle', None), 'getTaskHaltFlag', None)
+                if callable(halt_checker) and halt_checker():
+                    rospy.logwarn(
+                        "[Phase3B] Task halt requested during safe-pose hold")
+                    return False
+                self.send_assembly_command_from_end_effector(
+                    locked_pos, spoke_yaw)
+                measured_pos = self.get_end_effector_position()
+                measured_yaw = self.get_end_effector_yaw()
+                geometry = self._dual_fang_insertion_geometry(
+                    measured_pos, measured_yaw, valve_pos)
+                if (geometry is not None and geometry['safe'] and
+                        self._formation_feedback_is_fresh()):
+                    self._log_dual_fang_insertion_geometry(
+                        geometry, "Phase3B safe hold")
                     return True
-            else:
-                # Lenient fallback: accept if within 5 deg
-                pos_ok, yaw_ok, xy_error, z_error, yaw_error = self._check_positioning_error(
-                    locked_pos, spoke_yaw, pos_thresh=0.050, yaw_thresh=0.087
-                )
-                if pos_ok and yaw_ok:
-                    rospy.logwarn(f"[Phase3B] 2.5 deg not reached, yaw={math.degrees(yaw_error):.1f} deg < 5 deg - accepting")
-                    return True
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[Phase3B] Still holding above the valve: dual-fang "
+                    "geometry is unsafe or feedback is stale")
+                rate.sleep()
+            return False
 
-            pos_ok, _, xy_error, _, _ = self._check_positioning_error(locked_pos, pos_thresh=0.050)
-            if not pos_ok:
-                rospy.logwarn(f"[Phase3B] Position drift, correcting...")
-                final_yaw = self.get_end_effector_yaw()
-                self._execute_formation_phase3a_xy_positioning(locked_pos, final_yaw)
+        if not (pos_ok and yaw_ok):
+            rospy.logwarn(
+                "[Phase3B] Pose correction remains outside the desired "
+                "tolerance, but measured dual-fang geometry is safe; "
+                "continuing without failing the state machine")
+        return True
 
-        rospy.logerr("Phase 3B failed after 3 attempts")
-        return False
-
-    def _execute_formation_phase4_z_descent(self, final_ee_pos, final_yaw):
+    def _execute_formation_phase4_z_descent(
+            self, final_ee_pos, final_yaw, valve_pos):
         """Phase 4: Pure Z descent to insertion height (Formation version)"""
         rospy.loginfo(
-            f"[Phase4] target={FormationUtils.format_vec(final_ee_pos)}, "
-            f"yaw_hold={math.degrees(final_yaw):.1f} deg"
+            f"[Phase4] optimizer target={FormationUtils.format_vec(final_ee_pos)}, "
+            f"optimizer_yaw={math.degrees(final_yaw):.1f} deg"
         )
 
         # Reset cached contact pose for this attempt
         self._last_phase4_contact_position = None
+        self._last_phase4_contact_yaw = None
 
         current_pos = self.get_end_effector_position()
-        if current_pos is None:
-            rospy.logerr("Cannot get current position for Phase 4")
+        current_yaw = self.get_end_effector_yaw()
+        if (current_pos is None or current_yaw is None or
+                len(current_pos) != 3 or
+                not np.all(np.isfinite(np.asarray(current_pos, dtype=float))) or
+                not math.isfinite(float(current_yaw))):
+            rospy.logerr("Cannot get a valid measured pose for Phase 4")
             return False
 
-        final_target_pos = (final_ee_pos[0], final_ee_pos[1], final_ee_pos[2])
+        if valve_pos is not None:
+            settled, current_pos, current_yaw = (
+                self._wait_for_stable_descent_pose(
+                    current_pos, current_yaw, valve_pos,
+                    "pre-descent measured-pose settling"))
+            if not settled:
+                return False
 
-        descent_success, achieved_pos = self.streaming_z_descent(current_pos, final_target_pos, final_yaw)
-        if not descent_success:
-            fallback_pos = achieved_pos or self.get_end_effector_position()
-            if fallback_pos is not None:
-                xy_error = math.sqrt(
-                    (fallback_pos[0] - final_target_pos[0])**2 +
-                    (fallback_pos[1] - final_target_pos[1])**2
-                )
-                z_error = abs(fallback_pos[2] - final_target_pos[2])
+        def block_if_handoff_geometry_is_unacceptable(
+                position, yaw, phase_name):
+            if valve_pos is None:
+                return False
+            geometry = self._dual_fang_insertion_geometry(
+                position, yaw, valve_pos)
+            self._log_dual_fang_insertion_geometry(geometry, phase_name)
+            hold_yaw = (
+                float(yaw)
+                if yaw is not None and math.isfinite(float(yaw))
+                else float(current_yaw))
+            feedback_fresh = self._formation_feedback_is_fresh()
+            if (feedback_fresh and
+                    self._dual_fang_clearance_allows_handoff(geometry)):
+                if geometry['safe']:
+                    return False
+                self.send_assembly_command_from_end_effector(
+                    position, hold_yaw)
                 rospy.logwarn(
-                    f"[Phase4] Z descent aborted with residual XY {xy_error*1000:.1f}mm, Z {z_error*1000:.1f}mm"
-                )
+                    "[Phase4] Dual-fang clearance %.1fmm is below the "
+                    "preferred %.1fmm simulation margin but remains "
+                    "non-negative; holding the measured pose and continuing "
+                    "to contact search",
+                    geometry['clearance'] * 1000.0,
+                    geometry['required_clearance'] * 1000.0)
+                return False
+            self.send_assembly_command_from_end_effector(
+                position, hold_yaw)
+            rospy.logerr(
+                "[Phase4] Dual-fang geometry overlaps the rim, is unavailable, "
+                "or is stale; holding the measured pose and blocking contact "
+                "handoff")
+            return True
+
+        # All lateral/yaw alignment happens before insertion.  From this point
+        # onward, descend vertically from the measured pose instead of chasing
+        # the optimizer XY target close to the valve geometry.
+        final_target_pos = (
+            current_pos[0], current_pos[1], final_ee_pos[2])
+        locked_yaw = float(current_yaw)
+        rospy.loginfo(
+            "[Phase4] Locking measured pre-descent XY/yaw: "
+            "XY=(%.3f, %.3f), yaw=%.1fdeg "
+            "(optimizer XY=(%.3f, %.3f), yaw=%.1fdeg)",
+            current_pos[0], current_pos[1], math.degrees(locked_yaw),
+            final_ee_pos[0], final_ee_pos[1], math.degrees(final_yaw))
+
+        descent_success, achieved_pos = self.streaming_z_descent(
+            current_pos, final_target_pos, locked_yaw,
+            contact_detection_remaining=0.060,
+            xy_pause_near=self.pos_threshold,
+            valve_pos=valve_pos)
+        if achieved_pos is None:
+            achieved_pos = self.get_end_effector_position()
+        achieved_array = (
+            np.asarray(achieved_pos, dtype=float).reshape(-1)
+            if achieved_pos is not None else np.array([]))
+        if (achieved_array.size != 3 or
+                not np.all(np.isfinite(achieved_array))):
+            rospy.logerr("[Phase4] Cannot get achieved insertion pose")
+            return False
+        achieved_pos = tuple(achieved_array)
+
+        xy_error = math.sqrt(
+            (achieved_pos[0] - final_target_pos[0])**2 +
+            (achieved_pos[1] - final_target_pos[1])**2
+        )
+        z_error = abs(achieved_pos[2] - final_target_pos[2])
+
+        if z_error > 0.060 or xy_error > 0.120:
+            rospy.logerr(
+                "[Phase4] Descent stopped before reaching the insertion region: "
+                "residual XY %.1fmm, Z %.1fmm",
+                xy_error * 1000.0, z_error * 1000.0)
             return False
 
-        if achieved_pos is None:
-            achieved_pos = self.get_end_effector_position() or final_target_pos
+        if valve_pos is not None:
+            achieved_yaw = self.get_end_effector_yaw()
+            if block_if_handoff_geometry_is_unacceptable(
+                    achieved_pos, achieved_yaw, "Phase4 descent guard"):
+                return False
+
+        if not descent_success:
+            rospy.logwarn(
+                f"[Phase4] Z descent stopped with residual XY {xy_error*1000:.1f}mm, "
+                f"Z {z_error*1000:.1f}mm"
+            )
+            rospy.logwarn("[Phase4] Insertion depth reached; continuing without another convergence check")
 
         if abs(achieved_pos[2] - final_target_pos[2]) > 1e-3:
             rospy.loginfo(
                 f"[Phase4] Contact depth locked at {achieved_pos[2]:.3f}m (planned {final_target_pos[2]:.3f}m)"
             )
 
-
-        convergence_target = achieved_pos
-        rospy.loginfo(f"[Phase4] Final convergence target: {FormationUtils.format_vec(convergence_target)}")
-        self._last_phase4_contact_position = convergence_target
-
-        rospy.loginfo("[Phase4] Performing final insertion pose convergence")
-        # Strict: try 2.5 deg within 5s
-        final_success = self.active_position_convergence(
-            target_pos=convergence_target,
-            target_yaw=final_yaw,
-            pos_thresh=0.080,  # 80mm convergence threshold (RELAXED for formation)
-            yaw_thresh=0.044,  # 2.5 degrees (0.044 rad)
-            timeout=5.0
-        )
-        if not final_success:
-            # Lenient fallback: accept if within 5 deg
-            pos_ok, yaw_ok, xy_err, z_err, yaw_err = self._check_positioning_error(
-                convergence_target, final_yaw, pos_thresh=0.080, yaw_thresh=0.087
-            )
-            if pos_ok and yaw_ok:
-                rospy.logwarn(f"[Phase4] 2.5 deg not reached in 5s, yaw={math.degrees(yaw_err):.1f} deg < 5 deg - accepting")
-                final_success = True
-
-        # CRITICAL: Regardless of final_success, always save the actual insertion depth Z coordinate reached
-        # Store Z coordinate for Contact/Rotation phases to avoid pitch errors
-        FormationSingleUAVStateBase._shared_target_z = convergence_target[2]
-        rospy.loginfo(f"Z continuity: saved _shared_target_z={FormationSingleUAVStateBase._shared_target_z:.3f}m")
-
-        if final_success:
-            rospy.loginfo("Phase 4 completed successfully - ready for valve insertion")
+        measured_contact_position = self.get_end_effector_position()
+        measured_contact_yaw = self.get_end_effector_yaw()
+        measured_array = (
+            np.asarray(measured_contact_position, dtype=float).reshape(-1)
+            if measured_contact_position is not None else np.array([]))
+        if (measured_array.size != 3 or
+                not np.all(np.isfinite(measured_array))):
+            measured_contact_position = achieved_pos
         else:
-            fallback_pos = self.get_end_effector_position()
-            if fallback_pos is not None:
-                xy_error = math.sqrt(
-                    (fallback_pos[0] - convergence_target[0])**2 +
-                    (fallback_pos[1] - convergence_target[1])**2
-                )
-                z_error = abs(fallback_pos[2] - convergence_target[2])
-                rospy.logwarn(
-                    f"[Phase4] Final residual: XY {xy_error*1000:.1f}mm, Z {z_error*1000:.1f}mm"
-                )
-            rospy.logwarn("Phase 4 completed with convergence issues")
+            measured_contact_position = tuple(measured_array)
+        if (measured_contact_yaw is None or
+                not math.isfinite(float(measured_contact_yaw))):
+            measured_contact_yaw = locked_yaw
+        # Hold the pose that was actually achieved.  This keeps the existing
+        # one-second stabilization period without commanding any post-insertion
+        # XY/yaw correction.
+        self.active_stabilization_wait(
+            measured_contact_position,
+            measured_contact_yaw,
+            1.0,
+            "post-insertion measured-pose hold")
 
-        return final_success
+        final_contact_position = self.get_end_effector_position()
+        final_contact_yaw = self.get_end_effector_yaw()
+        final_array = (
+            np.asarray(final_contact_position, dtype=float).reshape(-1)
+            if final_contact_position is not None else np.array([]))
+        final_pose_valid = (
+            final_array.size == 3 and np.all(np.isfinite(final_array)) and
+            final_contact_yaw is not None and
+            math.isfinite(float(final_contact_yaw)))
+        if not final_pose_valid:
+            if valve_pos is not None:
+                self.send_assembly_command_from_end_effector(
+                    measured_contact_position, measured_contact_yaw)
+                rospy.logerr(
+                    "[Phase4] Final measured handoff pose is unavailable; "
+                    "holding the last valid pose and blocking contact handoff")
+                return False
+            final_contact_position = measured_contact_position
+            final_contact_yaw = measured_contact_yaw
+        else:
+            final_contact_position = tuple(final_array)
+            final_contact_yaw = float(final_contact_yaw)
+
+        if block_if_handoff_geometry_is_unacceptable(
+                final_contact_position, final_contact_yaw,
+                "Phase4 final handoff guard"):
+            return False
+
+        self._last_phase4_contact_position = tuple(final_contact_position)
+        self._last_phase4_contact_yaw = float(final_contact_yaw)
+
+        FormationSingleUAVStateBase._shared_target_z = (
+            self._last_phase4_contact_position[2])
+        rospy.loginfo(f"Z continuity: saved _shared_target_z={FormationSingleUAVStateBase._shared_target_z:.3f}m")
+        rospy.loginfo(
+            "Phase 4 completed at the measured pose - proceeding directly "
+            "to valve contact")
+        return True
 
     def normalize_angle(self, angle):
         """Normalize angle to [-pi, pi] range"""
@@ -1516,20 +2191,29 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         )
         self.rotation_direction = rotation_direction
         self.target_rotation = abs(target_rotation)
-        self.max_rotation_time = 60.0
-        self.contact_angular_velocity = 0.1   # rad/s for contact phase
-        self.rotation_angular_velocity = 0.1  # rad/s for rotation phase
+        simulation = bool(rospy.get_param("~simulation", True))
+        real_machine = bool(rospy.get_param("~real_machine", False))
+        real_hardware_mode = real_machine and not simulation
+        self.real_hardware_mode = real_hardware_mode
+        self.max_rotation_time = 60.0 if real_hardware_mode else 600.0
+        self.rotation_angular_velocity = math.radians(3.0)
+        self.angular_velocity_ramp_time = 3.0
+        self.max_phase_lead = math.radians(3.0)
+        self.phase_lead_slowdown_width = math.radians(1.5)
+        self._contact_hold_position = None
+        self._contact_hold_yaw = None
+        self._contact_position_offset = np.zeros(3)
 
     def execute(self, userdata):
         rospy.loginfo("=== Formation Contact and Rotate Valve State (Streaming) ===")
 
         valve_pos = list(userdata.valve_position)
         valve_yaw = userdata.valve_yaw
-        self.optimizer.update_valve_info(valve_pos, valve_yaw)
 
         current_ee_pos = self.get_end_effector_position()
-        if current_ee_pos is None:
-            rospy.logerr("Failed to get current end-effector position")
+        current_ee_yaw = self.get_end_effector_yaw()
+        if current_ee_pos is None or current_ee_yaw is None:
+            rospy.logerr("Failed to get current end-effector pose")
             return 'failed'
 
         rospy.loginfo(f"Current EE pos: {FormationUtils.format_vec(current_ee_pos)}")
@@ -1540,25 +2224,80 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             valve_pos[2] = FormationSingleUAVStateBase._shared_target_z
             rospy.loginfo(f"Valve Z corrected to {valve_pos[2]:.3f}m")
 
-        # Compute geometric parameters from EE position
-        ee_radius = math.sqrt((current_ee_pos[0] - valve_pos[0])**2 +
-                              (current_ee_pos[1] - valve_pos[1])**2)
-        ee_start_angle = math.atan2(current_ee_pos[1] - valve_pos[1],
-                                    current_ee_pos[0] - valve_pos[0])
-        rospy.loginfo(f"EE radius={ee_radius*1000:.1f}mm, start_angle={math.degrees(ee_start_angle):.1f} deg")
+        # Compare with the saved Phase 4 handoff pose, then re-anchor the
+        # contact trajectory to the measured post-insertion pose.  Position
+        # angle and yaw are intentionally independent so neither jumps on the
+        # first search command when a small radial/yaw residual remains.
+        phase4_ee_pos = userdata.phase4_contact_pose
+        phase4_ee_yaw = userdata.phase4_contact_yaw
+        current_ee_array = np.asarray(current_ee_pos, dtype=float)
+        phase4_ee_array = np.asarray(phase4_ee_pos, dtype=float)
+        if (current_ee_array.size != 3 or phase4_ee_array.size != 3 or
+                not np.all(np.isfinite(current_ee_array)) or
+                not np.all(np.isfinite(phase4_ee_array)) or
+                not math.isfinite(float(current_ee_yaw)) or
+                not math.isfinite(float(phase4_ee_yaw))):
+            rospy.logerr("Contact start pose is invalid")
+            return 'failed'
+        if not self._verify_contact_start_pose(
+                current_ee_pos, current_ee_yaw,
+                phase4_ee_pos, phase4_ee_yaw):
+            rospy.logwarn(
+                "Contact start pose drifted outside the Phase 4 handoff "
+                "tolerance; re-anchoring contact to the latest measured pose")
 
-        # Spoke selection
-        spoke_angles = self.optimizer.get_spoke_angles()
-        angle_diffs = [abs(a - ee_start_angle) for a in spoke_angles]
-        selected_spoke = spoke_angles[angle_diffs.index(min(angle_diffs))]
-        rospy.loginfo(f"Spoke selection: approach={math.degrees(ee_start_angle):.1f} deg, selected={math.degrees(selected_spoke):.1f} deg")
+        measured_ee = np.asarray(current_ee_pos, dtype=float)
+        measured_offset = (
+            measured_ee[:2] - np.asarray(valve_pos[:2], dtype=float))
+        ee_radius = float(np.linalg.norm(measured_offset))
+        ee_start_angle = (
+            math.atan2(measured_offset[1], measured_offset[0])
+            if ee_radius > 1e-9 else
+            FormationUtils.normalize_angle(float(current_ee_yaw) - math.pi))
+        ee_start_yaw = float(current_ee_yaw)
+        valve_pos[2] = float(measured_ee[2])
+        handoff_radius = math.hypot(
+            phase4_ee_pos[0] - valve_pos[0],
+            phase4_ee_pos[1] - valve_pos[1])
+        rospy.loginfo(
+            "Contact trajectory replanned from measured EE: "
+            f"pose={FormationUtils.format_vec(measured_ee)}, "
+            f"radius={ee_radius*1000:.1f}mm "
+            f"(Phase4 handoff {handoff_radius*1000:.1f}mm), "
+            f"start_angle={math.degrees(ee_start_angle):.1f}deg, "
+            f"yaw={math.degrees(ee_start_yaw):.1f}deg")
+
+        geometry = self._dual_fang_insertion_geometry(
+            measured_ee, ee_start_yaw, valve_pos)
+        self._log_dual_fang_insertion_geometry(
+            geometry, "Contact handoff")
+        feedback_fresh = self._formation_feedback_is_fresh()
+        if (not feedback_fresh or
+                not self._dual_fang_clearance_allows_handoff(geometry)):
+            self.send_assembly_command_from_end_effector(
+                current_ee_pos, current_ee_yaw)
+            rospy.logerr(
+                "Contact handoff geometry overlaps the rim, is unavailable, "
+                "or is stale; holding the measured pose and blocking contact "
+                "search")
+            return 'failed'
+        if not geometry['safe']:
+            self.send_assembly_command_from_end_effector(
+                current_ee_pos, current_ee_yaw)
+            rospy.logwarn(
+                "Contact handoff clearance %.1fmm is below the preferred "
+                "%.1fmm simulation margin but remains non-negative; holding "
+                "the measured pose and continuing with no-wrench contact search",
+                geometry['clearance'] * 1000.0,
+                geometry['required_clearance'] * 1000.0)
 
         self.valve_center = valve_pos
         self.initial_valve_yaw = valve_yaw
 
         # --- Phase 1: Contact establishment via streaming circular trajectory ---
         rospy.loginfo(">>> Phase 1: Streaming circular contact establishment")
-        contact_ok = self._streaming_circular_contact(valve_pos, ee_radius, ee_start_angle)
+        contact_ok = self._streaming_circular_contact(
+            valve_pos, ee_radius, ee_start_angle, ee_start_yaw)
         if not contact_ok:
             return 'failed'
 
@@ -1584,6 +2323,72 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         tang_angle = angle + math.pi / 2  # perpendicular to radius
         return [speed * math.cos(tang_angle), speed * math.sin(tang_angle), 0.0]
 
+    def _contact_pose_tolerances(self):
+        simulation = bool(rospy.get_param("~simulation", True))
+        real_machine = bool(rospy.get_param("~real_machine", False))
+        default_xy = 0.050 if real_machine and not simulation else 0.040
+        return (
+            max(0.0, float(rospy.get_param(
+                "~contact_pose_tolerance", default_xy))),
+            max(0.0, float(rospy.get_param(
+                "~contact_z_tolerance", 0.060))),
+            max(0.0, float(rospy.get_param(
+                "~contact_yaw_tolerance", 0.044))),
+        )
+
+    def _verify_contact_start_pose(self, actual_position, actual_yaw,
+                                   handoff_position, handoff_yaw):
+        """Compare fresh feedback with the saved Phase 4 handoff pose."""
+        actual = np.asarray(actual_position, dtype=float)
+        handoff = np.asarray(handoff_position, dtype=float)
+        if (actual.size != 3 or handoff.size != 3 or
+                not np.all(np.isfinite(actual)) or
+                not np.all(np.isfinite(handoff)) or
+                not math.isfinite(float(actual_yaw)) or
+                not math.isfinite(float(handoff_yaw))):
+            rospy.logerr("Contact search rejected: invalid measured/handoff pose")
+            return False
+
+        xy_tolerance, z_tolerance, yaw_tolerance = \
+            self._contact_pose_tolerances()
+        xy_error = float(np.linalg.norm(actual[:2] - handoff[:2]))
+        z_error = abs(float(actual[2] - handoff[2]))
+        yaw_error = abs(FormationUtils.normalize_angle(
+            float(actual_yaw) - float(handoff_yaw)))
+        if (xy_error > xy_tolerance or z_error > z_tolerance or
+                yaw_error > yaw_tolerance):
+            rospy.logwarn(
+                "Contact start pose differs from the "
+                "Phase 4 handoff by XY %.1f/%.1fmm, Z %.1f/%.1fmm, "
+                "yaw %.1f/%.1fdeg",
+                xy_error * 1000.0, xy_tolerance * 1000.0,
+                z_error * 1000.0, z_tolerance * 1000.0,
+                math.degrees(yaw_error), math.degrees(yaw_tolerance))
+            return False
+        rospy.loginfo(
+            "Contact handoff continuity verified: XY=%.1fmm, Z=%.1fmm, "
+            "yaw=%.1fdeg",
+            xy_error * 1000.0, z_error * 1000.0,
+            math.degrees(yaw_error))
+        return True
+
+    def _hold_measured_pose(self, fallback_position, fallback_yaw):
+        """Replace a velocity target with the latest measured pose target."""
+        hold_position = self.get_end_effector_position()
+        hold_yaw = self.get_end_effector_yaw()
+        if hold_position is None or hold_yaw is None:
+            hold_position = fallback_position
+            hold_yaw = fallback_yaw
+        self.send_assembly_command_from_end_effector(hold_position, hold_yaw)
+        return hold_position, hold_yaw
+
+    def _freeze_circular_motion(self, fallback_position, fallback_yaw, reason):
+        """Replace streaming motion with a measured pose hold and clear wrench."""
+        self._hold_measured_pose(fallback_position, fallback_yaw)
+        self.beetle.clearExternalWrench()
+        self.beetle.setAttachModule(None)
+        rospy.logerr(reason)
+
     def _enable_task_wrench_prediction(self):
         module_masses = rospy.get_param("~module_masses", None)
         module_positions = rospy.get_param("~module_positions", None)
@@ -1598,39 +2403,48 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         mag = min(torque_limit, max(torque_min, abs(torque_z)))
         return math.copysign(mag, self.rotation_direction)
 
-    def _centripetal_force_world(self, radius, angular_vel, angle):
-        if radius < 1e-3:
-            return [0.0, 0.0, 0.0]
-        vel = self.beetle.getUavLinearVel()
-        speed = np.linalg.norm(vel[:2]) if vel is not None else 0.0
-        speed = max(speed, abs(radius * angular_vel))
-        mass = self.beetle.getFormationMass()
-        force_mag = mass * speed * speed / radius
-        radial = np.array([math.cos(angle), math.sin(angle), 0.0])
-        force = -force_mag * radial
-        return force.tolist()
-
-    def _pid_axis_effort(self, axis):
-        try:
-            return float(axis.p_term[0]) + float(axis.i_term[0])
-        except (AttributeError, IndexError, TypeError, ValueError):
-            return 0.0
-
-    def _dragon_roll_moment_adjust(self, target_yaw, dt, moment_thresh, adjust_gain):
-        control_pid = self.beetle.getControlPid()
-        if control_pid is None:
-            return 0.0, 0.0
-        moment = np.array([
-            self._pid_axis_effort(control_pid.roll),
-            self._pid_axis_effort(control_pid.pitch),
-            self._pid_axis_effort(control_pid.yaw)
-        ])
-        # Dragon projects the controller moment into the valve target frame.
-        # Beetle valve tasks are yaw-only here, so use the target-yaw x-axis.
-        roll_moment = math.cos(target_yaw) * moment[0] + math.sin(target_yaw) * moment[1]
-        if abs(roll_moment) < moment_thresh:
-            roll_moment = 0.0
-        return roll_moment * adjust_gain * dt, roll_moment
+    def _velocity_adaptive_torque_step(
+            self, torque_z, torque_min, torque_limit, ramp_time,
+            target_speed, measured_speed, dt, feedback_ready,
+            formation_overspeed=False, formation_relief_time=5.0):
+        """Adapt torque continuously from valve speed and safety relief."""
+        torque_min = max(0.0, abs(float(torque_min)))
+        torque_limit = max(torque_min, abs(float(torque_limit)))
+        magnitude = min(
+            torque_limit, max(torque_min, abs(float(torque_z))))
+        ramp_rate = (
+            (torque_limit - torque_min) /
+            max(1e-3, float(ramp_time)))
+        dt = max(0.0, float(dt))
+        max_adjustment = ramp_rate * dt
+        adjustment = 0.0
+        if formation_overspeed:
+            relief_rate = (
+                (torque_limit - torque_min) /
+                max(1e-3, float(formation_relief_time)))
+            adjustment = -relief_rate * dt
+            phase = "formation_overspeed_relief"
+        elif (not feedback_ready or
+              not math.isfinite(float(target_speed)) or
+              not math.isfinite(float(measured_speed))):
+            phase = "feedback_hold"
+        else:
+            target_speed = max(0.0, abs(float(target_speed)))
+            measured_speed = max(0.0, float(measured_speed))
+            velocity_gain = ramp_rate / max(target_speed, 1e-3)
+            adjustment = demo_common.velocity_error_adjustment(
+                target_speed, measured_speed, velocity_gain, dt)
+            adjustment = max(
+                -max_adjustment, min(max_adjustment, adjustment))
+            if measured_speed < target_speed:
+                phase = "low_speed_ramp"
+            elif measured_speed > target_speed:
+                phase = "overspeed_relief"
+            else:
+                phase = "speed_hold"
+        magnitude += adjustment
+        magnitude = min(torque_limit, max(torque_min, magnitude))
+        return math.copysign(magnitude, self.rotation_direction), phase
 
     def _formation_yaw_rate(self, max_age=0.2):
         """Measure leader CoG rotation around this task's world-Z valve axis."""
@@ -1653,139 +2467,357 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             application_offset_body=self._ee_offset_body(), frame_id="world")
         return force_body, torque_body, "fc"
 
-    # ------------------------------------------------------------------
-    def _streaming_circular_contact(self, valve_center, radius, start_angle):
-        """Stream circular trajectory at 25Hz until valve engagement detected."""
-        contact_threshold = math.radians(5.7)  # ~0.1 rad
-        angular_vel = self.contact_angular_velocity * self.rotation_direction
-        max_contact_time = 20.0
-        ee_z = valve_center[2]
-        ff_enabled = rospy.get_param("controller/valve_rotation_feedforward/enabled", False)
-        contact_torque = rospy.get_param("controller/valve_rotation_feedforward/contact_init_torque", 0.1)
-        torque_ramp = rospy.get_param("controller/valve_rotation_feedforward/contact_torque_ramp", 0.1)
-        torque_limit = abs(rospy.get_param("controller/valve_rotation_feedforward/torque_z", 3.0)) or 3.0
-        torque_z = self._clamp_directed_torque(
-            contact_torque * self.rotation_direction, 0.05, torque_limit)
+    def _end_effector_feedback_is_fresh(self, max_age):
+        return self.formation_adapter.has_fresh_end_effector_feedback(max_age)
 
-        start_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
-        last_valve_yaw = start_valve_yaw
-        last_valve_check_time = rospy.Time.now().to_sec()
-        max_detected = 0.0
+    def _hold_and_verify_contact_pose(self, hold_position, hold_yaw):
+        """Hold the measured stalled pose and reject unstable contact."""
+        hold_position = np.asarray(hold_position, dtype=float)
+        hold_yaw = float(hold_yaw)
+        self._contact_hold_position = hold_position.tolist()
+        self._contact_hold_yaw = hold_yaw
 
-        rospy.loginfo(f"Contact: radius={radius*1000:.1f}mm, omega={math.degrees(angular_vel):.1f} deg/s, "
-                      f"threshold={math.degrees(contact_threshold):.1f} deg, timeout={max_contact_time}s, "
-                      f"ff={ff_enabled}, torque0={torque_z:.2f}N*m")
+        duration = max(0.0, float(rospy.get_param(
+            "~contact_hold_time", 1.0)))
+        position_tolerance = max(0.0, float(rospy.get_param(
+            "~contact_hold_position_tolerance", 0.015)))
+        yaw_tolerance = max(0.0, float(rospy.get_param(
+            "~contact_hold_yaw_tolerance", math.radians(2.0))))
+        pose_max_age = max(0.0, float(rospy.get_param(
+            "~pose_feedback_max_age", 0.5)))
+        yaw_rate_limit = max(0.0, float(rospy.get_param(
+            "controller/valve_rotation_feedforward/yaw_rate_guard", 0.15)))
 
-        if ff_enabled:
-            self._enable_task_wrench_prediction()
-
+        start_time = rospy.get_time()
         rate = rospy.Rate(25)
-        t0 = rospy.get_time()
-        last_t = t0
-        angle = start_angle
-
-        while not rospy.is_shutdown():
-            now = rospy.get_time()
-            t = now - t0
-            dt = max(0.0, min(now - last_t, 0.1))
-            last_t = now
-            if t > max_contact_time:
-                break
-
-            # Advance angle
-            angle += angular_vel / 25.0
-
-            # EE target
-            ee_pos, ee_yaw = self._circular_ee_target(valve_center, radius, angle, ee_z)
-            ee_vel = self._circular_ee_velocity(radius, angular_vel, angle)
-
-            # Dragon-style contact torque: start small and ramp slowly.
-            if ff_enabled:
-                ff_force, ff_torque, ff_frame = self._build_valve_wrench_command(
-                    [0.0, 0.0, 0.0], [0.0, 0.0, torque_z])
-                self.beetle.addExternalWrench(force=ff_force, torque=ff_torque,
-                                              frame_id=ff_frame,
-                                              task_weights=VALVE_TASK_WRENCH_WEIGHTS if self.beetle.isUnifiedMode() else None)
-            self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
-
-            # Monitor valve rotation
-            cur_time = rospy.get_time()
-            cur_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, self.initial_valve_yaw)
-            valve_rot, valve_omega, updated, last_valve_yaw, last_valve_check_time = \
-                FormationUtils.monitor_valve_rotation(
-                    cur_valve_yaw, start_valve_yaw, last_valve_yaw,
-                    last_valve_check_time, cur_time, update_interval=0.2)
-            max_detected = max(max_detected, valve_rot)
-
-            rospy.loginfo_throttle(2.0,
-                f"Formation contact: radius={radius*1000:.1f}mm, angular_vel={math.degrees(angular_vel):.1f} deg/s, "
-                f"valve_rotation={math.degrees(valve_rot):.2f} deg, time={t:.1f}s")
-
-            if valve_rot >= contact_threshold:
-                rospy.loginfo(f"Valve engagement detected: {math.degrees(valve_rot):.1f} deg "
-                              f"(threshold: {math.degrees(contact_threshold):.1f} deg)")
-                rospy.loginfo(f"Contact establishment time: {t:.1f}s")
-                rospy.loginfo(f"Rotation baseline set: initial={math.degrees(self.initial_valve_yaw):.1f} deg, "
-                              f"current={math.degrees(cur_valve_yaw):.1f} deg, achieved={math.degrees(valve_rot):.1f} deg")
-                # Save angle for rotation phase continuity
-                self._contact_end_angle = angle
-                self._contact_final_torque_z = torque_z
-                return True
-
-            torque_z = self._clamp_directed_torque(
-                torque_z + self.rotation_direction * torque_ramp * dt,
-                0.05, torque_limit)
+        while (rospy.get_time() - start_time < duration and
+               not rospy.is_shutdown()):
+            if not self._end_effector_feedback_is_fresh(pose_max_age):
+                self._freeze_circular_motion(
+                    hold_position, hold_yaw,
+                    "Contact hold aborted: end-effector feedback is stale")
+                return False
+            actual_position = self.get_end_effector_position()
+            actual_yaw = self.get_end_effector_yaw()
+            if actual_position is None or actual_yaw is None:
+                self._freeze_circular_motion(
+                    hold_position, hold_yaw,
+                    "Contact hold aborted: end-effector pose is unavailable")
+                return False
+            position_error = float(np.linalg.norm(
+                np.asarray(actual_position, dtype=float) - hold_position))
+            yaw_error = abs(FormationUtils.normalize_angle(
+                float(actual_yaw) - hold_yaw))
+            measured_yaw_rate = self._formation_yaw_rate(pose_max_age)
+            if (position_error > position_tolerance or
+                    yaw_error > yaw_tolerance or
+                    (measured_yaw_rate is not None and
+                     abs(measured_yaw_rate) > yaw_rate_limit)):
+                self._freeze_circular_motion(
+                    hold_position, hold_yaw,
+                    "Contact hold unstable: position %.1fmm, yaw %.1fdeg, "
+                    "yaw_rate %s" % (
+                        position_error * 1000.0,
+                        math.degrees(yaw_error),
+                        ("%.1fdeg/s" % math.degrees(measured_yaw_rate)
+                         if measured_yaw_rate is not None else "unavailable")))
+                return False
+            self.send_assembly_command_from_end_effector(
+                self._contact_hold_position, self._contact_hold_yaw)
             rate.sleep()
 
-        rospy.logerr(f"Contact failed: max valve movement {math.degrees(max_detected):.2f} deg")
-        self.beetle.clearExternalWrench(duration=1.0, rate_hz=25.0)
+        rospy.loginfo(
+            "Stable contact pose held for %.1fs without wrench", duration)
+        return not rospy.is_shutdown()
+
+    # ------------------------------------------------------------------
+    def _streaming_circular_contact(self, valve_center, radius, start_angle,
+                                    start_yaw):
+        """Search from the measured EE pose for stall without task wrench."""
+        search_speed = math.radians(max(0.0, float(rospy.get_param(
+            "~contact_search_speed_deg_s", 3.0))))
+        search_ramp_time = max(0.0, float(rospy.get_param(
+            "~contact_search_ramp_time", 2.0)))
+        max_search_angle = math.radians(max(0.0, float(rospy.get_param(
+            "~contact_search_max_angle_deg", 90.0))))
+        min_search_angle = math.radians(max(0.0, float(rospy.get_param(
+            "~contact_min_search_angle_deg", 2.0))))
+        stall_lead = math.radians(max(0.0, float(rospy.get_param(
+            "~contact_stall_lead_deg", 3.0))))
+        stall_rate = math.radians(max(0.0, float(rospy.get_param(
+            "~contact_stall_velocity_deg_s", 0.5))))
+        velocity_window = max(1e-3, float(rospy.get_param(
+            "~contact_velocity_window", 0.4)))
+        required_cycles = max(1, int(rospy.get_param(
+            "~contact_required_cycles", 8)))
+        endpoint_hold_time = max(
+            1.0, velocity_window + required_cycles / 25.0 + 0.1)
+        pose_max_age = max(0.0, float(rospy.get_param(
+            "~pose_feedback_max_age", 0.5)))
+        ee_z = valve_center[2]
+        rp_guard = max(
+            0.0, float(rospy.get_param(
+                "controller/valve_rotation_feedforward/rp_guard",
+                math.radians(10.0))))
+        yaw_rate_limit = max(0.0, float(rospy.get_param(
+            "controller/valve_rotation_feedforward/yaw_rate_guard", 0.15)))
+        xy_tolerance, z_tolerance, _ = self._contact_pose_tolerances()
+
+        self.beetle.clearExternalWrench()
         self.beetle.setAttachModule(None)
+        if not self._end_effector_feedback_is_fresh(pose_max_age):
+            rospy.logerr("Contact search rejected: end-effector feedback is stale")
+            return False
+        actual_yaw = self.get_end_effector_yaw()
+        if actual_yaw is None:
+            rospy.logerr("Contact search rejected: end-effector yaw is unavailable")
+            return False
+
+        start_position, _ = self._circular_ee_target(
+            valve_center, radius, start_angle, ee_z)
+        start_target_yaw = FormationUtils.normalize_angle(float(start_yaw))
+        detector = demo_common.DirectedAngularStallDetector(
+            self.rotation_direction, min_search_angle, stall_lead,
+            stall_rate, velocity_window, required_cycles)
+        start_time = rospy.get_time()
+        detector.reset(start_target_yaw, float(actual_yaw), start_time)
+
+        rospy.loginfo(
+            "Contact search without wrench: radius=%.1fmm, speed=%.1fdeg/s, "
+            "ramp=%.1fs, max=%.1fdeg, stall lead/rate=%.1fdeg/%.1fdeg/s, "
+            "cycles=%d, endpoint hold=%.1fs",
+            radius * 1000.0,
+            math.degrees(self.rotation_direction * search_speed),
+            search_ramp_time, math.degrees(max_search_angle),
+            math.degrees(stall_lead), math.degrees(stall_rate),
+            required_cycles, endpoint_hold_time)
+
+        rate = rospy.Rate(25)
+        endpoint_hold_started_at = None
+        while not rospy.is_shutdown():
+            if self.beetle.getTaskHaltFlag():
+                self._freeze_circular_motion(
+                    start_position, start_target_yaw,
+                    "Valve contact search stopped by operator")
+                return False
+            if not self._end_effector_feedback_is_fresh(pose_max_age):
+                self._freeze_circular_motion(
+                    start_position, start_target_yaw,
+                    "Valve contact search aborted: pose feedback is stale")
+                return False
+
+            now = rospy.get_time()
+            if endpoint_hold_started_at is None:
+                raw_progress, current_speed = \
+                    demo_common.smooth_start_angular_motion(
+                        now - start_time,
+                        search_speed, search_ramp_time)
+                progress = min(raw_progress, max_search_angle)
+                if raw_progress >= max_search_angle:
+                    endpoint_hold_started_at = now
+                    current_speed = 0.0
+                    rospy.loginfo(
+                        "Contact search reached %.1fdeg; holding the final "
+                        "target for %.1fs stall verification",
+                        math.degrees(max_search_angle), endpoint_hold_time)
+            else:
+                progress = max_search_angle
+                current_speed = 0.0
+            command_angular_vel = self.rotation_direction * current_speed
+            angle = start_angle + self.rotation_direction * progress
+            ee_pos, _ = self._circular_ee_target(
+                valve_center, radius, angle, ee_z)
+            ee_yaw = FormationUtils.normalize_angle(
+                start_target_yaw + self.rotation_direction * progress)
+            ee_vel = self._circular_ee_velocity(
+                radius, command_angular_vel, angle)
+
+            roll, pitch, _ = self.beetle.getUavRPY()
+            if max(abs(roll), abs(pitch)) > rp_guard:
+                self._freeze_circular_motion(
+                    ee_pos, ee_yaw,
+                    "Valve contact aborted: roll/pitch %.1f/%.1f deg exceeds %.1f deg" % (
+                        math.degrees(roll), math.degrees(pitch),
+                        math.degrees(rp_guard)))
+                return False
+            measured_yaw_rate = self._formation_yaw_rate(pose_max_age)
+            if (measured_yaw_rate is not None and
+                    abs(measured_yaw_rate) > yaw_rate_limit):
+                self._freeze_circular_motion(
+                    ee_pos, ee_yaw,
+                    "Valve contact aborted: measured yaw rate %.1fdeg/s "
+                    "exceeds %.1fdeg/s" % (
+                        math.degrees(measured_yaw_rate),
+                        math.degrees(yaw_rate_limit)))
+                return False
+
+            if endpoint_hold_started_at is None:
+                self.send_assembly_command_from_end_effector(
+                    ee_pos, ee_yaw, linear_vel=ee_vel,
+                    angular_vel=command_angular_vel)
+            else:
+                self.send_assembly_command_from_end_effector(ee_pos, ee_yaw)
+
+            actual_position = self.get_end_effector_position()
+            actual_yaw = self.get_end_effector_yaw()
+            if actual_position is None or actual_yaw is None:
+                self._freeze_circular_motion(
+                    ee_pos, ee_yaw,
+                    "Valve contact aborted: measured pose is unavailable")
+                return False
+            actual_position_array = np.asarray(actual_position, dtype=float)
+            xy_error = float(np.linalg.norm(
+                actual_position_array[:2] - np.asarray(ee_pos[:2])))
+            z_error = abs(float(actual_position_array[2] - ee_pos[2]))
+            if xy_error > xy_tolerance or z_error > z_tolerance:
+                self._freeze_circular_motion(
+                    actual_position, actual_yaw,
+                    "Valve contact geometry unstable: XY %.1f/%.1fmm, "
+                    "Z %.1f/%.1fmm" % (
+                        xy_error * 1000.0, xy_tolerance * 1000.0,
+                        z_error * 1000.0, z_tolerance * 1000.0))
+                return False
+
+            sample_time = rospy.get_time()
+            observation = detector.update(
+                ee_yaw, float(actual_yaw), sample_time)
+            rospy.loginfo_throttle(2.0,
+                "Formation contact search: command=%.1f/%.1fdeg, "
+                "actual=%.1fdeg, lead=%.1fdeg, rate=%s, candidate=%d/%d" % (
+                    math.degrees(observation["command_progress"]),
+                    math.degrees(max_search_angle),
+                    math.degrees(observation["actual_progress"]),
+                    math.degrees(observation["directed_lead"]),
+                    ("%.2fdeg/s" % math.degrees(observation["actual_rate"])
+                     if math.isfinite(observation["actual_rate"])
+                     else "warming"),
+                    observation["candidate_cycles"], required_cycles))
+
+            if observation["contact"]:
+                if not self._hold_and_verify_contact_pose(
+                        actual_position, actual_yaw):
+                    return False
+                # Start rotation from the verified stalled yaw, not from the
+                # contact-search command.  Preserve the measured XY pose as a C1
+                # offset that is blended back to the valve-centred circle once
+                # motion resumes after the wrench preload.
+                self._contact_end_angle = FormationUtils.normalize_angle(
+                    self._contact_hold_yaw - math.pi)
+                ideal_contact_position, _ = self._circular_ee_target(
+                    valve_center, radius, self._contact_end_angle,
+                    self._contact_hold_position[2])
+                self._contact_position_offset = (
+                    np.asarray(self._contact_hold_position, dtype=float) -
+                    np.asarray(ideal_contact_position, dtype=float))
+                rospy.loginfo(
+                    "Stable valve contact confirmed without wrench: "
+                    "command=%.1fdeg, actual=%.1fdeg, lead=%.1fdeg, "
+                    "circle offset=%.1fmm",
+                    math.degrees(observation["command_progress"]),
+                    math.degrees(observation["actual_progress"]),
+                    math.degrees(observation["directed_lead"]),
+                    1000.0 * float(np.linalg.norm(
+                        self._contact_position_offset[:2])))
+                return True
+
+            if (endpoint_hold_started_at is not None and
+                    sample_time - endpoint_hold_started_at >=
+                    endpoint_hold_time):
+                self._freeze_circular_motion(
+                    actual_position, actual_yaw,
+                    "No stable angular stall contact within %.1fdeg "
+                    "after %.1fs endpoint hold" % (
+                        math.degrees(max_search_angle), endpoint_hold_time))
+                return False
+            rate.sleep()
         return False
 
     # ------------------------------------------------------------------
     def _streaming_circular_rotation(self, userdata, valve_center, radius, start_angle):
         """Stream circular rotation trajectory at 25Hz with adaptive wrench feedforward."""
-        # Continue from contact end angle for smooth transition
-        angle = getattr(self, '_contact_end_angle', start_angle)
-        angular_vel = self.rotation_angular_velocity * self.rotation_direction
-        ee_z = valve_center[2]
+        # Valve progress is re-zeroed after contact confirmation.  Keeping the
+        # contact-search phase out of the rotation phase avoids a backwards
+        # target jump when phase lead limiting first becomes active.
+        rotation_start_angle = getattr(self, '_contact_end_angle', start_angle)
+        angle = rotation_start_angle
+        nominal_progress = 0.0
+        command_progress = 0.0
+        contact_position_offset = np.asarray(
+            getattr(self, '_contact_position_offset', np.zeros(3)),
+            dtype=float)
+        target_angular_vel = self.rotation_angular_velocity * self.rotation_direction
+        motion_ramp_time = max(
+            1e-3, float(self.angular_velocity_ramp_time))
+        ee_z = (self._contact_hold_position[2]
+                if self._contact_hold_position is not None
+                else valve_center[2])
 
-        # Read feedforward parameters from launch config. Defaults mirror the
-        # Dragon valve task: small initial torque, slow adaptation, capped output.
+        # Read feedforward parameters from launch config.
         ff_enabled = rospy.get_param("controller/valve_rotation_feedforward/enabled", False)
         ff_force_z = rospy.get_param("controller/valve_rotation_feedforward/force_z", 0.0)
-        ff_torque_z_max = rospy.get_param("controller/valve_rotation_feedforward/torque_z", 0.0)
-        torque_min = rospy.get_param("controller/valve_rotation_feedforward/torque_min", 0.1)
-        torque_limit = rospy.get_param(
+        force_ramp_time = max(
+            0.0, float(rospy.get_param(
+                "controller/valve_rotation_feedforward/force_ramp_time", 3.0)))
+        rp_guard = max(
+            0.0, float(rospy.get_param(
+                "controller/valve_rotation_feedforward/rp_guard",
+                math.radians(10.0))))
+        contact_init_torque = rospy.get_param(
+            "controller/valve_rotation_feedforward/contact_init_torque", 0.1)
+        torque_min = abs(float(rospy.get_param(
+            "controller/valve_rotation_feedforward/torque_min",
+            contact_init_torque)))
+        torque_limit = max(torque_min, abs(float(rospy.get_param(
             "controller/valve_rotation_feedforward/torque_limit",
-            abs(ff_torque_z_max) if ff_torque_z_max != 0.0 else 3.0)
-        roll_moment_thresh = rospy.get_param("controller/valve_rotation_feedforward/roll_moment_thresh", 0.2)
-        torque_adjust_roll_k = rospy.get_param("controller/valve_rotation_feedforward/torque_adjust_roll_k", 0.01)
-        torque_adjust_yaw_k = max(
+            3.0))))
+        torque_ramp_time = max(1e-3, float(rospy.get_param(
+            "controller/valve_rotation_feedforward/torque_ramp_time",
+            60.0)))
+        torque_ramp_rate = (
+            torque_limit - torque_min) / torque_ramp_time
+        torque_velocity_gain = (
+            torque_ramp_rate / max(abs(target_angular_vel), 1e-3))
+        valve_feedback_timeout = max(
             0.0, float(rospy.get_param(
-                "controller/valve_rotation_feedforward/torque_adjust_yaw_k", 1.0)))
-        torque_adjust_yaw_rate_limit = max(
-            0.0, float(rospy.get_param(
-                "controller/valve_rotation_feedforward/torque_adjust_yaw_rate_limit",
-                0.3)))
-        yaw_velocity_thresh = max(
-            0.0, float(rospy.get_param(
-                "controller/valve_rotation_feedforward/yaw_velocity_thresh", 0.05)))
+                "controller/valve_rotation_feedforward/valve_feedback_timeout",
+                0.5)))
         yaw_velocity_timeout = max(
             0.0, float(rospy.get_param(
                 "controller/valve_rotation_feedforward/yaw_velocity_timeout", 0.2)))
-        torque_z = getattr(self, '_contact_final_torque_z',
-                           torque_min * self.rotation_direction)
+        yaw_rate_guard = 2.0 * abs(target_angular_vel)
+        yaw_rate_hard_limit = 4.0 * abs(target_angular_vel)
+        yaw_rate_emergency_limit = 5.0 * abs(target_angular_vel)
+        yaw_rate_guard_duration = 5.0
+        yaw_rate_hard_duration = 0.25
+        yaw_rate_recovery_limit = abs(target_angular_vel)
+        yaw_rate_recovery_duration = 1.0
+        torque_yaw_hard_relief_rate = (
+            (torque_limit - torque_min) / yaw_rate_hard_duration)
+        pose_max_age = max(0.0, float(rospy.get_param(
+            "~pose_feedback_max_age", 0.5)))
+        torque_z = torque_min * self.rotation_direction
         torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
 
         rospy.loginfo(f">>> Phase 2: Rotation {math.degrees(self.target_rotation):.1f} deg "
-                      f"@ {math.degrees(angular_vel):.1f} deg/s")
+                      f"@ {math.degrees(target_angular_vel):.1f} deg/s")
         rospy.loginfo(f"Feedforward: enabled={ff_enabled}, force_z={ff_force_z}, "
                       f"torque_limit={torque_limit:.1f} N*m (adaptive from {torque_z:.2f}), "
-                      f"velocity_gain={torque_adjust_yaw_k:.2f}Nm/rad, "
-                      f"velocity_rate_limit={torque_adjust_yaw_rate_limit:.2f}Nm/s, "
-                      f"deadband={yaw_velocity_thresh:.3f}rad/s, "
-                      f"feedback_timeout={yaw_velocity_timeout:.2f}s")
+                      f"velocity_rate_limit={torque_ramp_rate:.3f}Nm/s "
+                      f"over {torque_ramp_time:.1f}s, "
+                      f"velocity_gain={torque_velocity_gain:.2f}Nm/rad, "
+                      f"yaw_relief_soft={torque_ramp_rate:.3f}Nm/s, "
+                      f"yaw_relief_hard={torque_yaw_hard_relief_rate:.3f}Nm/s, "
+                      f"valve_feedback_timeout={valve_feedback_timeout:.2f}s, "
+                      f"yaw_feedback_timeout={yaw_velocity_timeout:.2f}s, "
+                      f"wrench_ramp={force_ramp_time:.1f}s, "
+                      f"yaw_rate_guard={math.degrees(yaw_rate_guard):.1f}deg/s "
+                      f"for {yaw_rate_guard_duration:.1f}s "
+                      f"(hard={math.degrees(yaw_rate_hard_limit):.1f}deg/s "
+                      f"for {yaw_rate_hard_duration:.2f}s, "
+                      f"emergency={math.degrees(yaw_rate_emergency_limit):.1f}deg/s, "
+                      f"recovery<{math.degrees(yaw_rate_recovery_limit):.1f}deg/s "
+                      f"for {yaw_rate_recovery_duration:.1f}s), "
+                      f"rp_guard={math.degrees(rp_guard):.1f}deg")
 
         # Configure the legacy LF per-module command shares for the rotation.
         # BeetleInterface keeps these topics fresh for legacy mode switching;
@@ -1803,6 +2835,17 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
         rate = rospy.Rate(25)
         t0 = rospy.get_time()
         last_t = t0
+        last_valve_omega = 0.0
+        valve_speed_ready = False
+        torque_phase = "wrench_preload" if ff_enabled else "rotation"
+        yaw_rate_exceeded_since = None
+        yaw_rate_hard_exceeded_since = None
+        yaw_rate_recovery_since = None
+        yaw_hard_overspeed_latched = False
+        yaw_hard_hold_position = None
+        yaw_hard_hold_yaw = None
+        last_command_position = list(self._contact_hold_position)
+        last_command_yaw = self._contact_hold_yaw
 
         while not rospy.is_shutdown():
             now = rospy.get_time()
@@ -1813,20 +2856,43 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             # Monitor valve rotation
             cur_time = rospy.get_time()
             cur_valve_yaw = FormationUtils.get_valve_yaw_safe(self.beetle, start_valve_yaw)
-            valve_rot, valve_omega, _, last_valve_yaw, last_valve_check_time = \
+            valve_rot, valve_omega, valve_updated, last_valve_yaw, last_valve_check_time = \
                 FormationUtils.monitor_cumulative_valve_rotation(
                     cur_valve_yaw, last_valve_yaw,
                     last_valve_check_time, cur_time,
                     cumulative_rotation, self.rotation_direction,
                     update_interval=0.2)
             cumulative_rotation = valve_rot
-            max_rotation_detected = max(max_rotation_detected, valve_rot)
+            valve_feedback_fresh = (
+                self.beetle.getFreshValvePos(
+                    max_age=valve_feedback_timeout) is not None)
+            if valve_updated or not valve_feedback_fresh:
+                live_valve_progress = valve_rot
+            else:
+                live_valve_progress = max(
+                    0.0,
+                    valve_rot + self.rotation_direction *
+                    FormationUtils._angle_diff(
+                        cur_valve_yaw, last_valve_yaw))
+            if valve_updated and valve_feedback_fresh:
+                last_valve_omega = valve_omega
+                valve_speed_ready = True
+            elif not valve_feedback_fresh:
+                valve_speed_ready = False
+                if ff_enabled:
+                    rospy.logwarn_throttle(
+                        2.0,
+                        "Valve pose feedback is stale; holding adaptive torque")
+            max_rotation_detected = max(
+                max_rotation_detected, live_valve_progress)
 
             # Check completion
             if valve_rot >= self.target_rotation:
                 rospy.loginfo(f"Valve rotation completed: {math.degrees(valve_rot):.1f} deg "
                               f"(target: {math.degrees(self.target_rotation):.1f} deg) in {t:.1f}s")
                 rospy.loginfo(f"Final adaptive torque: {torque_z:.2f} N*m")
+                self._hold_measured_pose(
+                    self._contact_hold_position, self._contact_hold_yaw)
                 self.beetle.clearExternalWrench(duration=1.0, rate_hz=25.0)
                 self.beetle.setAttachModule(None)
                 userdata.trajectory_state = {
@@ -1841,55 +2907,284 @@ class FormationRotateValveState(FormationSingleUAVStateBase):
             # Timeout
             if t > self.max_rotation_time:
                 rospy.logwarn(
-                    f"Rotation timeout after {t:.1f}s, current: {math.degrees(valve_rot):.1f} deg, "
+                    f"Rotation timeout after {t:.1f}s, current: {math.degrees(live_valve_progress):.1f} deg, "
                     f"max: {math.degrees(max_rotation_detected):.1f} deg")
                 break
 
-            # Advance angle (streaming)
-            angle += angular_vel / 25.0
+            total_valve_progress = live_valve_progress
+            previous_nominal_progress = nominal_progress
+            previous_command_progress = command_progress
+            previous_angle = angle
+            wrench_scale = (
+                smoothstep01(t / force_ramp_time)
+                if force_ramp_time > 0.0 else 1.0)
+            holding_for_wrench_ramp = ff_enabled and t < force_ramp_time
+            if holding_for_wrench_ramp:
+                angular_vel = 0.0
+                command_angular_vel = 0.0
+                ee_pos = list(self._contact_hold_position)
+                ee_yaw = self._contact_hold_yaw
+                ee_vel = None
+            elif yaw_hard_overspeed_latched:
+                angular_vel = 0.0
+                command_angular_vel = 0.0
+                ee_pos = list(yaw_hard_hold_position)
+                ee_yaw = yaw_hard_hold_yaw
+                ee_vel = None
+            else:
+                preload_time = force_ramp_time if ff_enabled else 0.0
+                motion_time = max(0.0, t - preload_time)
+                angular_vel = target_angular_vel * smoothstep01(
+                    motion_time / motion_ramp_time)
+                nominal_progress += abs(angular_vel) * dt
+                new_command_progress = FormationUtils.limit_phase_progress(
+                    nominal_progress, total_valve_progress,
+                    self.max_phase_lead, command_progress,
+                    abs(angular_vel) * dt,
+                    slowdown_width=self.phase_lead_slowdown_width)
+                progress_step = max(
+                    0.0, new_command_progress - command_progress)
+                command_angular_vel = self.rotation_direction * min(
+                    abs(target_angular_vel),
+                    progress_step / dt if dt > 0.0 else 0.0)
+                command_progress = new_command_progress
+                angle = (rotation_start_angle +
+                         self.rotation_direction * command_progress)
+                ee_pos, ee_yaw = self._circular_ee_target(
+                    valve_center, radius, angle, ee_z)
+                ee_vel = np.asarray(self._circular_ee_velocity(
+                    radius, command_angular_vel, angle), dtype=float)
 
-            # EE target
-            ee_pos, ee_yaw = self._circular_ee_target(valve_center, radius, angle, ee_z)
-            ee_vel = self._circular_ee_velocity(radius, angular_vel, angle)
+                # At motion_time == 0 the target is exactly the measured hold
+                # pose.  Smoothly remove its residual XY offset while circular
+                # speed ramps up, including the corresponding velocity term.
+                handoff_ratio = min(
+                    1.0, motion_time / motion_ramp_time)
+                handoff_scale = 1.0 - smoothstep01(handoff_ratio)
+                handoff_rate = (
+                    -6.0 * handoff_ratio * (1.0 - handoff_ratio) /
+                    motion_ramp_time
+                    if 0.0 < handoff_ratio < 1.0 else 0.0)
+                ee_pos = (
+                    np.asarray(ee_pos, dtype=float) +
+                    handoff_scale * contact_position_offset).tolist()
+                ee_vel = (
+                    ee_vel + handoff_rate * contact_position_offset).tolist()
+
+            if not self._end_effector_feedback_is_fresh(pose_max_age):
+                self._freeze_circular_motion(
+                    ee_pos, ee_yaw,
+                    "Valve rotation aborted: end-effector feedback is stale")
+                return 'failed'
+
+            roll, pitch, _ = self.beetle.getUavRPY()
+            if max(abs(roll), abs(pitch)) > rp_guard:
+                self._freeze_circular_motion(
+                    ee_pos, ee_yaw,
+                    "Valve rotation aborted: roll/pitch %.1f/%.1f deg exceeds %.1f deg" % (
+                        math.degrees(roll), math.degrees(pitch),
+                        math.degrees(rp_guard)))
+                return 'failed'
+
+            measured_yaw_rate = self._formation_yaw_rate(
+                yaw_velocity_timeout)
+            if measured_yaw_rate is None:
+                self._freeze_circular_motion(
+                    ee_pos, ee_yaw,
+                    "Valve rotation aborted: yaw-rate feedback is stale")
+                return 'failed'
+            measured_yaw_speed = abs(measured_yaw_rate)
+            if measured_yaw_speed > yaw_rate_emergency_limit:
+                self._freeze_circular_motion(
+                    ee_pos, ee_yaw,
+                    "Valve rotation aborted: measured yaw rate %.1fdeg/s "
+                    "exceeds emergency limit %.1fdeg/s" % (
+                        math.degrees(measured_yaw_rate),
+                        math.degrees(yaw_rate_emergency_limit)))
+                return 'failed'
+            yaw_rate_above_hard_limit = (
+                measured_yaw_speed > yaw_rate_hard_limit)
+            if yaw_rate_above_hard_limit:
+                if not yaw_hard_overspeed_latched:
+                    yaw_hard_overspeed_latched = True
+                    yaw_hard_hold_position = list(last_command_position)
+                    yaw_hard_hold_yaw = last_command_yaw
+                    nominal_progress = previous_nominal_progress
+                    command_progress = previous_command_progress
+                    angle = previous_angle
+                    rospy.logwarn(
+                        "Formation yaw hard-overspeed relief latched at "
+                        "%.1fdeg/s; holding circular phase and rapidly "
+                        "reducing torque" % math.degrees(measured_yaw_rate))
+                if yaw_rate_hard_exceeded_since is None:
+                    yaw_rate_hard_exceeded_since = now
+                yaw_rate_hard_exceeded_duration = max(
+                    0.0, now - yaw_rate_hard_exceeded_since)
+                if yaw_rate_hard_exceeded_duration >= yaw_rate_hard_duration:
+                    self._freeze_circular_motion(
+                        ee_pos, ee_yaw,
+                        "Valve rotation aborted: measured yaw rate %.1fdeg/s "
+                        "exceeded hard limit %.1fdeg/s continuously for %.2fs" % (
+                            math.degrees(measured_yaw_rate),
+                            math.degrees(yaw_rate_hard_limit),
+                            yaw_rate_hard_duration))
+                    return 'failed'
+                rospy.logwarn_throttle(
+                    0.2,
+                    "Formation yaw rate %.1fdeg/s exceeds hard limit "
+                    "%.1fdeg/s; relieving torque for %.2f/%.2fs" % (
+                        math.degrees(measured_yaw_rate),
+                        math.degrees(yaw_rate_hard_limit),
+                        yaw_rate_hard_exceeded_duration,
+                        yaw_rate_hard_duration))
+            else:
+                yaw_rate_hard_exceeded_since = None
+
+            yaw_rate_above_guard = (
+                measured_yaw_speed > yaw_rate_guard)
+            if yaw_rate_above_guard:
+                if yaw_rate_exceeded_since is None:
+                    yaw_rate_exceeded_since = now
+                yaw_rate_exceeded_duration = max(
+                    0.0, now - yaw_rate_exceeded_since)
+                if yaw_rate_exceeded_duration >= yaw_rate_guard_duration:
+                    self._freeze_circular_motion(
+                        ee_pos, ee_yaw,
+                        "Valve rotation aborted: measured yaw rate %.1fdeg/s "
+                        "exceeded %.1fdeg/s continuously for %.1fs" % (
+                            math.degrees(measured_yaw_rate),
+                            math.degrees(yaw_rate_guard),
+                            yaw_rate_guard_duration))
+                    return 'failed'
+                rospy.logwarn_throttle(
+                    0.5,
+                    "Formation yaw rate %.1fdeg/s exceeds %.1fdeg/s; "
+                    "continuing circular motion with mild torque relief "
+                    "(%.1f/%.1fs before abort)" % (
+                        math.degrees(measured_yaw_rate),
+                        math.degrees(yaw_rate_guard),
+                        yaw_rate_exceeded_duration,
+                        yaw_rate_guard_duration))
+            else:
+                yaw_rate_exceeded_since = None
+
+            if yaw_hard_overspeed_latched:
+                if measured_yaw_speed < yaw_rate_recovery_limit:
+                    if yaw_rate_recovery_since is None:
+                        yaw_rate_recovery_since = now
+                    yaw_rate_recovery_elapsed = max(
+                        0.0, now - yaw_rate_recovery_since)
+                    if yaw_rate_recovery_elapsed >= yaw_rate_recovery_duration:
+                        yaw_hard_overspeed_latched = False
+                        yaw_rate_recovery_since = None
+                        yaw_hard_hold_position = None
+                        yaw_hard_hold_yaw = None
+                        rospy.loginfo(
+                            "Formation yaw hard overspeed recovered after %.1fs "
+                            "below %.1fdeg/s; resuming circular motion" % (
+                                yaw_rate_recovery_duration,
+                                math.degrees(yaw_rate_recovery_limit)))
+                else:
+                    yaw_rate_recovery_since = None
+
+            if yaw_hard_overspeed_latched:
+                command_angular_vel = 0.0
+                ee_pos = list(yaw_hard_hold_position)
+                ee_yaw = yaw_hard_hold_yaw
+                ee_vel = None
+
+            if holding_for_wrench_ramp:
+                actual_position = self.get_end_effector_position()
+                actual_yaw = self.get_end_effector_yaw()
+                hold_position_tolerance = max(0.0, float(rospy.get_param(
+                    "~wrench_ramp_hold_position_tolerance", 0.030)))
+                hold_yaw_tolerance = math.radians(max(0.0, float(
+                    rospy.get_param(
+                        "~wrench_ramp_hold_yaw_tolerance_deg", 5.0))))
+                if actual_position is None or actual_yaw is None:
+                    self._freeze_circular_motion(
+                        ee_pos, ee_yaw,
+                        "Valve contact pose unavailable during wrench ramp")
+                    return 'failed'
+                position_delta = (
+                    np.asarray(actual_position, dtype=float) -
+                    np.asarray(self._contact_hold_position, dtype=float))
+                position_error = float(np.linalg.norm(position_delta))
+                xy_error = float(np.linalg.norm(position_delta[:2]))
+                z_error = abs(float(position_delta[2]))
+                yaw_error = abs(FormationUtils.normalize_angle(
+                    float(actual_yaw) - self._contact_hold_yaw))
+                if (position_error > hold_position_tolerance or
+                        yaw_error > hold_yaw_tolerance):
+                    self._freeze_circular_motion(
+                        ee_pos, ee_yaw,
+                        "Valve contact became unstable during wrench ramp: "
+                        "3D position %.1f/%.1fmm (XY %.1fmm, Z %.1fmm), "
+                        "yaw %.1f/%.1fdeg" % (
+                            position_error * 1000.0,
+                            hold_position_tolerance * 1000.0,
+                            xy_error * 1000.0, z_error * 1000.0,
+                            math.degrees(yaw_error),
+                            math.degrees(hold_yaw_tolerance)))
+                    return 'failed'
+
+            # Refresh the pose target before publishing any wrench, matching
+            # the static torque demo's hold-then-wrench ordering.
+            if holding_for_wrench_ramp:
+                self.send_assembly_command_from_end_effector(ee_pos, ee_yaw)
+            else:
+                self.send_assembly_command_from_end_effector(
+                    ee_pos, ee_yaw, linear_vel=ee_vel,
+                    angular_vel=command_angular_vel)
+            last_command_position = list(ee_pos)
+            last_command_yaw = ee_yaw
 
             # Wrench feedforward with adaptive torque
             if ff_enabled:
-                roll_adjust, roll_moment = self._dragon_roll_moment_adjust(
-                    ee_yaw, dt, roll_moment_thresh, torque_adjust_roll_k)
-                measured_yaw_rate = self._formation_yaw_rate(yaw_velocity_timeout)
-                yaw_rate_adjust = 0.0
-                if measured_yaw_rate is None:
-                    rospy.logwarn_throttle(
-                        1.0, "Valve FF velocity feedback stale; holding velocity adjustment")
-                else:
-                    yaw_rate_adjust = demo_common.velocity_error_adjustment(
-                        angular_vel, measured_yaw_rate,
-                        torque_adjust_yaw_k, dt, yaw_velocity_thresh)
-                    if torque_adjust_yaw_rate_limit > 0.0:
-                        max_yaw_adjust = torque_adjust_yaw_rate_limit * dt
-                        yaw_rate_adjust = max(
-                            -max_yaw_adjust,
-                            min(max_yaw_adjust, yaw_rate_adjust))
-                torque_z += roll_adjust + yaw_rate_adjust
-                torque_z = self._clamp_directed_torque(torque_z, torque_min, torque_limit)
-                ff_force = self._centripetal_force_world(radius, angular_vel, angle)
-                ff_force[2] += ff_force_z
+                torque_relief_active = (
+                    yaw_hard_overspeed_latched or yaw_rate_above_guard)
+                if torque_relief_active or not holding_for_wrench_ramp:
+                    active_relief_time = (
+                        yaw_rate_hard_duration
+                        if yaw_hard_overspeed_latched
+                        else torque_ramp_time)
+                    torque_z, torque_phase = \
+                        self._velocity_adaptive_torque_step(
+                            torque_z, torque_min, torque_limit,
+                            torque_ramp_time, abs(target_angular_vel),
+                            last_valve_omega, dt, valve_speed_ready,
+                            formation_overspeed=torque_relief_active,
+                            formation_relief_time=active_relief_time)
                 ff_force_cmd, ff_torque_cmd, ff_frame = self._build_valve_wrench_command(
-                    ff_force, [0.0, 0.0, torque_z])
-                self.beetle.addExternalWrench(force=ff_force_cmd, torque=ff_torque_cmd,
-                                              frame_id=ff_frame,
-                                              task_weights=VALVE_TASK_WRENCH_WEIGHTS if self.beetle.isUnifiedMode() else None)
+                    [0.0, 0.0, ff_force_z * wrench_scale],
+                    [0.0, 0.0, torque_z * wrench_scale])
+                self.beetle.addExternalWrench(
+                    force=ff_force_cmd, torque=ff_torque_cmd,
+                    frame_id=ff_frame,
+                    task_weights=(VALVE_TASK_WRENCH_WEIGHTS
+                                  if self.beetle.isUnifiedMode() else None))
 
-            self.send_assembly_command_from_end_effector(ee_pos, ee_yaw, linear_vel=ee_vel)
+            reported_torque_phase = torque_phase
+            if (holding_for_wrench_ramp and
+                    not yaw_hard_overspeed_latched and
+                    not yaw_rate_above_guard):
+                reported_torque_phase = "wrench_ramp_hold"
 
             # Log every 5s
             rospy.loginfo_throttle(5.0,
-                f"Rotation: {math.degrees(valve_rot):.1f} deg/{math.degrees(self.target_rotation):.1f} deg, "
-                f"omega={math.degrees(valve_omega):.2f} deg/s, torque={torque_z:.2f}N*m, t={t:.1f}s")
+                f"Rotation: {math.degrees(live_valve_progress):.1f} deg/{math.degrees(self.target_rotation):.1f} deg, "
+                f"valve_omega={math.degrees(last_valve_omega):.2f} deg/s, "
+                f"cmd_omega={math.degrees(command_angular_vel):.2f} deg/s, "
+                f"phase_lead={math.degrees(command_progress-total_valve_progress):.2f} deg, "
+                f"torque={torque_z*wrench_scale:.2f}N*m, "
+                f"phase={reported_torque_phase}, "
+                f"t={t:.1f}s")
 
             rate.sleep()
 
         # Failed
+        self._hold_measured_pose(
+            self._contact_hold_position, self._contact_hold_yaw)
         self.beetle.clearExternalWrench(duration=1.0, rate_hz=25.0)
         self.beetle.setAttachModule(None)
         rospy.logerr(f"Valve rotation failed: achieved {math.degrees(max_rotation_detected):.1f} deg "
@@ -2101,12 +3396,12 @@ def main():
     rospy.init_node('formation_valve_rotation')
 
     # Get target rotation angle (degrees)
-    rotation_angle_deg_param = rospy.get_param("~rotation_angle_deg", 90.0)
+    rotation_angle_deg_param = rospy.get_param("~rotation_angle_deg", 360.0)
     try:
         rotation_angle_deg = float(rotation_angle_deg_param)
     except (TypeError, ValueError):
-        rospy.logwarn(f"Invalid rotation_angle_deg '{rotation_angle_deg_param}', fallback to 90 deg")
-        rotation_angle_deg = 90.0
+        rospy.logwarn(f"Invalid rotation_angle_deg '{rotation_angle_deg_param}', fallback to 360 deg")
+        rotation_angle_deg = 360.0
 
     if rotation_angle_deg == 0.0:
         rospy.logwarn("rotation_angle_deg is 0.0 deg; no effective valve rotation target")

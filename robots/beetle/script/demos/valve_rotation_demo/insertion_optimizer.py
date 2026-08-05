@@ -59,7 +59,7 @@ class InsertionOptimizer:
         self.insertion_safety_margin_z = 0.0673 + 0.0221140
         
         # Safety constraints
-        self.min_end_effector_to_valve_center_distance = 0.020
+        self.min_end_effector_to_valve_center_distance = 0.005
         self.min_uav_to_valve_outer_rim_distance = 0.180
         self.min_uav_to_valve_center_distance = 0.200
         

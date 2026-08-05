@@ -30,11 +30,8 @@
   <arg name="wall_thickness" default="0.1"/>
   <arg name="wall_width" default="2.0"/>
   <arg name="wall_height" default="2.0"/>
-  <arg name="wall_mass" default="20.0"/>
   <arg name="wall_static" default="false"
        doc="false enables object motion required by wrench adaptation"/>
-  <arg name="wall_slide_friction" default="2.0"
-       doc="Kept below the conservative 5N single-UAV force default"/>
   <arg name="wall_slide_damping" default="50.0"/>
   <arg name="use_wall_mocap" default="true"
        doc="Required on hardware for object-speed adaptive validation"/>

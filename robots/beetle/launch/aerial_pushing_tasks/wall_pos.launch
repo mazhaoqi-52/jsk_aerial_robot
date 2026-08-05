@@ -14,10 +14,8 @@
   <arg name="wall_thickness" default="0.1" />
   <arg name="wall_width" default="2.0" />
   <arg name="wall_height" default="2.0" />
-  <arg name="wall_mass" default="20.0" />
   <arg name="wall_static" default="true"
        doc="true = wall anchored to world (static force test); false = wall slides along push X (dynamic push)" />
-  <arg name="wall_slide_friction" default="10.0" />
   <arg name="wall_slide_damping" default="50.0" />
 
   <group ns="$(arg robot_ns)">
@@ -33,7 +31,7 @@
     <group if="$(arg simulation)">
       <group unless="$(arg real_machine)">
         <param name="robot_description"
-          command="$(find xacro)/xacro $(find beetle)/urdf/wall.urdf wall_thickness:=$(arg wall_thickness) wall_width:=$(arg wall_width) wall_height:=$(arg wall_height) wall_mass:=$(arg wall_mass) wall_static:=$(arg wall_static) wall_slide_friction:=$(arg wall_slide_friction) wall_slide_damping:=$(arg wall_slide_damping)" />
+          command="$(find xacro)/xacro $(find beetle)/urdf/wall.urdf wall_thickness:=$(arg wall_thickness) wall_width:=$(arg wall_width) wall_height:=$(arg wall_height) wall_static:=$(arg wall_static) wall_slide_damping:=$(arg wall_slide_damping)" />
         <node pkg="gazebo_ros" type="spawn_model" name="spawn_wall" respawn="false" output="screen"
           args="-urdf -model wall -x $(arg wall_x) -y $(arg wall_y) -z $(arg wall_z) -Y $(arg wall_yaw) -param robot_description" />
       </group>

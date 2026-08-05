@@ -11,7 +11,6 @@
   <arg name="load_y" default="0" />
   <arg name="load_z" default="0" />
   <arg name="load_yaw" default="0" />
-  <arg name="load_friction" default="5.0" />
 
   <group ns="$(arg robot_ns)">
     <group if="$(arg real_machine)">
@@ -24,7 +23,7 @@
     <group if="$(arg simulation)">
       <group unless="$(arg real_machine)">
         <param name="robot_description"
-          command="$(find xacro)/xacro $(find beetle)/urdf/load.urdf load_friction:=$(arg load_friction)" />
+          command="$(find xacro)/xacro $(find beetle)/urdf/load.urdf" />
         <!-- Spawn load -->
         <node pkg="gazebo_ros" type="spawn_model" name="spawn_load" respawn="false" output="screen"
           args="-urdf -model load -x $(arg load_x) -y $(arg load_y) -z $(arg load_z) -Y $(arg load_yaw) -param robot_description" />

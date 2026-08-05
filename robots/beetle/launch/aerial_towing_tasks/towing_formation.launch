@@ -15,7 +15,6 @@
   <arg name="load_y"        default="0"/>
   <arg name="load_z"        default="0"/>
   <arg name="load_yaw"      default="0"/>
-  <arg name="load_friction" default="15.0"/>
 
   <include file="$(find beetle)/launch/aerial_towing_tasks/load_pos.launch">
     <arg name="real_machine"  value="$(arg real_machine)"/>
@@ -26,7 +25,6 @@
     <arg name="load_y"        value="$(arg load_y)"/>
     <arg name="load_z"        value="$(arg load_z)"/>
     <arg name="load_yaw"      value="$(arg load_yaw)"/>
-    <arg name="load_friction" value="$(arg load_friction)"/>
   </include>
 
   ###########  Parameters  ###########
@@ -34,7 +32,7 @@
        doc="Target towing distance (m)"/>
   <arg name="towing_force"    default="5.0"
        doc="Initial towing force (N), ramps adaptively"/>
-  <arg name="hook_contact_insert_clearance" default="0.03"
+  <arg name="hook_contact_insert_clearance" default="0.015"
        doc="Hook contact clearance above load top at insertion (m)"/>
   <arg name="towing_pitch_torque_task_weight" default="0.18"
        doc="Unified QP task weight for towing pitch torque compensation"/>
@@ -55,13 +53,17 @@
   <arg name="stable_rolling_force_floor_ratio" default="0.85"
        doc="Temporary force floor as a ratio of breakaway force before stable rolling"/>
   <arg name="overspeed_force_relief_time" default="10.0"
-       doc="Time constant that sets the maximum velocity-error towing force relief rate (s)"/>
+       doc="Time constant that sets the post-feedback force adjustment rate limit in both directions (s)"/>
   <arg name="velocity_force_gain" default="0.0"
-       doc="Incremental velocity-error force gain (N/m); 0 maps a stopped load to the pre-breakaway recovery-rate limit; task force-rate caps still apply"/>
+       doc="Velocity-error integral gain Ki (N/m); 0 maps a stopped load to the pre-breakaway recovery-rate limit; force-rate caps still apply"/>
+  <arg name="velocity_force_damping_gain" default="0.0"
+       doc="Direct velocity damping gain for the incremental PI force loop (N*s/m); 0 uses the same numeric value as automatic velocity_force_gain"/>
   <arg name="velocity_error_deadband" default="0.005"
        doc="Towing speed-error deadband for feedforward adaptation (m/s)"/>
   <arg name="velocity_filter_time_constant" default="0.15"
        doc="Towing first-order load-speed filter time constant (s); 0 disables filtering"/>
+  <arg name="severe_overspeed_confirm_time" default="1.0"
+       doc="Continuous time above twice target speed before safety relief (s)"/>
   <arg name="velocity_feedback_timeout" default="0.5"
        doc="Hold towing force adaptation when load pose samples are older than this (s)"/>
   <arg name="unload_contact_lead" default="0.03"
@@ -90,8 +92,10 @@
     <param name="stable_rolling_force_floor_ratio" value="$(arg stable_rolling_force_floor_ratio)"/>
     <param name="overspeed_force_relief_time" value="$(arg overspeed_force_relief_time)"/>
     <param name="velocity_force_gain" value="$(arg velocity_force_gain)"/>
+    <param name="velocity_force_damping_gain" value="$(arg velocity_force_damping_gain)"/>
     <param name="velocity_error_deadband" value="$(arg velocity_error_deadband)"/>
     <param name="velocity_filter_time_constant" value="$(arg velocity_filter_time_constant)"/>
+    <param name="severe_overspeed_confirm_time" value="$(arg severe_overspeed_confirm_time)"/>
     <param name="velocity_feedback_timeout" value="$(arg velocity_feedback_timeout)"/>
     <param name="unload_contact_lead" value="$(arg unload_contact_lead)"/>
     <param name="unload_force_rate" value="$(arg unload_force_rate)"/>

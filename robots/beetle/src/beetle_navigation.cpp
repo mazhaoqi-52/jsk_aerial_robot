@@ -2,6 +2,7 @@
 
 #include <beetle/beetle_navigation.h>
 #include <aerial_robot_control/util/joy_parser.h>
+#include <limits>
 
 using namespace aerial_robot_model;
 using namespace aerial_robot_navigation;
@@ -1189,13 +1190,21 @@ void BeetleNavigator::rosParamInit()
 void BeetleNavigator::calculateAndPublishAssemblyCoGOdom()
 {
   if(!publish_assembly_odom_) return;
-  if(getModuleState() == SEPARATED) return;  // Not assembled
+  // Publish one authoritative control origin instead of racing identical
+  // global-topic publishers from every follower.
+  if(getModuleState() != LEADER) return;
   
   std::vector<int> assembled_ids = getAssemblyIds();
   if(assembled_ids.empty()) return;
   
   // Calculate CoG position (weighted average)
   Eigen::Vector3d cog_pos = calculateAssemblyCoGPosition();
+  if (!cog_pos.allFinite()) {
+    ROS_WARN_THROTTLE(
+      1.0,
+      "[BeetleNavigator] Assembly CoG odom skipped: module transforms incomplete");
+    return;
+  }
   
   // Calculate CoG orientation (quaternion average)
   Eigen::Quaterniond cog_quat = calculateAssemblyCoGOrientation();
@@ -1223,7 +1232,25 @@ Eigen::Vector3d BeetleNavigator::calculateAssemblyCoGPosition()
   std::vector<int> assembled_ids = getAssemblyIds();
   Eigen::Vector3d cog_pos = Eigen::Vector3d::Zero();
   double total_mass = 0.0;
-  double module_mass = beetle_robot_model_->getMass();
+  const bool use_module_model_masses = getUnifiedControlMode();
+  std::map<int, double> module_masses_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(mutex_module_masses_);
+    module_masses_snapshot = module_masses_;
+  }
+  const bool all_module_masses_ready =
+    !use_module_model_masses ||
+    std::all_of(assembled_ids.begin(), assembled_ids.end(),
+                [&module_masses_snapshot](int id) {
+                  return module_masses_snapshot.count(id) > 0;
+                });
+
+  if (use_module_model_masses && !all_module_masses_ready) {
+    ROS_WARN_THROTTLE(
+      1.0,
+      "[UnifiedNav id=%d] ModuleModel masses incomplete; publishing equal-weight assembly CoG odom",
+      my_id_);
+  }
   
   for(int id : assembled_ids) {
     geometry_msgs::TransformStamped transform;
@@ -1237,20 +1264,25 @@ Eigen::Vector3d BeetleNavigator::calculateAssemblyCoGPosition()
         transform.transform.translation.z
       );
       
-      cog_pos += module_pos * module_mass;
-      total_mass += module_mass;
+      const double weight =
+        (use_module_model_masses && all_module_masses_ready)
+        ? module_masses_snapshot[id] : 1.0;
+      cog_pos += module_pos * weight;
+      total_mass += weight;
       
     } catch(tf2::TransformException& ex) {
       ROS_WARN_THROTTLE(5.0, "[BeetleNavigator] Failed to get transform for %s%d: %s", 
                         my_name_.c_str(), id, ex.what());
+      return Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
     }
   }
   
-  if(total_mass > 0) {
-    cog_pos /= total_mass;
+  if(total_mass <= 0.0) {
+    return Eigen::Vector3d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
   }
-  
-  return cog_pos;
+  return cog_pos / total_mass;
 }
 
 Eigen::Quaterniond BeetleNavigator::calculateAssemblyCoGOrientation()

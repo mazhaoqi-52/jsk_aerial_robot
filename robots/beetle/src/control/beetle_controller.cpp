@@ -798,17 +798,21 @@ namespace aerial_robot_control
       I_comp_Ty_ = pid_controllers_.at(TY).result();
       I_comp_Tz_ = pid_controllers_.at(TZ).result();
 
-      // X/Y: inject parasitic compensation + task feedforward as persistent FF
-      // Uses setPersistentFF to avoid race condition with nav callback clearing target_acc_
+      // Task acceleration is withdrawable feedforward and must never enter
+      // ICompTerm, which accumulates into the pose PID integral every cycle.
+      // Keep the legacy residual-compensation semantics separate below.
       pid_controllers_.at(X).setPersistentFF(lf_total_acc_term(0));
       pid_controllers_.at(Y).setPersistentFF(lf_total_acc_term(1));
+      pid_controllers_.at(Z).setPersistentFF(lf_task_ff_acc(2));
+      pid_controllers_.at(ROLL).setPersistentFF(lf_task_ff_acc(3));
+      pid_controllers_.at(PITCH).setPersistentFF(lf_task_ff_acc(4));
+      pid_controllers_.at(YAW).setPersistentFF(lf_task_ff_acc(5));
       pid_controllers_.at(X).setICompTerm(0.0);
       pid_controllers_.at(Y).setICompTerm(0.0);
-      // Z and torque: keep original ICompTerm path
-      pid_controllers_.at(Z).setICompTerm(I_comp_Fz_ + lf_task_ff_acc(2));
-      pid_controllers_.at(ROLL).setICompTerm(I_comp_Tx_ + lf_task_ff_acc(3));
-      pid_controllers_.at(PITCH).setICompTerm(I_comp_Ty_ + lf_task_ff_acc(4));
-      pid_controllers_.at(YAW).setICompTerm(I_comp_Tz_ + lf_task_ff_acc(5));
+      pid_controllers_.at(Z).setICompTerm(I_comp_Fz_);
+      pid_controllers_.at(ROLL).setICompTerm(I_comp_Tx_);
+      pid_controllers_.at(PITCH).setICompTerm(I_comp_Ty_);
+      pid_controllers_.at(YAW).setICompTerm(I_comp_Tz_);
 
       geometry_msgs::WrenchStamped wrench_msg;
       wrench_msg.header.stamp.fromSec(estimator_->getImuLatestTimeStamp());
@@ -882,12 +886,16 @@ namespace aerial_robot_control
         // decomposed task share; residual compensation is follower-only.
         pid_controllers_.at(X).setPersistentFF(lf_task_ff_acc(0));
         pid_controllers_.at(Y).setPersistentFF(lf_task_ff_acc(1));
+        pid_controllers_.at(Z).setPersistentFF(lf_task_ff_acc(2));
+        pid_controllers_.at(ROLL).setPersistentFF(lf_task_ff_acc(3));
+        pid_controllers_.at(PITCH).setPersistentFF(lf_task_ff_acc(4));
+        pid_controllers_.at(YAW).setPersistentFF(lf_task_ff_acc(5));
         pid_controllers_.at(X).setICompTerm(0.0);
         pid_controllers_.at(Y).setICompTerm(0.0);
-        pid_controllers_.at(Z).setICompTerm(lf_task_ff_acc(2));
-        pid_controllers_.at(ROLL).setICompTerm(lf_task_ff_acc(3));
-        pid_controllers_.at(PITCH).setICompTerm(lf_task_ff_acc(4));
-        pid_controllers_.at(YAW).setICompTerm(lf_task_ff_acc(5));
+        pid_controllers_.at(Z).setICompTerm(0.0);
+        pid_controllers_.at(ROLL).setICompTerm(0.0);
+        pid_controllers_.at(PITCH).setICompTerm(0.0);
+        pid_controllers_.at(YAW).setICompTerm(0.0);
       }
     }
       

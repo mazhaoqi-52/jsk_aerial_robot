@@ -9,8 +9,8 @@
   <xacro:property name="wall_thickness" value="0.015" /> <!-- wall thickness -->
   
   <!-- Load properties -->
-  <xacro:property name="load_mass" value="2.0" />   <!-- kg -->
-  <xacro:arg name="load_friction" default="15.0" /> <!-- N, force needed to move -->
+  <xacro:property name="load_mass" value="40.0" />   <!-- kg -->
+  <xacro:property name="load_friction" value="1500.0" /> <!-- N, force needed to move -->
   
   <!-- Inertia approximation (treating as hollow box) -->
   <xacro:property name="ixx" value="${(1.0/12.0) * load_mass * (box_width*box_width + box_height*box_height)}" />
@@ -46,7 +46,7 @@
     <child link="slide_x"/>
     <origin xyz="0 0 ${box_height/2}" rpy="0 0 0"/>
     <axis xyz="1 0 0"/>
-    <dynamics damping="1.0" friction="$(arg load_friction)"/>
+    <dynamics damping="1.0" friction="${load_friction}"/>
     <limit lower="-1000" upper="1000" effort="1000" velocity="10"/>
   </joint>
 
@@ -56,7 +56,7 @@
     <child link="load_box"/>
     <origin xyz="0 0 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-    <dynamics damping="1.0" friction="$(arg load_friction)"/>
+    <dynamics damping="1.0" friction="${load_friction}"/>
     <limit lower="-1000" upper="1000" effort="1000" velocity="10"/>
   </joint>
 

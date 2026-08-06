@@ -33,7 +33,6 @@
 // header (e.g. ninja) do not need to link against OsqpEigen.
 namespace OsqpEigen { class Solver; }
 #include <spinal/FourAxisCommand.h>
-#include <spinal/ActuatorCommandFeedback.h>
 #include <spinal/MotorInfo.h>
 #include <spinal/Pwms.h>
 #include <spinal/TorqueAllocationMatrixInv.h>
@@ -230,24 +229,15 @@ public:
    *   F = M * w_allocated_acc.head(3)
    *   T = I_cog * w_allocated_acc.tail(3)
    *
-   * It deliberately remains a command/allocation diagnostic; it does not
-   * include spinal-side P/D increments, saturation shedding, or actuator
-   * tracking error and must not be used as the momentum-observer known input.
+   * It is the PC-side model input used by the existing momentum observers. It
+   * does not include spinal-side P/D increments, saturation shedding, or
+   * actuator tracking error, so the observer output remains a model residual.
    *
    * @return 6D wrench [Fx,Fy,Fz,Tx,Ty,Tz] in virtual CoG frame (N, N·m).
    *         Returns zero vector if allocation has not been computed yet.
    */
   Eigen::VectorXd getAllocatedWrenchCog() const;
   bool getAllocatedModuleWrenchCog(int module_id, Eigen::VectorXd& allocated) const;
-
-  /** @brief Convert one module's atomic Spinal command feedback into a wrench
-   *  about that module's CoG, expressed in its virtual CoG control axes.
-   *  The feedback thrust is a post-PWM-clamp command-model value, not measured
-   *  rotor thrust. */
-  bool computeModuleActuatorWrenchCog(
-      int module_id,
-      const spinal::ActuatorCommandFeedback& feedback,
-      Eigen::VectorXd& wrench) const;
 
 private:
   ros::NodeHandle nh_;

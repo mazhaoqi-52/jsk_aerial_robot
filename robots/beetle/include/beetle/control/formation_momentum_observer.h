@@ -4,10 +4,9 @@
 // Design rationale:
 //   - Separate class from single-module observer (different semantics)
 //   - Uses formation mass/inertia, not single-module parameters
-//   - Observer input = final-FC actuator-command wrench reconstructed locally
-//     from Spinal's atomic post-clamp thrust and gimbal-target feedback
+//   - Observer input = existing PC-side allocation-model wrench (A * f)
 //   - The input is about the formation CoG in the virtual CoG control frame
-//   - It remains a command-model estimate, not measured rotor thrust
+//   - It is not measured or reconstructed rotor thrust
 //
 // Version 1 (Phase U2):
 //   - 3D external force estimation only (no torque)
@@ -56,7 +55,7 @@ public:
    *   f_ext_hat = K_obs * (p(t) - p(0) - integrate_term)
    *
    * where:
-   *   tau_known = spatial sum of the per-module final-FC command wrenches
+   *   tau_known = PC-side formation allocation-model wrench (A * f)
    *   N = gravity + gyroscopic terms
    *   K_obs = diagonal observer gain matrix
    *
@@ -65,9 +64,9 @@ public:
    * @param cog_rot                3x3 rotation matrix: formation body → world.
    * @param vel_w                  Formation CoG linear velocity in world frame [m/s].
    * @param omega_cog              Formation angular velocity in virtual CoG frame [rad/s].
-   * @param known_actuator_wrench_cog 6D final-FC actuator-command wrench about
-   *                               formation CoG, expressed in virtual CoG axes
-   *                               [Fx,Fy,Fz,Tx,Ty,Tz] (N, N·m).
+   * @param allocated_wrench_cog 6D PC-side allocation-model wrench about the
+   *                             formation CoG, expressed in virtual CoG axes
+   *                             [Fx,Fy,Fz,Tx,Ty,Tz] (N, N·m).
    * @param dt                     Time step [s].
    */
   void update(double formation_mass,
@@ -75,7 +74,7 @@ public:
               const Eigen::Matrix3d& cog_rot,
               const Eigen::Vector3d& vel_w,
               const Eigen::Vector3d& omega_cog,
-              const Eigen::VectorXd& known_actuator_wrench_cog,
+              const Eigen::VectorXd& allocated_wrench_cog,
               double dt);
 
   // ---- Accessors (debug / optional controller feedback) ----
@@ -180,7 +179,7 @@ private:
   ros::Publisher est_ext_wrench_pub_;          // geometry_msgs/WrenchStamped (full 6D)
   ros::Publisher observer_residual_pub_;       // geometry_msgs/Vector3Stamped (force residual)
   ros::Publisher observer_residual_torque_pub_; // geometry_msgs/Vector3Stamped (torque residual, V2)
-  ros::Publisher known_wrench_input_pub_;       // geometry_msgs/WrenchStamped (input for verification)
+  ros::Publisher allocated_wrench_input_pub_;   // geometry_msgs/WrenchStamped (input for verification)
 
   // ---- Internal helpers ----
   void publishDebug(const ros::Time& stamp,

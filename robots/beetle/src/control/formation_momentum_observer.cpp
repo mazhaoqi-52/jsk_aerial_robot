@@ -7,18 +7,18 @@
 //
 //   Linear momentum:  p_lin = M * v_w   (world frame)
 //
-//   Known actuator-command force → world:  f_known_w = R * f_known_cog
+//   PC allocated force → world:  f_alloc_w = R * f_alloc_cog
 //
 //   Non-linear term (force):  N_f = M * g_w  (gravity in world = [0, 0, +9.8])
 //
 //   Integration:
-//     integrate_term_f += (f_known_w - N_f + f_ext_hat) * dt
+//     integrate_term_f += (f_alloc_w - N_f + f_ext_hat) * dt
 //
 //   Observer output (raw):
 //     f_ext_hat_raw = K_f * (p_lin - p_lin_0 - integrate_term_f)
 //
 // Diagnostic equation check:
-//   finite_diff_ext = d(M*v_w)/dt - (f_known_w - M*g_w)
+//   finite_diff_ext = d(M*v_w)/dt - (f_alloc_w - M*g_w)
 // This should roughly match f_ext_hat when the allocation/thrust model is
 // consistent. If it does not, the observer output is a model residual rather
 // than a trustworthy physical external force.
@@ -72,7 +72,7 @@ void FormationMomentumObserver::initialize(ros::NodeHandle nh)
   est_ext_wrench_pub_        = obs_nh.advertise<geometry_msgs::WrenchStamped>("est_ext_wrench", 1);
   observer_residual_pub_     = obs_nh.advertise<geometry_msgs::Vector3Stamped>("residual_force", 1);
   observer_residual_torque_pub_ = obs_nh.advertise<geometry_msgs::Vector3Stamped>("residual_torque", 1);
-  known_wrench_input_pub_    = obs_nh.advertise<geometry_msgs::WrenchStamped>("known_actuator_wrench_input", 1);
+  allocated_wrench_input_pub_ = obs_nh.advertise<geometry_msgs::WrenchStamped>("allocated_wrench_input", 1);
 
   ROS_INFO("[FormationObserver] Initialized: force_gain=%.2f, torque_gain=%.2f, "
            "force_en=%d, torque_en=%d",
@@ -143,7 +143,7 @@ void FormationMomentumObserver::update(
     const Eigen::Matrix3d& cog_rot,
     const Eigen::Vector3d& vel_w,
     const Eigen::Vector3d& omega_cog,
-    const Eigen::VectorXd& known_actuator_wrench_cog,
+    const Eigen::VectorXd& allocated_wrench_cog,
     double dt)
 {
   if (!active_) return;
@@ -172,19 +172,19 @@ void FormationMomentumObserver::update(
                init_linear_momentum_.z(), formation_mass);
     }
 
-    // 3. Known actuator-command force: rotate virtual CoG frame to world
-    Eigen::Vector3d known_force_cog = Eigen::Vector3d::Zero();
-    if (known_actuator_wrench_cog.size() >= 3)
+    // 3. PC allocated force: rotate virtual CoG frame to world
+    Eigen::Vector3d allocated_force_cog = Eigen::Vector3d::Zero();
+    if (allocated_wrench_cog.size() >= 3)
     {
-      known_force_cog = known_actuator_wrench_cog.head(3);
+      allocated_force_cog = allocated_wrench_cog.head(3);
     }
-    Eigen::Vector3d known_force_w = cog_rot * known_force_cog;
+    Eigen::Vector3d allocated_force_w = cog_rot * allocated_force_cog;
 
     // 4. Gravity term (world frame)
     constexpr double G = 9.797;  // same as aerial_robot_estimation::G
     Eigen::Vector3d gravity_force_w = formation_mass * Eigen::Vector3d(0, 0, G);
 
-    Eigen::Vector3d model_net_force_w = known_force_w - gravity_force_w;
+    Eigen::Vector3d model_net_force_w = allocated_force_w - gravity_force_w;
     Eigen::Vector3d p_dot_w = Eigen::Vector3d::Zero();
     Eigen::Vector3d finite_diff_ext_w = Eigen::Vector3d::Zero();
     const bool p_dot_ready = prev_linear_momentum_valid_ && dt > 1e-6;
@@ -197,7 +197,7 @@ void FormationMomentumObserver::update(
     prev_linear_momentum_valid_ = true;
 
     // 5. Integration step:
-    //    integrate_term_f += (f_known_w - N_f + f_ext_hat) * dt
+    //    integrate_term_f += (f_alloc_w - N_f + f_ext_hat) * dt
     integrate_term_force_ += (model_net_force_w + est_ext_force_w_) * dt;
 
     // 6. Observer output (raw, internal feedback uses this directly):
@@ -225,11 +225,11 @@ void FormationMomentumObserver::update(
     //    measured momentum are not self-consistent.
     ROS_DEBUG_THROTTLE(
         2.0,
-        "[FormObsEq_F] f_known_w=(%.2f,%.2f,%.2f) Mg=(%.2f,%.2f,%.2f) "
+        "[FormObsEq_F] f_alloc_w=(%.2f,%.2f,%.2f) Mg=(%.2f,%.2f,%.2f) "
         "model_net=(%.2f,%.2f,%.2f) p_dot=(%.2f,%.2f,%.2f) "
         "fd_ext=(%.2f,%.2f,%.2f) obs_raw=(%.2f,%.2f,%.2f) obs_filt=(%.2f,%.2f,%.2f) "
         "ready=%d dt=%.3f ff=%s",
-        known_force_w.x(), known_force_w.y(), known_force_w.z(),
+        allocated_force_w.x(), allocated_force_w.y(), allocated_force_w.z(),
         gravity_force_w.x(), gravity_force_w.y(), gravity_force_w.z(),
         model_net_force_w.x(), model_net_force_w.y(), model_net_force_w.z(),
         p_dot_w.x(), p_dot_w.y(), p_dot_w.z(),
@@ -264,11 +264,11 @@ void FormationMomentumObserver::update(
                init_angular_momentum_.z());
     }
 
-    // 3. Known actuator-command torque in virtual CoG frame
-    Eigen::Vector3d known_torque_cog = Eigen::Vector3d::Zero();
-    if (known_actuator_wrench_cog.size() >= 6)
+    // 3. PC allocated torque in virtual CoG frame
+    Eigen::Vector3d allocated_torque_cog = Eigen::Vector3d::Zero();
+    if (allocated_wrench_cog.size() >= 6)
     {
-      known_torque_cog = known_actuator_wrench_cog.tail(3);
+      allocated_torque_cog = allocated_wrench_cog.tail(3);
     }
 
     // 4. Gyroscopic term: N_torque = omega × (I * omega)
@@ -276,7 +276,7 @@ void FormationMomentumObserver::update(
 
     // 5. Integration step:
     //    integrate_torque += (tau_known_cog - N_torque + tau_ext_hat) * dt
-    integrate_term_torque_ += (known_torque_cog - gyroscopic + est_ext_torque_cog_) * dt;
+    integrate_term_torque_ += (allocated_torque_cog - gyroscopic + est_ext_torque_cog_) * dt;
 
     // 6. Observer output (raw):
     //    tau_ext_hat = K_t * (p_ang - p_ang_0 - integrate_torque)
@@ -320,17 +320,17 @@ void FormationMomentumObserver::update(
     geometry_msgs::WrenchStamped rw_msg;
     rw_msg.header.stamp = ros::Time::now();
     rw_msg.header.frame_id = "assembly_cog";
-    if (known_actuator_wrench_cog.size() >= 3) {
-      rw_msg.wrench.force.x = known_actuator_wrench_cog(0);
-      rw_msg.wrench.force.y = known_actuator_wrench_cog(1);
-      rw_msg.wrench.force.z = known_actuator_wrench_cog(2);
+    if (allocated_wrench_cog.size() >= 3) {
+      rw_msg.wrench.force.x = allocated_wrench_cog(0);
+      rw_msg.wrench.force.y = allocated_wrench_cog(1);
+      rw_msg.wrench.force.z = allocated_wrench_cog(2);
     }
-    if (known_actuator_wrench_cog.size() >= 6) {
-      rw_msg.wrench.torque.x = known_actuator_wrench_cog(3);
-      rw_msg.wrench.torque.y = known_actuator_wrench_cog(4);
-      rw_msg.wrench.torque.z = known_actuator_wrench_cog(5);
+    if (allocated_wrench_cog.size() >= 6) {
+      rw_msg.wrench.torque.x = allocated_wrench_cog(3);
+      rw_msg.wrench.torque.y = allocated_wrench_cog(4);
+      rw_msg.wrench.torque.z = allocated_wrench_cog(5);
     }
-    known_wrench_input_pub_.publish(rw_msg);
+    allocated_wrench_input_pub_.publish(rw_msg);
   }
 }
 

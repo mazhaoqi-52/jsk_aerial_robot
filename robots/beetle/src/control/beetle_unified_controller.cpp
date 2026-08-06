@@ -2549,61 +2549,6 @@ Eigen::VectorXd BeetleUnifiedController::getAllocatedWrenchCog() const
   return allocated;
 }
 
-bool BeetleUnifiedController::computeModuleActuatorWrenchCog(
-    int module_id,
-    const spinal::ActuatorCommandFeedback& feedback,
-    Eigen::VectorXd& wrench) const
-{
-  wrench = Eigen::VectorXd::Zero(6);
-  if ((feedback.saturation_flags &
-       spinal::ActuatorCommandFeedback::THRUST_MODEL_INVALID) != 0 ||
-      static_cast<int>(feedback.thrust.size()) != motor_num_per_module_ ||
-      static_cast<int>(feedback.gimbal_angle.size()) !=
-          motor_num_per_module_ * gimbal_dof_) {
-    return false;
-  }
-  ModuleModelDescriptor model;
-  if (!getModuleModelDescriptor(module_id, model)) return false;
-
-  const Eigen::Matrix3d cog_from_body =
-      robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
-  const std::vector<Eigen::MatrixXd> masked_rot_cog = buildRotorMask();
-  if (static_cast<int>(masked_rot_cog.size()) < motor_num_per_module_) return false;
-
-  for (int r = 0; r < motor_num_per_module_; r++) {
-    const double thrust = feedback.thrust[r];
-    if (!std::isfinite(thrust) || thrust < 0.0) return false;
-
-    Eigen::VectorXd actuator_coordinates = Eigen::VectorXd::Zero(rotor_coef_);
-    if (gimbal_dof_ == 0) {
-      actuator_coordinates(0) = thrust;
-    } else if (gimbal_dof_ == 1 && rotor_coef_ == 2) {
-      const double angle = feedback.gimbal_angle[r];
-      if (!std::isfinite(angle)) return false;
-      actuator_coordinates(0) = -thrust * std::sin(angle);
-      actuator_coordinates(1) = thrust * std::cos(angle);
-    } else if (gimbal_dof_ == 2 && rotor_coef_ == 3) {
-      const double roll = feedback.gimbal_angle[2 * r];
-      const double pitch = feedback.gimbal_angle[2 * r + 1];
-      if (!std::isfinite(roll) || !std::isfinite(pitch)) return false;
-      actuator_coordinates(0) = thrust * std::sin(pitch);
-      actuator_coordinates(1) = -thrust * std::cos(pitch) * std::sin(roll);
-      actuator_coordinates(2) = thrust * std::cos(pitch) * std::cos(roll);
-    } else {
-      return false;
-    }
-
-    const Eigen::Vector3d force_cog =
-        masked_rot_cog[r] * actuator_coordinates;
-    const Eigen::Vector3d rotor_origin_cog =
-        cog_from_body * model.rotor_origins_from_cog.at(r);
-    wrench.head(3) += force_cog;
-    wrench.tail(3) += rotor_origin_cog.cross(force_cog) +
-        model.rotor_direction.at(r + 1) * model.mf_rate * force_cog;
-  }
-  return wrench.allFinite();
-}
-
 bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()
 {
   std::lock_guard<std::mutex> lock(allocation_mutex_);

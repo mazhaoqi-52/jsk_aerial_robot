@@ -45,7 +45,6 @@
 #include <std_msgs/Float32MultiArray.h>
 #include <std_srvs/SetBool.h>
 #include <spinal/Pwms.h>
-#include <spinal/ActuatorCommandFeedback.h>
 #include <spinal/PwmTest.h>
 #include <spinal/FourAxisCommand.h>
 #include <spinal/RollPitchYawTerms.h>
@@ -122,11 +121,9 @@ private:
 
   ros::NodeHandle* nh_;
   ros::Publisher pwms_pub_;
-  ros::Publisher actuator_command_feedback_pub_;
   ros::Publisher control_term_pub_;
   ros::Publisher control_feedback_state_pub_;
   spinal::Pwms pwms_msg_;
-  spinal::ActuatorCommandFeedback actuator_command_feedback_msg_;
   spinal::RollPitchYawTerms control_term_msg_;
   spinal::RollPitchYawTerm control_feedback_state_msg_;
 
@@ -216,7 +213,6 @@ private:
   float target_thrust_[MAX_MOTOR_NUMBER];
   float target_pwm_[MAX_MOTOR_NUMBER];
   float target_gimbal_angles_[MAX_MOTOR_NUMBER];
-  uint8_t saturation_flags_;
   float min_duty_;
   float max_duty_;
   float min_thrust_; // max thrust is variant according to the voltage
@@ -243,7 +239,6 @@ private:
   void pwmTestCallback(const spinal::PwmTest& pwm_msg);
   void pwmConversion(void);
   void pwmsControl(void);
-  bool thrustFromPwm(float pwm, float& thrust) const;
 
   void reset(void);
 

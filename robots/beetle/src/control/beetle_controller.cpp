@@ -22,9 +22,7 @@ namespace aerial_robot_control
     desired_wrench_timeout_(0.5),
     unified_control_mode_(false),
     prev_unified_control_mode_(false),
-    formation_observer_known_wrench_source_(OBSERVER_WRENCH_SOURCE_UNKNOWN),
-    module_observer_known_wrench_source_(OBSERVER_WRENCH_SOURCE_UNKNOWN),
-    formation_wrench_feedback_timeout_(0.35),
+    module_observer_spatial_sum_timeout_(0.35),
     unified_external_wrench_feedback_(false),
     unified_external_wrench_feedback_gain_(0.3),
     unified_external_wrench_feedback_task_weight_(0.05),
@@ -132,16 +130,9 @@ namespace aerial_robot_control
     for(int i = 0; i < max_modules_num; i++){
       std::string module_name  = string("/") + beetle_navigator_->getMyName() + std::to_string(i+1);
       est_wrench_subs_.insert(make_pair(module_name, nh_.subscribe( module_name + string("/tagged_wrench"), 1, &BeetleController::estExternalWrenchCallback, this)));
-      actuator_command_wrench_subs_[i+1] =
-          nh_.subscribe<geometry_msgs::WrenchStamped>(
-              module_name + string("/actuator_command_wrench"), 1,
-              boost::bind(&BeetleController::actuatorCommandWrenchCallback,
-                          this, _1, i + 1));
       Eigen::VectorXd wrench = Eigen::VectorXd::Zero(6);
       est_wrench_list_.insert(make_pair(i+1, wrench));
       est_wrench_receipt_stamps_[i+1] = -1.0;
-      actuator_command_wrench_list_[i+1] = wrench;
-      actuator_command_wrench_receipt_stamps_[i+1] = -1.0;
       inter_wrench_list_.insert(make_pair(i+1, wrench));
       wrench_comp_list_.insert(make_pair(i+1, wrench));
       est_wrench_task_list_.insert(make_pair(i+1, wrench));
@@ -174,15 +165,9 @@ namespace aerial_robot_control
     module_observer_spatial_sum_pub_ =
         nh_.advertise<geometry_msgs::WrenchStamped>(
             "/assemble/formation_observer/module_observer_spatial_sum", 1);
-    actuator_command_spatial_sum_pub_ =
-        nh_.advertise<geometry_msgs::WrenchStamped>(
-            "/assemble/formation_observer/actuator_command_spatial_sum", 1);
     module_observer_spatial_sum_status_pub_ =
         nh_.advertise<diagnostic_msgs::KeyValue>(
             "/assemble/formation_observer/module_observer_spatial_sum_status", 1, true);
-    actuator_command_spatial_sum_status_pub_ =
-        nh_.advertise<diagnostic_msgs::KeyValue>(
-            "/assemble/formation_observer/actuator_command_spatial_sum_status", 1, true);
     // Initialize assemble_pid_msg_ arrays
     auto initPidField = [](aerial_robot_msgs::Pid& f) {
       f.total.resize(1, 0); f.p_term.resize(1, 0); f.i_term.resize(1, 0); f.d_term.resize(1, 0);
@@ -218,19 +203,9 @@ namespace aerial_robot_control
     // Initialize unified controller (unified_control_mode_ is read by rosParamInit)
     unified_controller_ = std::make_shared<BeetleUnifiedController>();
     unified_controller_->initialize(nh_, beetle_robot_model_, beetle_navigator_, estimator_);
-    actuator_command_feedback_sub_ =
-        nh_.subscribe("actuator_command_feedback", 1,
-                      &BeetleController::actuatorCommandFeedbackCallback, this);
-    actuator_command_wrench_pub_ =
-        nh_.advertise<geometry_msgs::WrenchStamped>("actuator_command_wrench", 1);
-
     // Initialize formation-level momentum observer (Phase U2)
     formation_observer_ = std::make_shared<FormationMomentumObserver>();
     formation_observer_->initialize(nh_);
-    formation_observer_input_source_pub_ =
-        nh_.advertise<diagnostic_msgs::KeyValue>(
-            "/assemble/formation_observer/known_wrench_source", 1, true);
-
     unified_reference_pub_ = nh_.advertise<beetle::UnifiedControlReference>("unified_control/reference", 1);
     module_model_pub_ = nh_.advertise<beetle::ModuleModel>("unified_control/module_model", 1, true);
     // Publishers to this module's own spinal (same topic names as GimbalrotorController)
@@ -446,8 +421,6 @@ namespace aerial_robot_control
     integrate_term_ = Eigen::VectorXd::Zero(6);
     est_external_wrench_ = Eigen::VectorXd::Zero(6);
     init_sum_momentum_ = Eigen::VectorXd::Zero(6);
-    formation_observer_known_wrench_source_ = OBSERVER_WRENCH_SOURCE_UNKNOWN;
-    module_observer_known_wrench_source_ = OBSERVER_WRENCH_SOURCE_UNKNOWN;
     ROS_INFO("[UnifiedCtrl] Single-module observer re-initialized (timestamp/integrate/est zeroed)");
 
     // Clear formation-observer FF on mode exit to avoid stale values
@@ -478,31 +451,6 @@ namespace aerial_robot_control
       unified_external_wrench_feedback_bias_samples_ = 0;
       unified_external_wrench_feedback_bias_ = Eigen::VectorXd::Zero(6);
     }
-  }
-
-  void BeetleController::updateFormationObserverKnownWrenchSource(
-      bool actuator_command_ready)
-  {
-    const int source = actuator_command_ready
-        ? OBSERVER_WRENCH_SOURCE_ACTUATOR_COMMAND
-        : OBSERVER_WRENCH_SOURCE_UNAVAILABLE;
-    if (source == formation_observer_known_wrench_source_) return;
-
-    formation_observer_known_wrench_source_ = source;
-    if (formation_observer_) {
-      formation_observer_->reset();
-      if (!actuator_command_ready) formation_observer_->setFfArmed(false);
-    }
-    unified_external_wrench_feedback_bias_ready_ = false;
-    unified_external_wrench_feedback_bias_samples_ = 0;
-    unified_external_wrench_feedback_bias_ = Eigen::VectorXd::Zero(6);
-
-    diagnostic_msgs::KeyValue msg;
-    msg.key = "known_wrench_source";
-    msg.value = actuator_command_ready ? "actuator_command" : "unavailable";
-    formation_observer_input_source_pub_.publish(msg);
-    ROS_WARN("[FormationObserver] known wrench source -> %s; observer and hover bias reset",
-             msg.value.c_str());
   }
 
   void BeetleController::initUnifiedMode(bool is_leader)
@@ -604,7 +552,6 @@ namespace aerial_robot_control
     if (is_leader && formation_observer_) {
       formation_observer_->reset();
       formation_observer_->setActive(true);
-      formation_observer_known_wrench_source_ = OBSERVER_WRENCH_SOURCE_UNKNOWN;
       ROS_INFO("[UnifiedCtrl] Formation observer activated (reset + active)");
     }
 
@@ -615,7 +562,6 @@ namespace aerial_robot_control
     integrate_term_ = Eigen::VectorXd::Zero(6);
     est_external_wrench_ = Eigen::VectorXd::Zero(6);
     init_sum_momentum_ = Eigen::VectorXd::Zero(6);
-    module_observer_known_wrench_source_ = OBSERVER_WRENCH_SOURCE_UNKNOWN;
     ROS_INFO("[UnifiedCtrl] Single-module observer reset for unified residual diagnostics");
 
     ROS_INFO("[UnifiedCtrl] %s id=%d mode switch: reset targets, %s, "
@@ -1969,9 +1915,8 @@ namespace aerial_robot_control
      *    est_residual_list_[i] = est_wrench_list_[i] - est_wrench_task_list_[i]
      *
      *    est_wrench_task_list_ is a command-side task share, while the momentum
-     *    observer already uses the final-FC actuator-command wrench as a known
-     *    input. This comes from atomic Spinal feedback, not from the
-     *    command-side task share.
+     *    observer uses the PC-side module allocation-model wrench as its known
+     *    input, not this command-side task share.
      *    It is therefore not a valid observer-output prediction for unified
      *    internal-force control. Unified mode no longer calls this function;
      *    this calculation is retained only to preserve legacy LF behaviour.
@@ -2123,10 +2068,10 @@ namespace aerial_robot_control
     ros::NodeHandle control_nh(nh_, "controller");
     getParam<bool>(control_nh, "pd_wrench_comp_mode", pd_wrench_comp_mode_, false);
     getParam<double>(control_nh, "desired_wrench_timeout", desired_wrench_timeout_, 0.5);
-    getParam<double>(control_nh, "formation_wrench_feedback_timeout",
-                     formation_wrench_feedback_timeout_, 0.35);
-    formation_wrench_feedback_timeout_ =
-        std::max(0.0, formation_wrench_feedback_timeout_);
+    getParam<double>(control_nh, "module_observer_spatial_sum_timeout",
+                     module_observer_spatial_sum_timeout_, 0.35);
+    module_observer_spatial_sum_timeout_ =
+        std::max(0.0, module_observer_spatial_sum_timeout_);
 
     double external_force_upper_limit, external_force_lower_limit, external_torque_upper_limit, external_torque_lower_limit;
     getParam<double>(control_nh, "external_force_upper_limit", external_force_upper_limit, 0.5);
@@ -2265,9 +2210,8 @@ namespace aerial_robot_control
   void BeetleController::externalWrenchEstimate()
   {
     // The single-module observer remains available for external-wrench topics
-    // and diagnostics. In unified mode it uses the final-FC actuator-command
-    // wrench; unavailable feedback fails closed instead of falling back to the
-    // PC allocation model.
+    // and diagnostics. In unified mode its known input is the existing PC-side
+    // module allocation-model wrench.
     const Eigen::VectorXd target_wrench_acc_cog = getTargetWrenchAccCog();
 
     if(navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE &&
@@ -2299,50 +2243,17 @@ namespace aerial_robot_control
     sum_momentum.tail(3) = inertia * omega_cog;
 
     Eigen::VectorXd target_wrench_cog = Eigen::VectorXd::Zero(6);
-    bool actuator_command_ready = false;
+    bool use_allocated_module_wrench = false;
     const int my_id = beetle_navigator_->getMyID();
-    {
-      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
-      const auto wrench_it = actuator_command_wrench_list_.find(my_id);
-      const auto stamp_it = actuator_command_wrench_receipt_stamps_.find(my_id);
-      const auto frame_it = actuator_command_wrench_frame_ids_.find(my_id);
-      const std::string expected_frame =
-          beetle_navigator_->getMyName() + std::to_string(my_id) + "/cog";
-      if (wrench_it != actuator_command_wrench_list_.end() &&
-          stamp_it != actuator_command_wrench_receipt_stamps_.end() &&
-          frame_it != actuator_command_wrench_frame_ids_.end() &&
-          wrench_it->second.size() == 6 && wrench_it->second.allFinite() &&
-          frame_it->second == expected_frame) {
-        const double age = ros::Time::now().toSec() - stamp_it->second;
-        actuator_command_ready =
-            stamp_it->second >= 0.0 && age >= 0.0 &&
-            (formation_wrench_feedback_timeout_ <= 0.0 ||
-             age <= formation_wrench_feedback_timeout_);
-        if (actuator_command_ready) target_wrench_cog = wrench_it->second;
-      }
+    if (unified_control_mode_ && unified_controller_) {
+      use_allocated_module_wrench =
+          unified_controller_->getAllocatedModuleWrenchCog(
+              my_id, target_wrench_cog);
     }
-
-    int source = OBSERVER_WRENCH_SOURCE_ACTUATOR_COMMAND;
-    const char* source_name = "actuator_command";
-    if (!actuator_command_ready && unified_control_mode_) {
-      source = OBSERVER_WRENCH_SOURCE_UNAVAILABLE;
-      source_name = "unavailable";
-    } else if (!actuator_command_ready) {
-      source = OBSERVER_WRENCH_SOURCE_LEGACY_PC_TARGET;
-      source_name = "legacy_pc_target";
+    if (!use_allocated_module_wrench) {
       target_wrench_cog.head(3) = mass * target_wrench_acc_cog.head(3);
       target_wrench_cog.tail(3) = inertia * target_wrench_acc_cog.tail(3);
     }
-    if (source != module_observer_known_wrench_source_) {
-      module_observer_known_wrench_source_ = source;
-      prev_est_wrench_timestamp_ = 0;
-      integrate_term_ = Eigen::VectorXd::Zero(6);
-      est_external_wrench_ = Eigen::VectorXd::Zero(6);
-      init_sum_momentum_ = Eigen::VectorXd::Zero(6);
-      ROS_WARN("[ModuleObserver id=%d] known wrench source -> %s; observer reset",
-               my_id, source_name);
-    }
-    if (source == OBSERVER_WRENCH_SOURCE_UNAVAILABLE) return;
 
     Eigen::MatrixXd J_t = Eigen::MatrixXd::Identity(6,6);
     J_t.topLeftCorner(3,3) = cog_rot;
@@ -2416,63 +2327,6 @@ namespace aerial_robot_control
     est_wrench_frame_ids_[id] = msg.wrench.header.frame_id;
   }
 
-  void BeetleController::actuatorCommandFeedbackCallback(
-      const spinal::ActuatorCommandFeedback::ConstPtr& msg)
-  {
-    if (!msg || !unified_controller_) return;
-
-    const int module_id = beetle_navigator_->getMyID();
-    Eigen::VectorXd wrench;
-    if (!unified_controller_->computeModuleActuatorWrenchCog(
-            module_id, *msg, wrench)) {
-      ROS_WARN_THROTTLE(
-          1.0,
-          "[ModuleObserver id=%d] rejected actuator command feedback: "
-          "invalid size, model, or thrust conversion",
-          module_id);
-      return;
-    }
-
-    geometry_msgs::WrenchStamped wrench_msg;
-    wrench_msg.header.stamp = msg->header.stamp.isZero()
-        ? ros::Time::now() : msg->header.stamp;
-    wrench_msg.header.frame_id =
-        beetle_navigator_->getMyName() + std::to_string(module_id) + "/cog";
-    wrench_msg.wrench.force.x = wrench(0);
-    wrench_msg.wrench.force.y = wrench(1);
-    wrench_msg.wrench.force.z = wrench(2);
-    wrench_msg.wrench.torque.x = wrench(3);
-    wrench_msg.wrench.torque.y = wrench(4);
-    wrench_msg.wrench.torque.z = wrench(5);
-
-    {
-      std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
-      actuator_command_wrench_list_[module_id] = wrench;
-      actuator_command_wrench_receipt_stamps_[module_id] =
-          ros::Time::now().toSec();
-      actuator_command_wrench_frame_ids_[module_id] =
-          wrench_msg.header.frame_id;
-    }
-    actuator_command_wrench_pub_.publish(wrench_msg);
-  }
-
-  void BeetleController::actuatorCommandWrenchCallback(
-      const geometry_msgs::WrenchStamped::ConstPtr& msg, int module_id)
-  {
-    if (!msg || module_id <= 0) return;
-    Eigen::VectorXd wrench(6);
-    wrench << msg->wrench.force.x, msg->wrench.force.y,
-        msg->wrench.force.z, msg->wrench.torque.x,
-        msg->wrench.torque.y, msg->wrench.torque.z;
-    if (!wrench.allFinite()) return;
-
-    std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
-    actuator_command_wrench_list_[module_id] = wrench;
-    actuator_command_wrench_receipt_stamps_[module_id] =
-        ros::Time::now().toSec();
-    actuator_command_wrench_frame_ids_[module_id] = msg->header.frame_id;
-  }
-
   bool BeetleController::computeFormationSpatialWrenchSum(
       const std::map<int, Eigen::VectorXd>& module_wrenches,
       const std::map<int, double>& receipt_stamps,
@@ -2515,8 +2369,8 @@ namespace aerial_robot_control
       }
       const double age = now - stamp_it->second;
       if (stamp_it->second < 0.0 || age < 0.0 ||
-          (formation_wrench_feedback_timeout_ > 0.0 &&
-           age > formation_wrench_feedback_timeout_)) {
+          (module_observer_spatial_sum_timeout_ > 0.0 &&
+           age > module_observer_spatial_sum_timeout_)) {
         status = "unavailable:stale_module_" + std::to_string(module_id);
         formation_wrench.setZero();
         return false;
@@ -3329,37 +3183,16 @@ namespace aerial_robot_control
     tf::Vector3 target_formation_pos = target_pos_ + target_baselink_rot * offset_body;
     markUnifiedDebugStage("formation_kinematics_ready");
 
-    Eigen::VectorXd formation_observer_known_wrench_cog;
-    bool formation_observer_input_ready = false;
     if (is_leader) {
-      std::map<int, Eigen::VectorXd> actuator_wrenches;
-      std::map<int, double> actuator_stamps;
-      std::map<int, std::string> actuator_frames;
       std::map<int, Eigen::VectorXd> observer_wrenches;
       std::map<int, double> observer_stamps;
       std::map<int, std::string> observer_frames;
       {
         std::lock_guard<std::mutex> lock(unified_wrench_state_mutex_);
-        actuator_wrenches = actuator_command_wrench_list_;
-        actuator_stamps = actuator_command_wrench_receipt_stamps_;
-        actuator_frames = actuator_command_wrench_frame_ids_;
         observer_wrenches = est_wrench_list_;
         observer_stamps = est_wrench_receipt_stamps_;
         observer_frames = est_wrench_frame_ids_;
       }
-
-      std::string actuator_status;
-      formation_observer_input_ready = computeFormationSpatialWrenchSum(
-          actuator_wrenches, actuator_stamps, actuator_frames,
-          formation_observer_known_wrench_cog, actuator_status);
-      if (formation_observer_input_ready) {
-        publishSpatialWrench(actuator_command_spatial_sum_pub_,
-                             formation_observer_known_wrench_cog);
-      }
-      publishSpatialSumStatus(
-          actuator_command_spatial_sum_status_pub_,
-          actuator_command_spatial_sum_status_,
-          "actuator_command_spatial_sum", actuator_status);
 
       Eigen::VectorXd module_observer_spatial_sum;
       std::string module_observer_status;
@@ -3374,10 +3207,6 @@ namespace aerial_robot_control
           module_observer_spatial_sum_status_,
           "module_observer_spatial_sum", module_observer_status);
 
-      if (formation_observer_ && formation_observer_->isActive()) {
-        updateFormationObserverKnownWrenchSource(
-            formation_observer_input_ready);
-      }
     }
 
     tf::Vector3 formation_rpy = rpy_;
@@ -3898,24 +3727,21 @@ namespace aerial_robot_control
                 observer_nav_state == aerial_robot_navigation::LAND_STATE;
             const bool observer_feedback_gate_ready =
                 observer_nav_state == aerial_robot_navigation::HOVER_STATE;
-            formation_observer_->setFfArmed(
-                observer_feedback_gate_ready && formation_observer_input_ready);
-            if (observer_update_nav_ready && formation_observer_input_ready) {
+            formation_observer_->setFfArmed(observer_feedback_gate_ready);
+            if (observer_update_nav_ready) {
               const Eigen::Matrix3d observer_cog_from_body =
                   robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
               const Eigen::Matrix3d formation_inertia_cog =
                   observer_cog_from_body *
                   unified_controller_->getFormationInertia() *
                   observer_cog_from_body.transpose();
+              const Eigen::VectorXd allocated_wrench_cog =
+                  unified_controller_->getAllocatedWrenchCog();
               formation_observer_->update(
                   unified_controller_->getFormationMass(),
                   formation_inertia_cog,
                   cog_rot_eigen, vel_formation_w, omega_cog,
-                  formation_observer_known_wrench_cog, du);
-            } else if (observer_update_nav_ready && !formation_observer_input_ready) {
-              ROS_WARN_THROTTLE(
-                  1.0,
-                  "[FormationObserver] update suspended: complete fresh per-module actuator command feedback unavailable");
+                  allocated_wrench_cog, du);
             }
           }
           markUnifiedDebugStage("formation_observer_exit");

@@ -57,9 +57,19 @@ namespace aerial_robot_control
     bool unified_control_mode_;
     bool prev_unified_control_mode_;  // for detecting mode switch
 
-    // Formation-level momentum observer.
-    // Runs only in unified LEADER mode; uses realized wrench from allocation.
+    // Formation-level momentum observer. Runs only in unified LEADER mode and
+    // uses the spatial sum of per-module final-FC command feedback.
     std::shared_ptr<FormationMomentumObserver> formation_observer_;
+    enum ObserverKnownWrenchSource {
+      OBSERVER_WRENCH_SOURCE_UNKNOWN = -1,
+      OBSERVER_WRENCH_SOURCE_UNAVAILABLE = 0,
+      OBSERVER_WRENCH_SOURCE_ACTUATOR_COMMAND = 1,
+      OBSERVER_WRENCH_SOURCE_LEGACY_PC_TARGET = 2,
+    };
+    int formation_observer_known_wrench_source_;
+    int module_observer_known_wrench_source_;
+    double formation_wrench_feedback_timeout_;
+    ros::Publisher formation_observer_input_source_pub_;
     bool unified_external_wrench_feedback_;
     double unified_external_wrench_feedback_gain_;
     double unified_external_wrench_feedback_task_weight_;
@@ -109,6 +119,22 @@ namespace aerial_robot_control
     /** @brief Unified-mode switch (LEADER or FOLLOWER): reset targets, migrate I-terms,
      *  configure this module's spinal when ready, apply unified gains. */
     void initUnifiedMode(bool is_leader);
+    void updateFormationObserverKnownWrenchSource(bool actuator_command_ready);
+    void actuatorCommandFeedbackCallback(
+      const spinal::ActuatorCommandFeedback::ConstPtr& msg);
+    void actuatorCommandWrenchCallback(
+      const geometry_msgs::WrenchStamped::ConstPtr& msg, int module_id);
+    bool computeFormationSpatialWrenchSum(
+      const std::map<int, Eigen::VectorXd>& module_wrenches,
+      const std::map<int, double>& receipt_stamps,
+      const std::map<int, std::string>& frame_ids,
+      Eigen::VectorXd& formation_wrench,
+      std::string& status) const;
+    void publishSpatialWrench(
+      ros::Publisher& publisher, const Eigen::VectorXd& wrench) const;
+    void publishSpatialSumStatus(
+      ros::Publisher& publisher, std::string& previous_status,
+      const std::string& key, const std::string& status);
 
     /** @brief Symmetric unified-mode control body. Both leader and follower run the full
      *  outer PID + formation allocation locally using their own estimator state. */
@@ -232,11 +258,25 @@ namespace aerial_robot_control
     aerial_robot_msgs::PoseControlPid wrench_pid_msg_;
 
     map<string, ros::Subscriber> est_wrench_subs_;
+    map<int, ros::Subscriber> actuator_command_wrench_subs_;
+    ros::Subscriber actuator_command_feedback_sub_;
+    ros::Publisher actuator_command_wrench_pub_;
+    ros::Publisher module_observer_spatial_sum_pub_;
+    ros::Publisher actuator_command_spatial_sum_pub_;
+    ros::Publisher module_observer_spatial_sum_status_pub_;
+    ros::Publisher actuator_command_spatial_sum_status_pub_;
+    std::string module_observer_spatial_sum_status_;
+    std::string actuator_command_spatial_sum_status_;
     
     void estExternalWrenchCallback(const beetle::TaggedWrench & msg);
 
   protected:
     std::map<int, Eigen::VectorXd> est_wrench_list_;
+    std::map<int, double> est_wrench_receipt_stamps_;
+    std::map<int, std::string> est_wrench_frame_ids_;
+    std::map<int, Eigen::VectorXd> actuator_command_wrench_list_;
+    std::map<int, double> actuator_command_wrench_receipt_stamps_;
+    std::map<int, std::string> actuator_command_wrench_frame_ids_;
     // Legacy leader-follower task-wrench shares, set by the demo layer through
     // /<robot>{i}/est_wrench_task. These are command-side mass/inertia shares;
     // they are not momentum-observer outputs and are not consumed by unified

@@ -2,7 +2,8 @@
 """
 Estimate mass error and CoG offset from the hover external-wrench estimate.
 
-Theory (static level hover; wrench in formation_body frame ~ world frame):
+Theory (static level hover; formation wrench about and expressed in
+assembly_cog, whose axes are approximately aligned with world at level hover):
   Unmodeled gravity (true mass m_true = m_model + dm at true CoG = model CoG + r)
   appears in the momentum-observer estimate as a constant external wrench:
 
@@ -22,7 +23,7 @@ Usage:
 
   --start/--end are seconds relative to bag start; pick a quiet hover window.
   Also works with a per-module observer topic (geometry_msgs/WrenchStamped,
-  body frame) if --mass is that module's model mass.
+  module CoG frame) if --mass is that module's model mass.
 """
 
 import argparse
@@ -46,7 +47,7 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("bag", help="rosbag file")
     parser.add_argument("--topic", default="/assemble/formation_observer/est_ext_wrench",
-                        help="WrenchStamped topic, body frame (default: formation observer)")
+                        help="WrenchStamped topic (default: formation observer in assembly_cog)")
     parser.add_argument("--mass", type=float, required=True,
                         help="model mass [kg] matching the topic (formation or module)")
     parser.add_argument("--start", type=float, default=None,
@@ -84,7 +85,7 @@ def main():
     print("topic   : %s" % args.topic)
     print("window  : %.1f - %.1f s (rel), %d samples" %
           (t_first, t_last, len(samples[0])))
-    print("\nwrench mean over window (body frame):")
+    print("\nwrench mean over window (topic frame):")
     for label, (m, s) in zip(labels, stats):
         print("  %-11s % 8.3f  (std %6.3f)" % (label, m, s))
 

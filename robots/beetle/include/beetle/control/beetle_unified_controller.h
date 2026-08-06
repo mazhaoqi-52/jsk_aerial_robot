@@ -33,6 +33,7 @@
 // header (e.g. ninja) do not need to link against OsqpEigen.
 namespace OsqpEigen { class Solver; }
 #include <spinal/FourAxisCommand.h>
+#include <spinal/ActuatorCommandFeedback.h>
 #include <spinal/MotorInfo.h>
 #include <spinal/Pwms.h>
 #include <spinal/TorqueAllocationMatrixInv.h>
@@ -221,26 +222,32 @@ public:
   bool buildModuleTorqueAllocationMatrixInv(int module_id, spinal::TorqueAllocationMatrixInv& msg) const;
 
   /**
-   * @brief Compute the realized 6D wrench in the virtual CoG control frame.
+   * @brief Compute the allocated 6D wrench in the virtual CoG control frame.
    *
-   * This is the allocation-model wrench commanded by the PC-side allocator:
-   *   w_realized_acc = A * f   (integrated_map_ * target_vectoring_f_)
+   * This is the model wrench commanded by the PC-side allocator:
+   *   w_allocated_acc = A * f   (integrated_map_ * target_vectoring_f_)
    * then converted from acc-space to force/torque space:
-   *   F = M * w_realized_acc.head(3)
-   *   T = I_cog * w_realized_acc.tail(3)
+   *   F = M * w_allocated_acc.head(3)
+   *   T = I_cog * w_allocated_acc.tail(3)
    *
-   * In cascade mode this does not include spinal-side P/D increments, motor
-   * dynamics, or thrust/gimbal tracking errors. Treat it as a diagnostic
-   * model input, not a measured actuator wrench.
-   *
-   * The legacy method name uses "Body" for the controller's CoG frame. This
-   * is not the tilted physical baselink frame when desire_coordinate is active.
+   * It deliberately remains a command/allocation diagnostic; it does not
+   * include spinal-side P/D increments, saturation shedding, or actuator
+   * tracking error and must not be used as the momentum-observer known input.
    *
    * @return 6D wrench [Fx,Fy,Fz,Tx,Ty,Tz] in virtual CoG frame (N, N·m).
    *         Returns zero vector if allocation has not been computed yet.
    */
-  Eigen::VectorXd getRealizedWrenchBody() const;
-  bool getRealizedModuleWrenchBody(int module_id, Eigen::VectorXd& realized) const;
+  Eigen::VectorXd getAllocatedWrenchCog() const;
+  bool getAllocatedModuleWrenchCog(int module_id, Eigen::VectorXd& allocated) const;
+
+  /** @brief Convert one module's atomic Spinal command feedback into a wrench
+   *  about that module's CoG, expressed in its virtual CoG control axes.
+   *  The feedback thrust is a post-PWM-clamp command-model value, not measured
+   *  rotor thrust. */
+  bool computeModuleActuatorWrenchCog(
+      int module_id,
+      const spinal::ActuatorCommandFeedback& feedback,
+      Eigen::VectorXd& wrench) const;
 
 private:
   ros::NodeHandle nh_;
@@ -279,7 +286,7 @@ private:
   // Allocation matrices
   // integrated_map_ maps actuator coordinates to acceleration in the virtual
   // CoG control frame. Keep the exact body->CoG rotation paired with the map
-  // so realized-wrench diagnostics use the same frame snapshot.
+  // so allocated-wrench diagnostics use the same frame snapshot.
   Eigen::Matrix3d allocation_cog_from_body_;
   Eigen::MatrixXd integrated_map_;        // 6 x (rotor_coef * total_rotors)
   Eigen::MatrixXd integrated_map_inv_;    // pseudoinverse

@@ -38,6 +38,7 @@ add_message_files(
   MotorInfo.msg
   PwmInfo.msg
   Pwms.msg
+  ActuatorCommandFeedback.msg
   PwmTest.msg
   UavInfo.msg
   DesireCoord.msg
@@ -93,6 +94,13 @@ add_library(spinal_flight_controller
   ${SPINAL_DIRS}/flight_control/attitude/attitude_control.cpp)
 target_link_libraries(spinal_flight_controller ${catkin_LIBRARIES} spinal_math)
 add_dependencies(spinal_flight_controller ${PROJECT_NAME}_generate_messages_cpp)
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_saturation_utils test/test_saturation_utils.cpp)
+  if(TARGET test_saturation_utils)
+    target_link_libraries(test_saturation_utils ${catkin_LIBRARIES})
+  endif()
+endif()
 
 # generate ros_lib for STM32F7
 add_custom_target(${PROJECT_NAME}_generate_stm32f7_ros_lib ALL COMMAND ${CATKIN_DEVEL_PREFIX}/env.sh ${PYTHON_EXECUTABLE}  ${PROJECT_SOURCE_DIR}/scripts/make_libraries.py --save_path ${PROJECT_SOURCE_DIR}/mcu_project/boards/stm32F7 --support_rtos)

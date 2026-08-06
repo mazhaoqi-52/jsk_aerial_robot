@@ -4,10 +4,10 @@
 // Design rationale:
 //   - Separate class from single-module observer (different semantics)
 //   - Uses formation mass/inertia, not single-module parameters
-//   - Observer input = "realized wrench" from allocation (A * f), not PID commands
-//   - Cascade-agnostic: no dependency on which PID terms are in PC vs spinal
-//   - Diagnostic by default: the estimate is a model residual, not a guaranteed
-//     physical external force unless the allocation/thrust model is validated.
+//   - Observer input = final-FC actuator-command wrench reconstructed locally
+//     from Spinal's atomic post-clamp thrust and gimbal-target feedback
+//   - The input is about the formation CoG in the virtual CoG control frame
+//   - It remains a command-model estimate, not measured rotor thrust
 //
 // Version 1 (Phase U2):
 //   - 3D external force estimation only (no torque)
@@ -51,12 +51,12 @@ public:
    * @brief Main update: estimate external wrench on the formation.
    *
    * Implements a generalized-momentum observer:
-   *   p(t) = [M * v_w;  I * omega_body]
-   *   integrate_term += (J * tau_realized - N + f_ext_hat) * dt
+   *   p(t) = [M * v_w;  I * omega_cog]
+   *   integrate_term += (J * tau_known - N + f_ext_hat) * dt
    *   f_ext_hat = K_obs * (p(t) - p(0) - integrate_term)
    *
    * where:
-   *   tau_realized = realized wrench from allocation (A * f), NOT PID command
+   *   tau_known = spatial sum of the per-module final-FC command wrenches
    *   N = gravity + gyroscopic terms
    *   K_obs = diagonal observer gain matrix
    *
@@ -64,18 +64,18 @@ public:
    * @param formation_inertia      3x3 inertia matrix of the formation about formation CoG [kg·m²].
    * @param cog_rot                3x3 rotation matrix: formation body → world.
    * @param vel_w                  Formation CoG linear velocity in world frame [m/s].
-   * @param omega_body             Formation angular velocity in body frame [rad/s].
-   * @param realized_wrench_body   6D realized wrench in body frame [Fx,Fy,Fz,Tx,Ty,Tz] (N, N·m).
-   *                               Computed as: integrated_map * target_vectoring_f * [M; I]
-   *                               (i.e., allocation result converted back to force/torque space).
+   * @param omega_cog              Formation angular velocity in virtual CoG frame [rad/s].
+   * @param known_actuator_wrench_cog 6D final-FC actuator-command wrench about
+   *                               formation CoG, expressed in virtual CoG axes
+   *                               [Fx,Fy,Fz,Tx,Ty,Tz] (N, N·m).
    * @param dt                     Time step [s].
    */
   void update(double formation_mass,
               const Eigen::Matrix3d& formation_inertia,
               const Eigen::Matrix3d& cog_rot,
               const Eigen::Vector3d& vel_w,
-              const Eigen::Vector3d& omega_body,
-              const Eigen::VectorXd& realized_wrench_body,
+              const Eigen::Vector3d& omega_cog,
+              const Eigen::VectorXd& known_actuator_wrench_cog,
               double dt);
 
   // ---- Accessors (debug / optional controller feedback) ----
@@ -88,17 +88,17 @@ public:
   /** @brief Get raw (pre-LPF) estimated external force in world frame [N]. */
   const Eigen::Vector3d& getRawEstExternalForceWorld() const { return est_ext_force_w_; }
 
-  /** @brief Get estimated external force in body frame [N] (LPF-filtered). */
-  Eigen::Vector3d getEstExternalForceBody() const { return last_cog_rot_.transpose() * est_ext_force_w_filt_; }
+  /** @brief Get estimated external force in virtual CoG frame [N] (LPF-filtered). */
+  Eigen::Vector3d getEstExternalForceCog() const { return last_cog_rot_.transpose() * est_ext_force_w_filt_; }
 
-  /** @brief Get estimated external torque in body frame [N·m] (LPF-filtered, V2). */
-  Eigen::Vector3d getEstExternalTorqueBody() const { return est_ext_torque_body_filt_; }
+  /** @brief Get estimated external torque in virtual CoG frame [N·m] (LPF-filtered, V2). */
+  Eigen::Vector3d getEstExternalTorqueCog() const { return est_ext_torque_cog_filt_; }
 
-  /** @brief Get raw (pre-LPF) estimated external torque in body frame [N·m]. */
-  const Eigen::Vector3d& getRawEstExternalTorqueBody() const { return est_ext_torque_body_; }
+  /** @brief Get raw (pre-LPF) estimated external torque in virtual CoG frame [N·m]. */
+  const Eigen::Vector3d& getRawEstExternalTorqueCog() const { return est_ext_torque_cog_; }
 
-  /** @brief Get full 6D estimated external wrench in formation_body frame.
-   *  [force_body(3); torque_body(3)]. torque is zero when torque observer is disabled. */
+  /** @brief Get full 6D estimated external wrench about and expressed in assembly_cog.
+   *  [force_cog(3); torque_cog(3)]. torque is zero when torque observer is disabled. */
   Eigen::VectorXd getEstExternalWrench6D() const;
 
   /** @brief Is the observer initialized (has received at least one update)? */
@@ -142,7 +142,7 @@ private:
   // V2: angular momentum observer (placeholder, zeroed in V1)
   Eigen::Vector3d init_angular_momentum_;    // p_ang(t=0)
   Eigen::Vector3d integrate_term_torque_;    // accumulated integral for torque channel
-  Eigen::Vector3d est_ext_torque_body_;      // estimated external torque in body frame
+  Eigen::Vector3d est_ext_torque_cog_;       // estimated external torque in virtual CoG frame
 
   // ---- FF arming (no bias subtraction) ----
   // Used only as a downstream gate/ramp; the observer itself stays estimator-only.
@@ -169,18 +169,18 @@ private:
   // ---- Output LPF on torque estimate (mirrors force channel) ----
   double est_torque_lpf_cutoff_freq_;         // Hz
   bool   est_torque_lpf_initialized_;         // false until first update
-  Eigen::Vector3d est_ext_torque_body_filt_;  // LPF-smoothed torque estimate
+  Eigen::Vector3d est_ext_torque_cog_filt_;   // LPF-smoothed torque estimate
 
   // ---- Enable flags ----
   bool enable_force_observer_;   // V1: default true
   bool enable_torque_observer_;  // V2: default false (placeholder)
 
   // ---- ROS publishers (debug-only) ----
-  ros::Publisher est_ext_torque_body_pub_;     // geometry_msgs/Vector3Stamped (V2)
+  ros::Publisher est_ext_torque_cog_pub_;      // geometry_msgs/Vector3Stamped (V2)
   ros::Publisher est_ext_wrench_pub_;          // geometry_msgs/WrenchStamped (full 6D)
   ros::Publisher observer_residual_pub_;       // geometry_msgs/Vector3Stamped (force residual)
   ros::Publisher observer_residual_torque_pub_; // geometry_msgs/Vector3Stamped (torque residual, V2)
-  ros::Publisher realized_wrench_debug_pub_;   // geometry_msgs/WrenchStamped (input for verification)
+  ros::Publisher known_wrench_input_pub_;       // geometry_msgs/WrenchStamped (input for verification)
 
   // ---- Internal helpers ----
   void publishDebug(const ros::Time& stamp,

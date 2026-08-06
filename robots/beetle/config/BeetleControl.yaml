@@ -6,6 +6,7 @@ controller:
   gimbal_calc_in_fc : true
   i_term_rp_calc_in_pc: true
   wrench_estimate_update_rate: 100
+  formation_wrench_feedback_timeout: 0.35  # [s], fail closed in unified mode if any module feedback is stale
   momentum_observer_force_weight: 3
   momentum_observer_torque_weight: 2.5
   wrench_estimate_flag: true
@@ -31,7 +32,8 @@ controller:
   # handles LF↔unified switching directly in initUnifiedMode().
 
   # ========== Formation Momentum Observer ==========
-  # Formation-level external wrench estimation using realized wrench from allocation.
+  # Formation-level external wrench estimation using the final-FC
+  # actuator-command wrench spatially summed from each module's atomic Spinal feedback.
   # Feedback is bias-corrected, hover-settled, and injected only as a low-weight
   # task-space disturbance-rejection objective.
   formation_observer:

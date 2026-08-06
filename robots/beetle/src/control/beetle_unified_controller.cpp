@@ -181,7 +181,6 @@ void BeetleUnifiedController::rosParamInit()
   alloc_interface_torque_limit_ = std::max(0.0, alloc_interface_torque_limit_);
   alloc_task_priority_min_weight_ = std::max(0.0, alloc_task_priority_min_weight_);
   pinv_pwm_pred_pub_interval_ = std::max(0.0, pinv_pwm_pred_pub_interval_);
-
   ros::NodeHandle motor_nh(nh_, "motor_info");
   motor_nh.param<double>("min_pwm", pinv_pwm_min_, 0.5);
   motor_nh.param<double>("max_pwm", pinv_pwm_max_, 0.85);
@@ -2444,11 +2443,11 @@ bool BeetleUnifiedController::buildModuleThrustCommand(
   return true;
 }
 
-bool BeetleUnifiedController::getRealizedModuleWrenchBody(
+bool BeetleUnifiedController::getAllocatedModuleWrenchCog(
     int module_id,
-    Eigen::VectorXd& realized) const
+    Eigen::VectorXd& allocated) const
 {
-  realized = Eigen::VectorXd::Zero(6);
+  allocated = Eigen::VectorXd::Zero(6);
   std::lock_guard<std::mutex> lock(allocation_mutex_);
 
   int module_index = getModuleIndex(module_id);
@@ -2472,8 +2471,8 @@ bool BeetleUnifiedController::getRealizedModuleWrenchBody(
         masked_rot_cog[r] * target_vectoring_f_.segment(block_start, rotor_coef_);
     const Eigen::Vector3d rotor_origin_cog =
         cog_from_body * model.rotor_origins_from_cog.at(r);
-    realized.head(3) += f_i;
-    realized.tail(3) += aerial_robot_model::skew(rotor_origin_cog) * f_i
+    allocated.head(3) += f_i;
+    allocated.tail(3) += aerial_robot_model::skew(rotor_origin_cog) * f_i
                         + model.rotor_direction.at(r + 1) * model.mf_rate * f_i;
   }
 
@@ -2510,9 +2509,9 @@ bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInvLocked(
   return true;
 }
 
-Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
+Eigen::VectorXd BeetleUnifiedController::getAllocatedWrenchCog() const
 {
-  // Compute realized wrench in the virtual CoG control frame from the same
+  // Compute allocated wrench in the virtual CoG control frame from the same
   // frame snapshot used to construct the allocation matrix.
   //
   // integrated_map_ is in "acc-space":
@@ -2523,19 +2522,19 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   //     F_cog = M * w_acc.head(3)
   //     T_cog = I_cog * w_acc.tail(3)
 
-  Eigen::VectorXd realized = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd allocated = Eigen::VectorXd::Zero(6);
   std::lock_guard<std::mutex> lock(allocation_mutex_);
 
   if (integrated_map_.rows() != 6 || target_vectoring_f_.size() == 0) {
-    return realized;
+    return allocated;
   }
 
   if (integrated_map_.cols() != target_vectoring_f_.size()) {
-    ROS_WARN_THROTTLE(2.0, "[UnifiedCtrl] getRealizedWrenchBody: dimension mismatch: "
+    ROS_WARN_THROTTLE(2.0, "[UnifiedCtrl] getAllocatedWrenchCog: dimension mismatch: "
                       "map=%ldx%ld, vf=%ld",
                       integrated_map_.rows(), integrated_map_.cols(),
                       target_vectoring_f_.size());
-    return realized;
+    return allocated;
   }
 
   // w_acc = A * f  (6D acceleration-space wrench)
@@ -2544,10 +2543,65 @@ Eigen::VectorXd BeetleUnifiedController::getRealizedWrenchBody() const
   const Eigen::Matrix3d formation_inertia_cog =
       allocation_cog_from_body_ * formation_inertia_ *
       allocation_cog_from_body_.transpose();
-  realized.head(3) = formation_mass_ * w_acc.head(3);
-  realized.tail(3) = formation_inertia_cog * w_acc.tail(3);
+  allocated.head(3) = formation_mass_ * w_acc.head(3);
+  allocated.tail(3) = formation_inertia_cog * w_acc.tail(3);
 
-  return realized;
+  return allocated;
+}
+
+bool BeetleUnifiedController::computeModuleActuatorWrenchCog(
+    int module_id,
+    const spinal::ActuatorCommandFeedback& feedback,
+    Eigen::VectorXd& wrench) const
+{
+  wrench = Eigen::VectorXd::Zero(6);
+  if ((feedback.saturation_flags &
+       spinal::ActuatorCommandFeedback::THRUST_MODEL_INVALID) != 0 ||
+      static_cast<int>(feedback.thrust.size()) != motor_num_per_module_ ||
+      static_cast<int>(feedback.gimbal_angle.size()) !=
+          motor_num_per_module_ * gimbal_dof_) {
+    return false;
+  }
+  ModuleModelDescriptor model;
+  if (!getModuleModelDescriptor(module_id, model)) return false;
+
+  const Eigen::Matrix3d cog_from_body =
+      robot_model_->getCogDesireOrientation<Eigen::Matrix3d>();
+  const std::vector<Eigen::MatrixXd> masked_rot_cog = buildRotorMask();
+  if (static_cast<int>(masked_rot_cog.size()) < motor_num_per_module_) return false;
+
+  for (int r = 0; r < motor_num_per_module_; r++) {
+    const double thrust = feedback.thrust[r];
+    if (!std::isfinite(thrust) || thrust < 0.0) return false;
+
+    Eigen::VectorXd actuator_coordinates = Eigen::VectorXd::Zero(rotor_coef_);
+    if (gimbal_dof_ == 0) {
+      actuator_coordinates(0) = thrust;
+    } else if (gimbal_dof_ == 1 && rotor_coef_ == 2) {
+      const double angle = feedback.gimbal_angle[r];
+      if (!std::isfinite(angle)) return false;
+      actuator_coordinates(0) = -thrust * std::sin(angle);
+      actuator_coordinates(1) = thrust * std::cos(angle);
+    } else if (gimbal_dof_ == 2 && rotor_coef_ == 3) {
+      const double roll = feedback.gimbal_angle[2 * r];
+      const double pitch = feedback.gimbal_angle[2 * r + 1];
+      if (!std::isfinite(roll) || !std::isfinite(pitch)) return false;
+      actuator_coordinates(0) = thrust * std::sin(pitch);
+      actuator_coordinates(1) = -thrust * std::cos(pitch) * std::sin(roll);
+      actuator_coordinates(2) = thrust * std::cos(pitch) * std::cos(roll);
+    } else {
+      return false;
+    }
+
+    const Eigen::Vector3d force_cog =
+        masked_rot_cog[r] * actuator_coordinates;
+    const Eigen::Vector3d rotor_origin_cog =
+        cog_from_body * model.rotor_origins_from_cog.at(r);
+    wrench.head(3) += force_cog;
+    wrench.tail(3) += rotor_origin_cog.cross(force_cog) +
+        model.rotor_direction.at(r + 1) * model.mf_rate * force_cog;
+  }
+  return wrench.allFinite();
 }
 
 bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()

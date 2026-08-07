@@ -10,7 +10,6 @@
 #endif
 
 #include "flight_control/attitude/attitude_control.h"
-#include "flight_control/attitude/saturation_utils.h"
 #include <cstdio>
 
 #ifdef SIMULATION
@@ -1062,14 +1061,9 @@ void AttitudeController::pwmConversion()
     {
       float residual_term = thrust_limit - max_thrust / rotor_devider_;
 
-      if(residual_term < 0)
+      if(residual_term < 0 && base_thrust_term_[max_thrust_index] > 0)
         {
-          const int base_index = rotor_coef_ * max_thrust_index;
-          const float base_scale = spinal_saturation::maxBaseThrustScale(
-              &base_thrust_term_[base_index],
-              &roll_pitch_term_[base_index],
-              rotor_coef_, thrust_limit * rotor_devider_);
-          base_thrust_decreasing_rate = base_scale - 1.0f;
+          base_thrust_decreasing_rate = residual_term / (base_thrust_term_[max_thrust_index] / rotor_devider_);
           yaw_decreasing_rate = -1; // also, we have to ignore the yaw control
         }
       else
@@ -1145,10 +1139,8 @@ void AttitudeController::pwmConversion()
   if(start_control_flag_ && base_thrust_decreasing_rate < -0.05f)
     {
       const int base_idx = rotor_coef_ * sat_check_max_thrust_index;
-      float denom = 0.0f;
-      for(int j = 0; j < rotor_coef_ && base_idx + j < motor_number_; j++)
-        denom += base_thrust_term_[base_idx + j] * base_thrust_term_[base_idx + j];
-      denom = std::sqrt(denom);
+      const float denom = (sat_check_max_thrust_index >= 0 && sat_check_max_thrust_index < motor_number_) ?
+        base_thrust_term_[sat_check_max_thrust_index] : 0.0f;
       const float base0 = (base_idx >= 0 && base_idx < motor_number_) ? base_thrust_term_[base_idx] : 0.0f;
       const float base1 = (base_idx + 1 >= 0 && base_idx + 1 < motor_number_) ? base_thrust_term_[base_idx + 1] : 0.0f;
       const float rp0 = (base_idx >= 0 && base_idx < motor_number_) ? roll_pitch_term_[base_idx] : 0.0f;
@@ -1160,7 +1152,7 @@ void AttitudeController::pwmConversion()
         "rotor=%d denom_idx=%d denom=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
         "v_factor=%.3f ref=%d rotor_coef=%d",
         base_thrust_decreasing_rate, yaw_decreasing_rate, sat_check_max_thrust,
-        thrust_limit, sat_check_max_thrust_index, base_idx, denom,
+        thrust_limit, sat_check_max_thrust_index, sat_check_max_thrust_index, denom,
         base0, base1, rp0, rp1, v_factor_, motor_ref_index_, rotor_coef_);
 #else
       static uint32_t sat_diag_last_time = 0;
@@ -1173,7 +1165,7 @@ void AttitudeController::pwmConversion()
                    "rotor=%d denom_idx=%d denom=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
                    "v_factor=%.3f ref=%d rotor_coef=%d",
                    base_thrust_decreasing_rate, yaw_decreasing_rate, sat_check_max_thrust,
-                   thrust_limit, sat_check_max_thrust_index, base_idx, denom,
+                   thrust_limit, sat_check_max_thrust_index, sat_check_max_thrust_index, denom,
                    base0, base1, rp0, rp1, v_factor_, motor_ref_index_, rotor_coef_);
           nh_->logwarn(log_msg);
         }

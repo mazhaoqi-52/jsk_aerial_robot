@@ -468,20 +468,17 @@ private:
                         double thrust_limit,
                         int n_rotors);
 
-  /** @brief Build a wrench-consistent secondary allocation reference.
+  /** @brief Build the secondary actuator allocation reference.
    *
-   *    f_ref = A^+ * desired_wrench_acc
-   *          + (I - A^+ A) * balanced_hover_load
+   *    f_ref = balanced_hover_load + A^+ * task_wrench_acc
    *
-   *  The balanced per-module hover load is expressed in actuator coordinates,
-   *  so using it directly would tilt the QP reference with the physical body
-   *  when the virtual CoG frame changes. Projecting it into null(A) preserves
-   *  its load-sharing preference without changing a reachable requested 6D
-   *  wrench. The final component guard may relax that equality only if this
-   *  soft reference itself lies outside the configured actuator bounds. */
+   *  Only explicit task feedforward is added to the balanced hover center.
+   *  Dynamic stabilization and observer feedback stay exclusively in the
+   *  primary wrench objective so the secondary cost does not raise their
+   *  effective actuator-side closed-loop gain. */
   Eigen::VectorXd buildSecondaryAllocationReference(
       const std::vector<int>& assembled_ids,
-      const Eigen::VectorXd& desired_wrench_acc) const;
+      const Eigen::VectorXd& task_wrench_acc) const;
 
   /** @brief Sort allocation IDs into the physical Beetle chain (increasing
    *  leader-frame CoG x), while preserving the original ID-to-QP-column map. */

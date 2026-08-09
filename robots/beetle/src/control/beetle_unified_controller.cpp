@@ -638,7 +638,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   Eigen::VectorXd desired_wrench_acc =
       control_wrench_acc + task_wrench_acc + feedback_wrench_acc;
   Eigen::VectorXd secondary_ref =
-      buildSecondaryAllocationReference(assembled_ids, desired_wrench_acc);
+      buildSecondaryAllocationReference(assembled_ids, task_wrench_acc);
 
   Eigen::MatrixXd interface_actuation_matrix;
   Eigen::VectorXd interface_required_wrench;
@@ -693,14 +693,11 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
           retry_priority_acc = target_wrench_acc_cog;
         }
 
-        // Rebuild the secondary reference around the complete retried target.
-        // The null-space load-sharing term must never bias any wrench row.
-        const Eigen::VectorXd retry_desired_wrench_acc =
-            control_wrench_acc + retry_task_wrench_acc +
-            retry_feedback_wrench_acc;
+        // Keep the secondary actuator center task-consistent without feeding
+        // dynamic control/observer feedback through a second QP path.
         Eigen::VectorXd retry_secondary_ref =
             buildSecondaryAllocationReference(assembled_ids,
-                                              retry_desired_wrench_acc);
+                                              retry_task_wrench_acc);
 
         qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                   retry_task_wrench_acc, retry_task_weights,
@@ -834,54 +831,44 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
 Eigen::VectorXd BeetleUnifiedController::buildSecondaryAllocationReference(
     const std::vector<int>& assembled_ids,
-    const Eigen::VectorXd& desired_wrench_acc) const
+    const Eigen::VectorXd& task_wrench_acc) const
 {
   const int n_rotors = static_cast<int>(assembled_ids.size()) * motor_num_per_module_;
-  Eigen::VectorXd balanced_hover =
-      Eigen::VectorXd::Zero(rotor_coef_ * n_rotors);
+  Eigen::VectorXd ref = Eigen::VectorXd::Zero(rotor_coef_ * n_rotors);
   if (n_rotors <= 0 || rotor_coef_ <= 0 || formation_mass_ <= 0.0) {
-    return balanced_hover;
+    return ref;
   }
 
   for (size_t m = 0; m < assembled_ids.size(); m++) {
     ModuleModelDescriptor model;
     if (!getModuleModelDescriptor(assembled_ids[m], model)) {
-      return balanced_hover;
+      return ref;
     }
     const double hover_per_rotor = model.mass * aerial_robot_estimation::G / motor_num_per_module_;
     const double bounded_hover = std::max(0.0, std::min(hover_per_rotor, alloc_t_max_));
     const int module_col = static_cast<int>(m) * motor_num_per_module_ * rotor_coef_;
     for (int r = 0; r < motor_num_per_module_; r++) {
-      balanced_hover(module_col + r * rotor_coef_ + rotor_coef_ - 1) =
-          bounded_hover;
+      ref(module_col + r * rotor_coef_ + rotor_coef_ - 1) = bounded_hover;
     }
   }
 
-  Eigen::VectorXd ref = balanced_hover;
+  // Cooperative task share: distribute only the explicit task wrench over all
+  // rotors. Dynamic stabilization and observer feedback remain exclusively in
+  // the primary wrench-tracking objective; including them here changes the
+  // actuator-side closed-loop gain seen by the already tuned pose PID.
   const bool has_allocation_block =
       (integrated_map_.rows() == 6 && integrated_map_.cols() == ref.size());
   const bool inv_consistent =
       (integrated_map_inv_.rows() == integrated_map_.cols() &&
        integrated_map_inv_.cols() == integrated_map_.rows());
   if (has_allocation_block && inv_consistent &&
-      desired_wrench_acc.size() == integrated_map_.rows() &&
-      desired_wrench_acc.allFinite()) {
-    // balanced_hover is body/actuator-fixed. At nonzero physical roll/pitch it
-    // no longer realizes a vertical virtual-CoG wrench. Keep only its null-space
-    // component, then add the exact minimum-norm solution of the complete
-    // control + task + observer target. Therefore A*f_ref equals the requested
-    // wrench (up to numerical rank tolerance) for every virtual-CoG rotation.
-    const Eigen::MatrixXd nullspace_projector =
-        Eigen::MatrixXd::Identity(ref.size(), ref.size()) -
-        integrated_map_inv_ * integrated_map_;
-    ref = integrated_map_inv_ * desired_wrench_acc +
-          nullspace_projector * balanced_hover;
+      task_wrench_acc.size() == integrated_map_.rows() &&
+      task_wrench_acc.allFinite() && task_wrench_acc.norm() > 1e-9) {
+    ref += integrated_map_inv_ * task_wrench_acc;
   }
 
-  // Keep a pathological/infeasible soft center numerically bounded. Nominal
-  // feasible references (including the attitude-tracking case guarded by the
-  // unit test) do not clip and retain A*ref == desired_wrench_acc. The QP's
-  // actuator constraints remain authoritative for the actual command.
+  // Keep the soft center numerically bounded. The QP constraints remain
+  // authoritative for the actual actuator command.
   for (int idx = 0; idx < ref.size(); idx++) {
     if (rotor_coef_ == 2 && (idx % rotor_coef_) == rotor_coef_ - 1) {
       ref(idx) = std::max(0.0, std::min(ref(idx), alloc_t_max_));

@@ -20,6 +20,7 @@
   <arg name="valve_id" default="85" />
   <arg name="robot_ns" value="beetle$(arg robot_id)" />
   <arg name="leader_fang" default="false" />
+  <arg name="battery" default="false" doc="Add the two batteries to the robot description" />
   <arg name="beetle_model"
        default="$(eval 'beetle_fang' if arg('leader_fang') else 'beetle')"
        doc="beetle, beetle_fang, or beetle_hyper_fang_upward" />
@@ -76,7 +77,7 @@
     <arg name="rviz_config" value="$(arg config_dir)/rviz_config" />
     <arg name="rviz_init_pose" value="$(arg config_dir)/RvizInit.yaml" />
     <arg name="need_joint_state" value="false" if ="$(eval arg('simulation') or arg('real_machine'))"/>
-   
+    <arg name="model_options" value="battery:=$(arg battery)" />
 
   </include >
 

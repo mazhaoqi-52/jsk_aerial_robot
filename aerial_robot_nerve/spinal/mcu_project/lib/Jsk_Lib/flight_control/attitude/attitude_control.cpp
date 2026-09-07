@@ -10,6 +10,7 @@
 #endif
 
 #include "flight_control/attitude/attitude_control.h"
+#include "flight_control/attitude/vectoring_saturation.h"
 #include <cstdio>
 
 #ifdef SIMULATION
@@ -1027,6 +1028,7 @@ void AttitudeController::pwmConversion()
   /* get the decreasing rate for the thrust to avoid the divergence because of the pwm saturation */
   float base_thrust_decreasing_rate = 0;
   float yaw_decreasing_rate = 0;
+  float roll_pitch_scale = 1.0f;
   float thrust_limit = motor_info_[motor_ref_index_].max_thrust / v_factor_;
 
   /* check saturation level 2: z control saturation */
@@ -1057,7 +1059,19 @@ void AttitudeController::pwmConversion()
     }
   const float sat_check_max_thrust = max_thrust;
   const int sat_check_max_thrust_index = max_thrust_index;
-  if(start_control_flag_)
+  if(start_control_flag_ && gimbal_dof_ > 0)
+    {
+      const auto scales = spinal_saturation::vectoringScales(
+          base_thrust_term_, roll_pitch_term_, yaw_term_, motor_number_ / rotor_coef_,
+          rotor_coef_, thrust_limit * rotor_devider_, min_thrust_ * rotor_devider_);
+      // Hold the previous PWM and gimbal outputs on invalid input. The thrust
+      // scratch buffer below is compacted in-place and cannot serve as a cache.
+      if (!scales.valid) return;
+      roll_pitch_scale = scales.roll_pitch;
+      base_thrust_decreasing_rate = scales.base - 1.0f;
+      yaw_decreasing_rate = scales.yaw - 1.0f;
+    }
+  else if(start_control_flag_)
     {
       float residual_term = thrust_limit - max_thrust / rotor_devider_;
 
@@ -1139,8 +1153,6 @@ void AttitudeController::pwmConversion()
   if(start_control_flag_ && base_thrust_decreasing_rate < -0.05f)
     {
       const int base_idx = rotor_coef_ * sat_check_max_thrust_index;
-      const float denom = (sat_check_max_thrust_index >= 0 && sat_check_max_thrust_index < motor_number_) ?
-        base_thrust_term_[sat_check_max_thrust_index] : 0.0f;
       const float base0 = (base_idx >= 0 && base_idx < motor_number_) ? base_thrust_term_[base_idx] : 0.0f;
       const float base1 = (base_idx + 1 >= 0 && base_idx + 1 < motor_number_) ? base_thrust_term_[base_idx + 1] : 0.0f;
       const float rp0 = (base_idx >= 0 && base_idx < motor_number_) ? roll_pitch_term_[base_idx] : 0.0f;
@@ -1149,10 +1161,10 @@ void AttitudeController::pwmConversion()
       ROS_WARN_THROTTLE(
         0.2,
         "[SAT_DIAG] base_shed rate=%.3f yaw_rate=%.3f thrust=%.3f limit=%.3f "
-        "rotor=%d denom_idx=%d denom=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
+        "rotor=%d base_idx=%d rp_scale=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
         "v_factor=%.3f ref=%d rotor_coef=%d",
         base_thrust_decreasing_rate, yaw_decreasing_rate, sat_check_max_thrust,
-        thrust_limit, sat_check_max_thrust_index, sat_check_max_thrust_index, denom,
+        thrust_limit, sat_check_max_thrust_index, base_idx, roll_pitch_scale,
         base0, base1, rp0, rp1, v_factor_, motor_ref_index_, rotor_coef_);
 #else
       static uint32_t sat_diag_last_time = 0;
@@ -1162,10 +1174,10 @@ void AttitudeController::pwmConversion()
           char log_msg[240];
           snprintf(log_msg, sizeof(log_msg),
                    "[SAT_DIAG] base_shed rate=%.3f yaw_rate=%.3f thrust=%.3f limit=%.3f "
-                   "rotor=%d denom_idx=%d denom=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
+                   "rotor=%d base_idx=%d rp_scale=%.3f base_pair=(%.3f,%.3f) rp_pair=(%.3f,%.3f) "
                    "v_factor=%.3f ref=%d rotor_coef=%d",
                    base_thrust_decreasing_rate, yaw_decreasing_rate, sat_check_max_thrust,
-                   thrust_limit, sat_check_max_thrust_index, sat_check_max_thrust_index, denom,
+                   thrust_limit, sat_check_max_thrust_index, base_idx, roll_pitch_scale,
                    base0, base1, rp0, rp1, v_factor_, motor_ref_index_, rotor_coef_);
           nh_->logwarn(log_msg);
         }
@@ -1174,7 +1186,7 @@ void AttitudeController::pwmConversion()
 
   for(int i = 0; i < motor_number_; i++)
     {
-      float candidate = roll_pitch_term_[i] + (1 + base_thrust_decreasing_rate) * base_thrust_term_[i] + (1 + yaw_decreasing_rate) * yaw_term_[i];
+      float candidate = roll_pitch_scale * roll_pitch_term_[i] + (1 + base_thrust_decreasing_rate) * base_thrust_term_[i] + (1 + yaw_decreasing_rate) * yaw_term_[i];
 
       /* NaN/Inf guard: hold last valid value to avoid thrust discontinuity */
       if(std::isfinite(candidate))

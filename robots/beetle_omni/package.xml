@@ -28,6 +28,16 @@
   <exec_depend>roscpp</exec_depend>
   <exec_depend>pluginlib</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
+  <!-- Offline rosbag visualization (no controller build required). -->
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>rosbag</exec_depend>
+  <exec_depend>rviz</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>tf</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
 
   <!-- The export tag contains other, unspecified, tags -->
   <export>

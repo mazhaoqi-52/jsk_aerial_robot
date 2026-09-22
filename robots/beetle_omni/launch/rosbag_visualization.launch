@@ -1,0 +1,22 @@
+<launch>
+  <arg name="bag"/>
+  <arg name="start" default="0"/>
+  <arg name="rate" default="1.0"/>
+  <arg name="pause" default="true"/>
+  <arg name="rviz" default="true"/>
+  <!-- Load the senior's original display configuration without modifications. -->
+  <arg name="rviz_config" default="$(find beetle_omni)/config/rviz/nmpc_exp.rviz"/>
+  <arg name="interaction_wrench" default="false"/>
+  <arg name="pause_flag" value="$(eval '--pause' if arg('pause') else '')"/>
+  <param name="use_sim_time" value="true"/>
+  <param name="beetle1/robot_description"
+         command="$(find xacro)/xacro '$(find beetle_omni)/robots/beetle_art_omni.urdf.xacro' end_effector:=brush robot_name:=beetle1"/>
+  <!-- Recorded TF drives the model; no controller or robot_state_publisher. -->
+  <node pkg="beetle_omni" type="rosbag_wrench_viz.py" name="rosbag_wrench_viz" output="screen" required="true">
+    <param name="bag" value="$(arg bag)"/>
+    <param name="interaction_wrench" value="$(arg interaction_wrench)"/>
+  </node>
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz" args="-d $(arg rviz_config)" output="screen" required="true"/>
+  <node pkg="rosbag" type="play" name="bag_player" output="screen"
+        args="--quiet --clock --hz=100 --delay=2 --keep-alive $(arg pause_flag) --start=$(arg start) --rate=$(arg rate) --bags '$(arg bag)' --topics /tf /beetle1/uav/cog/odom /beetle1/uav/baselink/odom /beetle1/uav/ee_contact/odom /beetle1/nmpc/viz_pred /beetle1/nmpc/viz_ref /beetle1/dist_w_f_cog_tq/ext /beetle1/ext_wrench_est/value /beetle1/ext_wrench_est/viz_ring /walls /hand_markers"/>
+</launch>

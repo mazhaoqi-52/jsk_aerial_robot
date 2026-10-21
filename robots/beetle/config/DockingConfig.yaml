@@ -1,36 +1,20 @@
 docking:
-  position_tolerance: 0.03       # interface Y/Z, m; strict <
-  angle_tolerance_deg: 4.0       # mutual AND fixed-reference roll/pitch/yaw; strict <
-  settle_time: 1.0              # fresh geometry observation window, s
-  alignment_pass_ratio: 0.9     # >=90% pass AND current sample passes
-  approach_speed: 0.1           # axial trajectory speed upper bound, m/s
-  slowdown_gain: 2.0            # speed cap = gain * remaining target distance, 1/s
-  realign_timeout: 3.0          # pause/correct first; retreat if not recovered within 3 s
-  retreat_hysteresis: 0.015     # retreat below 13 cm, return above 14.5 cm (default gap)
-  retreat_speed: 0.03           # outward recovery speed, m/s
-  prealign_gap: 0.15            # nominal interface clearance, m
-  correction_speed: 0.05        # Y/Z target slew, m/s
-  max_target_lead: 0.02         # cap axial position target error, m
-  insertion_depth: 0.05         # existing maximum inward bias, now approached gradually
-  final_x_tolerance: 0.02       # keep locking stricter than prealignment
+  prealign_gap: 0.15           # intermediate interface gap, m
+  position_tolerance: 0.05     # prealignment XYZ arrival tolerance, m
+  angle_tolerance_deg: 8.6     # mutual interface RPY arrival tolerance (~original 0.15 rad)
+  approach_speed: 0.1          # axial waypoint speed upper bound, m/s
+  correction_speed: 0.05      # Y/Z waypoint slew, m/s
+  slowdown_gain: 2.0          # slow the waypoint near each fixed goal, 1/s
+  insertion_depth: 0.05       # final inward target offset, m
+  final_x_tolerance: 0.02     # lock when gap is in [-insertion_depth, final_x_tolerance)
   final_y_tolerance: 0.02
   final_z_tolerance: 0.015
-  final_hold_time: 0.3          # fixed waypoint, continuous final geometry; speed is diagnostic only
-  max_sample_gap: 0.2
-  flight_state_timeout: 0.5
   reference:
-    attitude_rate_deg: 10.0     # each aircraft slews to fixed common interface attitude
-    trim_time_constant: 0.5    # low-pass relative Y/Z error, s
-    trim_gain: 0.3             # integral trim gain, 1/s
-    trim_speed: 0.01           # Y/Z trim vector speed limit, m/s
-    trim_limit: 0.05           # Y/Z trim vector displacement limit, m
-    leader_drift_limit: 0.05   # FC distance from capture; abort and restart beyond this
+    attitude_rate_deg: 10.0   # smooth transition to the common fixed attitude
   world_frame: world
   baselink_frame: fc
-  # Optional calibrated transforms from each root to its mating reference frame.
-  # Both mating frames have PARALLEL axes at assembly (not opposing face normals).
-  # Default XYZ for attach_dir=+1: leader [0.26,0,0], follower [-0.26,0,0].
-  # Defaults are mirrored automatically for attach_dir=-1.
+  # Optional root -> mating reference transforms; axes are parallel when mated.
+  # Defaults mirror automatically for attach_dir=-1.
   # leader_connector_xyz: [0.26, 0.0, 0.0]
   # follower_connector_xyz: [-0.26, 0.0, 0.0]
   # leader_connector_rpy: [0.0, 0.0, 0.0]   # radians

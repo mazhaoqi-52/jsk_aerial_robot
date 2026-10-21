@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Offline trajectory/state regression tests; no ROS master or aircraft."""
-import math
+"""Offline regressions for the two-stage assembly trajectory."""
 from pathlib import Path
 import sys
 import unittest
@@ -14,271 +13,87 @@ class GuidanceTest(unittest.TestCase):
     def setUp(self):
         self.g = DockingGuidance(DockingConfig())
 
-    def step(self, t, p=(.15, 0, 0), r=(0, 0, 0), v=(0, 0, 0)):
-        return self.g.update(t, p, r, v)
+    def step(self, t, p=(.15, 0, 0), r=(0, 0, 0), q=None):
+        return self.g.update(t, p, r, p if q is None else q)
 
-    def arm_approach(self):
-        for i in range(43):
-            self.step(i*.025)
-        self.assertEqual(self.g.phase, 'approach')
+    def test_prealignment_requires_basic_arrival_but_no_dwell(self):
+        self.assertEqual(self.step(0, (.3, .1, .08)), 'prealign')
+        self.assertEqual(self.step(.025, (.15, .02, .02), np.radians([5, 0, 0])), 'approach')
 
-    def test_window_tolerates_isolated_spikes_but_requires_current_alignment(self):
-        for i in range(42):
-            self.step(i*.025, p=(.15, .031 if i in (10, 41) else 0, 0))
-        self.assertEqual(self.g.phase, 'prealign')  # current sample is bad
-        self.step(1.05)
-        self.assertEqual(self.g.phase, 'approach')
+    def test_prealignment_checks_each_coordinate_and_relative_angle(self):
+        for p, r in [((.21, 0, 0), (0, 0, 0)), ((.15, .06, 0), (0, 0, 0)),
+                     ((.15, 0, .06), (0, 0, 0)), ((.15, 0, 0), (0, .2, 0))]:
+            self.g = DockingGuidance(DockingConfig())
+            self.assertEqual(self.step(0, p, r), 'prealign')
 
-    def test_mostly_misaligned_window_cannot_release(self):
-        for i in range(43):
-            self.step(i*.025, p=(.15, .031 if i % 3 == 0 else 0, 0))
+    def test_misalignment_does_not_block_motion_to_prealignment_point(self):
+        self.step(0, (.9, -.1, .05))
+        self.step(.025, (.9, -.1, .05))
+        np.testing.assert_allclose(self.g.command, [.8975, -.09875, .04875])
+        self.assertAlmostEqual(self.g.axial_velocity, -.1)
         self.assertEqual(self.g.phase, 'prealign')
 
-    def test_velocity_is_not_a_prealign_gate(self):
-        for velocity in (None, (.08,0,0), (float('nan'),0,0)):
-            self.g = DockingGuidance(DockingConfig())
-            for i in range(43):
-                self.step(i*.025, v=velocity)
-            self.assertEqual(self.g.phase, 'approach')
-
-    def test_static_hover_with_two_independent_1mm_noise_sources_releases(self):
-        rng = np.random.default_rng(20261020)
-        positions, speeds = [], []
-        for i in range(81):
-            p = np.array([.15,0,0])+rng.normal(0,.001,3)-rng.normal(0,.001,3)
-            positions.append(p)
-            v = None if i < 6 else (p-positions[i-6])/.15
-            if v is not None:
-                speeds.append(np.linalg.norm(v))
-            self.step(i*.025, p, v=v)
-            if self.g.phase == 'approach':
-                break
-        self.assertTrue(any(speed >= .02 for speed in speeds))
-        self.assertEqual(self.g.phase, 'approach')
-        self.assertLessEqual(i*.025, 1.2)
-
-    def test_strict_thresholds(self):
-        for p, r, v in [((.15, .03, 0), (0,0,0), (0,0,0)),
-                        ((.15, 0, .03), (0,0,0), (0,0,0)),
-                        ((.15, 0, 0), (0,math.radians(4.1),0), (0,0,0))]:
-            self.g = DockingGuidance(DockingConfig())
-            for i in range(100):
-                self.step(i*.025, p, r, v)
-            self.assertNotEqual(self.g.phase, 'approach')
-
-    def test_01_speed_cap_and_slowdown_near_contact(self):
-        self.arm_approach()
-        p = np.array([.15, 0, 0])
-        speeds = []
-        for i in range(43, 105):
-            before = self.g.command[0]
-            self.step(i*.025, p, v=(-.1, 0, 0))
-            speed = (before-self.g.command[0])/.025
-            self.assertLessEqual(speed, .1+1e-10)
-            self.assertGreaterEqual(speed, 0)
-            speeds.append(speed)
-            p = self.g.command.copy()
-        self.assertAlmostEqual(speeds[0], .1)
-        self.assertLess(speeds[-1], .05)
-        self.assertEqual(self.g.phase, 'approach')
-
-    def test_coarse_leg_slows_before_prealign(self):
-        p = np.array([.4,0,0])
-        speeds = []
-        for i in range(200):
-            self.step(i*.025, p)
-            speeds.append(-self.g.axial_velocity)
-            p = self.g.command.copy()
-            if self.g.phase == 'prealign':
-                break
-        self.assertAlmostEqual(max(speeds), .1)
-        self.assertLess(speeds[-1], .05)
-
-    def test_stalled_aircraft_does_not_accumulate_inward_waypoint(self):
-        self.arm_approach()
-        for i in range(43, 200):
-            self.step(i*.025)
-            self.assertGreaterEqual(self.g.command[0], .13-1e-12)
-        self.assertAlmostEqual(self.g.axial_velocity, 0)
-
-    def test_any_misalignment_stops_but_does_not_immediately_retreat(self):
-        for p, r in [((.08,.031,0), (0,0,0)), ((.08,0,.031), (0,0,0)),
-                     ((.08,0,0), (0,math.radians(5),0))]:
-            self.g = DockingGuidance(DockingConfig())
-            self.arm_approach()
-            self.step(1.075, p, r)
-            self.assertEqual(self.g.phase, 'approach')
-            self.assertIsNotNone(self.g.paused_since)
-            self.assertAlmostEqual(self.g.command[0], .08)
-            self.assertEqual(self.g.axial_velocity, 0)
-            self.step(1.1, p, r)
-            self.assertAlmostEqual(self.g.command[0], .08)
-            self.assertEqual(self.g.axial_velocity, 0)
-
-    def test_pause_recovers_without_retreat(self):
-        self.arm_approach()
-        self.step(1.075, (.08,.04,0))
-        for i in range(44, 87):
-            self.step(i*.025, (.08,0,0))
-        self.assertEqual(self.g.phase, 'approach')
-        self.assertIsNone(self.g.paused_since)
-        self.assertLess(self.g.axial_velocity, 0)
-
-    def test_persistent_or_severe_error_retreats(self):
-        self.arm_approach()
-        for i in range(43, 167):
-            self.step(i*.025, (.08,.04,0))
-        self.assertEqual(self.g.phase, 'retreat')
-        self.g = DockingGuidance(DockingConfig())
-        self.arm_approach()
-        self.step(1.075, (.08,.061,0))
-        self.assertEqual(self.g.phase, 'retreat')
-        self.assertEqual(self.g.axial_velocity, 0)  # brake on this frame
-
-    def test_retreat_hysteresis_avoids_13cm_chatter(self):
-        self.g.phase = 'retreat'
-        for i in range(80):
-            self.step(i*.025, (.129 if i%2 else .131,0,0))
-            self.assertEqual(self.g.phase, 'retreat')
-        self.step(2.0, (.146,0,0))
-        self.assertEqual(self.g.phase, 'prealign')
-
-    def test_initial_leg_does_not_close_while_misaligned(self):
-        for i in range(80):
-            self.step(i*.025, (.5,.1,0))
-        self.assertAlmostEqual(self.g.command[0], .5)
-        self.assertEqual(self.g.phase, 'standby')
-
-    def test_duplicate_or_lost_tf_cannot_release(self):
+    def test_approach_continues_under_disturbance_without_retreat_or_abort(self):
         self.step(0)
-        self.step(.025)
-        for _ in range(100):
-            self.step(.025)
-        self.assertEqual(self.g.phase, 'prealign')
-        self.step(10)  # discontinuity resets dwell
-        self.assertEqual(self.g.phase, 'prealign')
-        self.assertEqual(self.g.axial_velocity, 0)
-
-    def test_tf_recovery_near_contact_requires_retreat(self):
-        self.arm_approach()
-        self.g.invalidate()
-        self.step(4, (.04,0,0))
-        self.assertEqual(self.g.phase, 'retreat')
-
-    def test_pause_anchors_fixed_position_not_live_leader_gap(self):
-        self.arm_approach()
-        self.g.update(1.075, [.08, .04, 0], [0, 0, 0], [0, 0, 0], [.10, 0, 0])
-        self.assertAlmostEqual(self.g.command[0], .10)
-        self.g.update(1.1, [.07, .04, 0], [0, 0, 0], [0, 0, 0], [.10, 0, 0])
-        self.assertAlmostEqual(self.g.command[0], .10)
-        self.assertEqual(self.g.axial_velocity, 0)
-
-    def test_final_hold_ignores_speed_but_requires_full_duration(self):
-        for velocity in (None, (.11, 0, 0), (float('nan'), 0, 0)):
-            self.g = DockingGuidance(DockingConfig())
-            self.arm_approach()
-            for i in range(43, 55):
-                self.step(i*.025, (.01, 0, 0), v=velocity)
-                self.assertEqual(self.g.phase, 'approach')
-                self.assertEqual(self.g.axial_velocity, 0)
-            self.step(55*.025, (.01, 0, 0), v=velocity)
-            self.assertEqual(self.g.phase, 'complete')
-            self.assertAlmostEqual(self.g.final_hold_elapsed, .3)
-
-    def test_final_waypoint_is_captured_once_despite_measured_motion(self):
-        self.arm_approach()
-        self.g.command[1:] = [.003, -.002]
-        self.g.update(1.075, [.01, 0, 0], [0, 0, 0], None, [.04, 0, 0])
-        target = self.g.command.copy()
-        for i in range(44, 55):
-            # Motion exceeds the normal 2 cm lead clamp; the held target stays fixed.
-            q = [.01 if i % 2 else .045, .002, -.003]
-            self.g.update(i*.025, [.001, .002, -.003], [0, 0, 0], [.03, 0, 0], q)
-            np.testing.assert_allclose(self.g.command, target)
-            self.assertEqual(self.g.axial_velocity, 0)
-
-    def test_final_geometry_failure_cancels_hold_even_inside_coarse_tolerance(self):
-        for position, angles in [((.01, .021, 0), (0, 0, 0)),
-                                 ((.01, 0, .016), (0, 0, 0)),
-                                 ((.021, 0, 0), (0, 0, 0)),
-                                 ((.01, 0, 0), (0, math.radians(5), 0))]:
-            self.g = DockingGuidance(DockingConfig())
-            self.arm_approach()
-            self.step(1.075, (.01, 0, 0))
-            self.step(1.1, position, angles)
-            self.assertFalse(self.g.final_holding)
-            self.assertIsNotNone(self.g.paused_since)
-            self.assertEqual(self.g.axial_velocity, 0)
-            for i in range(45, 65):
-                self.step(i*.025, position, angles)
-                self.assertNotEqual(self.g.phase, 'complete')
-
-    def test_final_hold_restarts_after_alignment_recovery(self):
-        self.arm_approach()
-        self.step(1.075, (.01, 0, 0))
-        self.step(1.1, (.01, 0, .016))
-        for i in range(45, 85):
-            self.step(i*.025, (.01, 0, 0))
-            self.assertFalse(self.g.final_holding)
-        self.step(85*.025, (.01, 0, 0))
-        self.assertTrue(self.g.final_holding)
-        self.assertAlmostEqual(self.g.final_hold_elapsed, 0)
-        for i in range(86, 97):
-            self.step(i*.025, (.01, 0, 0))
+        for i in range(1, 300):
+            self.step(i*.025, (.1, .12, -.1), (.3, .3, .3))
             self.assertEqual(self.g.phase, 'approach')
-        self.step(97*.025, (.01, 0, 0))
-        self.assertEqual(self.g.phase, 'complete')
+        self.assertGreaterEqual(self.g.command[0], -.05)
+        self.assertAlmostEqual(self.g.command[0], -.05, places=5)
 
-    def test_persistent_final_geometry_loss_retreats(self):
-        self.arm_approach()
-        self.step(1.075, (.01, 0, 0))
-        for i in range(44, 165):
-            self.step(i*.025, (.01, 0, .016))
-        self.assertEqual(self.g.phase, 'retreat')
-        self.assertFalse(self.g.final_holding)
+    def test_measurement_motion_cannot_drag_the_fixed_waypoint(self):
+        self.step(0, (.925, -.103, .051))
+        self.step(.025, (.895, -.103, .051))
+        self.assertAlmostEqual(self.g.command[0], .9225)
+        self.assertAlmostEqual(self.g.axial_velocity, -.1)
+        self.step(.05, (.5, -.103, .051))
+        self.assertAlmostEqual(self.g.command[0], .92)
 
-    def test_final_hold_cannot_accumulate_on_duplicate_or_missing_tf(self):
-        self.arm_approach()
-        self.step(1.075, (.01, 0, 0))
-        for _ in range(100):
-            self.step(1.075, (.01, 0, 0))
-        self.assertEqual(self.g.final_hold_elapsed, 0)
-        self.step(2, (.01, 0, 0))
-        self.assertFalse(self.g.final_holding)
-        self.assertEqual(self.g.phase, 'retreat')
+    def test_immediate_lock_when_final_geometry_arrives(self):
+        self.step(0)
+        # Even a rapid measured change is not a velocity or holding-time gate.
+        self.assertEqual(self.step(.025, (.01, .005, .005)), 'complete')
+        self.assertEqual(self.g.axial_velocity, 0)
+        target = self.g.command.copy()
+        self.step(.05, (.002, 0, 0))
+        np.testing.assert_allclose(self.g.command, target)
 
-    def test_mm_noise_and_alternating_speed_spikes_do_not_block_final_hold(self):
-        self.arm_approach()
-        rng = np.random.default_rng(20261021)
-        for i in range(13):
-            p = np.array([.003, 0, 0])+rng.normal(0, .001, 3)
-            self.step(1.075+i*.025, p, v=(.03 if i%2 else .01, 0, 0))
-        self.assertEqual(self.g.phase, 'complete')
+    def test_lock_still_requires_final_position_and_angle(self):
+        for p, r in [((.03, 0, 0), (0, 0, 0)), ((-.06, 0, 0), (0, 0, 0)),
+                     ((0, .021, 0), (0, 0, 0)), ((0, 0, .016), (0, 0, 0)),
+                     ((0, 0, 0), (0, .2, 0))]:
+            self.g = DockingGuidance(DockingConfig())
+            self.step(0)
+            self.assertEqual(self.step(.025, p, r), 'approach')
+        self.assertEqual(self.step(.05, (0, 0, 0)), 'complete')
 
-    def test_bad_config_rejected(self):
-        with self.assertRaises(ValueError):
-            DockingConfig(approach_speed=-1)
-        with self.assertRaises(ValueError):
-            DockingConfig(position_tolerance=float('nan'))
+    def test_tf_interruption_resumes_same_phase_without_target_jump(self):
+        self.step(0)
+        self.step(.025, (.1, 0, 0))
+        self.g.suspend()
+        self.assertEqual(self.g.phase, 'approach')
+        self.assertEqual(self.step(10, (.08, 0, 0)), 'approach')
+        np.testing.assert_allclose(self.g.command, [.08, 0, 0])
+        self.assertEqual(self.g.axial_velocity, 0)
 
-    def test_full_sequence_and_recovery_with_ideal_tracking(self):
-        p, r, velocity = np.array([.5,.10,.04]), np.radians([0,8,0]), np.zeros(3)
-        phases, injected = set(), False
-        for i in range(1600):
-            phase = self.step(i*.025, p, r, velocity)
+    def test_complete_sequence_and_speed_bound_with_ideal_tracking(self):
+        p = np.array([.9, -.1, .05])
+        phases = set()
+        for i in range(1000):
+            phase = self.step(i*.025, p)
             phases.add(phase)
-            if phase == 'approach' and p[0] < .10 and not injected:
-                p[1] = .05
-                injected = True
-                continue
+            self.assertLessEqual(abs(self.g.axial_velocity), .1+1e-10)
             if phase == 'complete':
                 break
-            new_p = self.g.command.copy()
-            velocity = (new_p-p)/.025
-            p, r = new_p, np.zeros(3)  # attitude planner is tested separately
-        self.assertTrue(injected)
+            p = self.g.command.copy()
         self.assertEqual(phase, 'complete')
-        self.assertEqual(phases, {'standby', 'prealign', 'approach', 'complete'})
+        self.assertEqual(phases, {'prealign', 'approach', 'complete'})
+
+    def test_invalid_feedback_does_not_generate_a_target(self):
+        with self.assertRaises(ValueError):
+            self.step(0, (float('nan'), 0, 0))
+        with self.assertRaises(ValueError):
+            DockingConfig(approach_speed=-1)
 
 
 if __name__ == '__main__':

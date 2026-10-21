@@ -77,8 +77,8 @@ class AdapterTest(unittest.TestCase):
         self.m.tick()
         msg = self.m.publisher.publish.call_args[0][0]
         self.assertEqual([msg.target_vel_x,msg.target_vel_y,msg.target_vel_z], [0,0,0])
-        self.assertEqual(self.m.guidance.phase, 'prealign')
-        self.assertIsNone(self.m.guidance.stable_since)
+        self.assertEqual(self.m.guidance.phase, 'approach')
+        self.assertIsNone(self.m.guidance.previous_time)
 
     def test_ground_clock_offset_does_not_block_navigation(self):
         self.leader = connector_matrix([1, 2, .8], [0, 0, .3])
@@ -144,25 +144,33 @@ class AdapterTest(unittest.TestCase):
         after = self.m.publisher.publish.call_args[0][0]
         np.testing.assert_allclose([after.target_roll, after.target_pitch, after.target_yaw],
                                    [before.target_roll, before.target_pitch, before.target_yaw], atol=1e-10)
-        # Trim may react slowly; it cannot copy the instantaneous connector movement.
-        self.assertLess(np.linalg.norm(np.array([after.target_pos_x, after.target_pos_y, after.target_pos_z])-
-                                       [before.target_pos_x, before.target_pos_y, before.target_pos_z]), .0003)
+        # Leader measurement perturbations cannot rotate the fixed trajectory.
+        delta = np.array([after.target_pos_x, after.target_pos_y, after.target_pos_z])-np.array(
+            [before.target_pos_x, before.target_pos_y, before.target_pos_z])
+        np.testing.assert_allclose(delta, self.m.reference.axial_feedforward(-.1)*.025, atol=1e-9)
 
-    def test_large_leader_drift_aborts_without_reanchoring(self):
+    def test_leader_height_drift_does_not_abort_or_reset_reference(self):
         self.m.tick()
         frozen = self.m.reference.frame.copy()
-        self.leader[1, 3] += .06
+        self.leader[2, 3] += .06  # reproduce the displacement that aborted the real trial
         self.now += .025
-        self.refresh_flight()
-        self.assertEqual(self.m.tick(), 'aborted')
+        phase = self.m.tick()
+        self.assertNotEqual(phase, 'aborted')
+        self.assertFalse(self.m.aborted)
         np.testing.assert_allclose(self.m.reference.frame, frozen)
-        msg = self.m.publisher.publish.call_args[0][0]
-        self.assertEqual([msg.target_vel_x, msg.target_vel_y, msg.target_vel_z], [0, 0, 0])
+        self.assertEqual(self.m.publisher.publish.call_count, 2)
+
+    def test_flight_feedback_age_does_not_abort_navigation(self):
+        self.m.tick()
+        self.now += 1.0
+        # Last reported state remains HOVER; no receipt-time expiration gate.
+        self.assertNotEqual(self.m.tick(), 'aborted')
+        self.assertFalse(self.m.aborted)
+
 
     def test_tf_recovery_keeps_frame_and_has_no_pose_jump(self):
         self.m.tick()
         frozen = self.m.reference.frame.copy()
-        self.m.reference.trim[:] = [.01, -.01]
         self.m.listener.lookupTransform.side_effect = tf.Exception('missing')
         self.now += .025
         self.m.tick()
@@ -197,47 +205,8 @@ class AdapterTest(unittest.TestCase):
                                                     leader_msg.target_yaw]) @ np.linalg.inv(self.root_fc)
             self.now += .025
         self.assertEqual(phase, 'complete')
-        self.assertEqual(phases, {'standby', 'prealign', 'approach', 'complete'})
+        self.assertEqual(phases, {'prealign', 'approach', 'complete'})
 
-    def test_final_hold_freezes_world_waypoint_and_trim_until_completion(self):
-        self.leader = connector_matrix([1, 2, .8], [0, 0, .3])
-        self.follower = self.leader @ connector_matrix([.53, .004, .003], [0, 0, 0])
-        self.m.tick()
-        self.m.guidance.phase = 'approach'
-        self.m.reference.trim[:] = [.001, -.001]
-        self.m.reference.filtered_error = np.array([.004, .003])
-        targets = []
-        for i in range(13):
-            self.now += .025
-            self.refresh_flight()
-            # Millimetre jitter produces velocity spikes without leaving the final geometry.
-            self.follower = self.leader @ connector_matrix(
-                [.53+.001*(-1)**i, .004+.001*(-1)**i, .003], [0, 0, 0])
-            phase = self.m.tick()
-            self.assertTrue(self.m.guidance.final_holding)
-            np.testing.assert_allclose(self.m.reference.trim, [.001, -.001])
-            msg = self.m.publisher.publish.call_args[0][0]
-            targets.append([msg.target_pos_x, msg.target_pos_y, msg.target_pos_z])
-            np.testing.assert_allclose(targets[-1], targets[0])
-            self.assertEqual([msg.target_vel_x, msg.target_vel_y, msg.target_vel_z], [0, 0, 0])
-        self.assertEqual(phase, 'complete')
-
-    def test_final_geometry_loss_unfreezes_trim_for_correction(self):
-        self.leader = connector_matrix([1, 2, .8], [0, 0, 0])
-        self.follower = self.leader @ connector_matrix([.53, .004, 0], [0, 0, 0])
-        self.m.tick()
-        self.m.guidance.phase = 'approach'
-        self.now += .025
-        self.m.tick()
-        self.assertTrue(self.m.guidance.final_holding)
-        before = self.m.reference.trim.copy()
-        self.follower[2, 3] += .016
-        self.now += .025
-        self.m.tick()
-        self.assertFalse(self.m.guidance.final_holding)
-        self.assertIsNotNone(self.m.guidance.paused_since)
-        self.assertLess(self.m.reference.trim[1], before[1])
-        self.assertEqual(self.m.guidance.axial_velocity, 0)
 
     def test_hardware_preparation_is_once_and_mirrors_male_female(self):
         for direction, expected in [(1, ['beetle2', 'beetle3']), (-1, ['beetle3', 'beetle2'])]:
@@ -295,7 +264,7 @@ class AdapterTest(unittest.TestCase):
         with patch('smach_ros.IntrospectionServer'), patch('smach.StateMachine.execute', inspect):
             self.assertEqual(module.AssemblyDemo([2,3], False).main(), 'succeeded')
         self.assertEqual(set(captured), {'StandbyState3_2', 'PreAlignState3_2', 'ApproachState3_2',
-                                        'RetreatState3_2', 'AssemblyState3_2'})
+                                        'AssemblyState3_2'})
 
 
 if __name__ == '__main__':

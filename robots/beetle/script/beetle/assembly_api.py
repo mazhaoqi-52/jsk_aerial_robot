@@ -18,9 +18,10 @@ class MotionState(smach.State):
         return 'emergency' if phase == 'aborted' else self.transitions.get(phase, 'in_process')
 
 
-class DockingStandbyState(MotionState):
+class DockingStandbyState(smach.State):
     def __init__(self, motion, hardware):
-        super().__init__(motion, {'prealign': 'done', 'retreat': 'done'})
+        super().__init__(outcomes=['done', 'in_process', 'emergency'])
+        self.motion = motion
         self.hardware = hardware
 
     def execute(self, userdata):
@@ -29,7 +30,9 @@ class DockingStandbyState(MotionState):
             if not self.hardware.prepare():
                 self.motion.abort(reason='connector preparation interrupted')
                 return 'emergency'
-        return super().execute(userdata)
+            return 'done'
+        self.motion.rate.sleep()
+        return 'emergency' if self.motion.aborted else 'in_process'
 
 
 class AssemblyState(smach.State):
@@ -55,19 +58,15 @@ def build_assembly_pair(leader_id, follower_id, real_machine, direction=1):
                                 leader=motion.leader, leader_id=leader_id,
                                 real_machine=real_machine, attach_dir=direction, motion=motion)
     machine = smach.StateMachine(outcomes=['succeeded', 'interupted'])
-    standby, prealign, approach, retreat, assembly = [name+suffix for name in
-        ('StandbyState', 'PreAlignState', 'ApproachState', 'RetreatState', 'AssemblyState')]
+    standby, prealign, approach, assembly = [name+suffix for name in
+        ('StandbyState', 'PreAlignState', 'ApproachState', 'AssemblyState')]
     with machine:
         smach.StateMachine.add(standby, DockingStandbyState(motion, hardware),
                                transitions={'done': prealign, 'in_process': standby, 'emergency': 'interupted'})
-        smach.StateMachine.add(prealign, MotionState(motion, {'approach': 'done', 'retreat': 'retreat'}),
-                               transitions={'done': approach, 'retreat': retreat, 'in_process': prealign,
-                                            'emergency': 'interupted'})
-        smach.StateMachine.add(approach, MotionState(motion, {'complete': 'done', 'prealign': 'realign', 'retreat': 'retreat'}),
-                               transitions={'done': assembly, 'realign': prealign, 'retreat': retreat,
-                                            'in_process': approach, 'emergency': 'interupted'})
-        smach.StateMachine.add(retreat, MotionState(motion, {'prealign': 'done'}),
-                               transitions={'done': prealign, 'in_process': retreat, 'emergency': 'interupted'})
+        smach.StateMachine.add(prealign, MotionState(motion, {'approach': 'done'}),
+                               transitions={'done': approach, 'in_process': prealign, 'emergency': 'interupted'})
+        smach.StateMachine.add(approach, MotionState(motion, {'complete': 'done'}),
+                               transitions={'done': assembly, 'in_process': approach, 'emergency': 'interupted'})
         smach.StateMachine.add(assembly, AssemblyState(hardware),
                                transitions={'done': 'succeeded', 'emergency': 'interupted'})
     return machine, motion

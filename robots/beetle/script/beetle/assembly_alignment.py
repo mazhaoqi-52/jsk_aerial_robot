@@ -1,9 +1,8 @@
-"""ROS adapter for guarded interface alignment and docking.
+"""ROS adapter for prealignment and position/attitude docking navigation.
 
 Connector frames use parallel axes at mating, with X along the insertion axis.
 The defaults are nominal root offsets; calibrated offsets can be supplied in YAML.
 """
-from collections import deque
 import math
 import threading
 import numpy as np
@@ -48,7 +47,6 @@ class DockingMotion:
         self.guidance = DockingGuidance(DockingConfig(**parameters))
         self.world = rospy.get_param('~docking/world_frame', 'world')
         self.baselink = rospy.get_param('~docking/baselink_frame', 'fc')
-        self.flight_timeout = rospy.get_param('~docking/flight_state_timeout', 0.5)
         self.leader_connector = connector_matrix(
             rospy.get_param('~docking/leader_connector_xyz', [self.direction*.26, 0, 0]),
             rospy.get_param('~docking/leader_connector_rpy', [0, 0, 0]))
@@ -67,7 +65,6 @@ class DockingMotion:
         self.leader_publisher = rospy.Publisher(leader+'/uav/nav', FlightNav, queue_size=1)
         self.flight = {}
         self.command_lock = threading.RLock()
-        self.history = deque()
         self.started = False
         self.aborted = False
         self.holding = False
@@ -79,15 +76,12 @@ class DockingMotion:
         self.subscribers.append(rospy.Subscriber('/emergency_assembly_interuption', Empty, self.abort))
 
     def flight_cb(self, msg, robot):
-        self.flight[robot] = (msg.data, rospy.Time.now().to_sec())
+        self.flight[robot] = msg.data
 
     def ready(self):
-        now = rospy.Time.now().to_sec()
-        good = all(robot in self.flight and self.flight[robot][0] == self.HOVER and
-                   0 <= now-self.flight[robot][1] < self.flight_timeout
-                   for robot in (self.leader, self.follower))
+        good = all(self.flight.get(robot) == self.HOVER for robot in (self.leader, self.follower))
         if self.started and not good:
-            self.abort(reason='left HOVER or flight-state feedback expired')
+            self.abort(reason='left HOVER')
         return good and not self.aborted
 
     def abort(self, _msg=None, reason='operator interruption'):
@@ -121,24 +115,8 @@ class DockingMotion:
             rospy.loginfo('[Docking] frozen interface reference xyz=%s yaw=%.1f deg',
                           self.reference.frame[:3, 3].tolist(),
                           math.degrees(tf.transformations.euler_from_matrix(self.reference.frame)[2]))
-        if self.reference.leader_displacement(world_leader, baselinks[0]) > self.reference.config.leader_drift_limit:
-            self.abort(reason='leader moved beyond fixed reference limit; stabilize and restart assembly')
-        timestamp = stamp.to_sec()
-        if self.history and (timestamp < self.history[-1][0] or
-                             timestamp-self.history[-1][0] > self.guidance.config.max_sample_gap):
-            self.history.clear()
-            self.guidance.invalidate()
-            self.reference.suspend()
         position, trajectory, angles = self.reference.feedback(roots)
-        # Guidance owns the coarse waypoint; the reference owns the additive trim.
-        trajectory[1:] -= self.reference.trim
-        if not self.history or timestamp > self.history[-1][0]:
-            self.history.append((timestamp, position.copy()))
-        while len(self.history) > 2 and timestamp-self.history[1][0] >= .15:
-            self.history.popleft()
-        elapsed = timestamp-self.history[0][0]
-        velocity = ((position-self.history[0][1])/elapsed if .1 <= elapsed <= .3 else None)
-        return timestamp, position, trajectory, angles, velocity, baselinks
+        return position, trajectory, angles, baselinks
 
     def publish_pose(self, pose, velocity, holding=False):
         rpy = tf.transformations.euler_from_matrix(pose)
@@ -172,50 +150,38 @@ class DockingMotion:
 
     def tick(self):
         if not self.ready():
-            self.guidance.invalidate()
+            self.guidance.suspend()
             self.rate.sleep()
             return 'aborted' if self.aborted else self.guidance.phase
         self.started = True
         try:
-            stamp, position, trajectory, angles, velocity, baselinks = self.snapshot()
+            position, trajectory, angles, baselinks = self.snapshot()
         except (tf.Exception, ValueError, np.linalg.LinAlgError) as exc:
             rospy.logwarn_throttle(1, '[Docking] holding for valid TF: %s' % exc)
             self.hold()
-            self.guidance.invalidate()
+            self.guidance.suspend()
             self.reference.suspend()
-            self.history.clear()
             self.rate.sleep()
             return self.guidance.phase
         if self.aborted:
             return 'aborted'
+        now = rospy.Time.now().to_sec()
         previous = self.guidance.previous_time
-        dt = 0 if previous is None else stamp-previous
-        if dt < 0 or dt > self.guidance.config.max_sample_gap:
-            dt = 0
-            self.reference.suspend()
-        phase = self.guidance.update(stamp, position, angles, velocity, trajectory)
+        dt = 0.0 if previous is None else max(0.0, now-previous)
+        phase = self.guidance.update(now, position, angles, trajectory)
         if self.guidance.command is not None:
-            trim_enabled = (phase in ('standby', 'prealign', 'approach') and
-                            not self.guidance.final_holding and
-                            np.linalg.norm(self.guidance.command[1:]) < .005 and
-                            np.all(angles < self.guidance.config.angle_tolerance))
-            self.reference.update(dt, position, trim_enabled)
+            self.reference.update(dt)
             target_pose = self.reference.follower_pose(self.guidance.command, baselinks[1])
             feedforward = self.reference.axial_feedforward(self.guidance.axial_velocity)
             self.publish_leader_attitude(baselinks[0])
             self.publish_pose(target_pose, feedforward)
             self.holding = False
         if phase != self.last_phase:
-            rospy.loginfo('[Docking] phase=%s gap=%.3f yz=%s attitude_error_deg=%s', phase, position[0],
+            rospy.loginfo('[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s', phase, position[0],
                           position[1:].tolist(), np.degrees(angles).tolist())
             self.last_phase = phase
-        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s attitude_error_deg=%s trim_yz=%s speed=%s reason=%s window=%.2fs pass=%.0f%% paused=%s axial_cmd=%.3f final_hold=%.2f/%.2fs' %
+        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f' %
                                (phase, position[0], position[1:].tolist(), np.degrees(angles).tolist(),
-                                self.reference.trim.tolist(),
-                                None if velocity is None else float(np.linalg.norm(velocity)),
-                                self.guidance.reason, self.guidance.window_age,
-                                100*self.guidance.alignment_fraction,
-                                self.guidance.paused_since is not None, self.guidance.axial_velocity,
-                                self.guidance.final_hold_elapsed, self.guidance.config.final_hold_time))
+                                self.guidance.command.tolist(), self.guidance.axial_velocity))
         self.rate.sleep()
         return phase

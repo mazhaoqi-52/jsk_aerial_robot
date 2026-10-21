@@ -48,7 +48,6 @@ class DockingMotion:
         self.guidance = DockingGuidance(DockingConfig(**parameters))
         self.world = rospy.get_param('~docking/world_frame', 'world')
         self.baselink = rospy.get_param('~docking/baselink_frame', 'fc')
-        self.tf_timeout = rospy.get_param('~docking/tf_timeout', 0.2)
         self.flight_timeout = rospy.get_param('~docking/flight_state_timeout', 0.5)
         self.leader_connector = connector_matrix(
             rospy.get_param('~docking/leader_connector_xyz', [self.direction*.26, 0, 0]),
@@ -106,12 +105,9 @@ class DockingMotion:
         self.publish_pose(self.last_pose, np.zeros(3), holding=True)
 
     def snapshot(self):
-        # All dynamic transforms are looked up at one common, recent timestamp.
+        # Use one common TF timestamp without comparing it to the ground PC clock.
         frames = [self.leader+'/root', self.follower+'/root']
         stamp = min(self.listener.getLatestCommonTime(self.world, frame) for frame in frames)
-        age = (rospy.Time.now()-stamp).to_sec()
-        if age > self.tf_timeout or age < -.05:
-            raise ValueError('stale/future root TF (age %.3f s)' % age)
         world_leader, world_follower = [transform_matrix(*self.listener.lookupTransform(self.world, frame, stamp))
                                         for frame in frames]
         baselinks = [transform_matrix(*self.listener.lookupTransform(

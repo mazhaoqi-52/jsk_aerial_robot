@@ -68,17 +68,34 @@ class AdapterTest(unittest.TestCase):
         msg = self.m.publisher.publish.call_args[0][0]
         np.testing.assert_allclose([msg.target_pos_x,msg.target_pos_y,msg.target_pos_z], (self.follower @ self.root_fc)[:3,3])
 
-    def test_tf_timeout_holds_and_clears_dwell(self):
+    def test_missing_tf_holds_and_clears_dwell(self):
         self.m.tick()
         self.m.guidance.phase = 'approach'
         self.now += .25
         self.refresh_flight()
-        self.m.listener.getLatestCommonTime.side_effect = lambda *a: rospy.Time.from_sec(9)
+        self.m.listener.getLatestCommonTime.side_effect = tf.Exception('missing root TF')
         self.m.tick()
         msg = self.m.publisher.publish.call_args[0][0]
         self.assertEqual([msg.target_vel_x,msg.target_vel_y,msg.target_vel_z], [0,0,0])
         self.assertEqual(self.m.guidance.phase, 'prealign')
         self.assertIsNone(self.m.guidance.stable_since)
+
+    def test_ground_clock_offset_does_not_block_navigation(self):
+        self.leader = connector_matrix([1, 2, .8], [0, 0, .3])
+        self.follower = self.leader @ connector_matrix([.67, 0, 0], [0, 0, 0])
+        for offset in (.45, -.45):
+            with self.subTest(tf_offset=offset):
+                self.m = DockingMotion('beetle2', 'beetle3')
+                self.m.listener.getLatestCommonTime.side_effect = lambda *a: rospy.Time.from_sec(self.now+offset)
+                self.m.listener.lookupTransform.side_effect = self.lookup
+                for _ in range(45):
+                    self.refresh_flight()
+                    phase = self.m.tick()
+                    self.now += .025
+                self.assertEqual(phase, 'approach')
+                self.assertFalse(self.m.aborted)
+                self.assertEqual(self.m.publisher.publish.call_count, 45)
+                self.assertIsNotNone(self.m.reference.frame)
 
     def test_land_aborts_and_prevents_late_publish(self):
         self.m.tick()

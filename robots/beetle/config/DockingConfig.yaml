@@ -17,7 +17,6 @@ docking:
   final_z_tolerance: 0.015
   final_hold_time: 0.3          # fixed waypoint, continuous final geometry; speed is diagnostic only
   max_sample_gap: 0.2
-  tf_timeout: 0.2
   flight_state_timeout: 0.5
   reference:
     attitude_rate_deg: 10.0     # each aircraft slews to fixed common interface attitude

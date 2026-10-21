@@ -36,7 +36,7 @@ class ReferenceTest(unittest.TestCase):
         reference.feedback(self.roots)
         np.testing.assert_allclose(reference.frame, frame)
         np.testing.assert_allclose(reference.follower_pose(command, self.baselinks[1]), before)
-        np.testing.assert_allclose(reference.axial_feedforward(-.1), frame[:3, 0]*-.1)
+        np.testing.assert_allclose(reference.world_velocity([-.1, 0, 0]), frame[:3, 0]*-.1)
 
     def test_levelling_preserves_leader_fc_anchor(self):
         reference = self.make_reference(leader_angles=(.12, -.09, .3))
@@ -68,7 +68,7 @@ class ReferenceTest(unittest.TestCase):
         self.assertAlmostEqual(relative[0], .15)
         np.testing.assert_allclose(reference.follower_pose(trajectory, self.baselinks[1]),
                                    self.roots[1] @ self.baselinks[1], atol=1e-9)
-        np.testing.assert_allclose(reference.axial_feedforward(-.1), reference.frame[:3, 0]*.1)
+        np.testing.assert_allclose(reference.world_velocity([-.1, 0, 0]), reference.frame[:3, 0]*.1)
         # A connector calibration changes the root attitude needed for mating.
         reference.connectors = (pose((.26, .01, 0), (.02, -.01, .03)),
                                 pose((-.26, -.01, 0), (-.02, .01, -.03)))
@@ -78,6 +78,16 @@ class ReferenceTest(unittest.TestCase):
         follower_fc = reference.follower_pose([0, 0, 0], self.baselinks[1])
         follower_interface = follower_fc @ np.linalg.inv(self.baselinks[1]) @ reference.connectors[1]
         np.testing.assert_allclose(follower_interface, reference.frame, atol=1e-9)
+
+    def test_full_velocity_rotates_and_mirrors_like_the_position_target(self):
+        for direction in (-1, 1):
+            reference = self.make_reference(direction=direction)
+            command = np.array([.3, .02, -.04])
+            velocity = np.array([-.05, -.01, .02])
+            before = reference.follower_pose(command, self.baselinks[1])[:3, 3]
+            after = reference.follower_pose(command+velocity*.025, self.baselinks[1])[:3, 3]
+            np.testing.assert_allclose(reference.world_velocity(velocity), (after-before)/.025,
+                                       atol=1e-12)
 
 
     def test_interruption_keeps_reference_but_resets_attitude_slew(self):

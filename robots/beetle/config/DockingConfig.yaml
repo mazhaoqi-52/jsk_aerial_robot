@@ -6,7 +6,9 @@ docking:
   approach_speed: 0.1          # axial waypoint speed upper bound, m/s
   near_approach_speed: 0.05    # approach speed cap inside slowdown distance, m/s
   approach_slowdown_distance: 0.15  # measured interface gap, m; speed ramps down before this
-  correction_speed: 0.05      # Y/Z waypoint slew, m/s
+  correction_speed: 0.02      # relative Y/Z correction speed per axis, m/s
+  relative_correction_gain: 0.5  # measured relative error -> waypoint velocity, 1/s
+  contact_lock_gap: 0.05      # freeze aligned Y/Z waypoint inside this actual gap, m
   slowdown_gain: 2.0          # slow the waypoint near each fixed goal, 1/s
   insertion_depth: 0.05       # final inward target offset, m
   final_x_tolerance: 0.02     # lock when gap is in [-insertion_depth, final_x_tolerance)

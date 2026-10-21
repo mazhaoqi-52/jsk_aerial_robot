@@ -60,7 +60,9 @@ class AdapterTest(unittest.TestCase):
         values = {'~docking/prealign_angle_tolerance_deg': 2.5,
                   '~docking/angle_tolerance_deg': 7.0,
                   '~docking/near_approach_speed': .04,
-                  '~docking/approach_slowdown_distance': .12}
+                  '~docking/approach_slowdown_distance': .12,
+                  '~docking/relative_correction_gain': .6,
+                  '~docking/contact_lock_gap': .04}
         with patch('rospy.get_param', side_effect=lambda key, default=None: values.get(key, default)):
             motion = DockingMotion('beetle2', 'beetle3')
         config = motion.guidance.config
@@ -68,6 +70,8 @@ class AdapterTest(unittest.TestCase):
         self.assertAlmostEqual(config.angle_tolerance, np.radians(7.0))
         self.assertEqual(config.near_approach_speed, .04)
         self.assertEqual(config.approach_slowdown_distance, .12)
+        self.assertEqual(config.relative_correction_gain, .6)
+        self.assertEqual(config.contact_lock_gap, .04)
 
     def test_mirrored_connectors(self):
         self.m = DockingMotion('beetle2', 'beetle3', -1)
@@ -144,14 +148,16 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(msg.roll_nav_mode, FlightNav.POS_MODE)
         self.assertEqual(msg.pitch_nav_mode, FlightNav.POS_MODE)
 
-    def test_leader_perturbation_does_not_move_fixed_target(self):
+    def test_leader_perturbation_keeps_fixed_axes_and_insertion_goal(self):
         # Isolate the frozen frame from the separately tested gap-based speed cap.
         self.m.guidance.config.near_approach_speed = .1
         self.leader = connector_matrix([1, 2, .8], [0, 0, .3])
         self.follower = self.leader @ connector_matrix([.67, 0, 0], [0, 0, 0])
         self.m.tick()
         before = self.m.publisher.publish.call_args[0][0]
-        # A fresh small attitude disturbance changes feedback, not the trajectory frame.
+        frozen = self.m.reference.frame.copy()
+        goal_x = self.m.guidance.approach_goal_x
+        # A disturbance may correct Y/Z without rotating the frame or moving X goal.
         self.leader = self.leader @ connector_matrix([0, 0, 0], [.02, -.02, .01])
         self.now += .025
         self.refresh_flight()
@@ -159,10 +165,33 @@ class AdapterTest(unittest.TestCase):
         after = self.m.publisher.publish.call_args[0][0]
         np.testing.assert_allclose([after.target_roll, after.target_pitch, after.target_yaw],
                                    [before.target_roll, before.target_pitch, before.target_yaw], atol=1e-10)
-        # Leader measurement perturbations cannot rotate the fixed trajectory.
+        np.testing.assert_allclose(self.m.reference.frame, frozen)
+        self.assertEqual(self.m.guidance.approach_goal_x, goal_x)
         delta = np.array([after.target_pos_x, after.target_pos_y, after.target_pos_z])-np.array(
             [before.target_pos_x, before.target_pos_y, before.target_pos_z])
-        np.testing.assert_allclose(delta, self.m.reference.axial_feedforward(-.1)*.025, atol=1e-9)
+        np.testing.assert_allclose(delta, self.m.reference.world_velocity(self.m.guidance.velocity)*.025,
+                                   atol=1e-9)
+        self.assertLessEqual(np.max(np.abs(self.m.guidance.velocity[1:])), .02)
+
+    def test_leader_height_recovery_publishes_increasing_follower_height(self):
+        for direction in (-1, 1):
+            with self.subTest(direction=direction):
+                self.m = DockingMotion('beetle2', 'beetle3', direction)
+                self.refresh_flight()
+                self.leader = connector_matrix([1, 2, .70], [0, 0, .3])
+                self.follower = self.leader @ connector_matrix([direction*.9, 0, 0], [0, 0, 0])
+                self.m.listener.getLatestCommonTime.side_effect = lambda *args: rospy.Time.from_sec(self.now-.01)
+                self.m.listener.lookupTransform.side_effect = self.lookup
+                self.m.tick()
+                before = self.m.publisher.publish.call_args[0][0]
+                self.leader[2, 3] += .03
+                self.now += .025
+                self.m.tick()
+                after = self.m.publisher.publish.call_args[0][0]
+                self.assertEqual(self.m.guidance.phase, 'prealign')
+                self.assertGreater(after.target_pos_z, before.target_pos_z)
+                self.assertAlmostEqual(after.target_vel_z, .015)
+                self.assertAlmostEqual(after.target_pos_z-before.target_pos_z, after.target_vel_z*.025)
 
     def test_leader_height_drift_does_not_abort_or_reset_reference(self):
         self.m.tick()
@@ -221,6 +250,30 @@ class AdapterTest(unittest.TestCase):
             self.now += .025
         self.assertEqual(phase, 'complete')
         self.assertEqual(phases, {'prealign', 'approach', 'complete'})
+
+    def test_complete_sequence_after_height_recovery_with_tracking_bias(self):
+        self.leader = connector_matrix([1, 2, .77-.06747], [0, 0, .3])
+        self.follower = self.leader @ connector_matrix([1.0, .08, .03], [0, 0, 0])
+        bias = tf.transformations.euler_matrix(0, 0, .3)[:3, :3] @ [-.025, -.025, -.01]
+        phases = set()
+        for i in range(1200):
+            # Leader recovers 3 cm after reference capture, like the real test.
+            self.leader[2, 3] = .77-.06747+.03*min(i*.025/2, 1)
+            phase = self.m.tick()
+            phases.add(phase)
+            if phase == 'complete':
+                break
+            msg = self.m.publisher.publish.call_args[0][0]
+            actual_fc = self.follower @ self.root_fc
+            target = np.array([msg.target_pos_x, msg.target_pos_y, msg.target_pos_z])
+            # Simple lagged tracking with a persistent positioning error.
+            position = actual_fc[:3, 3]+(target+bias-actual_fc[:3, 3])*(.025/.4)
+            self.follower = connector_matrix(position, [msg.target_roll, msg.target_pitch,
+                                                        msg.target_yaw]) @ np.linalg.inv(self.root_fc)
+            self.now += .025
+        self.assertEqual(phase, 'complete')
+        self.assertEqual(phases, {'prealign', 'approach', 'complete'})
+        self.assertGreater(msg.target_pos_z, .79)
 
 
     def test_hardware_preparation_is_once_and_mirrors_male_female(self):

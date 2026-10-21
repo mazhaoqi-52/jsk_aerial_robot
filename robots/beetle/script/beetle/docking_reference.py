@@ -29,7 +29,7 @@ class FixedDockingReference:
         self.suspended = False
 
     def capture(self, roots, baselinks):
-        """Capture once in HOVER; preserve the leader's FC position target.
+        """Capture fixed axes once, anchored at the measured leader FC position.
 
         Desired interface attitude is level with the initial leader interface yaw.
         Account for the root/FC offset when levelling the leader.
@@ -82,5 +82,7 @@ class FixedDockingReference:
     def leader_attitude(self, root_baselink):
         return tr.quaternion_matrix(self.orientations[0]) @ np.linalg.inv(self.connectors[0]) @ root_baselink
 
-    def axial_feedforward(self, speed):
-        return self.frame[:3, 0]*self.direction*speed
+    def world_velocity(self, velocity):
+        coordinates = np.asarray(velocity, dtype=float).copy()
+        coordinates[0] *= self.direction
+        return self.frame[:3, :3] @ coordinates

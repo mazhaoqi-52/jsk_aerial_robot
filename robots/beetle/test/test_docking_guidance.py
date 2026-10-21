@@ -63,7 +63,7 @@ class GuidanceTest(unittest.TestCase):
     def test_misalignment_does_not_block_motion_to_prealignment_point(self):
         self.step(0, (.9, -.1, .05))
         self.step(.025, (.9, -.1, .05))
-        np.testing.assert_allclose(self.g.command, [.8975, -.09875, .04875])
+        np.testing.assert_allclose(self.g.command, [.8975, -.0995, .0495])
         self.assertAlmostEqual(self.g.axial_velocity, -.1)
         self.assertEqual(self.g.phase, 'prealign')
 
@@ -82,6 +82,75 @@ class GuidanceTest(unittest.TestCase):
         self.assertAlmostEqual(self.g.axial_velocity, -.1)
         self.step(.05, (.5, -.103, .051))
         self.assertAlmostEqual(self.g.command[0], .92)
+
+    def test_prealign_corrects_leader_displacement_and_persistent_tracking_bias(self):
+        # Reproduce a displaced leader and persistent tracking offsets instead
+        # of assuming that following the old absolute waypoint means alignment.
+        leader = np.array([.03, .03, .02227])
+        tracking_bias = np.array([-.03, -.025, 0])
+        actual = np.array([.15, 0, 0])+tracking_bias
+        for i in range(1000):
+            phase = self.step(i*.025, actual-leader, q=actual)
+            self.assertLessEqual(np.max(np.abs(self.g.velocity[1:])), .02+1e-10)
+            if phase == 'approach':
+                break
+            # First order position tracking with a steady offset.
+            actual += (self.g.command+tracking_bias-actual)*(.025/.4)
+        self.assertEqual(phase, 'approach')
+        self.assertGreater(self.g.command[0], .18)
+        self.assertGreater(self.g.command[1], .03)
+        self.assertGreater(self.g.command[2], .01)
+        self.assertAlmostEqual(self.g.approach_goal_x, leader[0]-.05)
+
+    def test_relative_height_error_moves_target_without_copying_measurement(self):
+        self.step(0, (.3, 0, -.04), q=(.3, 0, 0))
+        self.step(.025, (.3, 0, -.04), q=(.3, 0, 0))
+        self.assertAlmostEqual(self.g.command[2], .0005)
+        self.assertAlmostEqual(self.g.velocity[2], .02)
+        self.step(.05, (.3, 0, .04), q=(.3, 0, 0))
+        self.assertAlmostEqual(self.g.command[2], 0)
+        self.assertAlmostEqual(self.g.velocity[2], -.02)
+
+    def test_approach_goal_uses_current_leader_and_stays_fixed(self):
+        self.step(0, (.15, 0, 0), q=(.22, 0, 0))
+        self.assertAlmostEqual(self.g.approach_goal_x, .02)
+        self.step(.025, (.1, .03, -.04), q=(.4, .05, .06))
+        self.assertAlmostEqual(self.g.approach_goal_x, .02)
+        self.assertLess(self.g.velocity[1], 0)
+        self.assertGreater(self.g.velocity[2], 0)
+
+    def test_contact_locks_lateral_target_once_but_insertion_continues(self):
+        self.step(0)
+        self.step(.025, (.08, .03, -.04))
+        yz = self.g.command[1:].copy()
+        x = self.g.command[0]
+        self.step(.05, (.04, .01, -.01))
+        self.assertTrue(self.g.correction_locked)
+        np.testing.assert_allclose(self.g.command[1:], yz)
+        self.assertLess(self.g.command[0], x)
+        self.step(.075, (.04, -.1, .1))
+        np.testing.assert_allclose(self.g.command[1:], yz)
+        np.testing.assert_allclose(self.g.velocity[1:], [0, 0])
+        self.assertAlmostEqual(self.g.approach_goal_x, -.05)
+
+    def test_contact_lock_waits_for_alignment(self):
+        self.step(0)
+        self.step(.025, (.04, .03, 0))
+        self.assertFalse(self.g.correction_locked)
+        self.assertLess(self.g.velocity[1], 0)
+        self.step(.05, (.04, .01, .01), r=(0, .2, 0))
+        self.assertFalse(self.g.correction_locked)
+
+    def test_tf_interruption_preserves_insertion_goal_and_contact_lock(self):
+        self.step(0)
+        self.step(.025, (.04, .01, .01))
+        self.assertTrue(self.g.correction_locked)
+        self.g.suspend()
+        self.step(10, (.035, 0, 0), q=(.06, .02, .03))
+        self.assertAlmostEqual(self.g.approach_goal_x, -.05)
+        self.assertTrue(self.g.correction_locked)
+        np.testing.assert_allclose(self.g.command, [.06, .02, .03])
+        np.testing.assert_allclose(self.g.velocity, [0, 0, 0])
 
     def test_immediate_lock_when_final_geometry_arrives(self):
         self.step(0)

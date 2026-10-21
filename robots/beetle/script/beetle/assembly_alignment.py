@@ -180,9 +180,11 @@ class DockingMotion:
             rospy.loginfo('[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s', phase, position[0],
                           position[1:].tolist(), np.degrees(angles).tolist())
             self.last_phase = phase
-        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f correction_locked=%s' %
+        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f correction_locked=%s relative_vz=%.3f height_limited=%s' %
                                (phase, position[0], position[1:].tolist(), np.degrees(angles).tolist(),
                                 self.guidance.command.tolist(), self.guidance.axial_velocity,
-                                target_pose[2, 3], self.guidance.correction_locked))
+                                target_pose[2, 3], self.guidance.correction_locked,
+                                self.guidance.height_correction.relative_velocity,
+                                self.guidance.height_correction.integration_limited))
         self.rate.sleep()
         return phase

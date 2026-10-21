@@ -63,7 +63,7 @@ class GuidanceTest(unittest.TestCase):
     def test_misalignment_does_not_block_motion_to_prealignment_point(self):
         self.step(0, (.9, -.1, .05))
         self.step(.025, (.9, -.1, .05))
-        np.testing.assert_allclose(self.g.command, [.8975, -.0995, .0495])
+        np.testing.assert_allclose(self.g.command, [.8975, -.0995, .04975])
         self.assertAlmostEqual(self.g.axial_velocity, -.1)
         self.assertEqual(self.g.phase, 'prealign')
 
@@ -99,17 +99,18 @@ class GuidanceTest(unittest.TestCase):
         self.assertEqual(phase, 'approach')
         self.assertGreater(self.g.command[0], .18)
         self.assertGreater(self.g.command[1], .03)
-        self.assertGreater(self.g.command[2], .01)
+        self.assertGreater(self.g.command[2], 0)
+        self.assertLess(abs(actual[2]-leader[2]), .02)
         self.assertAlmostEqual(self.g.approach_goal_x, leader[0]-.05)
 
     def test_relative_height_error_moves_target_without_copying_measurement(self):
         self.step(0, (.3, 0, -.04), q=(.3, 0, 0))
         self.step(.025, (.3, 0, -.04), q=(.3, 0, 0))
-        self.assertAlmostEqual(self.g.command[2], .0005)
-        self.assertAlmostEqual(self.g.velocity[2], .02)
+        self.assertAlmostEqual(self.g.command[2], .0002)
+        self.assertAlmostEqual(self.g.velocity[2], .008)
         self.step(.05, (.3, 0, .04), q=(.3, 0, 0))
-        self.assertAlmostEqual(self.g.command[2], 0)
-        self.assertAlmostEqual(self.g.velocity[2], -.02)
+        self.assertAlmostEqual(self.g.command[2], -.00005)
+        self.assertAlmostEqual(self.g.velocity[2], -.01)
 
     def test_approach_goal_uses_current_leader_and_stays_fixed(self):
         self.step(0, (.15, 0, 0), q=(.22, 0, 0))

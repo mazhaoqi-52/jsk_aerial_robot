@@ -15,6 +15,12 @@ class DockingConfig:
     approach_slowdown_distance: float = 0.15
     correction_speed: float = 0.02
     relative_correction_gain: float = 0.5
+    height_correction_gain: float = 0.2
+    height_correction_speed: float = 0.01
+    height_velocity_damping: float = 0.4
+    height_velocity_filter_time: float = 0.25
+    height_tracking_error_limit: float = 0.03
+    contact_height_correction_limit: float = 0.01
     contact_lock_gap: float = 0.05
     slowdown_gain: float = 2.0
     insertion_depth: float = 0.05
@@ -24,8 +30,9 @@ class DockingConfig:
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError('%s must be finite and positive' % name)
+            minimum_ok = value >= 0 if name == 'height_velocity_damping' else value > 0
+            if not math.isfinite(value) or not minimum_ok:
+                raise ValueError('Invalid docking parameter: %s' % name)
 
 
 def move_towards(current, target, step):
@@ -45,6 +52,52 @@ class RelativePositionCorrection:
         return np.clip(-self.gain*np.asarray(error), -np.asarray(speed_limit), speed_limit)
 
 
+class DampedHeightCorrection:
+    """Damp relative vertical motion and conditionally integrate the height target.
+
+    Limits constrain additional motion, never drag a held target with feedback.
+    The contact budget also bounds correction when contact makes both aircraft
+    move together, so the follower's own tracking error may still be small.
+    """
+    def __init__(self, config):
+        self.config = config
+        self.contact_anchor = None
+        self.reset_velocity()
+
+    def reset_velocity(self):
+        self.previous_error = None
+        self.relative_velocity = 0.0
+        self.integration_limited = False
+
+    def update(self, command, error, actual, dt, contact=False, enabled=True):
+        c = self.config
+        self.integration_limited = False
+        if dt > 0 and self.previous_error is not None:
+            measured_velocity = (error-self.previous_error)/dt
+            alpha = dt/(c.height_velocity_filter_time+dt)
+            self.relative_velocity += alpha*(measured_velocity-self.relative_velocity)
+        self.previous_error = error
+        if contact and self.contact_anchor is None:
+            self.contact_anchor = command
+        if dt <= 0 or not enabled:
+            return command
+        velocity = np.clip(-c.height_correction_gain*error-
+                           c.height_velocity_damping*self.relative_velocity,
+                           -c.height_correction_speed, c.height_correction_speed)
+        step = float(velocity*dt)
+        lower = actual-c.height_tracking_error_limit
+        upper = actual+c.height_tracking_error_limit
+        if self.contact_anchor is not None:
+            lower = max(lower, self.contact_anchor-c.contact_height_correction_limit)
+            upper = min(upper, self.contact_anchor+c.contact_height_correction_limit)
+        # Stop outward integration at a bound; allow motion back toward it.
+        # If feedback moves beyond a bound, keep the existing target continuous.
+        limited_step = (min(step, max(0.0, upper-command)) if step > 0 else
+                        max(step, -max(0.0, command-lower)))
+        self.integration_limited = abs(limited_step-step) > 1e-12
+        return command+limited_step
+
+
 class DockingGuidance:
     def __init__(self, config):
         self.config = config
@@ -53,6 +106,7 @@ class DockingGuidance:
         self.previous_time = None
         self.velocity = np.zeros(3)
         self.correction = RelativePositionCorrection(config.relative_correction_gain)
+        self.height_correction = DampedHeightCorrection(config)
         self.approach_goal_x = None
         self.correction_locked = False
 
@@ -65,6 +119,7 @@ class DockingGuidance:
         self.command = None
         self.previous_time = None
         self.velocity[:] = 0.0
+        self.height_correction.reset_velocity()
 
     def axial_speed_limit(self, gap):
         """Reduce approach speed using measured separation, in fixed coordinates."""
@@ -97,9 +152,8 @@ class DockingGuidance:
         old_command = self.command.copy()
         if self.phase == 'prealign':
             error = p-np.array([c.prealign_gap, 0, 0])
-            velocity = self.correction.velocity(
-                error, [c.approach_speed, c.correction_speed, c.correction_speed])
-            self.command += velocity*dt
+            velocity = self.correction.velocity(error[:2], [c.approach_speed, c.correction_speed])
+            self.command[:2] += velocity*dt
             arrived = (abs(p[0]-c.prealign_gap) < c.position_tolerance and
                        np.all(np.abs(p[1:]) < c.position_tolerance) and
                        np.all(angle_errors < c.prealign_angle_tolerance))
@@ -124,7 +178,10 @@ class DockingGuidance:
                         c.slowdown_gain*abs(self.approach_goal_x-old_x))
             self.command[0] = move_towards(old_x, self.approach_goal_x, speed*dt)
             if not self.correction_locked:
-                self.command[1:] += self.correction.velocity(p[1:], c.correction_speed)*dt
+                self.command[1] += self.correction.velocity(p[1], c.correction_speed)*dt
+        contact = self.phase == 'approach' and p[0] <= c.contact_lock_gap
+        self.command[2] = self.height_correction.update(
+            self.command[2], p[2], q[2], dt, contact, enabled=not self.correction_locked)
         if dt > 0:
             self.velocity = (self.command-old_command)/dt
         return self.phase

@@ -62,7 +62,13 @@ class AdapterTest(unittest.TestCase):
                   '~docking/near_approach_speed': .04,
                   '~docking/approach_slowdown_distance': .12,
                   '~docking/relative_correction_gain': .6,
-                  '~docking/contact_lock_gap': .04}
+                  '~docking/contact_lock_gap': .04,
+                  '~docking/height_correction_gain': .15,
+                  '~docking/height_correction_speed': .008,
+                  '~docking/height_velocity_damping': .3,
+                  '~docking/height_velocity_filter_time': .2,
+                  '~docking/height_tracking_error_limit': .025,
+                  '~docking/contact_height_correction_limit': .008}
         with patch('rospy.get_param', side_effect=lambda key, default=None: values.get(key, default)):
             motion = DockingMotion('beetle2', 'beetle3')
         config = motion.guidance.config
@@ -72,6 +78,10 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(config.approach_slowdown_distance, .12)
         self.assertEqual(config.relative_correction_gain, .6)
         self.assertEqual(config.contact_lock_gap, .04)
+        for name in ('height_correction_gain', 'height_correction_speed', 'height_velocity_damping',
+                     'height_velocity_filter_time', 'height_tracking_error_limit',
+                     'contact_height_correction_limit'):
+            self.assertEqual(getattr(config, name), values['~docking/'+name])
 
     def test_mirrored_connectors(self):
         self.m = DockingMotion('beetle2', 'beetle3', -1)
@@ -190,7 +200,7 @@ class AdapterTest(unittest.TestCase):
                 after = self.m.publisher.publish.call_args[0][0]
                 self.assertEqual(self.m.guidance.phase, 'prealign')
                 self.assertGreater(after.target_pos_z, before.target_pos_z)
-                self.assertAlmostEqual(after.target_vel_z, .015)
+                self.assertAlmostEqual(after.target_vel_z, .01)
                 self.assertAlmostEqual(after.target_pos_z-before.target_pos_z, after.target_vel_z*.025)
 
     def test_leader_height_drift_does_not_abort_or_reset_reference(self):

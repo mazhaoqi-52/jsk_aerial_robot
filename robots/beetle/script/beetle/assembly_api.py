@@ -1,617 +1,87 @@
-#!/usr/bin/env python
-
+#!/usr/bin/env python3
+"""SMACH assembly workflow: motion and connector hardware are composed services."""
 import rospy
 import smach
 import smach_ros
-import math,time
-from std_msgs.msg import Empty, String, Bool
-from aerial_robot_msgs.msg import FlightNav
-from spinal.msg import DesireCoord
-from geometry_msgs.msg import PoseStamped
-from diagnostic_msgs.msg import KeyValue
-from beetle.dynamixel_control_api import DynamixelControl
-from beetle.utils import coordTransformer
-import numpy as np
-import tf
-from beetle.gazebo_link_attacher import GazeboLinkAttacher
-from beetle.gazebo_link_detacher import GazeboLinkDetacher
-from gazebo_ros_link_attacher.srv import Attach, AttachRequest, AttachResponse
+from beetle.assembly_alignment import DockingMotion
+from beetle.assembly_hardware import AssemblyHardware
 
 
-#### state classes ####
-
-"""
-Standby -> Approach -> Assembly
- ^            |          |
- | _ _ _ _ _ _|_ _ _ _ _ |
-                
-"""
-
-class StandbyState(smach.State):
-    def __init__(self,
-                 robot_name = 'beetle1',
-                 robot_id = 1,
-                 male_servo_id = 4,
-                 female_servo_id = 5,
-                 real_machine = False,
-                 unlock_servo_angle_male = 1820,
-                 lock_servo_angle_male = 1580,
-                 unlock_servo_angle_female = 2000,
-                 lock_servo_angle_female = 3000,
-                 leader = 'beetle2',
-                 leader_id = 2,
-                 airframe_size = 0.52,
-                 x_offset = 0.12,
-                 y_offset = 0,
-                 z_offset = 0,
-                 x_tol = 0.05,
-                 y_tol = 0.05,
-                 z_tol = 0.05,
-                 roll_tol = 0.15,
-                 pitch_tol = 0.15,
-                 yaw_tol = 0.15,
-                 root_fc_dis = [0,0,0.06747],  # Updated to match current fc_joint z
-                 attach_dir = -1.0,
-                 approach_mode = 'nav',
-                 run_rate = 40):
-
-        smach.State.__init__(self, outcomes=['done','in_process','emergency'])
-
-        self.robot_name = robot_name
-        self.robot_id = robot_id
-        self.male_servo_id = male_servo_id
-        self.female_servo_id = female_servo_id
-        self.real_machine = real_machine
-        self.unlock_servo_angle_male = unlock_servo_angle_male
-        self.lock_servo_angle_male = lock_servo_angle_male
-        self.unlock_servo_angle_female = unlock_servo_angle_female
-        self.lock_servo_angle_female = lock_servo_angle_female
-        self.leader = leader
-        self.leader_id = leader_id
-        self.airframe_size = airframe_size
-        self.x_offset = x_offset
-        self.y_offset = y_offset
-        self.z_offset = z_offset
-        self.x_tol = x_tol
-        self.y_tol = y_tol
-        self.z_tol = z_tol
-        self.roll_tol = roll_tol
-        self.pitch_tol = pitch_tol
-        self.yaw_tol = yaw_tol
-        self.root_fc_dis = root_fc_dis
-        self.attach_dir = attach_dir
-        self.approach_mode = approach_mode
-        self.run_rate = rospy.Rate(run_rate)
-
-        # flags
-        self.emergency_flag = False
-        self.follower_male_mech_activated = False
-        self.male_servo_initialized = False  # flag for male servo unlock initialization
-
-        # tf listener and broadcaster
-        self.listener = tf.TransformListener()
-        self.br = tf.TransformBroadcaster()
-
-        # publisher
-        self.follower_nav_pub = rospy.Publisher(self.robot_name+"/uav/nav", FlightNav, queue_size=10)
-        self.follower_traj_pub = rospy.Publisher(self.robot_name+"/target_pose", PoseStamped, queue_size=10)
-        # self.follower_att_pub = rospy.Publisher(self.robot_name+"/final_target_baselink_rot", DesireCoord, queue_size=10)
-        if(self.attach_dir < 0):
-            self.follower_docking_pub = rospy.Publisher(self.robot_name+"/docking_cmd", Bool, queue_size=10)
-            self.dynamixel_servo = DynamixelControl(self.leader,self.leader_id,self.female_servo_id,self.real_machine)
-            # male servo will be controlled - robot_name has male side
-            self.male_servo_robot_name = self.robot_name
-            self.male_servo_robot_id = self.robot_id
-        else:
-            self.follower_docking_pub = rospy.Publisher(self.leader+"/docking_cmd", Bool, queue_size=10)
-            self.dynamixel_servo = DynamixelControl(self.robot_name,self.robot_id,self.female_servo_id,self.real_machine)
-            # male servo will be controlled - leader has male side
-            self.male_servo_robot_name = self.leader
-            self.male_servo_robot_id = self.leader_id
-        
-        # Male servo control will be created dynamically in execute() to ensure fresh connection
-        self.dynamixel_servo_male = None
-            
-        # subscriber
-        self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
-
-        # messages
-        self.docking_msg = Bool()
-
-        # utils
-        self.coordTransformer = coordTransformer(self.robot_name)
-
-        # position offset while StandbyState
-        # attach_dir indicates which side has male connector:
-        # attach_dir = 1: leader has male side, follower is at +X of leader
-        # attach_dir = -1: follower has male side, follower is at -X of leader
-        self.target_offset = np.array([self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
-        self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol]) # position error torelance
-        self.att_error_tol = np.array([self.roll_tol, self.pitch_tol, self.yaw_tol]) # attitude error torelance
+class MotionState(smach.State):
+    def __init__(self, motion, outcomes):
+        self.transitions = outcomes
+        super().__init__(outcomes=sorted(set(outcomes.values()) | {'in_process', 'emergency'}))
+        self.motion = motion
 
     def execute(self, userdata):
-        # Initialize male servo to unlock angle (only once at the beginning)
-        if not self.male_servo_initialized:
-            if self.real_machine:
-                # Create DynamixelControl fresh at execute time to ensure valid publisher connection
-                self.dynamixel_servo_male = DynamixelControl(self.male_servo_robot_name, self.male_servo_robot_id, self.male_servo_id, self.real_machine)
-                
-                # Wait for publisher to establish connection
-                timeout = rospy.Time.now() + rospy.Duration(3.0)
-                while self.dynamixel_servo_male.dx_pos_pub.get_num_connections() == 0:
-                    if rospy.Time.now() > timeout:
-                        rospy.logwarn("[StandbyState] Timeout waiting for servo subscriber on /%s/servo/target_states" % self.male_servo_robot_name)
-                        break
-                    rospy.sleep(0.1)
-                
-                self.dynamixel_servo_male.sendTargetAngle(self.unlock_servo_angle_male)
-            self.male_servo_initialized = True
-        
-        # Initialize female servo (only once)
-        if not self.follower_male_mech_activated:
-            if self.real_machine:
-                self.dynamixel_servo.sendTargetAngle(self.lock_servo_angle_female)
-            else:
-                self.docking_msg.data = True
-                self.follower_docking_pub.publish(self.docking_msg)
-            self.follower_male_mech_activated = True
-        # calculate current follower position in leader coordinate
-        #TODO: determine leader namespace dynamically
-        try:
-            self.listener.waitForTransform('/world', self.leader+'/root', rospy.Time(0), rospy.Duration(1.0))
-            leader_from_world = self.listener.lookupTransform('/world', self.leader+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
-            rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: /world -> %s/root: %s" % (self.leader, str(e)))
-            self.run_rate.sleep()
-            return 'in_process'
-        try:
-            self.listener.waitForTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0), rospy.Duration(1.0))
-            follower_from_leader = self.listener.lookupTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
-            rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: %s/root -> %s/root: %s" % (self.leader, self.robot_name, str(e)))
-            self.run_rate.sleep()
-            return 'in_process'
+        phase = self.motion.tick()
+        return 'emergency' if phase == 'aborted' else self.transitions.get(phase, 'in_process')
 
-        # set target odom in leader coordinate
-        #TODO: determine leader namespace dynamically
-        self.br.sendTransform((self.target_offset[0] + self.root_fc_dis[0], self.target_offset[1] +self.root_fc_dis[1], self.target_offset[2] + self.root_fc_dis[2]),
-                              tf.transformations.quaternion_from_euler(0, 0, 0),
-                              rospy.Time.now(),
-                              "follower_target_odom",
-                              self.leader+"/root")
 
-        # convert target position from leader coord to world coord
-        try:
-            self.listener.waitForTransform('/world', '/follower_target_odom', rospy.Time(0), rospy.Duration(0.5))
-            homo_transformed_target_odom = self.listener.lookupTransform('/world', '/follower_target_odom', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
-            rospy.logwarn_throttle(2.0, "[StandbyState] TF lookup failed: /world -> /follower_target_odom: %s" % str(e))
-            self.run_rate.sleep()
-            return 'in_process'
-        target_pos = homo_transformed_target_odom[0]
-        target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])
-
-        pos_error = np.array(self.target_offset - follower_from_leader[0])
-        # If follower is on the target side and already inside the standby offset,
-        # ignore x error and let ApproachState handle final docking.
-        if(follower_from_leader[0][0] * self.target_offset[0] > 0 and
-           abs(follower_from_leader[0][0]) <= abs(self.target_offset[0])):
-            pos_error[0] = 0.0
-        att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
-
-        #check if pos and att error are within the torrelance
-        if np.all(np.less(np.abs(pos_error),self.pos_error_tol)) and np.all(np.less(np.abs(att_error),self.att_error_tol)):
-            return 'done'
-        elif self.emergency_flag:
-            return 'emergency'
-        else:
-            # Nav(x,y,z and yaw)
-            nav_msg_follower = FlightNav()
-            nav_msg_follower.target = 0
-            nav_msg_follower.control_frame = 0
-            nav_msg_follower.pos_xy_nav_mode=2
-            nav_msg_follower.pos_z_nav_mode=2
-            nav_msg_follower.yaw_nav_mode = 2
-            nav_msg_follower.target_pos_x = target_pos[0]
-            nav_msg_follower.target_pos_y = target_pos[1]
-            nav_msg_follower.target_pos_z = target_pos[2]
-            nav_msg_follower.target_yaw = target_att[2]
-            # Trajectory(x,y,z and yaw)
-            target_pos_cog = self.coordTransformer.posTransform('fc','cog',target_pos)
-            traj_msg_follower = PoseStamped()
-            traj_msg_follower.header.stamp = rospy.Time.now()
-            traj_msg_follower.pose.position.x = target_pos_cog[0]
-            traj_msg_follower.pose.position.y = target_pos_cog[1]
-            traj_msg_follower.pose.position.z = target_pos_cog[2]
-            traj_msg_follower.pose.orientation.x = homo_transformed_target_odom[1][0]
-            traj_msg_follower.pose.orientation.y = homo_transformed_target_odom[1][1]
-            traj_msg_follower.pose.orientation.z = homo_transformed_target_odom[1][2]
-            traj_msg_follower.pose.orientation.w = homo_transformed_target_odom[1][3]
-            
-            if(self.approach_mode == 'nav'):
-                self.follower_nav_pub.publish(nav_msg_follower)
-            elif(self.approach_mode == 'trajectory'):
-                self.follower_traj_pub.publish(traj_msg_follower)
-            else:
-                rospy.logerr("Invalid approach mode is setted")
-                return 'fail'
-
-            # roll and pitch
-            link_rot_follower = DesireCoord()
-            link_rot_follower.roll = target_att[0]
-            link_rot_follower.pitch = target_att[1]
-            # self.follower_att_pub.publish(link_rot_follower)
-            self.run_rate.sleep()
-            return 'in_process'
-
-    def emergencyCb(self,msg):
-        nav_msg_follower = FlightNav()
-        nav_msg_follower.target = 0
-        nav_msg_follower.control_frame = 0
-        nav_msg_follower.pos_xy_nav_mode=2
-        if self.attach_dir < 0:
-            nav_msg_follower.target_pos_x = -1.5
-        else:
-            nav_msg_follower.target_pos_x = 1.5
-        nav_msg_follower.target_pos_y = 0
-        self.follower_nav_pub.publish(nav_msg_follower)
-        self.emergency_flag = True
-        
-class ApproachState(smach.State):
-    def __init__(self,
-                 robot_name = 'beetle1',
-                 robot_id = 1,
-                 male_servo_id = 4,
-                 female_servo_id = 5,
-                 real_machine = False,
-                 unlock_servo_angle_male = 1820,
-                 lock_servo_angle_male = 1580,
-                 unlock_servo_angle_female = 2000,
-                 lock_servo_angle_female = 3000,
-                 leader = 'beetle2',
-                 leader_id = 2,
-                 airframe_size = 0.52,
-                 x_offset = 0,
-                 y_offset = 0,
-                 z_offset = 0,
-                 x_tol = 0.02,
-                 y_tol = 0.02,
-                 z_tol = 0.01,
-                 roll_tol = 0.15,
-                 pitch_tol = 0.15,
-                 yaw_tol = 0.15,
-                 root_fc_dis = [0,0,0.06747],  # Updated to match current fc_joint z
-                 x_danger_thre = 0.02,
-                 y_danger_thre = 0.1,
-                 z_danger_thre = 0.1,
-                 roll_danger_thre = 0.35,
-                 pitch_danger_thre = 0.35,
-                 yaw_danger_thre = 0.35,
-                 attach_dir = -1.0,
-                 approach_mode = 'nav',
-                 run_rate = 40):
-
-        smach.State.__init__(self, outcomes=['done','in_process','fail','emergency'])
-
-        self.robot_name = robot_name
-        self.robot_id = robot_id
-        self.male_servo_id = male_servo_id
-        self.female_servo_id = female_servo_id
-        self.real_machine = real_machine
-        self.unlock_servo_angle_male = unlock_servo_angle_male
-        self.lock_servo_angle_male = lock_servo_angle_male
-        self.unlock_servo_angle_female = unlock_servo_angle_female
-        self.lock_servo_angle_female = lock_servo_angle_female
-        self.leader = leader
-        self.leader_id = leader_id
-        self.airframe_size = airframe_size
-        self.x_offset = x_offset
-        self.y_offset = y_offset
-        self.z_offset = z_offset
-        self.x_tol = x_tol
-        self.y_tol = y_tol
-        self.z_tol = z_tol
-        if self.real_machine:
-            self.z_tol = max(self.z_tol, 0.015)
-        self.roll_tol = roll_tol
-        self.pitch_tol = pitch_tol
-        self.yaw_tol = yaw_tol
-        self.root_fc_dis = root_fc_dis
-        self.x_danger_thre = x_danger_thre
-        self.y_danger_thre = y_danger_thre
-        self.z_danger_thre = z_danger_thre
-        self.roll_danger_thre = roll_danger_thre
-        self.pitch_danger_thre = pitch_danger_thre
-        self.yaw_danger_thre = yaw_danger_thre
-        self.attach_dir = attach_dir
-        self.approach_mode = approach_mode
-        self.run_rate = rospy.Rate(run_rate)
-
-        # flags
-        self.emergency_flag = False        
-
-        # tf listener and broadcaster
-        self.listener = tf.TransformListener()
-        self.br = tf.TransformBroadcaster()
-
-        # publisher
-        self.follower_nav_pub = rospy.Publisher(self.robot_name+"/uav/nav", FlightNav, queue_size=10)
-        self.follower_traj_pub = rospy.Publisher(self.robot_name+"/target_pose", PoseStamped, queue_size=10)
-        # self.follower_att_pub = rospy.Publisher(self.robot_name+"/final_target_baselink_rot", DesireCoord, queue_size=10)
-
-        # subscriber
-        self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
-
-        # utils
-        self.coordTransformer = coordTransformer(self.robot_name)        
-
-        # position offset while ApproachState
-        # attach_dir indicates which side has male connector:
-        # attach_dir = 1: leader has male side, follower is at +X of leader
-        # attach_dir = -1: follower has male side, follower is at -X of leader
-        self.target_offset = np.array([self.attach_dir * (self.airframe_size + self.x_offset), self.y_offset, self.z_offset])
-        # position error torelance
-        self.pos_error_tol = np.array([self.x_tol, self.y_tol, self.z_tol])
-        # attitude error torelance
-        self.att_error_tol = np.array([self.roll_tol, self.pitch_tol, self.yaw_tol])
-        # position danger threshold
-        self.pos_danger_thre = np.array([self.x_danger_thre, self.y_danger_thre, self.z_danger_thre]) 
-        # attitude danger threshold
-        self.att_danger_thre = np.array([self.roll_danger_thre, self.pitch_danger_thre, self.yaw_danger_thre]) 
+class DockingStandbyState(MotionState):
+    def __init__(self, motion, hardware):
+        super().__init__(motion, {'prealign': 'done', 'retreat': 'done'})
+        self.hardware = hardware
 
     def execute(self, userdata):
-        # calculate now follower position in leader coordinate
-        #TODO: determine leader namespace dynamically
-        try:
-            self.listener.waitForTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0), rospy.Duration(1.0))
-            follower_from_leader = self.listener.lookupTransform(self.leader+'/root', self.robot_name+'/root', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception):
-            return 'in_process'
+        if self.motion.ready():
+            self.motion.started = True
+            if not self.hardware.prepare():
+                self.motion.abort(reason='connector preparation interrupted')
+                return 'emergency'
+        return super().execute(userdata)
 
-        # set target odom in leader coordinate
-        #TODO: determine leader namespace dynamically
-        # Add small offset toward leader for final approach (negative direction relative to attach_dir)
-        approach_offset = 0.05
-        self.br.sendTransform((self.target_offset[0] - approach_offset * self.attach_dir + self.root_fc_dis[0], self.target_offset[1]+self.root_fc_dis[1] , self.target_offset[2] + self.root_fc_dis[2]),
-                              tf.transformations.quaternion_from_euler(0, 0, 0),
-                              rospy.Time.now(),
-                              "follower_target_odom",
-                              self.leader+"/root")
-
-        # convert target position from leader coord to world coord
-        try:
-            self.listener.waitForTransform('/world', '/follower_target_odom', rospy.Time(0), rospy.Duration(0.5))
-            homo_transformed_target_odom = self.listener.lookupTransform('/world', '/follower_target_odom', rospy.Time(0))
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception):
-            return 'in_process'
-        target_pos = homo_transformed_target_odom[0]
-        target_att = tf.transformations.euler_from_quaternion(homo_transformed_target_odom[1])
-
-        pos_error = np.array(self.target_offset - follower_from_leader[0])
-        if(follower_from_leader[0][0] * self.target_offset[0] > 0 and
-           abs(follower_from_leader[0][0]) <= abs(self.target_offset[0]) and
-           abs(pos_error[0]) <= approach_offset):
-            pos_error[0] = 0.0
-        att_error = att_error = np.array([0,0,0])-tf.transformations.euler_from_quaternion(follower_from_leader[1])
-
-        rospy.loginfo(pos_error)
-
-        #check if pos and att error are within the torrelance
-        if np.all(np.less(np.abs(pos_error),self.pos_error_tol)) and np.all(np.less(np.abs(att_error),self.att_error_tol)):
-            return 'done'
-        elif self.emergency_flag:
-            return 'emergency'
-        elif np.all(np.greater(np.abs(pos_error),self.pos_danger_thre)) or np.all(np.greater(np.abs(att_error),self.att_danger_thre)):
-            return 'fail'
-        else:
-            # Nav(x,y,z and yaw)
-            nav_msg_follower = FlightNav()
-            nav_msg_follower.target = 0
-            nav_msg_follower.control_frame = 0
-            nav_msg_follower.pos_xy_nav_mode=2
-            nav_msg_follower.pos_z_nav_mode=2
-            nav_msg_follower.yaw_nav_mode = 2
-            nav_msg_follower.target_pos_x = target_pos[0]
-            nav_msg_follower.target_pos_y = target_pos[1]
-            nav_msg_follower.target_pos_z = target_pos[2]
-            nav_msg_follower.target_yaw = target_att[2]
-            # Trajectory(x,y,z and yaw)
-            target_pos_cog = self.coordTransformer.posTransform('fc','cog',target_pos)
-            traj_msg_follower = PoseStamped()
-            traj_msg_follower.header.stamp = rospy.Time.now()
-            traj_msg_follower.pose.position.x = target_pos_cog[0]
-            traj_msg_follower.pose.position.y = target_pos_cog[1]
-            traj_msg_follower.pose.position.z = target_pos_cog[2]
-            traj_msg_follower.pose.orientation.x = homo_transformed_target_odom[1][0]
-            traj_msg_follower.pose.orientation.y = homo_transformed_target_odom[1][1]
-            traj_msg_follower.pose.orientation.z = homo_transformed_target_odom[1][2]
-            traj_msg_follower.pose.orientation.w = homo_transformed_target_odom[1][3]
-            if(self.approach_mode == 'nav'):
-                self.follower_nav_pub.publish(nav_msg_follower)
-            elif(self.approach_mode == 'trajectory'):
-                self.follower_traj_pub.publish(traj_msg_follower)
-            else:
-                rospy.logerr("Invalid approach mode is setted")
-                return 'fail'
-
-            # roll and pitch
-            link_rot_follower = DesireCoord()
-            link_rot_follower.roll = target_att[0]
-            link_rot_follower.pitch = target_att[1]
-            # self.follower_att_pub.publish(link_rot_follower)
-            self.run_rate.sleep()
-            return 'in_process'
-
-    def emergencyCb(self,msg):
-        nav_msg_follower = FlightNav()
-        nav_msg_follower.target = 0
-        nav_msg_follower.control_frame = 0
-        nav_msg_follower.pos_xy_nav_mode=2
-        if self.attach_dir < 0:
-            nav_msg_follower.target_pos_x = -1.5
-        else:
-            nav_msg_follower.target_pos_x = 1.5
-        nav_msg_follower.target_pos_y = 0
-        self.follower_nav_pub.publish(nav_msg_follower)
-        self.emergency_flag = True
 
 class AssemblyState(smach.State):
-    def __init__(self,
-                 robot_name = 'beetle1',
-                 robot_id = 1,
-                 male_servo_id = 4,
-                 female_servo_id = 5,
-                 real_machine = False,
-                 unlock_servo_angle_male = 1820,
-                 lock_servo_angle_male = 1580,
-                 unlock_servo_angle_female = 2000,
-                 lock_servo_angle_female = 3000,
-                 leader = 'beetle2',
-                 leader_id = 2,
-                 attach_dir = -1.0):
-        smach.State.__init__(self, outcomes=['done','emergency'])
-
-        self.robot_name = robot_name
-        self.robot_id = robot_id
-        self.male_servo_id = male_servo_id
-        self.female_servo_id = female_servo_id
-        self.real_machine = real_machine
-        self.unlock_servo_angle_male = unlock_servo_angle_male
-        self.lock_servo_angle_male = lock_servo_angle_male
-        self.unlock_servo_angle_female = unlock_servo_angle_female
-        self.lock_servo_angle_female = lock_servo_angle_female
-        self.leader = leader
-        self.leader_id = leader_id
-        self.attach_dir = attach_dir
-        self.is_simulation = rospy.get_param("~simlation", True)
-
-        # flags
-        self.emergency_flag = False
-        self.dynamixel_servo = None  # Will be created in execute()
-
-        # publisher
-        self.follower_docking_pub = rospy.Publisher(self.robot_name+"/docking_cmd", Bool, queue_size=10)
-        self.follower_nav_pub = rospy.Publisher(self.robot_name+"/uav/nav", FlightNav, queue_size=10)
-        self.leader_nav_pub = rospy.Publisher(self.leader+"/uav/nav", FlightNav, queue_size=10)
-        self.assembly_nav_pub = rospy.Publisher("/assembly/uav/nav", FlightNav, queue_size=10)
-        self.flag_pub = rospy.Publisher('/' + self.robot_name + '/assembly_flag', KeyValue, queue_size = 1)
-        self.flag_pub_leader = rospy.Publisher('/' + self.leader + '/assembly_flag', KeyValue, queue_size = 1)
-
-        # subscriber
-        self.emergency_stop_sub = rospy.Subscriber("/emergency_assembly_interuption",Empty,self.emergencyCb)
-
-        #messeges
-        self.flag_msg = KeyValue()
-        self.docking_msg = Bool()
-        #messages
-        self.nav_msg = FlightNav()
+    def __init__(self, hardware):
+        super().__init__(outcomes=['done', 'emergency'])
+        self.hardware = hardware
 
     def execute(self, userdata):
-        if self.emergency_flag:
-            return 'emergency'
-        
-        # Determine which robot's male servo to control
-        if self.attach_dir < 0:
-            servo_robot_name = self.robot_name
-            servo_robot_id = self.robot_id
-        else:
-            servo_robot_name = self.leader
-            servo_robot_id = self.leader_id
-            
-        rospy.loginfo("[AssemblyState] Starting assembly, attach_dir=%s, real_machine=%s" % (self.attach_dir, self.real_machine))
-        rospy.loginfo("[AssemblyState] Servo control: robot=%s, servo_id=%s, lock_angle=%s" % 
-                      (servo_robot_name, self.male_servo_id, self.lock_servo_angle_male))
-        
-        if self.real_machine:
-            # Create DynamixelControl fresh at execute time to ensure valid publisher connection
-            rospy.loginfo("[AssemblyState] Creating new DynamixelControl for %s" % servo_robot_name)
-            self.dynamixel_servo = DynamixelControl(servo_robot_name, servo_robot_id, self.male_servo_id, self.real_machine)
-            
-            # Wait for publisher to establish connection
-            rospy.loginfo("[AssemblyState] Waiting for servo publisher to connect...")
-            timeout = rospy.Time.now() + rospy.Duration(5.0)
-            while self.dynamixel_servo.dx_pos_pub.get_num_connections() == 0:
-                if rospy.Time.now() > timeout:
-                    rospy.logwarn("[AssemblyState] Timeout waiting for servo subscriber on /%s/servo/target_states" % servo_robot_name)
-                    break
-                rospy.sleep(0.1)
-            
-            num_subscribers = self.dynamixel_servo.dx_pos_pub.get_num_connections()
-            rospy.loginfo("[AssemblyState] Publisher /%s/servo/target_states has %d subscribers" % (servo_robot_name, num_subscribers))
-            
-            if num_subscribers == 0:
-                rospy.logerr("[AssemblyState] No subscribers found! Servo command may not be received.")
-            
-            # Send servo command multiple times to ensure it's received
-            for i in range(5):
-                rospy.loginfo("[AssemblyState] Sending lock_servo_angle_male: %d (attempt %d)" % (self.lock_servo_angle_male, i+1))
-                self.dynamixel_servo.sendTargetAngle(self.lock_servo_angle_male)
-                rospy.sleep(0.2)
-        
-        time.sleep(1.0)
-        if not self.real_machine:
-            rospy.sleep(1.0)
-        self.nav_msg.pos_xy_nav_mode= 6
-        self.follower_nav_pub.publish(self.nav_msg)
-        self.leader_nav_pub.publish(self.nav_msg)
-        self.assembly_nav_pub.publish(self.nav_msg)
-        rospy.sleep(1.0)
-        self.flag_msg.key = str(self.robot_id)
-        self.flag_msg.value = '1'
-        self.flag_pub.publish(self.flag_msg)
-        self.flag_msg.key = str(self.leader_id)
-        self.flag_msg.value = '1'
-        self.flag_pub_leader.publish(self.flag_msg)
-        rospy.sleep(0.3)
-        if not self.real_machine:
-            try:
-                link_attacher = GazeboLinkAttacher(self.robot_name, 'root', self.leader, 'root')
-                link_attacher.attach_links()
-            except rospy.ServiceException:
-                rospy.loginfo("Attacher failed")        
-        rospy.sleep(2.0)
+        try:
+            outcome = self.hardware.finish()
+        except Exception:
+            self.hardware.motion.abort(reason='assembly handoff exception')
+            raise
+        if outcome == 'emergency':
+            self.hardware.motion.abort(reason='assembly handoff interrupted')
+        return outcome
 
-        return 'done'
 
-    def emergencyCb(self,msg):
-        nav_msg_follower = FlightNav()
-        nav_msg_follower.target = 0
-        nav_msg_follower.control_frame = 0
-        nav_msg_follower.pos_xy_nav_mode=2
-        if self.attach_dir < 0:
-            nav_msg_follower.target_pos_x = -1.5
-        else:
-            nav_msg_follower.target_pos_x = 1.5
-        nav_msg_follower.target_pos_y = 0
-        self.follower_nav_pub.publish(nav_msg_follower)
-        self.emergency_flag = True
+def build_assembly_pair(leader_id, follower_id, real_machine, direction=1):
+    suffix = '%s_%s' % (follower_id, leader_id)
+    motion = DockingMotion('beetle'+str(leader_id), 'beetle'+str(follower_id), direction)
+    hardware = AssemblyHardware(robot_name=motion.follower, robot_id=follower_id,
+                                leader=motion.leader, leader_id=leader_id,
+                                real_machine=real_machine, attach_dir=direction, motion=motion)
+    machine = smach.StateMachine(outcomes=['succeeded', 'interupted'])
+    standby, prealign, approach, retreat, assembly = [name+suffix for name in
+        ('StandbyState', 'PreAlignState', 'ApproachState', 'RetreatState', 'AssemblyState')]
+    with machine:
+        smach.StateMachine.add(standby, DockingStandbyState(motion, hardware),
+                               transitions={'done': prealign, 'in_process': standby, 'emergency': 'interupted'})
+        smach.StateMachine.add(prealign, MotionState(motion, {'approach': 'done', 'retreat': 'retreat'}),
+                               transitions={'done': approach, 'retreat': retreat, 'in_process': prealign,
+                                            'emergency': 'interupted'})
+        smach.StateMachine.add(approach, MotionState(motion, {'complete': 'done', 'prealign': 'realign', 'retreat': 'retreat'}),
+                               transitions={'done': assembly, 'realign': prealign, 'retreat': retreat,
+                                            'in_process': approach, 'emergency': 'interupted'})
+        smach.StateMachine.add(retreat, MotionState(motion, {'prealign': 'done'}),
+                               transitions={'done': prealign, 'in_process': retreat, 'emergency': 'interupted'})
+        smach.StateMachine.add(assembly, AssemblyState(hardware),
+                               transitions={'done': 'succeeded', 'emergency': 'interupted'})
+    return machine, motion
 
-#### main class ####
-class AssembleDemo():
-    def __init__(self):
-        if not rospy.core.is_initialized():  # 检查是否已初始化
-            rospy.init_node("assemble_demo")
-
-    def main(self):
-        sm_top = smach.StateMachine(outcomes=['succeeded','interupted'])
-        with sm_top:
-            smach.StateMachine.add('StandbyState', StandbyState(), transitions={'done':'ApproachState', 'in_process':'StandbyState', 'emergency':'interupted'})
-            smach.StateMachine.add('ApproachState', ApproachState(), transitions={'done':'AssemblyState', 'in_process':'ApproachState', 'fail':'StandbyState', 'emergency':'interupted'})
-            smach.StateMachine.add('AssemblyState', AssemblyState(), transitions={'done':'succeeded', 'emergency':'interupted'})
- 
-        sis = smach_ros.IntrospectionServer('smach_server', sm_top, '/SM_ROOT')
-        sis.start()
-        outcome = sm_top.execute()
-        # rospy.spin() #为了确保状态机的正常运行，故注释
-        # sis.stop()
-        # 保持ROS节点运行
-        while not rospy.is_shutdown() and outcome not in ['succeeded', 'interupted']:
-            rospy.sleep(0.1)  
-            sis.stop()
-            return outcome  
 
 if __name__ == '__main__':
+    rospy.init_node('assemble_demo')
+    machine, motion = build_assembly_pair(2, 1, rospy.get_param('~real_machine', False), direction=-1)
+    server = smach_ros.IntrospectionServer('smach_server', machine, '/SM_ROOT')
+    server.start()
     try:
-        assemble_demo = AssembleDemo();
-        assemble_demo.main()
-    except rospy.ROSInterruptException: pass
+        machine.execute()
+    except Exception:
+        motion.abort(reason='state machine exception')
+        raise
+    finally:
+        server.stop()

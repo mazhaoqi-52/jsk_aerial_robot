@@ -2,7 +2,9 @@
 <launch>
   <arg name = "module_ids" default=""/>
   <arg name = "real_machine" default="true"/>
-  <node pkg="beetle" type="assembly_motion.py" name="" output="screen" >
+  <arg name="docking_config" default="$(find beetle)/config/DockingConfig.yaml"/>
+  <node pkg="beetle" type="assembly_motion.py" name="assembly_motion" output="screen" >
+    <rosparam command="load" file="$(arg docking_config)"/>
     <param name = "module_ids" value="$(arg module_ids)"/>
     <param name = "real_machine" value="$(arg real_machine)"/>
   </node>

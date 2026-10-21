@@ -56,6 +56,19 @@ class AdapterTest(unittest.TestCase):
         stamps = [call.args[2].to_sec() for call in self.m.listener.lookupTransform.call_args_list]
         self.assertTrue(all(abs(t-(self.now-.01)) < 1e-8 for t in stamps))
 
+    def test_ros_loads_separate_angle_and_near_speed_parameters(self):
+        values = {'~docking/prealign_angle_tolerance_deg': 2.5,
+                  '~docking/angle_tolerance_deg': 7.0,
+                  '~docking/near_approach_speed': .04,
+                  '~docking/approach_slowdown_distance': .12}
+        with patch('rospy.get_param', side_effect=lambda key, default=None: values.get(key, default)):
+            motion = DockingMotion('beetle2', 'beetle3')
+        config = motion.guidance.config
+        self.assertAlmostEqual(config.prealign_angle_tolerance, np.radians(2.5))
+        self.assertAlmostEqual(config.angle_tolerance, np.radians(7.0))
+        self.assertEqual(config.near_approach_speed, .04)
+        self.assertEqual(config.approach_slowdown_distance, .12)
+
     def test_mirrored_connectors(self):
         self.m = DockingMotion('beetle2', 'beetle3', -1)
         self.refresh_flight()
@@ -132,6 +145,8 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(msg.pitch_nav_mode, FlightNav.POS_MODE)
 
     def test_leader_perturbation_does_not_move_fixed_target(self):
+        # Isolate the frozen frame from the separately tested gap-based speed cap.
+        self.m.guidance.config.near_approach_speed = .1
         self.leader = connector_matrix([1, 2, .8], [0, 0, .3])
         self.follower = self.leader @ connector_matrix([.67, 0, 0], [0, 0, 0])
         self.m.tick()

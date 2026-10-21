@@ -1,8 +1,11 @@
 docking:
   prealign_gap: 0.15           # intermediate interface gap, m
-  position_tolerance: 0.05     # prealignment XYZ arrival tolerance, m
-  angle_tolerance_deg: 8.6     # mutual interface RPY arrival tolerance (~original 0.15 rad)
+  position_tolerance: 0.02     # prealignment gap error and Y/Z errors, m
+  prealign_angle_tolerance_deg: 3.0  # mutual interface RPY before approach
+  angle_tolerance_deg: 8.6     # final locking RPY tolerance (~original 0.15 rad)
   approach_speed: 0.1          # axial waypoint speed upper bound, m/s
+  near_approach_speed: 0.05    # approach speed cap inside slowdown distance, m/s
+  approach_slowdown_distance: 0.15  # measured interface gap, m; speed ramps down before this
   correction_speed: 0.05      # Y/Z waypoint slew, m/s
   slowdown_gain: 2.0          # slow the waypoint near each fixed goal, 1/s
   insertion_depth: 0.05       # final inward target offset, m

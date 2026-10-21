@@ -18,13 +18,47 @@ class GuidanceTest(unittest.TestCase):
 
     def test_prealignment_requires_basic_arrival_but_no_dwell(self):
         self.assertEqual(self.step(0, (.3, .1, .08)), 'prealign')
-        self.assertEqual(self.step(.025, (.15, .02, .02), np.radians([5, 0, 0])), 'approach')
+        self.assertEqual(self.step(.025, (.15, .01, .01), np.radians([2, 0, 0])), 'approach')
 
     def test_prealignment_checks_each_coordinate_and_relative_angle(self):
-        for p, r in [((.21, 0, 0), (0, 0, 0)), ((.15, .06, 0), (0, 0, 0)),
-                     ((.15, 0, .06), (0, 0, 0)), ((.15, 0, 0), (0, .2, 0))]:
+        for p, r in [((.175, 0, 0), (0, 0, 0)), ((.125, 0, 0), (0, 0, 0)),
+                     ((.15, .025, 0), (0, 0, 0)), ((.15, 0, -.025), (0, 0, 0)),
+                     ((.15, 0, 0), np.radians([4, 0, 0])),
+                     ((.15, 0, 0), np.radians([0, -4, 0])),
+                     ((.15, 0, 0), np.radians([0, 0, 4]))]:
             self.g = DockingGuidance(DockingConfig())
             self.assertEqual(self.step(0, p, r), 'prealign')
+
+    def test_real_trial_entry_with_height_and_pitch_error_stays_in_prealign(self):
+        self.assertEqual(self.step(0, (.199, -.014, -.044),
+                                   np.radians([-4.35, -5.57, 2.70])), 'prealign')
+
+    def test_near_approach_uses_measured_gap_even_with_far_fixed_waypoint(self):
+        self.step(0, q=(.4, 0, 0))
+        self.step(.025, (.12, 0, 0), q=(.4, 0, 0))
+        self.assertAlmostEqual(self.g.axial_velocity, -.05)
+        self.assertAlmostEqual(self.g.command[0], .39875)
+
+    def test_approach_speed_ramps_continuously_with_actual_gap(self):
+        speeds = []
+        for gap, expected in [(.4, .1), (.225, .075), (.15, .05), (.08, .05), (-.02, .05)]:
+            self.g = DockingGuidance(DockingConfig())
+            self.step(0, q=(.4, 0, 0))
+            # Keep a lateral error to avoid completing the docking stage.
+            self.step(.025, (gap, .03, 0), q=(.4, 0, 0))
+            speeds.append(abs(self.g.axial_velocity))
+            self.assertAlmostEqual(speeds[-1], expected)
+        self.assertTrue(all(a >= b for a, b in zip(speeds, speeds[1:])))
+
+    def test_global_speed_limit_also_applies_to_near_approach(self):
+        self.g = DockingGuidance(DockingConfig(approach_speed=.03))
+        self.step(0, q=(.4, 0, 0))
+        self.step(.025, (.08, 0, 0), q=(.4, 0, 0))
+        self.assertAlmostEqual(self.g.axial_velocity, -.03)
+
+    def test_final_angle_tolerance_is_independent_of_prealignment(self):
+        self.step(0)
+        self.assertEqual(self.step(.025, (.01, 0, 0), np.radians([0, 5, 0])), 'complete')
 
     def test_misalignment_does_not_block_motion_to_prealignment_point(self):
         self.step(0, (.9, -.1, .05))
@@ -35,7 +69,7 @@ class GuidanceTest(unittest.TestCase):
 
     def test_approach_continues_under_disturbance_without_retreat_or_abort(self):
         self.step(0)
-        for i in range(1, 300):
+        for i in range(1, 500):
             self.step(i*.025, (.1, .12, -.1), (.3, .3, .3))
             self.assertEqual(self.g.phase, 'approach')
         self.assertGreaterEqual(self.g.command[0], -.05)

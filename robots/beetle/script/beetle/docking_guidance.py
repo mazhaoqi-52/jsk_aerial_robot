@@ -7,9 +7,12 @@ import numpy as np
 @dataclass
 class DockingConfig:
     prealign_gap: float = 0.15
-    position_tolerance: float = 0.05
+    position_tolerance: float = 0.02
+    prealign_angle_tolerance: float = math.radians(3.0)
     angle_tolerance: float = math.radians(8.6)
     approach_speed: float = 0.1
+    near_approach_speed: float = 0.05
+    approach_slowdown_distance: float = 0.15
     correction_speed: float = 0.05
     slowdown_gain: float = 2.0
     insertion_depth: float = 0.05
@@ -41,8 +44,18 @@ class DockingGuidance:
         self.previous_time = None
         self.axial_velocity = 0.0
 
+    def axial_speed_limit(self, gap):
+        """Reduce approach speed using measured separation, in fixed coordinates."""
+        c = self.config
+        if self.phase == 'prealign':
+            return c.approach_speed
+        # Continuous ramp: near speed inside the slowdown distance, rising
+        # toward the far speed as the actual interface separation increases.
+        return min(c.approach_speed,
+                   c.near_approach_speed*max(1.0, gap/c.approach_slowdown_distance))
+
     def update(self, stamp, position, angles, trajectory_position):
-        """Plan in fixed coordinates; relative geometry only decides stage completion.
+        """Plan fixed waypoints; relative geometry decides arrival and approach speed.
 
         stamp is the local control clock, not a comparison with remote TF time.
         """
@@ -58,17 +71,19 @@ class DockingGuidance:
         self.previous_time = stamp
         if self.command is None:
             self.command = q.copy()
-        angles_ok = np.all(np.abs((r+np.pi) % (2*np.pi)-np.pi) < c.angle_tolerance)
+        angle_errors = np.abs((r+np.pi) % (2*np.pi)-np.pi)
         if self.phase == 'prealign':
             goal = c.prealign_gap
             arrived = (abs(p[0]-c.prealign_gap) < c.position_tolerance and
-                       np.all(np.abs(p[1:]) < c.position_tolerance) and angles_ok)
+                       np.all(np.abs(p[1:]) < c.position_tolerance) and
+                       np.all(angle_errors < c.prealign_angle_tolerance))
             if arrived:
                 self.phase = 'approach'
         else:
             arrived = (-c.insertion_depth <= p[0] < c.final_x_tolerance and
                        abs(p[1]) < c.final_y_tolerance and
-                       abs(p[2]) < c.final_z_tolerance and angles_ok)
+                       abs(p[2]) < c.final_z_tolerance and
+                       np.all(angle_errors < c.angle_tolerance))
             if arrived:
                 self.command = q.copy()
                 self.phase = 'complete'
@@ -77,7 +92,7 @@ class DockingGuidance:
         # Feedback errors do not pause, reset, retreat or move the waypoint.
         # The trajectory advances toward its fixed goal at a bounded speed.
         old_x = self.command[0]
-        speed = min(c.approach_speed, c.slowdown_gain*abs(goal-old_x))
+        speed = min(self.axial_speed_limit(p[0]), c.slowdown_gain*abs(goal-old_x))
         self.command[0] = move_towards(old_x, goal, speed*dt)
         self.command[1:] = move_towards(self.command[1:], np.zeros(2), c.correction_speed*dt)
         if dt > 0:

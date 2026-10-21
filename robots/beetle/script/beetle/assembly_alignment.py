@@ -40,7 +40,7 @@ class DockingMotion:
         defaults = DockingConfig()
         parameters = {}
         for name, value in vars(defaults).items():
-            if name == 'angle_tolerance':
+            if name.endswith('angle_tolerance'):
                 parameters[name] = math.radians(rospy.get_param('~docking/'+name+'_deg', math.degrees(value)))
             else:
                 parameters[name] = rospy.get_param('~docking/'+name, value)

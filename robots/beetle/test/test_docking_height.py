@@ -85,12 +85,12 @@ class HeightCorrectionTest(unittest.TestCase):
         for _ in range(1000):
             actual = command
             command = h.update(command, .02, actual, .025, contact=True)
-        self.assertAlmostEqual(command, -.01)
+        self.assertAlmostEqual(command, -.015)
         self.assertTrue(h.integration_limited)
         # A noisy gap leaving/reentering the contact zone must not renew the budget.
         command = h.update(command, .02, command, .025, contact=False)
         command = h.update(command, .02, command, .025, contact=True)
-        self.assertAlmostEqual(command, -.01)
+        self.assertAlmostEqual(command, -.015)
 
     def test_contact_budget_allows_a_small_error_to_be_corrected(self):
         h = DampedHeightCorrection(DockingConfig())
@@ -105,13 +105,13 @@ class HeightCorrectionTest(unittest.TestCase):
     def test_guidance_limits_contact_height_drift_without_aborting_approach(self):
         g = DockingGuidance(DockingConfig())
         g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
-        for i in range(1, 1001):
+        for i in range(1, 1601):
             # Good local tracking but a persistent interface mismatch, so the
             # existing geometric Y/Z lock never activates.
             phase = g.update(i*.025, [.044, 0, .02], [0, 0, 0], g.command.copy())
         self.assertEqual(phase, 'approach')
         self.assertFalse(g.correction_locked)
-        self.assertAlmostEqual(g.command[2], -.01)
+        self.assertAlmostEqual(g.command[2], -.015)
         self.assertAlmostEqual(g.command[0], g.approach_goal_x)
         self.assertEqual(g.velocity[2], 0)
 

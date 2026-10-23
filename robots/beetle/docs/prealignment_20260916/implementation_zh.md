@@ -16,16 +16,18 @@ roslaunch beetle assembly_motion.launch module_ids:=2,3 real_machine:=true
 
 1. **Standby：接口准备。** 等待双方报告 HOVER，然后准备公母连接舵机；准备完成即进入 PreAlign。
 2. **PreAlign：预对齐。** 保持固定对接方向和共同姿态，根据实际接口相对位置生成连续的 XYZ 目标，使接口间隙收敛到 15 cm、Y/Z 收敛到 0。接口间隙相对 15 cm 的误差、Y/Z 误差各 <2 cm，双方接口相对姿态各轴 <3°，一次达标即进入 Approach。预对齐姿态阈值单独配置，不改变锁扣阶段的姿态阈值。
-3. **Approach：接近。** 进入本阶段时，用当前 leader 接口位置确定一次 X 终点，终点位于名义接触点内侧 5 cm，后续不追随 leader 的 X 波动。Y/Z 继续根据实际相对误差缓慢修正；首次进入 5 cm 接触区时记录高度目标，此后额外高度调整限制在该目标的 ±1 cm 内。名义间隙进入 **4 cm** 内、且 Y/Z 和姿态已满足最终对齐阈值时，一次性锁定 Y/Z 目标，X 继续向本次固定终点推进。4～5 cm 区间保留 Y 限速纠偏及 Z 有界纠偏。锁定后不重新开启相对修正。途中误差不触发暂停、自动缓退、重新预对齐或任务退出。
+3. **Approach：接近。** 进入本阶段时，用当前 leader 接口位置确定一次 X 终点，终点位于名义接触点内侧 5 cm，后续不追随 leader 的 X 波动。Y/Z 继续根据实际相对误差缓慢修正；首次进入 5 cm 接触区时分别记录 Y/Z 目标，此后额外 Y 调整限制在当时目标的 ±1 cm、Z 调整限制在 ±1.5 cm 内。名义间隙进入 **4 cm** 内、且 Y/Z 和姿态已满足最终对齐阈值时，一次性锁定 Y/Z 目标，X 继续向本次固定终点推进。4～5 cm 区间保留 Y/Z 有界纠偏。锁定后不重新开启相对修正。途中误差不触发暂停、自动缓退、重新预对齐或任务退出。
 4. **Assembly：锁扣。** 实际名义接口间隙在 [-5 cm, 2 cm)、Y 误差 <2 cm、Z 误差 <1.5 cm、双方接口相对姿态各轴 <8.6° 时，立即转入原锁扣和 assembly_flag 交接。不再等待差分速度达标或额外保持 0.3 s。
 
-预对齐的轴向目标速度上限为 **0.1 m/s**。接近阶段根据实际接口间隙降低上限：间隙 ≥30 cm 时为 0.1 m/s，15～30 cm 内连续降低到 0.05 m/s，15 cm 内为 **0.05 m/s**；靠近固定 X 终点时仍按剩余目标距离进一步减速。对应配置为 `approach_speed`、`near_approach_speed`、`approach_slowdown_distance`，速度上限公式为 `min(approach_speed, near_approach_speed * max(1, 实测间隙 / approach_slowdown_distance))`。这里限制的是目标轨迹速度，实际飞机速度取决于控制跟踪。
+预对齐的轴向目标速度上限保持 **0.1 m/s**。`AlignmentAwareApproachSpeed` 独立负责 Approach 的速度上限，先按实际间隙计算 `distance_limit = min(approach_speed, near_approach_speed * max(1, gap / approach_slowdown_distance))`，再乘对齐程度系数。默认近距离上限由 0.05 降为 **0.03 m/s**；15 cm 内取该上限，15～50 cm 随间隙增加，50 cm 及以上不超过 0.1 m/s。
+
+对齐程度使用当前接口 Y、Z、yaw：`e = max(abs(Y)/0.01, abs(Z)/0.01, abs(wrapped_yaw)/radians(2))`，`scale = 0.2 + 0.8/(1+e*e)`，最终上限为 `distance_limit * scale`。四个参数分别为 `approach_alignment_y_scale`、`approach_alignment_z_scale`、`approach_alignment_yaw_scale_deg` 和 `approach_min_speed_scale`。1 cm/2° 是连续减速尺度，不是新阶段门槛。误差减小时恢复速度，误差较大时仍保留正的速度上限；靠近固定 X 终点时仍按剩余目标距离减速。例如 15 cm 内只有 2 cm 高度差时，上限约 **0.0108 m/s**；完全对齐时为 0.03 m/s。设置 `approach_min_speed_scale: 1.0` 可关闭误差缩放作对照。这限制目标轨迹，实际闭合速度仍取决于飞机跟踪。
 
 预对齐 X 相对位置修正由 `RelativePositionCorrection` 类完成：目标速度为 `-relative_correction_gain * 相对误差`，先限速，再按控制周期积分到上次目标。增益保持 **0.5 /s**，预对齐 X 限速为 `approach_speed`。
 
 Y 使用 `DampedLateralCorrection`，在预对齐和接近阶段均采用 `v_y = clip(-relative_correction_gain * e_y - lateral_velocity_damping * filtered_relative_vy, ±correction_speed)`。Y 增益保持 **0.5 /s**，目标速度上限保持 **0.02 m/s**；新增阻尼系数 **0.4**（`lateral_velocity_damping`）及滤波时间常数 **0.25 s**（`lateral_velocity_filter_time`），阻尼允许设为 0 作对照。接口仍在一侧、但正快速接近对齐位置时，目标会提前减速或反向调整。进入 4 cm 范围且几何对齐后，Y/Z 目标同时锁定，相应速度前馈归零。
 
-Y/Z 共用 `FilteredRelativeVelocity` 的一阶速度估计实现，分别保存滤波历史。提取公共滤波模块没有改变原 Z 阻尼、滤波数值或条件积分算法；Z 参数和边界保持原值。
+Y/Z 共用 `BoundedDampedCorrection` 的速度阻尼和条件积分实现，分别保存滤波历史与接触基准；`DampedLateralCorrection`、`DampedHeightCorrection` 仅负责各轴参数映射。Y 新增 `lateral_tracking_error_limit: 0.03`，`contact_lateral_correction_limit: 0.01`，`contact_lateral_correction_gap: 0.05`。Y 目标与实测位置相差超过 3 cm 时，不继续增加该方向的积分；首次进入 5 cm 范围后，额外目标变化限于 ±1 cm。即使两机一起横向移动，也不会反复刷新接触额度。
 
 Z 使用独立的 `DampedHeightCorrection`，在预对齐和接近阶段采用相同控制律：`v_z = clip(-height_correction_gain * e_z - height_velocity_damping * filtered_relative_vz, ±height_correction_speed)`，其中 `e_z` 为 follower 接口高度减 leader 接口高度。根据相邻高度误差和本地控制周期求相对速度，再做一阶低通平滑。例如静止的 follower 接口低 4 cm 时，默认 Z 目标以 0.8 cm/s 向上移动；若 follower 正快速上升，速度阻尼会提前减小或反转目标速度。不把瞬时实测位置直接复制为目标。导航消息同时发布 XYZ 目标位置和实际施加的目标速度前馈。
 
@@ -36,11 +38,11 @@ Z 使用独立的 `DampedHeightCorrection`，在预对齐和接近阶段采用�
 | `height_velocity_damping` | 0.4 | 相对垂直速度阻尼，允许设为 0 作对照 |
 | `height_velocity_filter_time` | 0.25 s | 相对速度低通时间常数 |
 | `height_tracking_error_limit` | 0.03 m | 目标与实测 follower 接口高度的跟踪偏差限制 |
-| `contact_height_correction_limit` | 0.01 m | 首次进入接触区后，目标相对当时高度的额外调整范围 ±1 cm |
+| `contact_height_correction_limit` | 0.015 m | 首次进入接触区后，目标相对当时高度的额外调整范围 ±1.5 cm |
 
 高度采用条件积分：若本次修正会继续扩大超出 3 cm 的目标跟踪偏差，就停止该方向的累积；靠近边界时只允许剩余可用的增量，反向修正仍可执行。反馈移动导致旧目标已在边界外时，不直接裁剪或拖动旧目标，避免重新引入“实测位置变化带着保持目标移动”的问题。
 
-单机跟踪偏差小不代表接口误差在减小：接触受阻时，两机可能一起升降。因此首次进入 `contact_height_correction_gap` 范围（保持 **0.05 m**）还会记录高度目标，之后的高度修正被限制在其 ±1 cm 内；即使暂时离开再进入该范围，也不会刷新调整额度。高度额度起点与 Y/Z 锁定距离分开配置，推迟锁定不改变原有高度保护。这只限制 Z 目标积分，不新增任务状态、退出条件或自动重试。
+单机跟踪偏差小不代表接口误差在减小：接触受阻时，两机可能一起升降。因此首次进入 `contact_height_correction_gap` 范围（保持 **0.05 m**）还会记录高度目标，之后的高度修正被限制在其 ±1.5 cm 内；即使暂时离开再进入该范围，也不会刷新调整额度。高度额度起点与 Y/Z 锁定距离分开配置，推迟锁定不改变原有高度保护。Y/Z 的边界均通过条件积分实现，不拖动已有目标。Z 跟踪限幅仍为 3 cm，阻尼、滤波和速度上限保持原值；只将接触后高度额度从 ±1 cm 增至 ±1.5 cm。
 
 `contact_lock_gap` 默认为 **0.04 m**，用于上述 Y/Z 一次性锁定；锁定条件复用最终 Y/Z 与姿态阈值，不增加停稳时间或速度门槛。X 终点从进入 Approach 起就固定。满足最终合体几何条件时保持当前实测位姿，并执行锁扣。
 
@@ -60,7 +62,11 @@ Z 使用独立的 `DampedHeightCorrection`，在预对齐和接近阶段采用�
 
 ### 2026-10-23 20:08:22 卡接后的调整
 
-该次实验接触附近横向误差约 2 cm，随后在名义间隙约 4.5 cm 时锁定 Y/Z；高度差后来增至约 2 cm，但目标已无法继续修正。视频确认已接触并卡住。本次给 Y 加入相对速度阻尼，并将 Y/Z 几何锁定距离从 5 cm 改为 4 cm，在此前保留限速纠偏；原高度跟踪限幅、5 cm 开始的 ±1 cm 调整额度及 Z 阻尼均保留。轴向速度和任务状态连接不变。
+该次实验接触附近横向误差约 2 cm，随后在名义间隙约 4.5 cm 时锁定 Y/Z；高度差后来增至约 2 cm，但目标已无法继续修正。视频确认已接触并卡住。上一轮给 Y 加入相对速度阻尼，并将 Y/Z 几何锁定距离从 5 cm 改为 4 cm，在此前保留限速纠偏；原高度跟踪限幅、5 cm 开始的 ±1 cm 调整额度及 Z 阻尼均保留。轴向速度和任务状态连接不变。
+
+### 2026-10-23 20:39:29 对齐不足与受阻积分
+
+该次切入 Approach 时 Y=-1.89 cm、Z=+1.98 cm、yaw=-3°，均在预对齐放行边界附近。随后名义间隙长期约 4 cm，Z 仍约 2 cm，Y 多为 0.3～1 cm；`correction_locked` 全程 False。进入 5 cm 区域后 Y 目标继续累计移动约 4.7 cm，表明只有速度上限仍可能持续推拉。此次采用上述连续接近减速、Y 条件积分，并将接触区 Z 额度适度增至 ±1.5 cm。高度误差的最终到位阈值仍为 1.5 cm；可调范围与成功判定阈值是两个不同概念。共同固定姿态和 yaw PID 保持现有设置。
 
 默认接口坐标为 root±0.26 m，不代表实测插接面。可配置双方 `connector_xyz/rpy`；完全对齐时两个接口坐标系的轴应平行。持续的定位偏差仍可能使基本到位条件不满足，应结合标定与实际控制误差分析。
 
@@ -72,13 +78,13 @@ Z 使用独立的 `DampedHeightCorrection`，在预对齐和接近阶段采用�
 
 TF 仍按同一共同时间查询；轨迹步长使用本地 ROS 控制时钟，不比较机载 TF 时间与地面时间，也不使用 TF 时间差作为状态转换条件。
 
-日志输出 `phase`、`gap`、`yz`、`relative_rpy_deg`、`target_xyz`（固定参考系中的轨迹目标）、`axial_cmd`、`target_fc_z`（世界坐标中的导航高度目标）、`correction_locked`（Y/Z 是否已锁定）、`relative_vz`（滤波后的接口相对垂直速度）、`height_limited`（本周期高度积分是否受限）及 `relative_vy`（滤波后的接口横向相对速度）。可检查目标修正是否减速，以及受阻时是否停止继续累积。
+日志输出 `phase`、`gap`、`yz`、`relative_rpy_deg`、`target_xyz`（固定参考系中的轨迹目标）、`axial_cmd`、`target_fc_z`（世界坐标中的导航高度目标）、`correction_locked`（Y/Z 是否已锁定）、`relative_vz`（滤波后的接口相对垂直速度）、`height_limited`（本周期高度积分是否受限）、`relative_vy`（滤波后的接口横向相对速度）、`lateral_limited`（Y 条件积分是否受限）及 `approach_scale`（当前几何误差对应的接近倍率，实际应用于 Approach）。可检查目标修正是否减速，以及受阻时是否停止继续累积。
 
 ## 模块职责与验证
 
 | 文件 | 职责 |
 | --- | --- |
-| `docking_guidance.py` | X 相对位置修正、Y/Z 速度阻尼、Z 条件积分、轨迹及到位判断 |
+| `docking_guidance.py` | X 相对位置修正、对齐程度连续限速、Y/Z 阻尼和条件积分、轨迹及到位判断 |
 | `docking_reference.py` | 固定坐标转换、共同姿态平滑 |
 | `assembly_alignment.py` | TF 与飞行状态读取、导航消息、人工中断 |
 | `assembly_hardware.py` | 舵机准备、锁扣及合体交接 |
@@ -90,8 +96,8 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover \
   -s robots/beetle/test -p 'test_docking_*.py' -v
 ```
 
-71 项离线测试覆盖完整理想跟踪流程、leader 高度回升与 follower 持续跟踪偏差下的完整流程、Y 双向提前减速及静态误差纠正、Y 阻尼在预对齐/接近两阶段生效且不改变 X/Z、4～5 cm 区间继续纠偏、4 cm 锁定后速度归零、Z 跟踪与接触限幅、左右镜像、参数加载、TF 恢复时 Y/Z 滤波重置、±0.45 s 时钟差、人工急停、实际 LAND 后停止、舵机准备及四状态连接。另用相同输入对比重构前后高度模块 1500 个采样点，包含滤波重置、接触限幅及目标锁定，目标高度、滤波速度及限幅判定完全一致。
+82 项离线测试覆盖完整理想跟踪与持续跟踪偏差流程、Y/Z 双向提前减速、跟踪受阻的条件积分、接触区内小误差纠正、两机共同移动时的 Y/Z 累计额度、间隙离开/重进及 TF 恢复不刷新额度、4 cm 锁定、Y/Z/yaw 误差各自连续降低接近速度、正的速度上限、角度跨 π、ROS 参数加载、人工急停、实际 LAND 后停止以及原四状态连接。另用相同配置（接触 Z 额度设回 1 cm）逐点比较重构前后的高度模块：2000 个采样点中的目标、滤波速度和限幅判定完全一致；默认行为差别来自明确调整为 1.5 cm 的额度。
 
-使用 20:31:32 bag 的记录反馈重建并回放 918 个控制周期：新 Z 目标速度不超过 0.01 m/s，接触区相对首次高度目标的变化不超过 1 cm；在保持原实测轨迹的回放中，末端生成的 FC 高度目标约为 0.774 m，原记录目标约为 0.727 m。回放只验证目标生成、限速及防累积行为，不预测修改后的实际飞机运动。
+上一轮使用 20:31:32 bag 的记录反馈重建并回放 918 个控制周期（当时接触额度为 1 cm）：新 Z 目标速度不超过 0.01 m/s，接触区相对首次高度目标的变化不超过 1 cm；在保持原实测轨迹的回放中，末端生成的 FC 高度目标约为 0.774 m，原记录目标约为 0.727 m。回放只验证目标生成、限速及防累积行为，不预测修改后的实际飞机运动。
 
 ROS 通信使用替身，未运行新的 Gazebo 或实机闭环。先前的 bag 门槛回放文件反映历史实现，不能用于证明当前闭环效果。

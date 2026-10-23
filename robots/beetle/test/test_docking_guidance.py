@@ -36,16 +36,16 @@ class GuidanceTest(unittest.TestCase):
     def test_near_approach_uses_measured_gap_even_with_far_fixed_waypoint(self):
         self.step(0, q=(.4, 0, 0))
         self.step(.025, (.12, 0, 0), q=(.4, 0, 0))
-        self.assertAlmostEqual(self.g.axial_velocity, -.05)
-        self.assertAlmostEqual(self.g.command[0], .39875)
+        self.assertAlmostEqual(self.g.axial_velocity, -.03)
+        self.assertAlmostEqual(self.g.command[0], .39925)
 
     def test_approach_speed_ramps_continuously_with_actual_gap(self):
         speeds = []
-        for gap, expected in [(.4, .1), (.225, .075), (.15, .05), (.08, .05), (-.02, .05)]:
+        for gap, expected in [(.5, .1), (.225, .045), (.15, .03), (.08, .03), (-.02, .03)]:
             self.g = DockingGuidance(DockingConfig())
             self.step(0, q=(.4, 0, 0))
-            # Keep a lateral error to avoid completing the docking stage.
-            self.step(.025, (gap, .03, 0), q=(.4, 0, 0))
+            # Isolate distance scaling; roll prevents completion without changing yaw slowdown.
+            self.step(.025, (gap, 0, 0), r=(.2, 0, 0), q=(.4, 0, 0))
             speeds.append(abs(self.g.axial_velocity))
             self.assertAlmostEqual(speeds[-1], expected)
         self.assertTrue(all(a >= b for a, b in zip(speeds, speeds[1:])))
@@ -69,7 +69,7 @@ class GuidanceTest(unittest.TestCase):
 
     def test_approach_continues_under_disturbance_without_retreat_or_abort(self):
         self.step(0)
-        for i in range(1, 500):
+        for i in range(1, 2000):
             self.step(i*.025, (.1, .12, -.1), (.3, .3, .3))
             self.assertEqual(self.g.phase, 'approach')
         self.assertGreaterEqual(self.g.command[0], -.05)
@@ -117,7 +117,9 @@ class GuidanceTest(unittest.TestCase):
         self.assertAlmostEqual(self.g.approach_goal_x, .02)
         self.step(.025, (.1, .03, -.04), q=(.4, .05, .06))
         self.assertAlmostEqual(self.g.approach_goal_x, .02)
-        self.assertLess(self.g.velocity[1], 0)
+        # The old Y target is already 5 cm behind actual: do not add more lead.
+        self.assertEqual(self.g.velocity[1], 0)
+        self.assertTrue(self.g.lateral_correction.integration_limited)
         self.assertGreater(self.g.velocity[2], 0)
 
     def test_contact_locks_lateral_target_once_but_insertion_continues(self):
@@ -136,7 +138,7 @@ class GuidanceTest(unittest.TestCase):
 
     def test_contact_lock_waits_for_alignment(self):
         self.step(0)
-        self.step(.025, (.04, .03, 0))
+        self.step(.025, (.04, .03, 0), q=(.04, 0, 0))
         self.assertFalse(self.g.correction_locked)
         self.assertLess(self.g.velocity[1], 0)
         self.step(.05, (.04, .01, .01), r=(0, .2, 0))

@@ -40,7 +40,7 @@ class DockingMotion:
         defaults = DockingConfig()
         parameters = {}
         for name, value in vars(defaults).items():
-            if name.endswith('angle_tolerance'):
+            if name.endswith('angle_tolerance') or name == 'approach_alignment_yaw_scale':
                 parameters[name] = math.radians(rospy.get_param('~docking/'+name+'_deg', math.degrees(value)))
             else:
                 parameters[name] = rospy.get_param('~docking/'+name, value)
@@ -180,12 +180,14 @@ class DockingMotion:
             rospy.loginfo('[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s', phase, position[0],
                           position[1:].tolist(), np.degrees(angles).tolist())
             self.last_phase = phase
-        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f correction_locked=%s relative_vz=%.3f height_limited=%s relative_vy=%.3f' %
+        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f correction_locked=%s relative_vz=%.3f height_limited=%s relative_vy=%.3f lateral_limited=%s approach_scale=%.3f' %
                                (phase, position[0], position[1:].tolist(), np.degrees(angles).tolist(),
                                 self.guidance.command.tolist(), self.guidance.axial_velocity,
                                 target_pose[2, 3], self.guidance.correction_locked,
                                 self.guidance.height_correction.relative_velocity,
                                 self.guidance.height_correction.integration_limited,
-                                self.guidance.lateral_correction.relative_velocity))
+                                self.guidance.lateral_correction.relative_velocity,
+                                self.guidance.lateral_correction.integration_limited,
+                                self.guidance.approach_speed_policy.alignment_scale(position[1:], angles[2])))
         self.rate.sleep()
         return phase

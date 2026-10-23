@@ -65,6 +65,13 @@ class AdapterTest(unittest.TestCase):
                   '~docking/contact_lock_gap': .04,
                   '~docking/lateral_velocity_damping': .3,
                   '~docking/lateral_velocity_filter_time': .2,
+                  '~docking/lateral_tracking_error_limit': .025,
+                  '~docking/contact_lateral_correction_limit': .008,
+                  '~docking/contact_lateral_correction_gap': .055,
+                  '~docking/approach_alignment_y_scale': .012,
+                  '~docking/approach_alignment_z_scale': .008,
+                  '~docking/approach_alignment_yaw_scale_deg': 1.5,
+                  '~docking/approach_min_speed_scale': .15,
                   '~docking/contact_height_correction_gap': .055,
                   '~docking/height_correction_gain': .15,
                   '~docking/height_correction_speed': .008,
@@ -81,7 +88,11 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(config.approach_slowdown_distance, .12)
         self.assertEqual(config.relative_correction_gain, .6)
         self.assertEqual(config.contact_lock_gap, .04)
+        self.assertAlmostEqual(config.approach_alignment_yaw_scale, np.radians(1.5))
         for name in ('lateral_velocity_damping', 'lateral_velocity_filter_time',
+                     'lateral_tracking_error_limit', 'contact_lateral_correction_limit',
+                     'contact_lateral_correction_gap', 'approach_alignment_y_scale',
+                     'approach_alignment_z_scale', 'approach_min_speed_scale',
                      'contact_height_correction_gap',
                      'height_correction_gain', 'height_correction_speed', 'height_velocity_damping',
                      'height_velocity_filter_time', 'height_tracking_error_limit',

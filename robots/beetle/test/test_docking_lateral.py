@@ -90,10 +90,67 @@ class LateralCorrectionTest(unittest.TestCase):
         for value in (-1, float('nan'), float('inf')):
             with self.assertRaises(ValueError):
                 DockingConfig(lateral_velocity_damping=value)
-        for name in ('lateral_velocity_filter_time', 'contact_height_correction_gap'):
+        for name in ('lateral_velocity_filter_time', 'contact_height_correction_gap',
+                     'lateral_tracking_error_limit', 'contact_lateral_correction_limit',
+                     'contact_lateral_correction_gap'):
             for value in (0, -1, float('nan'), float('inf')):
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
                     DockingConfig(**{name: value})
+
+    def test_blocked_tracking_stops_lateral_integration_in_both_directions(self):
+        for error in (-.2, .2):
+            c = DampedLateralCorrection(DockingConfig())
+            target = c.update(0, error, 0, 0)
+            for _ in range(300):
+                target = c.update(target, error, 0, .025)
+            self.assertAlmostEqual(abs(target), .03)
+            self.assertTrue(c.integration_limited)
+            # A changed measurement cannot pull an already held target to the bound.
+            held = c.update(target, error, np.sign(error)*.1, .025)
+            self.assertEqual(held, target)
+
+    def test_contact_bounds_common_lateral_drift_without_renewing_budget(self):
+        for error in (-.02, .02):
+            c = DampedLateralCorrection(DockingConfig())
+            target = c.update(0, error, 0, 0, contact=True)
+            for _ in range(300):
+                target = c.update(target, error, target, .025, contact=True)
+            self.assertAlmostEqual(abs(target), .01)
+            self.assertTrue(c.integration_limited)
+            c.reset_velocity()
+            c.update(target, error, target, .025, contact=False)
+            held = c.update(target, error, target, .025, contact=True)
+            self.assertEqual(held, target)
+            self.assertEqual(c.contact_anchor, 0)
+
+    def test_lateral_contact_budget_allows_small_alignment_correction(self):
+        c = DampedLateralCorrection(DockingConfig())
+        actual = c.update(0, -.005, 0, 0, contact=True)
+        for _ in range(1000):
+            actual = c.update(actual, actual-.005, actual, .025, contact=True)
+        self.assertLess(abs(actual-.005), .0002)
+
+    def test_lateral_bound_allows_unwinding_and_limits_remaining_step(self):
+        c = DampedLateralCorrection(DockingConfig(lateral_velocity_damping=0))
+        c.update(.0299, -.2, 0, 0)
+        target = c.update(.0299, -.2, 0, .025)
+        self.assertAlmostEqual(target, .03)
+        self.assertTrue(c.integration_limited)
+        reverse = c.update(target, .1, 0, .025)
+        self.assertLess(reverse, target)
+        self.assertLessEqual(target-reverse, .02*.025+1e-12)
+
+    def test_unlocked_approach_cannot_keep_accumulating_lateral_contact_targets(self):
+        g = DockingGuidance(DockingConfig())
+        g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
+        for i in range(1, 1001):
+            # Replay the failed trial's residual mismatch with good local tracking.
+            g.update(i*.025, [.04, .007, .02], [0, 0, 0], g.command.copy())
+        self.assertFalse(g.correction_locked)
+        self.assertEqual(g.phase, 'approach')
+        self.assertAlmostEqual(g.command[1], -.01)
+        self.assertAlmostEqual(g.command[2], -.015)
+        np.testing.assert_allclose(g.velocity[1:], [0, 0])
 
 
 if __name__ == '__main__':

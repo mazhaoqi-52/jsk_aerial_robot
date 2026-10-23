@@ -4,18 +4,25 @@ docking:
   prealign_angle_tolerance_deg: 3.0  # mutual interface RPY before approach
   angle_tolerance_deg: 8.6     # final locking RPY tolerance (~original 0.15 rad)
   approach_speed: 0.1          # axial waypoint speed upper bound, m/s
-  near_approach_speed: 0.05    # approach speed cap inside slowdown distance, m/s
+  near_approach_speed: 0.03    # aligned approach speed cap inside slowdown distance, m/s
   approach_slowdown_distance: 0.15  # measured interface gap, m; speed ramps down before this
+  approach_alignment_y_scale: 0.01  # Y error scale for continuous approach slowdown, m
+  approach_alignment_z_scale: 0.01  # Z error scale for continuous approach slowdown, m
+  approach_alignment_yaw_scale_deg: 2.0  # relative yaw error scale, not an arrival gate
+  approach_min_speed_scale: 0.2  # positive minimum multiplier; misalignment slows progression
   correction_speed: 0.02      # relative Y correction speed, m/s
   relative_correction_gain: 0.5  # prealignment X / relative Y gain, 1/s
   lateral_velocity_damping: 0.4  # filtered relative Y velocity damping
   lateral_velocity_filter_time: 0.25  # relative Y velocity low-pass time constant, s
+  lateral_tracking_error_limit: 0.03  # stop integration that increases Y tracking lead, m
+  contact_lateral_correction_limit: 0.01  # additional Y target travel +/- after first contact zone, m
+  contact_lateral_correction_gap: 0.05  # latch lateral correction budget inside this gap, m
   height_correction_gain: 0.2  # relative Z error -> height target velocity, 1/s
   height_correction_speed: 0.01  # Z target velocity limit, m/s
   height_velocity_damping: 0.4  # filtered relative vertical velocity damping
   height_velocity_filter_time: 0.25  # relative velocity low-pass time constant, s
   height_tracking_error_limit: 0.03  # stop integration that increases Z tracking lead, m
-  contact_height_correction_limit: 0.01  # additional Z target travel +/- after first contact zone, m
+  contact_height_correction_limit: 0.015  # additional Z target travel +/- after first contact zone, m
   contact_height_correction_gap: 0.05  # preserve Z correction budget onset independently of Y/Z lock, m
   contact_lock_gap: 0.04      # freeze aligned Y/Z waypoint inside this actual gap, m
   slowdown_gain: 2.0          # slow the waypoint near each fixed goal, 1/s

@@ -11,18 +11,25 @@ class DockingConfig:
     prealign_angle_tolerance: float = math.radians(3.0)
     angle_tolerance: float = math.radians(8.6)
     approach_speed: float = 0.1
-    near_approach_speed: float = 0.05
+    near_approach_speed: float = 0.03
     approach_slowdown_distance: float = 0.15
+    approach_alignment_y_scale: float = 0.01
+    approach_alignment_z_scale: float = 0.01
+    approach_alignment_yaw_scale: float = math.radians(2.0)
+    approach_min_speed_scale: float = 0.2
     correction_speed: float = 0.02
     relative_correction_gain: float = 0.5
     lateral_velocity_damping: float = 0.4
     lateral_velocity_filter_time: float = 0.25
+    lateral_tracking_error_limit: float = 0.03
+    contact_lateral_correction_limit: float = 0.01
+    contact_lateral_correction_gap: float = 0.05
     height_correction_gain: float = 0.2
     height_correction_speed: float = 0.01
     height_velocity_damping: float = 0.4
     height_velocity_filter_time: float = 0.25
     height_tracking_error_limit: float = 0.03
-    contact_height_correction_limit: float = 0.01
+    contact_height_correction_limit: float = 0.015
     contact_height_correction_gap: float = 0.05
     contact_lock_gap: float = 0.04
     slowdown_gain: float = 2.0
@@ -36,6 +43,8 @@ class DockingConfig:
             minimum_ok = value >= 0 if name in ('height_velocity_damping', 'lateral_velocity_damping') else value > 0
             if not math.isfinite(value) or not minimum_ok:
                 raise ValueError('Invalid docking parameter: %s' % name)
+        if self.approach_min_speed_scale > 1:
+            raise ValueError('approach_min_speed_scale must be in (0, 1]')
 
 
 def move_towards(current, target, step):
@@ -74,40 +83,39 @@ class FilteredRelativeVelocity:
         return self.velocity
 
 
-class DampedLateralCorrection:
-    """Slow lateral motion before the interfaces cross their alignment point."""
+class AlignmentAwareApproachSpeed:
+    """Continuously slow insertion when Y, Z or yaw still needs correction."""
     def __init__(self, config):
         self.config = config
-        self.velocity_filter = FilteredRelativeVelocity(config.lateral_velocity_filter_time)
 
-    @property
-    def relative_velocity(self):
-        return self.velocity_filter.velocity
-
-    def reset_velocity(self):
-        self.velocity_filter.reset()
-
-    def velocity(self, error, dt, enabled=True):
+    def alignment_scale(self, yz, yaw):
         c = self.config
-        relative_velocity = self.velocity_filter.update(error, dt)
-        if not enabled:
-            return 0.0
-        return float(np.clip(-c.relative_correction_gain*error-
-                             c.lateral_velocity_damping*relative_velocity,
-                             -c.correction_speed, c.correction_speed))
+        yaw = (yaw+math.pi) % (2*math.pi)-math.pi
+        error = max(abs(yz[0])/c.approach_alignment_y_scale,
+                    abs(yz[1])/c.approach_alignment_z_scale,
+                    abs(yaw)/c.approach_alignment_yaw_scale)
+        return c.approach_min_speed_scale+(1-c.approach_min_speed_scale)/(1+error*error)
+
+    def limit(self, gap, yz, yaw):
+        c = self.config
+        distance_limit = min(c.approach_speed,
+                             c.near_approach_speed*max(1.0, gap/c.approach_slowdown_distance))
+        return distance_limit*self.alignment_scale(yz, yaw)
 
 
-class DampedHeightCorrection:
-    """Damp relative vertical motion and conditionally integrate the height target.
+class BoundedDampedCorrection:
+    """Integrate damped interface feedback within tracking and contact bounds.
 
-    Limits constrain additional motion, never drag a held target with feedback.
-    The contact budget also bounds correction when contact makes both aircraft
-    move together, so the follower's own tracking error may still be small.
+    Feedback may reduce the available step, but never drags an existing target.
+    A latched contact anchor also bounds motion when both aircraft move together.
     """
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, gain, speed_limit, damping, filter_time,
+                 tracking_error_limit, contact_correction_limit):
+        self.gain, self.speed_limit, self.damping = gain, speed_limit, damping
+        self.tracking_error_limit = tracking_error_limit
+        self.contact_correction_limit = contact_correction_limit
         self.contact_anchor = None
-        self.velocity_filter = FilteredRelativeVelocity(config.height_velocity_filter_time)
+        self.velocity_filter = FilteredRelativeVelocity(filter_time)
         self.reset_velocity()
 
     @property
@@ -118,29 +126,46 @@ class DampedHeightCorrection:
         self.velocity_filter.reset()
         self.integration_limited = False
 
+    def velocity(self, error, dt, enabled=True):
+        relative_velocity = self.velocity_filter.update(error, dt)
+        if not enabled:
+            return 0.0
+        return float(np.clip(-self.gain*error-self.damping*relative_velocity,
+                             -self.speed_limit, self.speed_limit))
+
     def update(self, command, error, actual, dt, contact=False, enabled=True):
-        c = self.config
         self.integration_limited = False
-        self.velocity_filter.update(error, dt)
+        velocity = self.velocity(error, dt, enabled)
         if contact and self.contact_anchor is None:
             self.contact_anchor = command
         if dt <= 0 or not enabled:
             return command
-        velocity = np.clip(-c.height_correction_gain*error-
-                           c.height_velocity_damping*self.relative_velocity,
-                           -c.height_correction_speed, c.height_correction_speed)
         step = float(velocity*dt)
-        lower = actual-c.height_tracking_error_limit
-        upper = actual+c.height_tracking_error_limit
+        lower = actual-self.tracking_error_limit
+        upper = actual+self.tracking_error_limit
         if self.contact_anchor is not None:
-            lower = max(lower, self.contact_anchor-c.contact_height_correction_limit)
-            upper = min(upper, self.contact_anchor+c.contact_height_correction_limit)
+            lower = max(lower, self.contact_anchor-self.contact_correction_limit)
+            upper = min(upper, self.contact_anchor+self.contact_correction_limit)
         # Stop outward integration at a bound; allow motion back toward it.
         # If feedback moves beyond a bound, keep the existing target continuous.
         limited_step = (min(step, max(0.0, upper-command)) if step > 0 else
                         max(step, -max(0.0, command-lower)))
         self.integration_limited = abs(limited_step-step) > 1e-12
         return command+limited_step
+
+
+class DampedLateralCorrection(BoundedDampedCorrection):
+    def __init__(self, config):
+        super().__init__(config.relative_correction_gain, config.correction_speed,
+                         config.lateral_velocity_damping, config.lateral_velocity_filter_time,
+                         config.lateral_tracking_error_limit, config.contact_lateral_correction_limit)
+
+
+class DampedHeightCorrection(BoundedDampedCorrection):
+    def __init__(self, config):
+        super().__init__(config.height_correction_gain, config.height_correction_speed,
+                         config.height_velocity_damping, config.height_velocity_filter_time,
+                         config.height_tracking_error_limit, config.contact_height_correction_limit)
 
 
 class DockingGuidance:
@@ -151,6 +176,7 @@ class DockingGuidance:
         self.previous_time = None
         self.velocity = np.zeros(3)
         self.correction = RelativePositionCorrection(config.relative_correction_gain)
+        self.approach_speed_policy = AlignmentAwareApproachSpeed(config)
         self.lateral_correction = DampedLateralCorrection(config)
         self.height_correction = DampedHeightCorrection(config)
         self.approach_goal_x = None
@@ -168,15 +194,12 @@ class DockingGuidance:
         self.lateral_correction.reset_velocity()
         self.height_correction.reset_velocity()
 
-    def axial_speed_limit(self, gap):
+    def axial_speed_limit(self, gap, yz=(0, 0), yaw=0.0):
         """Reduce approach speed using measured separation, in fixed coordinates."""
         c = self.config
         if self.phase == 'prealign':
             return c.approach_speed
-        # Continuous ramp: near speed inside the slowdown distance, rising
-        # toward the far speed as the actual interface separation increases.
-        return min(c.approach_speed,
-                   c.near_approach_speed*max(1.0, gap/c.approach_slowdown_distance))
+        return self.approach_speed_policy.limit(gap, yz, yaw)
 
     def update(self, stamp, position, angles, trajectory_position):
         """Align relative position, then approach along a fixed insertion axis.
@@ -220,11 +243,12 @@ class DockingGuidance:
             if -c.insertion_depth <= p[0] <= c.contact_lock_gap and aligned:
                 self.correction_locked = True
             old_x = self.command[0]
-            speed = min(self.axial_speed_limit(p[0]),
+            speed = min(self.axial_speed_limit(p[0], p[1:], r[2]),
                         c.slowdown_gain*abs(self.approach_goal_x-old_x))
             self.command[0] = move_towards(old_x, self.approach_goal_x, speed*dt)
-        self.command[1] += self.lateral_correction.velocity(
-            p[1], dt, enabled=not self.correction_locked)*dt
+        lateral_contact = self.phase == 'approach' and p[0] <= c.contact_lateral_correction_gap
+        self.command[1] = self.lateral_correction.update(
+            self.command[1], p[1], q[1], dt, lateral_contact, enabled=not self.correction_locked)
         contact = self.phase == 'approach' and p[0] <= c.contact_height_correction_gap
         self.command[2] = self.height_correction.update(
             self.command[2], p[2], q[2], dt, contact, enabled=not self.correction_locked)

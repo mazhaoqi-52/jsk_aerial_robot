@@ -63,6 +63,9 @@ class AdapterTest(unittest.TestCase):
                   '~docking/approach_slowdown_distance': .12,
                   '~docking/relative_correction_gain': .6,
                   '~docking/contact_lock_gap': .04,
+                  '~docking/lateral_velocity_damping': .3,
+                  '~docking/lateral_velocity_filter_time': .2,
+                  '~docking/contact_height_correction_gap': .055,
                   '~docking/height_correction_gain': .15,
                   '~docking/height_correction_speed': .008,
                   '~docking/height_velocity_damping': .3,
@@ -78,7 +81,9 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(config.approach_slowdown_distance, .12)
         self.assertEqual(config.relative_correction_gain, .6)
         self.assertEqual(config.contact_lock_gap, .04)
-        for name in ('height_correction_gain', 'height_correction_speed', 'height_velocity_damping',
+        for name in ('lateral_velocity_damping', 'lateral_velocity_filter_time',
+                     'contact_height_correction_gap',
+                     'height_correction_gain', 'height_correction_speed', 'height_velocity_damping',
                      'height_velocity_filter_time', 'height_tracking_error_limit',
                      'contact_height_correction_limit'):
             self.assertEqual(getattr(config, name), values['~docking/'+name])

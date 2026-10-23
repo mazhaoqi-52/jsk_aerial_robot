@@ -8,13 +8,16 @@ docking:
   approach_slowdown_distance: 0.15  # measured interface gap, m; speed ramps down before this
   correction_speed: 0.02      # relative Y correction speed, m/s
   relative_correction_gain: 0.5  # prealignment X / relative Y gain, 1/s
+  lateral_velocity_damping: 0.4  # filtered relative Y velocity damping
+  lateral_velocity_filter_time: 0.25  # relative Y velocity low-pass time constant, s
   height_correction_gain: 0.2  # relative Z error -> height target velocity, 1/s
   height_correction_speed: 0.01  # Z target velocity limit, m/s
   height_velocity_damping: 0.4  # filtered relative vertical velocity damping
   height_velocity_filter_time: 0.25  # relative velocity low-pass time constant, s
   height_tracking_error_limit: 0.03  # stop integration that increases Z tracking lead, m
   contact_height_correction_limit: 0.01  # additional Z target travel +/- after first contact zone, m
-  contact_lock_gap: 0.05      # freeze aligned Y/Z waypoint inside this actual gap, m
+  contact_height_correction_gap: 0.05  # preserve Z correction budget onset independently of Y/Z lock, m
+  contact_lock_gap: 0.04      # freeze aligned Y/Z waypoint inside this actual gap, m
   slowdown_gain: 2.0          # slow the waypoint near each fixed goal, 1/s
   insertion_depth: 0.05       # final inward target offset, m
   final_x_tolerance: 0.02     # lock when gap is in [-insertion_depth, final_x_tolerance)

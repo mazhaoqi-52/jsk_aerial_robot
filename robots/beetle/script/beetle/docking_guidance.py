@@ -15,13 +15,16 @@ class DockingConfig:
     approach_slowdown_distance: float = 0.15
     correction_speed: float = 0.02
     relative_correction_gain: float = 0.5
+    lateral_velocity_damping: float = 0.4
+    lateral_velocity_filter_time: float = 0.25
     height_correction_gain: float = 0.2
     height_correction_speed: float = 0.01
     height_velocity_damping: float = 0.4
     height_velocity_filter_time: float = 0.25
     height_tracking_error_limit: float = 0.03
     contact_height_correction_limit: float = 0.01
-    contact_lock_gap: float = 0.05
+    contact_height_correction_gap: float = 0.05
+    contact_lock_gap: float = 0.04
     slowdown_gain: float = 2.0
     insertion_depth: float = 0.05
     final_x_tolerance: float = 0.02
@@ -30,7 +33,7 @@ class DockingConfig:
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            minimum_ok = value >= 0 if name == 'height_velocity_damping' else value > 0
+            minimum_ok = value >= 0 if name in ('height_velocity_damping', 'lateral_velocity_damping') else value > 0
             if not math.isfinite(value) or not minimum_ok:
                 raise ValueError('Invalid docking parameter: %s' % name)
 
@@ -52,6 +55,48 @@ class RelativePositionCorrection:
         return np.clip(-self.gain*np.asarray(error), -np.asarray(speed_limit), speed_limit)
 
 
+class FilteredRelativeVelocity:
+    """Differentiate interface error on the local control clock and smooth it."""
+    def __init__(self, time_constant):
+        self.time_constant = time_constant
+        self.reset()
+
+    def reset(self):
+        self.previous_error = None
+        self.velocity = 0.0
+
+    def update(self, error, dt):
+        if dt > 0 and self.previous_error is not None:
+            measured_velocity = (error-self.previous_error)/dt
+            alpha = dt/(self.time_constant+dt)
+            self.velocity += alpha*(measured_velocity-self.velocity)
+        self.previous_error = error
+        return self.velocity
+
+
+class DampedLateralCorrection:
+    """Slow lateral motion before the interfaces cross their alignment point."""
+    def __init__(self, config):
+        self.config = config
+        self.velocity_filter = FilteredRelativeVelocity(config.lateral_velocity_filter_time)
+
+    @property
+    def relative_velocity(self):
+        return self.velocity_filter.velocity
+
+    def reset_velocity(self):
+        self.velocity_filter.reset()
+
+    def velocity(self, error, dt, enabled=True):
+        c = self.config
+        relative_velocity = self.velocity_filter.update(error, dt)
+        if not enabled:
+            return 0.0
+        return float(np.clip(-c.relative_correction_gain*error-
+                             c.lateral_velocity_damping*relative_velocity,
+                             -c.correction_speed, c.correction_speed))
+
+
 class DampedHeightCorrection:
     """Damp relative vertical motion and conditionally integrate the height target.
 
@@ -62,21 +107,21 @@ class DampedHeightCorrection:
     def __init__(self, config):
         self.config = config
         self.contact_anchor = None
+        self.velocity_filter = FilteredRelativeVelocity(config.height_velocity_filter_time)
         self.reset_velocity()
 
+    @property
+    def relative_velocity(self):
+        return self.velocity_filter.velocity
+
     def reset_velocity(self):
-        self.previous_error = None
-        self.relative_velocity = 0.0
+        self.velocity_filter.reset()
         self.integration_limited = False
 
     def update(self, command, error, actual, dt, contact=False, enabled=True):
         c = self.config
         self.integration_limited = False
-        if dt > 0 and self.previous_error is not None:
-            measured_velocity = (error-self.previous_error)/dt
-            alpha = dt/(c.height_velocity_filter_time+dt)
-            self.relative_velocity += alpha*(measured_velocity-self.relative_velocity)
-        self.previous_error = error
+        self.velocity_filter.update(error, dt)
         if contact and self.contact_anchor is None:
             self.contact_anchor = command
         if dt <= 0 or not enabled:
@@ -106,6 +151,7 @@ class DockingGuidance:
         self.previous_time = None
         self.velocity = np.zeros(3)
         self.correction = RelativePositionCorrection(config.relative_correction_gain)
+        self.lateral_correction = DampedLateralCorrection(config)
         self.height_correction = DampedHeightCorrection(config)
         self.approach_goal_x = None
         self.correction_locked = False
@@ -119,6 +165,7 @@ class DockingGuidance:
         self.command = None
         self.previous_time = None
         self.velocity[:] = 0.0
+        self.lateral_correction.reset_velocity()
         self.height_correction.reset_velocity()
 
     def axial_speed_limit(self, gap):
@@ -152,8 +199,7 @@ class DockingGuidance:
         old_command = self.command.copy()
         if self.phase == 'prealign':
             error = p-np.array([c.prealign_gap, 0, 0])
-            velocity = self.correction.velocity(error[:2], [c.approach_speed, c.correction_speed])
-            self.command[:2] += velocity*dt
+            self.command[0] += self.correction.velocity(error[0], c.approach_speed)*dt
             arrived = (abs(p[0]-c.prealign_gap) < c.position_tolerance and
                        np.all(np.abs(p[1:]) < c.position_tolerance) and
                        np.all(angle_errors < c.prealign_angle_tolerance))
@@ -177,9 +223,9 @@ class DockingGuidance:
             speed = min(self.axial_speed_limit(p[0]),
                         c.slowdown_gain*abs(self.approach_goal_x-old_x))
             self.command[0] = move_towards(old_x, self.approach_goal_x, speed*dt)
-            if not self.correction_locked:
-                self.command[1] += self.correction.velocity(p[1], c.correction_speed)*dt
-        contact = self.phase == 'approach' and p[0] <= c.contact_lock_gap
+        self.command[1] += self.lateral_correction.velocity(
+            p[1], dt, enabled=not self.correction_locked)*dt
+        contact = self.phase == 'approach' and p[0] <= c.contact_height_correction_gap
         self.command[2] = self.height_correction.update(
             self.command[2], p[2], q[2], dt, contact, enabled=not self.correction_locked)
         if dt > 0:

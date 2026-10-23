@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lateral braking and continued correction before the 4 cm target lock."""
+"""Lateral braking and bounded correction throughout insertion."""
 from pathlib import Path
 import sys
 import unittest
@@ -62,7 +62,6 @@ class LateralCorrectionTest(unittest.TestCase):
         g = DockingGuidance(DockingConfig())
         g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(.025, [.045, .01, -.01], [0, 0, 0], [.045, .01, -.01])
-        self.assertFalse(g.correction_locked)
         self.assertLess(g.velocity[1], 0)
         self.assertLessEqual(abs(g.velocity[1]), .02)
         self.assertGreater(g.velocity[2], 0)
@@ -70,9 +69,12 @@ class LateralCorrectionTest(unittest.TestCase):
         self.assertEqual(g.height_correction.contact_anchor, 0)
         yz = g.command[1:].copy()
         g.update(.05, [.04, .01, -.01], [0, 0, 0], [.04, .01, -.01])
-        self.assertTrue(g.correction_locked)
-        np.testing.assert_allclose(g.command[1:], yz)
-        np.testing.assert_allclose(g.velocity[1:], [0, 0])
+        self.assertLess(g.command[1], yz[0])
+        self.assertGreater(g.command[2], yz[1])
+        self.assertLess(g.velocity[1], 0)
+        self.assertGreater(g.velocity[2], 0)
+        self.assertEqual(g.lateral_correction.contact_anchor, 0)
+        self.assertEqual(g.height_correction.contact_anchor, 0)
 
     def test_tf_recovery_resets_lateral_derivative_without_target_jump(self):
         g = DockingGuidance(DockingConfig())
@@ -146,7 +148,6 @@ class LateralCorrectionTest(unittest.TestCase):
         for i in range(1, 1001):
             # Replay the failed trial's residual mismatch with good local tracking.
             g.update(i*.025, [.04, .007, .02], [0, 0, 0], g.command.copy())
-        self.assertFalse(g.correction_locked)
         self.assertEqual(g.phase, 'approach')
         self.assertAlmostEqual(g.command[1], -.01)
         self.assertAlmostEqual(g.command[2], -.015)

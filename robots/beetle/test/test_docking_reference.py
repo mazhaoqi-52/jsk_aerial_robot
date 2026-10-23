@@ -105,6 +105,20 @@ class ReferenceTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ReferenceConfig(attitude_rate=value)
 
+    def test_equivalent_tracking_position_measures_fc_error_with_calibrated_geometry(self):
+        for direction in (-1, 1):
+            reference = self.make_reference(direction)
+            reference.connectors = (pose((direction*.26, .01, .02), (.02, -.03, .04)),
+                                    pose((-direction*.27, -.01, .01), (-.02, .01, -.03)))
+            # Arbitrary desired attitude and an actual FC with a different tilt.
+            reference.orientations[1] = tr.quaternion_from_euler(.06, -.04, .2)
+            command = np.array([.15, .01, -.02])
+            target = reference.follower_pose(command, self.baselinks[1])
+            actual = pose(target[:3, 3]+[.01, -.02, -.02], (.1, -.15, -.1))
+            tracking = reference.tracking_position(actual, self.baselinks[1])
+            np.testing.assert_allclose(reference.world_velocity(command-tracking),
+                                       target[:3, 3]-actual[:3, 3], atol=1e-12)
+
 
 if __name__ == '__main__':
     unittest.main()

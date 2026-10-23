@@ -18,7 +18,7 @@ class GuidanceTest(unittest.TestCase):
 
     def test_prealignment_requires_basic_arrival_but_no_dwell(self):
         self.assertEqual(self.step(0, (.3, .1, .08)), 'prealign')
-        self.assertEqual(self.step(.025, (.15, .01, .01), np.radians([2, 0, 0])), 'approach')
+        self.assertEqual(self.step(.025, (.15, .005, .005), np.radians([2, 0, 0])), 'approach')
 
     def test_prealignment_checks_each_coordinate_and_relative_angle(self):
         for p, r in [((.175, 0, 0), (0, 0, 0)), ((.125, 0, 0), (0, 0, 0)),
@@ -36,15 +36,15 @@ class GuidanceTest(unittest.TestCase):
     def test_near_approach_uses_measured_gap_even_with_far_fixed_waypoint(self):
         self.step(0, q=(.4, 0, 0))
         self.step(.025, (.12, 0, 0), q=(.4, 0, 0))
-        self.assertAlmostEqual(self.g.axial_velocity, -.03)
-        self.assertAlmostEqual(self.g.command[0], .39925)
+        self.assertAlmostEqual(self.g.axial_velocity, -.05)
+        self.assertAlmostEqual(self.g.command[0], .39875)
 
     def test_approach_speed_ramps_continuously_with_actual_gap(self):
         speeds = []
-        for gap, expected in [(.5, .1), (.225, .045), (.15, .03), (.08, .03), (-.02, .03)]:
+        for gap, expected in [(.4, .1), (.225, .075), (.15, .05), (.08, .05), (-.02, .05)]:
             self.g = DockingGuidance(DockingConfig())
             self.step(0, q=(.4, 0, 0))
-            # Isolate distance scaling; roll prevents completion without changing yaw slowdown.
+            # Roll prevents completion so distance scaling can be checked.
             self.step(.025, (gap, 0, 0), r=(.2, 0, 0), q=(.4, 0, 0))
             speeds.append(abs(self.g.axial_velocity))
             self.assertAlmostEqual(speeds[-1], expected)
@@ -122,36 +122,33 @@ class GuidanceTest(unittest.TestCase):
         self.assertTrue(self.g.lateral_correction.integration_limited)
         self.assertGreater(self.g.velocity[2], 0)
 
-    def test_contact_locks_lateral_target_once_but_insertion_continues(self):
+    def test_contact_keeps_correcting_small_offsets_while_insertion_continues(self):
         self.step(0)
-        self.step(.025, (.08, .03, -.04))
+        self.step(.025, (.08, .006, -.014), q=(.08, 0, 0))
         yz = self.g.command[1:].copy()
         x = self.g.command[0]
-        self.step(.05, (.04, .01, -.01))
-        self.assertTrue(self.g.correction_locked)
-        np.testing.assert_allclose(self.g.command[1:], yz)
+        self.step(.05, (.04, .006, -.014), q=(.04, 0, 0))
+        self.assertLess(self.g.command[1], yz[0])
+        self.assertGreater(self.g.command[2], yz[1])
         self.assertLess(self.g.command[0], x)
-        self.step(.075, (.04, -.1, .1))
-        np.testing.assert_allclose(self.g.command[1:], yz)
-        np.testing.assert_allclose(self.g.velocity[1:], [0, 0])
         self.assertAlmostEqual(self.g.approach_goal_x, -.05)
 
-    def test_contact_lock_waits_for_alignment(self):
+    def test_contact_correction_remains_active_despite_angle_error(self):
         self.step(0)
         self.step(.025, (.04, .03, 0), q=(.04, 0, 0))
-        self.assertFalse(self.g.correction_locked)
         self.assertLess(self.g.velocity[1], 0)
         self.step(.05, (.04, .01, .01), r=(0, .2, 0))
-        self.assertFalse(self.g.correction_locked)
+        self.assertEqual(self.g.phase, 'approach')
+        self.assertNotEqual(self.g.velocity[2], 0)
 
-    def test_tf_interruption_preserves_insertion_goal_and_contact_lock(self):
+    def test_tf_interruption_preserves_insertion_goal_and_contact_budgets(self):
         self.step(0)
         self.step(.025, (.04, .01, .01))
-        self.assertTrue(self.g.correction_locked)
+        anchors = (self.g.lateral_correction.contact_anchor, self.g.height_correction.contact_anchor)
         self.g.suspend()
         self.step(10, (.035, 0, 0), q=(.06, .02, .03))
         self.assertAlmostEqual(self.g.approach_goal_x, -.05)
-        self.assertTrue(self.g.correction_locked)
+        self.assertEqual((self.g.lateral_correction.contact_anchor, self.g.height_correction.contact_anchor), anchors)
         np.testing.assert_allclose(self.g.command, [.06, .02, .03])
         np.testing.assert_allclose(self.g.velocity, [0, 0, 0])
 

@@ -1,70 +1,59 @@
 #!/usr/bin/env python3
-"""Alignment-dependent approach speed, without new state-transition gates."""
+"""Fine prealignment followed by prompt, bounded insertion."""
 from pathlib import Path
 import sys
 import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'script'))
-from beetle.docking_guidance import AlignmentAwareApproachSpeed, DockingConfig, DockingGuidance
+from beetle.docking_guidance import GapLimitedApproachSpeed, DockingConfig, DockingGuidance
 
 
 class ApproachSpeedTest(unittest.TestCase):
-    def setUp(self):
-        self.c = DockingConfig()
-        self.policy = AlignmentAwareApproachSpeed(self.c)
+    def test_failed_bag_coarse_alignment_no_longer_starts_insertion(self):
+        for yz, angles in [([-.0189095, .0187643], [2.34185, -2.54283, -1.27007]),
+                           ([-.0188917, .0197988], [.06313, -1.39309, -2.99635])]:
+            g = DockingGuidance(DockingConfig())
+            self.assertEqual(g.update(0, [.165, *yz], np.radians(angles), [.165, 0, 0]), 'prealign')
+            self.assertIsNone(g.approach_goal_x)
 
-    def test_each_error_smoothly_slows_both_signs_and_still_progresses(self):
-        for axis, scale in enumerate((.01, .01, np.radians(2))):
-            for sign in (-1, 1):
-                speeds = []
-                for ratio in (0, .5, 1, 2, 4, 20):
-                    e = np.zeros(3)
-                    e[axis] = sign*scale*ratio
-                    speeds.append(self.policy.limit(.1, e[:2], e[2]))
-                self.assertAlmostEqual(speeds[0], .03)
-                self.assertTrue(all(a > b for a, b in zip(speeds, speeds[1:])))
-                self.assertTrue(all(.006 <= s <= .03 for s in speeds))
+    def test_each_fine_alignment_error_keeps_correction_at_noncontact_gap(self):
+        cases = [([.15, .009, 0], [0, 0, 0]), ([.15, 0, -.009], [0, 0, 0]),
+                 ([.15, 0, 0], [0, 0, 2.1]), ([.15, 0, 0], [3.1, 0, 0])]
+        for p, deg in cases:
+            g = DockingGuidance(DockingConfig())
+            for t in (0, .025):
+                phase = g.update(t, p, np.radians(deg), [.15, 0, 0])
+            self.assertEqual(phase, 'prealign')
+            self.assertEqual(g.command[0], .15)
+            self.assertEqual(g.axial_velocity, 0)
 
-    def test_two_cm_height_error_slows_insertion_while_height_corrects(self):
-        g = DockingGuidance(self.c)
-        g.update(0, [.15, 0, 0], [0, 0, 0], [.4, 0, 0])
-        g.update(.025, [.1, 0, .02], [0, 0, 0], [.4, 0, 0])
-        self.assertEqual(g.phase, 'approach')
-        self.assertAlmostEqual(g.axial_velocity, -.0108)
-        self.assertLess(g.velocity[2], 0)
+    def test_fine_alignment_immediately_releases_faster_insertion(self):
+        g = DockingGuidance(DockingConfig())
+        self.assertEqual(g.update(0, [.15, .006, -.007], np.radians([2.5, -2.5, 1.5]), [.4, 0, 0]), 'approach')
+        # Residual disturbance keeps bounded Y/Z correction active, without crawling.
+        g.update(.025, [.1, .006, -.014], np.radians([0, 0, 5]), [.4, 0, 0])
+        self.assertAlmostEqual(g.axial_velocity, -.05)
+        self.assertGreater(g.velocity[2], 0)
 
-    def test_bag_entry_with_three_near_boundary_errors_is_not_full_speed(self):
-        limit = self.policy.limit(.156, [-.0188917, .0197988], np.radians(-2.99635))
-        self.assertGreater(limit, 0)
-        self.assertLess(limit, .012)
-        self.assertGreater(self.policy.limit(.156, [0, 0], 0), limit)
+    def test_distance_speed_is_continuous_and_respects_global_cap(self):
+        policy = GapLimitedApproachSpeed(DockingConfig())
+        for gap, expected in [(.4, .1), (.225, .075), (.15, .05), (.05, .05)]:
+            self.assertAlmostEqual(policy.limit(gap), expected)
+        for gap in (.15, .3):
+            self.assertLess(abs(policy.limit(gap-1e-7)-policy.limit(gap+1e-7)), 1e-6)
+        self.assertAlmostEqual(GapLimitedApproachSpeed(DockingConfig(approach_speed=.03)).limit(.05), .03)
 
-    def test_yaw_wrap_and_geometry_noise_do_not_create_speed_jumps(self):
-        self.assertAlmostEqual(self.policy.limit(.1, [0, 0], .01),
-                               self.policy.limit(.1, [0, 0], 2*np.pi+.01))
-        for error in (.0, .01, .02):
-            lo = self.policy.limit(.1, [error-1e-7, 0], 0)
-            hi = self.policy.limit(.1, [error+1e-7, 0], 0)
-            self.assertLess(abs(hi-lo), 1e-6)
+    def test_prealign_releases_without_dwell_and_angles_wrap(self):
+        g = DockingGuidance(DockingConfig())
+        self.assertEqual(g.update(0, [.15, .02, .02], [0, 0, 0], [.15, 0, 0]), 'prealign')
+        self.assertEqual(g.update(.025, [.15, .005, .005], [0, 0, 2*np.pi+.01], [.15, 0, 0]), 'approach')
 
-    def test_prealign_speed_and_common_yaw_goal_are_unaffected(self):
-        g = DockingGuidance(self.c)
-        g.update(0, [.9, .1, .1], [0, 0, .3], [.9, .1, .1])
-        g.update(.025, [.9, .1, .1], [0, 0, .3], [.9, .1, .1])
-        self.assertEqual(g.phase, 'prealign')
-        self.assertAlmostEqual(g.axial_velocity, -.1)
-
-    def test_speed_scales_are_loaded_and_validated_independently(self):
-        for name in ('approach_alignment_y_scale', 'approach_alignment_z_scale',
-                     'approach_alignment_yaw_scale', 'approach_min_speed_scale'):
+    def test_fine_alignment_parameters_are_positive_and_finite(self):
+        for name in ('prealign_y_tolerance', 'prealign_z_tolerance', 'prealign_yaw_tolerance'):
             for value in (0, -1, float('nan'), float('inf')):
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
                     DockingConfig(**{name: value})
-        with self.assertRaises(ValueError):
-            DockingConfig(approach_min_speed_scale=1.01)
-        disabled = AlignmentAwareApproachSpeed(DockingConfig(approach_min_speed_scale=1))
-        self.assertAlmostEqual(disabled.limit(.1, [.1, .1], 1), .03)
 
 
 if __name__ == '__main__':

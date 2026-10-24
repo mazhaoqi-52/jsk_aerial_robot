@@ -104,13 +104,15 @@ class HeightCorrectionTest(unittest.TestCase):
 
     def test_guidance_limits_contact_height_drift_without_aborting_approach(self):
         g = DockingGuidance(DockingConfig())
+        g.update(-.25, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         for i in range(1, 1601):
             # Good FC tracking but a persistent interface mismatch.
             phase = g.update(i*.025, [.044, 0, .02], [0, 0, 0], g.command.copy())
         self.assertEqual(phase, 'approach')
         self.assertAlmostEqual(g.command[2], -.015)
-        self.assertAlmostEqual(g.command[0], g.approach_goal_x)
+        self.assertAlmostEqual(g.command[0], .15)
+        self.assertEqual(g.axial_velocity, 0)
         self.assertEqual(g.velocity[2], 0)
 
     def test_filter_reset_keeps_contact_budget_without_velocity_spike(self):
@@ -126,6 +128,7 @@ class HeightCorrectionTest(unittest.TestCase):
 
     def test_height_keeps_correcting_old_lock_geometry_until_actual_completion(self):
         g = DockingGuidance(DockingConfig())
+        g.update(-.25, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(.025, [.04, .006, -.014], [0, 0, 0], [.04, 0, 0])
         z = g.command[2]
@@ -137,6 +140,7 @@ class HeightCorrectionTest(unittest.TestCase):
 
     def test_height_resumes_when_fc_recovers_from_tracking_limit_at_four_cm(self):
         g = DockingGuidance(DockingConfig())
+        g.update(-.25, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         # The interface remains low; FC initially cannot follow the target.
         g.update(.025, [.04, .006, -.014], [0, 0, 0], [.04, 0, -.05], [.04, 0, -.04])

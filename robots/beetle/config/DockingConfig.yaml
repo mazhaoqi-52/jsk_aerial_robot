@@ -5,6 +5,8 @@ docking:
   prealign_z_tolerance: 0.008  # fine height alignment before insertion, m
   prealign_angle_tolerance_deg: 3.0  # mutual roll/pitch before insertion
   prealign_yaw_tolerance_deg: 2.0  # mutual yaw before insertion
+  prealign_hold_duration: 0.25  # continuous fine alignment before insertion/resume, s
+  approach_alignment_gap: 0.10  # hold X on misalignment at/below this measured or waypoint gap, m
   angle_tolerance_deg: 8.6     # final locking RPY tolerance (~original 0.15 rad)
   approach_speed: 0.1          # axial waypoint speed upper bound, m/s
   near_approach_speed: 0.05    # insertion speed cap after fine prealignment, m/s

@@ -171,7 +171,8 @@ class DockingMotion:
         # Use the same desired orientation for FC tracking bounds and publication.
         self.reference.update(dt)
         tracking = self.reference.tracking_position(self.last_pose, baselinks[1])
-        phase = self.guidance.update(now, position, angles, trajectory, tracking)
+        phase = self.guidance.update(now, position, angles, trajectory, tracking,
+                                     self.reference.tracking_offset(baselinks[1]))
         if self.guidance.command is not None:
             target_pose = self.reference.follower_pose(self.guidance.command, baselinks[1])
             feedforward = self.reference.world_velocity(self.guidance.velocity)
@@ -182,7 +183,7 @@ class DockingMotion:
             rospy.loginfo('[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s', phase, position[0],
                           position[1:].tolist(), np.degrees(angles).tolist())
             self.last_phase = phase
-        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f relative_vz=%.3f height_limited=%s relative_vy=%.3f lateral_limited=%s fc_tracking_yz=%s height_limit_reason=%s lateral_limit_reason=%s' %
+        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f relative_vz=%.3f height_limited=%s relative_vy=%.3f lateral_limited=%s fc_tracking_yz=%s height_limit_reason=%s lateral_limit_reason=%s prealign_elapsed=%.3f axial_holding=%s recovery_elapsed=%.3f' %
                                (phase, position[0], position[1:].tolist(), np.degrees(angles).tolist(),
                                 self.guidance.command.tolist(), self.guidance.axial_velocity,
                                 target_pose[2, 3],
@@ -192,6 +193,9 @@ class DockingMotion:
                                 self.guidance.lateral_correction.integration_limited,
                                 self.guidance.tracking_error[1:].tolist(),
                                 self.guidance.height_correction.limit_reason,
-                                self.guidance.lateral_correction.limit_reason))
+                                self.guidance.lateral_correction.limit_reason,
+                                self.guidance.prealignment.elapsed,
+                                self.guidance.approach_alignment.holding,
+                                self.guidance.approach_alignment.recovery.elapsed))
         self.rate.sleep()
         return phase

@@ -85,10 +85,16 @@ class FixedDockingReference:
         command - result is the FC tracking error in the fixed docking axes.
         Actual connector tilt remains part of alignment feedback, not FC lag.
         """
+        coordinates = self.frame[:3, :3].T @ (
+            actual_baselink[:3, 3]-self.frame[:3, 3])
+        coordinates[0] *= self.direction
+        return coordinates-self.tracking_offset(root_baselink)
+
+    def tracking_offset(self, root_baselink):
+        """Desired interface-to-FC displacement in signed docking coordinates."""
         desired_offset = (tr.quaternion_matrix(self.orientations[1]) @
                           np.linalg.inv(self.connectors[1]) @ root_baselink)[:3, 3]
-        coordinates = self.frame[:3, :3].T @ (
-            actual_baselink[:3, 3]-desired_offset-self.frame[:3, 3])
+        coordinates = self.frame[:3, :3].T @ desired_offset
         coordinates[0] *= self.direction
         return coordinates
 

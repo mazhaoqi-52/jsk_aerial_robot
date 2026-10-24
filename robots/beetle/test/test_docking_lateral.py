@@ -41,6 +41,9 @@ class LateralCorrectionTest(unittest.TestCase):
     def test_braking_is_active_in_prealign_and_approach(self):
         for x, expected_phase in ((.4, 'prealign'), (.15, 'approach')):
             g = DockingGuidance(DockingConfig())
+            if expected_phase == 'approach':
+                g.update(-.5, [.15, 0, 0], [0, 0, 0], [.15, -.015, 0])
+                g.update(-.25, [.15, 0, 0], [0, 0, 0], [.15, -.015, 0])
             g.update(0, [x, -.015, 0], [0, 0, 0], [x, -.015, 0])
             for i in range(1, 8):
                 phase = g.update(i*.025, [x, -.015+i*.0015, 0], [0, 0, 0], [x, 0, 0])
@@ -60,6 +63,7 @@ class LateralCorrectionTest(unittest.TestCase):
 
     def test_four_to_five_cm_band_keeps_bounded_correction_and_height_budget(self):
         g = DockingGuidance(DockingConfig())
+        g.update(-.25, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(.025, [.045, .01, -.01], [0, 0, 0], [.045, .01, -.01])
         self.assertLess(g.velocity[1], 0)
@@ -144,6 +148,7 @@ class LateralCorrectionTest(unittest.TestCase):
 
     def test_unlocked_approach_cannot_keep_accumulating_lateral_contact_targets(self):
         g = DockingGuidance(DockingConfig())
+        g.update(-.25, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         g.update(0, [.15, 0, 0], [0, 0, 0], [.15, 0, 0])
         for i in range(1, 1001):
             # Replay the failed trial's residual mismatch with good local tracking.

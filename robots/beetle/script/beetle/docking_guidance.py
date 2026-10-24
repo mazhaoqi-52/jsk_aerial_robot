@@ -12,6 +12,8 @@ class DockingConfig:
     prealign_z_tolerance: float = 0.008
     prealign_angle_tolerance: float = math.radians(3.0)
     prealign_yaw_tolerance: float = math.radians(2.0)
+    prealign_hold_duration: float = 0.25
+    approach_alignment_gap: float = 0.10
     angle_tolerance: float = math.radians(8.6)
     approach_speed: float = 0.1
     near_approach_speed: float = 0.05
@@ -41,6 +43,9 @@ class DockingConfig:
             minimum_ok = value >= 0 if name in ('height_velocity_damping', 'lateral_velocity_damping') else value > 0
             if not math.isfinite(value) or not minimum_ok:
                 raise ValueError('Invalid docking parameter: %s' % name)
+        if not (max(self.contact_height_correction_gap, self.contact_lateral_correction_gap)
+                < self.approach_alignment_gap < self.prealign_gap):
+            raise ValueError('approach_alignment_gap must lie between contact and prealignment gaps')
 
 
 def move_towards(current, target, step):
@@ -88,6 +93,63 @@ class GapLimitedApproachSpeed:
         c = self.config
         return min(c.approach_speed,
                    c.near_approach_speed*max(1.0, gap/c.approach_slowdown_distance))
+
+
+class AlignmentDwell:
+    """Require consecutive aligned observations on the local control clock."""
+    def __init__(self, duration):
+        self.duration = duration
+        self.reset()
+
+    def reset(self):
+        self.since = None
+        self.elapsed = 0.0
+
+    def update(self, stamp, aligned):
+        if not aligned:
+            self.reset()
+            return False
+        if self.since is None or stamp < self.since:
+            self.since = stamp
+        self.elapsed = stamp-self.since
+        return self.elapsed >= self.duration
+
+
+class AlignmentLimitedApproach:
+    """Replace inward position lead with a fixed FC hold when alignment is lost.
+
+    Check both measured separation and the next waypoint, so a leading waypoint
+    cannot keep pulling toward contact before the measured gap reaches the gate.
+    """
+    def __init__(self, config):
+        self.gap = config.approach_alignment_gap
+        self.recovery = AlignmentDwell(config.prealign_hold_duration)
+        self.reset()
+
+    @property
+    def holding(self):
+        return self.hold_x is not None
+
+    def reset(self):
+        self.hold_x = None
+        self.recovery.reset()
+
+    def held_command(self, offset_x):
+        return self.hold_x-offset_x
+
+    def update(self, stamp, gap, aligned, actual_x, candidate_x, offset_x=0.0):
+        waypoint_gap = gap+candidate_x-actual_x
+        if not self.holding and min(gap, waypoint_gap) <= self.gap and not aligned:
+            # Latch the FC coordinate itself, so continued attitude slew cannot
+            # move the hold through the interface-to-FC lever arm.
+            self.hold_x = float(actual_x+offset_x)
+            self.recovery.reset()
+        if self.holding:
+            if self.recovery.update(stamp, aligned):
+                self.hold_x = None
+            else:
+                return self.held_command(offset_x)
+        return candidate_x
 
 
 class BoundedDampedCorrection:
@@ -174,6 +236,8 @@ class DockingGuidance:
         self.velocity = np.zeros(3)
         self.correction = RelativePositionCorrection(config.relative_correction_gain)
         self.approach_speed_policy = GapLimitedApproachSpeed(config)
+        self.prealignment = AlignmentDwell(config.prealign_hold_duration)
+        self.approach_alignment = AlignmentLimitedApproach(config)
         self.lateral_correction = DampedLateralCorrection(config)
         self.height_correction = DampedHeightCorrection(config)
         self.approach_goal_x = None
@@ -188,6 +252,8 @@ class DockingGuidance:
         self.command = None
         self.previous_time = None
         self.velocity[:] = 0.0
+        self.prealignment.reset()
+        self.approach_alignment.reset()
         self.lateral_correction.reset_velocity()
         self.height_correction.reset_velocity()
 
@@ -198,7 +264,8 @@ class DockingGuidance:
             return c.approach_speed
         return self.approach_speed_policy.limit(gap)
 
-    def update(self, stamp, position, angles, trajectory_position, tracking_position=None):
+    def update(self, stamp, position, angles, trajectory_position, tracking_position=None,
+               tracking_offset=None):
         """Align relative position, then approach along a fixed insertion axis.
 
         stamp is the local control clock, not a comparison with remote TF time.
@@ -209,7 +276,8 @@ class DockingGuidance:
         # The adapter maps actual FC position into equivalent command coordinates.
         # Offline callers with matching actual/desired attitude may use q directly.
         tracking = q if tracking_position is None else np.asarray(tracking_position, dtype=float)
-        if not np.all(np.isfinite(np.r_[stamp, p, r, q, tracking])):
+        offset = np.zeros(3) if tracking_offset is None else np.asarray(tracking_offset, dtype=float)
+        if not np.all(np.isfinite(np.r_[stamp, p, r, q, tracking, offset])):
             raise ValueError('Non-finite docking feedback')
         self.velocity[:] = 0.0
         if self.phase == 'complete':
@@ -219,16 +287,17 @@ class DockingGuidance:
         if self.command is None:
             self.command = q.copy()
         angle_errors = np.abs((r+np.pi) % (2*np.pi)-np.pi)
+        fine_aligned = (abs(p[1]) < c.prealign_y_tolerance and
+                        abs(p[2]) < c.prealign_z_tolerance and
+                        np.all(angle_errors[:2] < c.prealign_angle_tolerance) and
+                        angle_errors[2] < c.prealign_yaw_tolerance)
         old_command = self.command.copy()
+        was_holding = self.approach_alignment.holding
         if self.phase == 'prealign':
             error = p-np.array([c.prealign_gap, 0, 0])
             self.command[0] += self.correction.velocity(error[0], c.approach_speed)*dt
-            arrived = (abs(p[0]-c.prealign_gap) < c.position_tolerance and
-                       abs(p[1]) < c.prealign_y_tolerance and
-                       abs(p[2]) < c.prealign_z_tolerance and
-                       np.all(angle_errors[:2] < c.prealign_angle_tolerance) and
-                       angle_errors[2] < c.prealign_yaw_tolerance)
-            if arrived:
+            arrived = abs(p[0]-c.prealign_gap) < c.position_tolerance and fine_aligned
+            if self.prealignment.update(stamp, arrived):
                 # Fix X once using the leader's current interface position,
                 # not its potentially displaced position at initial capture.
                 self.approach_goal_x = float(q[0]-p[0]-c.insertion_depth)
@@ -241,12 +310,17 @@ class DockingGuidance:
             if arrived:
                 self.command = tracking.copy()
                 self.tracking_error[:] = 0.0
+                self.approach_alignment.reset()
                 self.phase = 'complete'
                 return self.phase
             old_x = self.command[0]
+            if self.approach_alignment.holding:
+                old_x = self.approach_alignment.held_command(offset[0])
             speed = min(self.axial_speed_limit(p[0]),
                         c.slowdown_gain*abs(self.approach_goal_x-old_x))
-            self.command[0] = move_towards(old_x, self.approach_goal_x, speed*dt)
+            candidate_x = move_towards(old_x, self.approach_goal_x, speed*dt)
+            self.command[0] = self.approach_alignment.update(
+                stamp, p[0], fine_aligned, tracking[0], candidate_x, offset[0])
         lateral_contact = self.phase == 'approach' and p[0] <= c.contact_lateral_correction_gap
         self.command[1] = self.lateral_correction.update(
             self.command[1], p[1], tracking[1], dt, lateral_contact)
@@ -256,4 +330,13 @@ class DockingGuidance:
         self.tracking_error = self.command-tracking
         if dt > 0:
             self.velocity = (self.command-old_command)/dt
+        if self.approach_alignment.holding:
+            # Cancelling an inward waypoint is a position reset, not a retreat
+            # velocity request. Y/Z feedforward and correction remain active.
+            self.velocity[0] = 0.0
+        elif was_holding and dt > 0:
+            # old_x already compensates this tick's attitude lever-arm change.
+            # Resume at the FC insertion speed rather than differentiating that
+            # geometric adjustment as an extra axial velocity.
+            self.velocity[0] = (self.command[0]-old_x)/dt
         return self.phase

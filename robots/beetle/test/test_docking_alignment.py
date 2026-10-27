@@ -56,90 +56,13 @@ class AdapterTest(unittest.TestCase):
         stamps = [call.args[2].to_sec() for call in self.m.listener.lookupTransform.call_args_list]
         self.assertTrue(all(abs(t-(self.now-.01)) < 1e-8 for t in stamps))
 
-    def test_pitch_offset_does_not_spend_fc_height_tracking_budget(self):
-        self.leader = connector_matrix([1, 2, .8], [0, 0, 0])
-        self.follower = self.leader @ connector_matrix([.67, 0, 0], [0, 0, 0])
-        self.m.tick()
-        before = self.m.publisher.publish.call_args[0][0]
-        actual_fc = connector_matrix([before.target_pos_x, before.target_pos_y, before.target_pos_z-.02],
-                                     [0, np.radians(-3), 0])
-        self.follower = actual_fc @ np.linalg.inv(self.root_fc)
-        self.now += .025
-        self.m.tick()
-        after = self.m.publisher.publish.call_args[0][0]
-        # Physical interface lag exceeds 3 cm, but FC lag is only 2 cm.
-        interface = self.m.reference.feedback((self.leader, self.follower))[1]
-        self.assertGreater(self.m.guidance.command[2]-interface[2], .03)
-        self.assertGreater(after.target_pos_z, before.target_pos_z)
-        self.assertLess(self.m.guidance.tracking_error[2], .03)
-        self.assertFalse(self.m.guidance.height_correction.integration_limited)
-        self.assertAlmostEqual(self.m.guidance.tracking_error[2], after.target_pos_z-actual_fc[2, 3])
-
-    def test_final_hold_preserves_actual_fc_position_with_remaining_pitch(self):
-        self.leader = connector_matrix([1, 2, .8], [0, 0, 0])
-        self.follower = self.leader @ connector_matrix([.67, 0, 0], [0, 0, 0])
-        self.m.tick()
-        self.now += .25
-        self.assertEqual(self.m.tick(), 'approach')
-        leader_iface = self.leader @ self.m.leader_connector
-        actual_iface = leader_iface @ connector_matrix([.01, .005, -.005], [0, np.radians(-3), 0])
-        self.follower = actual_iface @ np.linalg.inv(self.m.follower_connector)
-        actual_fc = self.follower @ self.root_fc
-        self.now += .025
-        self.assertEqual(self.m.tick(), 'complete')
-        msg = self.m.publisher.publish.call_args[0][0]
-        np.testing.assert_allclose([msg.target_pos_x, msg.target_pos_y, msg.target_pos_z], actual_fc[:3, 3], atol=1e-12)
-
-    def test_alignment_hold_publishes_fixed_fc_x_while_attitude_slew_continues(self):
-        for direction in (1, -1):
-            self.m = DockingMotion('beetle2', 'beetle3', direction)
-            self.refresh_flight()
-            self.m.listener.getLatestCommonTime.side_effect = lambda *a: rospy.Time.from_sec(self.now-.01)
-            self.m.listener.lookupTransform.side_effect = self.lookup
-            self.leader = connector_matrix([1, 2, .8], [0, 0, .3])
-            self.follower = self.leader @ connector_matrix([direction*.67, 0, 0], [0, 0, 0])
-            self.m.tick()
-            self.now += .25
-            self.assertEqual(self.m.tick(), 'approach')
-            # A leading waypoint must be replaced by actual FC X, while a pending
-            # attitude slew still changes the interface-to-FC geometric offset.
-            self.m.guidance.command[0] = .02
-            self.follower = self.leader @ connector_matrix([direction*.61, .01, -.02], [0, 0, 0])
-            actual_fc = self.follower @ self.root_fc
-            self.m.reference.orientations[1] = tf.transformations.quaternion_from_euler(0, direction*.06, .3)
-            axis = self.m.reference.frame[:3, 0]
-            height_commands = []
-            for _ in range(3):
-                self.now += .025
-                self.assertEqual(self.m.tick(), 'approach')
-                self.assertTrue(self.m.guidance.approach_alignment.holding)
-                msg = self.m.publisher.publish.call_args[0][0]
-                position = np.array([msg.target_pos_x, msg.target_pos_y, msg.target_pos_z])
-                height_commands.append(self.m.guidance.command[2])
-                self.assertAlmostEqual(axis @ position, axis @ actual_fc[:3, 3])
-                self.assertAlmostEqual(axis @ [msg.target_vel_x, msg.target_vel_y, msg.target_vel_z], 0)
-                self.assertEqual(msg.pos_xy_nav_mode, FlightNav.POS_VEL_MODE)
-                self.assertEqual(msg.roll_nav_mode, FlightNav.POS_MODE)
-                self.assertEqual(msg.pitch_nav_mode, FlightNav.POS_MODE)
-            self.assertGreater(height_commands[-1], height_commands[0])
-
     def test_ros_loads_separate_angle_and_near_speed_parameters(self):
         values = {'~docking/prealign_angle_tolerance_deg': 2.5,
-                  '~docking/prealign_hold_duration': .3,
-                  '~docking/approach_alignment_gap': .09,
                   '~docking/angle_tolerance_deg': 7.0,
                   '~docking/near_approach_speed': .04,
                   '~docking/approach_slowdown_distance': .12,
                   '~docking/relative_correction_gain': .6,
-                  '~docking/prealign_y_tolerance': .007,
-                  '~docking/prealign_z_tolerance': .006,
-                  '~docking/prealign_yaw_tolerance_deg': 1.5,
-                  '~docking/lateral_velocity_damping': .3,
-                  '~docking/lateral_velocity_filter_time': .2,
-                  '~docking/lateral_tracking_error_limit': .025,
-                  '~docking/contact_lateral_correction_limit': .008,
-                  '~docking/contact_lateral_correction_gap': .055,
-                  '~docking/contact_height_correction_gap': .055,
+                  '~docking/contact_lock_gap': .04,
                   '~docking/height_correction_gain': .15,
                   '~docking/height_correction_speed': .008,
                   '~docking/height_velocity_damping': .3,
@@ -154,13 +77,8 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(config.near_approach_speed, .04)
         self.assertEqual(config.approach_slowdown_distance, .12)
         self.assertEqual(config.relative_correction_gain, .6)
-        self.assertAlmostEqual(config.prealign_yaw_tolerance, np.radians(1.5))
-        for name in ('lateral_velocity_damping', 'lateral_velocity_filter_time',
-                     'prealign_hold_duration', 'approach_alignment_gap',
-                     'lateral_tracking_error_limit', 'contact_lateral_correction_limit',
-                     'contact_lateral_correction_gap', 'prealign_y_tolerance', 'prealign_z_tolerance',
-                     'contact_height_correction_gap',
-                     'height_correction_gain', 'height_correction_speed', 'height_velocity_damping',
+        self.assertEqual(config.contact_lock_gap, .04)
+        for name in ('height_correction_gain', 'height_correction_speed', 'height_velocity_damping',
                      'height_velocity_filter_time', 'height_tracking_error_limit',
                      'contact_height_correction_limit'):
             self.assertEqual(getattr(config, name), values['~docking/'+name])

@@ -16,14 +16,9 @@ class GuidanceTest(unittest.TestCase):
     def step(self, t, p=(.15, 0, 0), r=(0, 0, 0), q=None):
         return self.g.update(t, p, r, p if q is None else q)
 
-    def start_approach(self, q=None):
-        self.step(-self.g.config.prealign_hold_duration, q=q)
-        self.assertEqual(self.step(0, q=q), 'approach')
-
-    def test_prealignment_requires_continuous_basic_arrival(self):
+    def test_prealignment_requires_basic_arrival_but_no_dwell(self):
         self.assertEqual(self.step(0, (.3, .1, .08)), 'prealign')
-        self.assertEqual(self.step(.025, (.15, .005, .005), np.radians([2, 0, 0])), 'prealign')
-        self.assertEqual(self.step(.275, (.15, .005, .005), np.radians([2, 0, 0])), 'approach')
+        self.assertEqual(self.step(.025, (.15, .01, .01), np.radians([2, 0, 0])), 'approach')
 
     def test_prealignment_checks_each_coordinate_and_relative_angle(self):
         for p, r in [((.175, 0, 0), (0, 0, 0)), ((.125, 0, 0), (0, 0, 0)),
@@ -39,7 +34,7 @@ class GuidanceTest(unittest.TestCase):
                                    np.radians([-4.35, -5.57, 2.70])), 'prealign')
 
     def test_near_approach_uses_measured_gap_even_with_far_fixed_waypoint(self):
-        self.start_approach(q=(.4, 0, 0))
+        self.step(0, q=(.4, 0, 0))
         self.step(.025, (.12, 0, 0), q=(.4, 0, 0))
         self.assertAlmostEqual(self.g.axial_velocity, -.05)
         self.assertAlmostEqual(self.g.command[0], .39875)
@@ -48,22 +43,21 @@ class GuidanceTest(unittest.TestCase):
         speeds = []
         for gap, expected in [(.4, .1), (.225, .075), (.15, .05), (.08, .05), (-.02, .05)]:
             self.g = DockingGuidance(DockingConfig())
-            self.start_approach(q=(.4, 0, 0))
-            # Overshoot past the final interval avoids completion without
-            # introducing misalignment, which now correctly holds near X.
-            self.step(.025, (gap if gap >= 0 else -.06, 0, 0), q=(.4, 0, 0))
+            self.step(0, q=(.4, 0, 0))
+            # Keep a lateral error to avoid completing the docking stage.
+            self.step(.025, (gap, .03, 0), q=(.4, 0, 0))
             speeds.append(abs(self.g.axial_velocity))
             self.assertAlmostEqual(speeds[-1], expected)
         self.assertTrue(all(a >= b for a, b in zip(speeds, speeds[1:])))
 
     def test_global_speed_limit_also_applies_to_near_approach(self):
         self.g = DockingGuidance(DockingConfig(approach_speed=.03))
-        self.start_approach(q=(.4, 0, 0))
+        self.step(0, q=(.4, 0, 0))
         self.step(.025, (.08, 0, 0), q=(.4, 0, 0))
         self.assertAlmostEqual(self.g.axial_velocity, -.03)
 
     def test_final_angle_tolerance_is_independent_of_prealignment(self):
-        self.start_approach()
+        self.step(0)
         self.assertEqual(self.step(.025, (.01, 0, 0), np.radians([0, 5, 0])), 'complete')
 
     def test_misalignment_does_not_block_motion_to_prealignment_point(self):
@@ -73,14 +67,13 @@ class GuidanceTest(unittest.TestCase):
         self.assertAlmostEqual(self.g.axial_velocity, -.1)
         self.assertEqual(self.g.phase, 'prealign')
 
-    def test_approach_holds_under_disturbance_without_aborting(self):
-        self.start_approach()
-        for i in range(1, 2000):
+    def test_approach_continues_under_disturbance_without_retreat_or_abort(self):
+        self.step(0)
+        for i in range(1, 500):
             self.step(i*.025, (.1, .12, -.1), (.3, .3, .3))
             self.assertEqual(self.g.phase, 'approach')
-        self.assertAlmostEqual(self.g.command[0], .1)
-        self.assertEqual(self.g.axial_velocity, 0)
-        self.assertTrue(self.g.approach_alignment.holding)
+        self.assertGreaterEqual(self.g.command[0], -.05)
+        self.assertAlmostEqual(self.g.command[0], -.05, places=5)
 
     def test_measurement_motion_cannot_drag_the_fixed_waypoint(self):
         self.step(0, (.925, -.103, .051))
@@ -120,48 +113,48 @@ class GuidanceTest(unittest.TestCase):
         self.assertAlmostEqual(self.g.velocity[2], -.01)
 
     def test_approach_goal_uses_current_leader_and_stays_fixed(self):
-        self.start_approach(q=(.22, 0, 0))
+        self.step(0, (.15, 0, 0), q=(.22, 0, 0))
         self.assertAlmostEqual(self.g.approach_goal_x, .02)
         self.step(.025, (.1, .03, -.04), q=(.4, .05, .06))
         self.assertAlmostEqual(self.g.approach_goal_x, .02)
-        # The old Y target is already 5 cm behind actual: do not add more lead.
-        self.assertEqual(self.g.velocity[1], 0)
-        self.assertTrue(self.g.lateral_correction.integration_limited)
+        self.assertLess(self.g.velocity[1], 0)
         self.assertGreater(self.g.velocity[2], 0)
 
-    def test_contact_keeps_correcting_small_offsets_while_x_holds(self):
-        self.start_approach()
-        self.step(.025, (.08, .006, -.014), q=(.08, 0, 0))
+    def test_contact_locks_lateral_target_once_but_insertion_continues(self):
+        self.step(0)
+        self.step(.025, (.08, .03, -.04))
         yz = self.g.command[1:].copy()
         x = self.g.command[0]
-        self.step(.05, (.04, .006, -.014), q=(.04, 0, 0))
-        self.assertLess(self.g.command[1], yz[0])
-        self.assertGreater(self.g.command[2], yz[1])
-        self.assertEqual(self.g.command[0], x)
-        self.assertEqual(self.g.axial_velocity, 0)
+        self.step(.05, (.04, .01, -.01))
+        self.assertTrue(self.g.correction_locked)
+        np.testing.assert_allclose(self.g.command[1:], yz)
+        self.assertLess(self.g.command[0], x)
+        self.step(.075, (.04, -.1, .1))
+        np.testing.assert_allclose(self.g.command[1:], yz)
+        np.testing.assert_allclose(self.g.velocity[1:], [0, 0])
         self.assertAlmostEqual(self.g.approach_goal_x, -.05)
 
-    def test_contact_correction_remains_active_despite_angle_error(self):
-        self.start_approach()
-        self.step(.025, (.04, .03, 0), q=(.04, 0, 0))
+    def test_contact_lock_waits_for_alignment(self):
+        self.step(0)
+        self.step(.025, (.04, .03, 0))
+        self.assertFalse(self.g.correction_locked)
         self.assertLess(self.g.velocity[1], 0)
         self.step(.05, (.04, .01, .01), r=(0, .2, 0))
-        self.assertEqual(self.g.phase, 'approach')
-        self.assertNotEqual(self.g.velocity[2], 0)
+        self.assertFalse(self.g.correction_locked)
 
-    def test_tf_interruption_preserves_insertion_goal_and_contact_budgets(self):
-        self.start_approach()
+    def test_tf_interruption_preserves_insertion_goal_and_contact_lock(self):
+        self.step(0)
         self.step(.025, (.04, .01, .01))
-        anchors = (self.g.lateral_correction.contact_anchor, self.g.height_correction.contact_anchor)
+        self.assertTrue(self.g.correction_locked)
         self.g.suspend()
         self.step(10, (.035, 0, 0), q=(.06, .02, .03))
         self.assertAlmostEqual(self.g.approach_goal_x, -.05)
-        self.assertEqual((self.g.lateral_correction.contact_anchor, self.g.height_correction.contact_anchor), anchors)
+        self.assertTrue(self.g.correction_locked)
         np.testing.assert_allclose(self.g.command, [.06, .02, .03])
         np.testing.assert_allclose(self.g.velocity, [0, 0, 0])
 
     def test_immediate_lock_when_final_geometry_arrives(self):
-        self.start_approach()
+        self.step(0)
         # Even a rapid measured change is not a velocity or holding-time gate.
         self.assertEqual(self.step(.025, (.01, .005, .005)), 'complete')
         self.assertEqual(self.g.axial_velocity, 0)
@@ -174,12 +167,12 @@ class GuidanceTest(unittest.TestCase):
                      ((0, .021, 0), (0, 0, 0)), ((0, 0, .016), (0, 0, 0)),
                      ((0, 0, 0), (0, .2, 0))]:
             self.g = DockingGuidance(DockingConfig())
-            self.start_approach()
+            self.step(0)
             self.assertEqual(self.step(.025, p, r), 'approach')
         self.assertEqual(self.step(.05, (0, 0, 0)), 'complete')
 
     def test_tf_interruption_resumes_same_phase_without_target_jump(self):
-        self.start_approach()
+        self.step(0)
         self.step(.025, (.1, 0, 0))
         self.g.suspend()
         self.assertEqual(self.g.phase, 'approach')

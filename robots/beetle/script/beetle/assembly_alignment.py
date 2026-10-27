@@ -40,7 +40,7 @@ class DockingMotion:
         defaults = DockingConfig()
         parameters = {}
         for name, value in vars(defaults).items():
-            if name.endswith('angle_tolerance') or name == 'prealign_yaw_tolerance':
+            if name.endswith('angle_tolerance'):
                 parameters[name] = math.radians(rospy.get_param('~docking/'+name+'_deg', math.degrees(value)))
             else:
                 parameters[name] = rospy.get_param('~docking/'+name, value)
@@ -168,12 +168,9 @@ class DockingMotion:
         now = rospy.Time.now().to_sec()
         previous = self.guidance.previous_time
         dt = 0.0 if previous is None else max(0.0, now-previous)
-        # Use the same desired orientation for FC tracking bounds and publication.
-        self.reference.update(dt)
-        tracking = self.reference.tracking_position(self.last_pose, baselinks[1])
-        phase = self.guidance.update(now, position, angles, trajectory, tracking,
-                                     self.reference.tracking_offset(baselinks[1]))
+        phase = self.guidance.update(now, position, angles, trajectory)
         if self.guidance.command is not None:
+            self.reference.update(dt)
             target_pose = self.reference.follower_pose(self.guidance.command, baselinks[1])
             feedforward = self.reference.world_velocity(self.guidance.velocity)
             self.publish_leader_attitude(baselinks[0])
@@ -183,19 +180,11 @@ class DockingMotion:
             rospy.loginfo('[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s', phase, position[0],
                           position[1:].tolist(), np.degrees(angles).tolist())
             self.last_phase = phase
-        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f relative_vz=%.3f height_limited=%s relative_vy=%.3f lateral_limited=%s fc_tracking_yz=%s height_limit_reason=%s lateral_limit_reason=%s prealign_elapsed=%.3f axial_holding=%s recovery_elapsed=%.3f' %
+        rospy.loginfo_throttle(.5, '[Docking] phase=%s gap=%.3f yz=%s relative_rpy_deg=%s target_xyz=%s axial_cmd=%.3f target_fc_z=%.3f correction_locked=%s relative_vz=%.3f height_limited=%s' %
                                (phase, position[0], position[1:].tolist(), np.degrees(angles).tolist(),
                                 self.guidance.command.tolist(), self.guidance.axial_velocity,
-                                target_pose[2, 3],
+                                target_pose[2, 3], self.guidance.correction_locked,
                                 self.guidance.height_correction.relative_velocity,
-                                self.guidance.height_correction.integration_limited,
-                                self.guidance.lateral_correction.relative_velocity,
-                                self.guidance.lateral_correction.integration_limited,
-                                self.guidance.tracking_error[1:].tolist(),
-                                self.guidance.height_correction.limit_reason,
-                                self.guidance.lateral_correction.limit_reason,
-                                self.guidance.prealignment.elapsed,
-                                self.guidance.approach_alignment.holding,
-                                self.guidance.approach_alignment.recovery.elapsed))
+                                self.guidance.height_correction.integration_limited))
         self.rate.sleep()
         return phase

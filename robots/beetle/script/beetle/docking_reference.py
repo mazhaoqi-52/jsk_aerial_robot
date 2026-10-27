@@ -79,25 +79,6 @@ class FixedDockingReference:
         interface[:3, 3] = self.frame[:3, 3]+self.frame[:3, :3] @ coordinates
         return interface @ np.linalg.inv(self.connectors[1]) @ root_baselink
 
-    def tracking_position(self, actual_baselink, root_baselink):
-        """Express measured FC as an equivalent command at the desired attitude.
-
-        command - result is the FC tracking error in the fixed docking axes.
-        Actual connector tilt remains part of alignment feedback, not FC lag.
-        """
-        coordinates = self.frame[:3, :3].T @ (
-            actual_baselink[:3, 3]-self.frame[:3, 3])
-        coordinates[0] *= self.direction
-        return coordinates-self.tracking_offset(root_baselink)
-
-    def tracking_offset(self, root_baselink):
-        """Desired interface-to-FC displacement in signed docking coordinates."""
-        desired_offset = (tr.quaternion_matrix(self.orientations[1]) @
-                          np.linalg.inv(self.connectors[1]) @ root_baselink)[:3, 3]
-        coordinates = self.frame[:3, :3].T @ desired_offset
-        coordinates[0] *= self.direction
-        return coordinates
-
     def leader_attitude(self, root_baselink):
         return tr.quaternion_matrix(self.orientations[0]) @ np.linalg.inv(self.connectors[0]) @ root_baselink
 

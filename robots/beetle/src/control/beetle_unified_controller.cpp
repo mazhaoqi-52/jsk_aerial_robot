@@ -86,6 +86,61 @@ BeetleUnifiedController::BeetleUnifiedController()
 
 BeetleUnifiedController::~BeetleUnifiedController() = default;
 
+bool BeetleUnifiedController::setAllocationMethod(const std::string& method)
+{
+  AllocationMethod selected;
+  if (method == "configured") selected = AllocationMethod::CONFIGURED;
+  else if (method == "qp") selected = AllocationMethod::QP;
+  else if (method == "pinv") selected = AllocationMethod::PINV;
+  else return false;
+
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  if (allocation_method_ != selected) {
+    allocation_method_ = selected;
+    resetQPState();
+  }
+  return true;
+}
+
+bool BeetleUnifiedController::usesConstrainedAllocation() const
+{
+  return allocation_method_ == AllocationMethod::QP ||
+      (allocation_method_ == AllocationMethod::CONFIGURED && use_constrained_alloc_);
+}
+
+Eigen::VectorXd BeetleUnifiedController::computeUnconstrainedAllocation(
+    const Eigen::VectorXd& target, const Eigen::VectorXd& secondary_ref) const
+{
+  // Explicit pinv is the existing numerical Moore-Penrose inverse of A.
+  // Only the legacy configured path may use the damped secondary reference.
+  if (allocation_method_ != AllocationMethod::PINV && alloc_lambda_ > 0.0 &&
+      secondary_ref.size() == integrated_map_.cols()) {
+    const Eigen::MatrixXd lhs = integrated_map_ * integrated_map_.transpose() +
+        alloc_lambda_ * Eigen::MatrixXd::Identity(integrated_map_.rows(),
+                                                 integrated_map_.rows());
+    return secondary_ref + integrated_map_.transpose() *
+        lhs.ldlt().solve(target - integrated_map_ * secondary_ref);
+  }
+  return integrated_map_inv_ * target;
+}
+
+Eigen::VectorXd BeetleUnifiedController::accelerationToWrench(
+    const Eigen::VectorXd& acceleration) const
+{
+  Eigen::VectorXd wrench(6);
+  wrench.head<3>() = formation_mass_ * acceleration.head<3>();
+  wrench.tail<3>() = allocation_cog_from_body_ * formation_inertia_ *
+      allocation_cog_from_body_.transpose() * acceleration.tail<3>();
+  return wrench;
+}
+
+BeetleUnifiedController::AllocationDiagnostics
+BeetleUnifiedController::getAllocationDiagnostics() const
+{
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return allocation_diagnostics_;
+}
+
 void BeetleUnifiedController::initialize(
     ros::NodeHandle nh,
     boost::shared_ptr<BeetleRobotModel> robot_model,
@@ -520,8 +575,20 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   const Eigen::VectorXd& observer_feedback_wrench,
   const Eigen::VectorXd& observer_feedback_wrench_weights)
 {
+  std::lock_guard<std::mutex> alloc_lock(allocation_mutex_);
+  allocation_diagnostics_ = AllocationDiagnostics();
+  auto& diagnostics = allocation_diagnostics_;
+  diagnostics.stamp = ros::Time::now();
+  diagnostics.sequence = ++allocation_sequence_;
+  const bool use_qp = usesConstrainedAllocation();
+  diagnostics.method = use_qp ? "qp" :
+      (allocation_method_ != AllocationMethod::PINV && alloc_lambda_ > 0.0
+           ? "regularized" : "pinv");
+  diagnostics.interface_force_limit = alloc_interface_force_limit_;
+  diagnostics.interface_torque_limit = alloc_interface_torque_limit_;
   std::vector<int> assembled_ids = navigator_->getAssemblyIds();
   if (assembled_ids.empty()) {
+    diagnostics.reason = "no_assembled_ids";
     ROS_WARN_THROTTLE(1.0,
                       "[UnifiedCtrl QP] stage=alloc_reject reason=no_assembled_ids");
     return false;
@@ -531,13 +598,12 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
   // Update formation geometry
   if (!updateFormationGeometry()) {
+    diagnostics.reason = "geometry_update_failed";
     ROS_WARN_THROTTLE(1.0,
                       "[UnifiedCtrl QP] stage=alloc_reject reason=geometry_update_failed N=%d",
                       N);
     return false;
   }
-
-  std::lock_guard<std::mutex> alloc_lock(allocation_mutex_);
 
   // Share this module's voltage-derived thrust limit BEFORE solving, so the
   // formation-consensus bound in getAllocationThrustLimit() stays fresh on
@@ -555,6 +621,19 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   integrated_map_ = buildFormationAllocationMatrix(
       assembled_ids, formation_mass_, formation_inertia_, formation_cog_offset_,
       allocation_cog_from_body_, masked_rot_cog);
+
+  if (target_wrench_acc_cog.size() != 6 || !target_wrench_acc_cog.allFinite() ||
+      integrated_map_.rows() != 6 || integrated_map_.cols() == 0 ||
+      !integrated_map_.allFinite() || !std::isfinite(formation_mass_) ||
+      formation_mass_ <= 0.0 || !formation_inertia_.allFinite() ||
+      !allocation_cog_from_body_.allFinite() ||
+      (desired_ext_wrench.size() != 0 &&
+       (desired_ext_wrench.size() != 6 || !desired_ext_wrench.allFinite())) ||
+      (observer_feedback_wrench.size() != 0 &&
+       (observer_feedback_wrench.size() != 6 || !observer_feedback_wrench.allFinite()))) {
+    diagnostics.reason = "invalid_allocation_input";
+    return false;
+  }
 
   // Pseudoinverse
   integrated_map_inv_ = aerial_robot_model::pseudoinverse(integrated_map_);
@@ -637,28 +716,42 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       integrated_map_inv_ * (control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
   Eigen::VectorXd desired_wrench_acc =
       control_wrench_acc + task_wrench_acc + feedback_wrench_acc;
+  diagnostics.requested = accelerationToWrench(desired_wrench_acc);
+  diagnostics.requested_valid = diagnostics.requested.allFinite();
+  if (!diagnostics.requested_valid || !pinv_vectoring_f.allFinite()) {
+    diagnostics.reason = "non_finite_composed_target";
+    return false;
+  }
   Eigen::VectorXd secondary_ref =
       buildSecondaryAllocationReference(assembled_ids, task_wrench_acc);
 
   Eigen::MatrixXd interface_actuation_matrix;
   Eigen::VectorXd interface_required_wrench;
   std::vector<std::pair<int, int>> interface_cuts;
-  const bool interface_constraints_enabled =
+  const bool interface_limits_configured =
       N > 1 &&
       (alloc_interface_force_limit_ > 0.0 || alloc_interface_torque_limit_ > 0.0);
-  if (interface_constraints_enabled && !use_constrained_alloc_) {
+  const bool interface_constraints_enabled = use_qp && interface_limits_configured;
+  diagnostics.interface_constraints = interface_constraints_enabled;
+  // Preserve the old configured-mode rejection, but explicit pinv keeps the
+  // rating for prediction/evaluation without enforcing it in the allocator.
+  if (interface_limits_configured && !use_qp &&
+      allocation_method_ == AllocationMethod::CONFIGURED) {
+    diagnostics.reason = "configured_interface_limits_require_qp";
     ROS_ERROR_THROTTLE(
         1.0,
         "[UnifiedCtrl Interface] hard limits require use_constrained_alloc=true");
     return false;
   }
-  if (interface_constraints_enabled || interface_load_pub_.getNumSubscribers() > 0) {
+  if (N > 1) {
     const bool interface_model_ok =
         buildInterfaceLoadModel(assembled_ids, control_wrench_acc,
                                 allocation_cog_from_body_, masked_rot_cog,
                                 interface_actuation_matrix,
                                 interface_required_wrench, interface_cuts);
+    diagnostics.interface_model_valid = interface_model_ok;
     if (!interface_model_ok && interface_constraints_enabled) {
+      diagnostics.reason = "interface_model_invalid";
       ROS_ERROR_THROTTLE(
           1.0,
           "[UnifiedCtrl Interface] hard-limit model construction failed; command not updated");
@@ -672,7 +765,8 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
 
   // Allocate: active task axes are narrow hard bands; effort/rate/balancing
   // terms then choose the actuator-side solution inside that feasible set.
-  if (use_constrained_alloc_) {
+  Eigen::VectorXd allocation_result;
+  if (use_qp) {
     bool qp_ok = solveFullVectorQP(integrated_map_, control_wrench_acc,
                                    task_wrench_acc, effective_task_weights,
                                    feedback_wrench_acc, effective_feedback_weights,
@@ -680,7 +774,7 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
                                    secondary_ref, assembled_ids,
                                    interface_actuation_matrix,
                                    interface_required_wrench,
-                                   target_vectoring_f_);
+                                   allocation_result);
     if (!qp_ok && (has_desired_ext_wrench || has_feedback_ext_wrench)) {
       const double retry_task_scales[] = {0.7, 0.4, 0.0};
       for (double retry_scale : retry_task_scales) {
@@ -706,12 +800,13 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
                                   retry_secondary_ref, assembled_ids,
                                   interface_actuation_matrix,
                                   interface_required_wrench,
-                                  target_vectoring_f_);
+                                  allocation_result);
         if (qp_ok) {
           secondary_ref = retry_secondary_ref;
         }
         if (!qp_ok) continue;
 
+        diagnostics.task_scale = retry_scale;
         task_wrench_acc = retry_task_wrench_acc;
         effective_task_weights = retry_task_weights;
         feedback_wrench_acc = retry_feedback_wrench_acc;
@@ -730,22 +825,25 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
       }
     }
     if (!qp_ok) {
+      diagnostics.reason = "qp_failed";
       ROS_ERROR_THROTTLE(1.0,
                          "[UnifiedCtrl QP] constrained allocation failed; command not updated");
       return false;
     }
   } else {
-    if (alloc_lambda_ > 0.0 && secondary_ref.size() == integrated_map_.cols()) {
-      Eigen::MatrixXd lhs = integrated_map_ * integrated_map_.transpose()
-                           + alloc_lambda_ * Eigen::MatrixXd::Identity(integrated_map_.rows(),
-                                                                       integrated_map_.rows());
-      target_vectoring_f_ = secondary_ref
-          + integrated_map_.transpose()
-              * lhs.ldlt().solve(desired_wrench_acc - integrated_map_ * secondary_ref);
-    } else {
-      target_vectoring_f_ = pinv_vectoring_f;
-    }
+    allocation_result = computeUnconstrainedAllocation(desired_wrench_acc, secondary_ref);
   }
+  if (allocation_result.size() != integrated_map_.cols() || !allocation_result.allFinite()) {
+    diagnostics.reason = "invalid_allocation_result";
+    return false;
+  }
+  target_vectoring_f_ = allocation_result;
+  diagnostics.adopted = accelerationToWrench(
+      control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
+  // Both solvers use the very same nominal mapping and frozen CoG axes.
+  diagnostics.nominal = getAllocatedWrenchCogLocked();
+  diagnostics.success = true;
+  diagnostics.reason = "ok";
   pinv_vectoring_f =
       integrated_map_inv_ * (control_wrench_acc + task_wrench_acc + feedback_wrench_acc);
   publishAllocationPwmPredictions(target_vectoring_f_, pinv_vectoring_f, assembled_ids);
@@ -781,11 +879,15 @@ bool BeetleUnifiedController::computeUnifiedAllocation(
   // Extract per-rotor scalar thrust + gimbal angles (for debug/visualization)
   extractThrustAndGimbal(target_vectoring_f_, assembled_ids);
   publishGimbalTracking(assembled_ids);
-  if (interface_load_pub_.getNumSubscribers() > 0 &&
-      interface_actuation_matrix.rows() > 0) {
-    publishInterfaceLoadDiagnostics(interface_actuation_matrix,
-                                    interface_required_wrench,
-                                    interface_cuts, target_vectoring_f_);
+  if (N > 1 && diagnostics.interface_model_valid) {
+    std_msgs::Float32MultiArray msg;
+    diagnostics.interface_model_valid = buildInterfaceLoadDiagnostics(
+        interface_actuation_matrix, interface_required_wrench,
+        interface_cuts, target_vectoring_f_, msg);
+    if (diagnostics.interface_model_valid && interface_load_pub_.getNumSubscribers() > 0) {
+      interface_load_pub_.publish(msg);
+      diagnostics.interface_load_published = true;
+    }
   }
 
   ROS_INFO_THROTTLE(5.0, "[UnifiedCtrl] N=%d mass=%.3f cog_offset=(%.4f,%.4f,%.4f) "
@@ -1107,25 +1209,35 @@ bool BeetleUnifiedController::buildInterfaceLoadModelWithMasks(
   return true;
 }
 
-void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
+bool BeetleUnifiedController::buildInterfaceLoadDiagnostics(
     const Eigen::MatrixXd& interface_actuation_matrix,
     const Eigen::VectorXd& interface_required_wrench,
     const std::vector<std::pair<int, int>>& interface_cuts,
-    const Eigen::VectorXd& vectoring_f)
+    const Eigen::VectorXd& vectoring_f,
+    std_msgs::Float32MultiArray& msg)
 {
-  if (interface_load_pub_.getNumSubscribers() == 0 ||
-      interface_actuation_matrix.rows() == 0 ||
+  msg = std_msgs::Float32MultiArray();
+  if (interface_actuation_matrix.rows() == 0 ||
       interface_actuation_matrix.cols() != vectoring_f.size() ||
       interface_required_wrench.size() != interface_actuation_matrix.rows() ||
-      static_cast<int>(interface_cuts.size()) * 6 != interface_actuation_matrix.rows()) {
-    return;
+      static_cast<int>(interface_cuts.size()) * 6 != interface_actuation_matrix.rows() ||
+      !interface_actuation_matrix.allFinite() || !interface_required_wrench.allFinite() ||
+      !vectoring_f.allFinite()) {
+    return false;
   }
 
   // Sign convention: wrench exerted by the positive-x side on the negative-x
   // subchain. Symmetric QP limits are invariant to reversing this convention.
   const Eigen::VectorXd load =
       interface_required_wrench - interface_actuation_matrix * vectoring_f;
-  std_msgs::Float32MultiArray msg;
+  if (!load.allFinite()) return false;
+  msg.layout.dim.resize(2);
+  msg.layout.dim[0].label = "predicted;physical_body_axes;positive_x_on_negative_x;adjacent_cog_midpoint";
+  msg.layout.dim[0].size = interface_cuts.size();
+  msg.layout.dim[0].stride = interface_cuts.size() * 10;
+  msg.layout.dim[1].label = "left_id,right_id,Fx,Fy,Fz,Tx,Ty,Tz,force_norm,torque_norm";
+  msg.layout.dim[1].size = 10;
+  msg.layout.dim[1].stride = 10;
   msg.data.reserve(interface_cuts.size() * 10);
   for (size_t i = 0; i < interface_cuts.size(); i++) {
     const Eigen::Vector3d force = load.segment<3>(6 * i);
@@ -1141,7 +1253,7 @@ void BeetleUnifiedController::publishInterfaceLoadDiagnostics(
     msg.data.push_back(static_cast<float>(force.norm()));
     msg.data.push_back(static_cast<float>(torque.norm()));
   }
-  interface_load_pub_.publish(msg);
+  return true;
 }
 void BeetleUnifiedController::batteryVoltageCallback(const std_msgs::Float32ConstPtr& msg)
 {
@@ -1443,7 +1555,7 @@ void BeetleUnifiedController::publishAllocationPwmPredictions(
   }
 
   bool published = false;
-  if (use_constrained_alloc_) {
+  if (usesConstrainedAllocation()) {
     spinal::Pwms qp_msg;
     if (buildPwmPredictionMsg(qp_vectoring_f, assembled_ids, qp_msg)) {
       qp_pwm_pred_pub_.publish(qp_msg);
@@ -2498,6 +2610,12 @@ bool BeetleUnifiedController::buildModuleTorqueAllocationMatrixInvLocked(
 
 Eigen::VectorXd BeetleUnifiedController::getAllocatedWrenchCog() const
 {
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  return getAllocatedWrenchCogLocked();
+}
+
+Eigen::VectorXd BeetleUnifiedController::getAllocatedWrenchCogLocked() const
+{
   // Compute allocated wrench in the virtual CoG control frame from the same
   // frame snapshot used to construct the allocation matrix.
   //
@@ -2510,8 +2628,6 @@ Eigen::VectorXd BeetleUnifiedController::getAllocatedWrenchCog() const
   //     T_cog = I_cog * w_acc.tail(3)
 
   Eigen::VectorXd allocated = Eigen::VectorXd::Zero(6);
-  std::lock_guard<std::mutex> lock(allocation_mutex_);
-
   if (integrated_map_.rows() != 6 || target_vectoring_f_.size() == 0) {
     return allocated;
   }
@@ -2527,13 +2643,7 @@ Eigen::VectorXd BeetleUnifiedController::getAllocatedWrenchCog() const
   // w_acc = A * f  (6D acceleration-space wrench)
   Eigen::VectorXd w_acc = integrated_map_ * target_vectoring_f_;
 
-  const Eigen::Matrix3d formation_inertia_cog =
-      allocation_cog_from_body_ * formation_inertia_ *
-      allocation_cog_from_body_.transpose();
-  allocated.head(3) = formation_mass_ * w_acc.head(3);
-  allocated.tail(3) = formation_inertia_cog * w_acc.tail(3);
-
-  return allocated;
+  return accelerationToWrench(w_acc);
 }
 
 bool BeetleUnifiedController::sendTorqueAllocationMatrixInv()

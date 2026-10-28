@@ -154,6 +154,53 @@ protected:
         Eigen::VectorXd::Zero(kCols), ids, D, d, f_out);
   }
 
+  Eigen::VectorXd unconstrained(const Eigen::MatrixXd& A,
+                                const Eigen::VectorXd& target,
+                                const Eigen::VectorXd& reference)
+  {
+    ctrl_.integrated_map_ = A;
+    ctrl_.integrated_map_inv_ = aerial_robot_model::pseudoinverse(A);
+    return ctrl_.computeUnconstrainedAllocation(target, reference);
+  }
+
+  bool usesQp() const { return ctrl_.usesConstrainedAllocation(); }
+
+  void configureSelectionCheck()
+  {
+    ctrl_.use_constrained_alloc_ = true;
+    ctrl_.yaw_in_allocation_ = false;
+    ctrl_.alloc_interface_force_limit_ = 70.0;
+    ctrl_.alloc_interface_torque_limit_ = 15.0;
+    ctrl_.target_vectoring_f_ = Eigen::VectorXd::Ones(kCols);
+  }
+
+  void expectSelectionSettingsUnchanged() const
+  {
+    EXPECT_TRUE(ctrl_.use_constrained_alloc_);
+    EXPECT_FALSE(ctrl_.yaw_in_allocation_);
+    EXPECT_DOUBLE_EQ(ctrl_.alloc_lambda_, lambda_);
+    EXPECT_DOUBLE_EQ(ctrl_.alloc_interface_force_limit_, 70.0);
+    EXPECT_DOUBLE_EQ(ctrl_.alloc_interface_torque_limit_, 15.0);
+    EXPECT_TRUE(ctrl_.target_vectoring_f_.isOnes());
+  }
+
+  static bool predict(const Eigen::MatrixXd& D, const Eigen::VectorXd& d,
+                      const std::vector<std::pair<int, int>>& cuts,
+                      const Eigen::VectorXd& forces, std_msgs::Float32MultiArray& msg)
+  {
+    return BeetleUnifiedController::buildInterfaceLoadDiagnostics(D, d, cuts, forces, msg);
+  }
+
+  Eigen::VectorXd physicalWrench(const Eigen::VectorXd& acceleration,
+                                 double mass, const Eigen::Matrix3d& inertia,
+                                 const Eigen::Matrix3d& cog_from_body)
+  {
+    ctrl_.formation_mass_ = mass;
+    ctrl_.formation_inertia_ = inertia;
+    ctrl_.allocation_cog_from_body_ = cog_from_body;
+    return ctrl_.accelerationToWrench(acceleration);
+  }
+
   bool physicalChainOrder(const std::vector<int>& allocation_ids,
                           const std::map<int, Eigen::Vector3d>& offsets,
                           std::vector<int>& chain_ids,
@@ -244,6 +291,109 @@ protected:
     return s;
   }
 };
+
+TEST_F(BeetleUnifiedAllocTest, SelectionChangesOnlyAllocatorAndRejectsUnknownMethod)
+{
+  configureSelectionCheck();
+  EXPECT_TRUE(usesQp());
+  ASSERT_TRUE(ctrl_.setAllocationMethod("pinv"));
+  EXPECT_FALSE(usesQp());
+  expectSelectionSettingsUnchanged();
+  ASSERT_TRUE(ctrl_.setAllocationMethod("qp"));
+  EXPECT_TRUE(usesQp());
+  EXPECT_FALSE(ctrl_.setAllocationMethod("lf"));
+  EXPECT_TRUE(usesQp());
+  ASSERT_TRUE(ctrl_.setAllocationMethod("configured"));
+  EXPECT_TRUE(usesQp());
+  expectSelectionSettingsUnchanged();
+}
+
+TEST_F(BeetleUnifiedAllocTest, ExplicitPinvUsesFullTargetWithoutDampingOrSecondaryBias)
+{
+  lambda_ = 100.0;
+  configure();
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6, 8);
+  A.leftCols(6).setIdentity();
+  A(0, 6) = 1.0;
+  A(2, 7) = 1.0;
+  Eigen::VectorXd control(6), task(6), feedback(6);
+  control << 0.2, -0.3, 9.8, 0.04, -0.05, 0.0;
+  task << 2.0, 1.0, -0.1, 0.4, 0.2, -0.5;
+  feedback << 0.1, 0.2, 0.3, -0.01, 0.02, 0.03;
+  const Eigen::VectorXd target = control + task + feedback;
+  const Eigen::VectorXd reference = Eigen::VectorXd::Constant(8, 12.0);
+  ASSERT_TRUE(ctrl_.setAllocationMethod("pinv"));
+  const Eigen::VectorXd result = unconstrained(A, target, reference);
+  EXPECT_LT((A * result - target).norm(), 1e-10);
+  EXPECT_NEAR(result(0), result(6), 1e-10);
+  EXPECT_NEAR(result(2), result(7), 1e-10);
+  EXPECT_LT((result - aerial_robot_model::pseudoinverse(A) * target).norm(), 1e-10);
+
+  ASSERT_TRUE(ctrl_.setAllocationMethod("configured"));
+  const Eigen::VectorXd legacy = unconstrained(A, target, reference);
+  EXPECT_GT((A * legacy - target).norm(), 1.0);
+}
+
+TEST_F(BeetleUnifiedAllocTest, InterfacePredictionUsesEachResultAndPreservesFieldOrder)
+{
+  Eigen::VectorXd control = Eigen::VectorXd::Zero(6);
+  control(2) = 9.8;
+  Eigen::MatrixXd D;
+  Eigen::VectorXd d;
+  std::vector<std::pair<int, int>> cuts;
+  ASSERT_TRUE(buildThreeModuleInterfaceModel(control, D, d, cuts));
+  const Eigen::VectorXd first = Eigen::VectorXd::Ones(D.cols());
+  const Eigen::VectorXd second = 3.0 * first;
+  std_msgs::Float32MultiArray one, two;
+  ASSERT_TRUE(predict(D, d, cuts, first, one));
+  ASSERT_TRUE(predict(D, d, cuts, second, two));
+  ASSERT_EQ(one.data.size(), 20u);
+  EXPECT_EQ(one.data[0], 2.0f);
+  EXPECT_EQ(one.data[1], 3.0f);
+  EXPECT_EQ(one.data[10], 3.0f);
+  EXPECT_EQ(one.data[11], 1.0f);
+  EXPECT_NE(one.layout.dim[0].label.find("predicted"), std::string::npos);
+  const Eigen::VectorXd expected = d - D * second;
+  for (size_t k = 0; k < cuts.size(); ++k) {
+    for (int j = 0; j < 6; ++j) EXPECT_NEAR(two.data[k * 10 + 2 + j], expected(6 * k + j), 1e-5);
+  }
+  EXPECT_NE(one.data[2], two.data[2]);
+  d(0) = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(predict(D, d, cuts, second, two));
+  EXPECT_TRUE(two.data.empty());
+}
+
+TEST_F(BeetleUnifiedAllocTest, PinvReportsInterfaceOverloadWithoutChangingRating)
+{
+  configureSelectionCheck();
+  ASSERT_TRUE(ctrl_.setAllocationMethod("pinv"));
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd target = Eigen::VectorXd::Zero(6);
+  target(0) = 160.0;
+  target(2) = 16.0;
+  const Eigen::VectorXd result = unconstrained(A, target, Eigen::VectorXd::Ones(kCols));
+  ASSERT_LT((A * result - target).norm(), 1e-9);
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  for (int rotor = 0; rotor < kRotorsPerModule; ++rotor) D(0, rotor * kRotorCoef) = 1.0;
+  std_msgs::Float32MultiArray msg;
+  ASSERT_TRUE(predict(D, Eigen::VectorXd::Zero(6), {{2, 1}}, result, msg));
+  EXPECT_NEAR(msg.data[2], -80.0, 1e-4);
+  EXPECT_GT(std::abs(msg.data[2]), 70.0);
+  expectSelectionSettingsUnchanged();
+}
+
+TEST_F(BeetleUnifiedAllocTest, WrenchConversionUsesMassAndRotatedFullInertia)
+{
+  const Eigen::Matrix3d R = Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  Eigen::Matrix3d inertia;
+  inertia << 2.0, 0.1, 0.2, 0.1, 3.0, 0.3, 0.2, 0.3, 4.0;
+  Eigen::VectorXd acceleration(6);
+  acceleration << 1.0, 2.0, 9.8, -0.2, 0.3, 0.4;
+  const Eigen::VectorXd wrench = physicalWrench(acceleration, 7.0, inertia, R);
+  EXPECT_LT((wrench.head<3>() - 7.0 * acceleration.head<3>()).norm(), 1e-12);
+  const Eigen::Vector3d torque_body = inertia * R.transpose() * acceleration.tail<3>();
+  EXPECT_LT((R.transpose() * wrench.tail<3>() - torque_body).norm(), 1e-12);
+}
 
 // (1) The solver tracks a feasible desired wrench and respects actuator bounds.
 TEST_F(BeetleUnifiedAllocTest, TracksFeasibleWrench)

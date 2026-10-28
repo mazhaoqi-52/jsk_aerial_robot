@@ -162,6 +162,9 @@ namespace aerial_robot_control
     assemble_pid_pub_ = nh_.advertise<aerial_robot_msgs::PoseControlPid>("/assemble/debug/pose/pid", 10);
     assemble_vectoring_f_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/assemble/debug/vectoring_force", 1);
     assemble_formation_wrench_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("/assemble/debug/formation_wrench", 1);
+    assemble_wrench_requested_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("/assemble/debug/formation_wrench_requested", 1);
+    assemble_wrench_adopted_pub_ = nh_.advertise<geometry_msgs::WrenchStamped>("/assemble/debug/formation_wrench_adopted", 1);
+    assemble_allocation_status_pub_ = nh_.advertise<diagnostic_msgs::DiagnosticArray>("/assemble/debug/allocation_status", 1);
     module_observer_spatial_sum_pub_ =
         nh_.advertise<geometry_msgs::WrenchStamped>(
             "/assemble/formation_observer/module_observer_spatial_sum", 1);
@@ -2603,15 +2606,28 @@ namespace aerial_robot_control
   bool BeetleController::setUnifiedModeCb(std_srvs::SetBool::Request &req,
                                           std_srvs::SetBool::Response &res)
   {
+    ros::NodeHandle control_nh(nh_, "controller");
+    std::string allocation_method = "configured";
+    if (req.data) {
+      if ((control_nh.hasParam("unified_allocation_method") &&
+           !control_nh.getParam("unified_allocation_method", allocation_method)) ||
+          !unified_controller_->setAllocationMethod(allocation_method)) {
+        res.success = false;
+        res.message = "invalid unified_allocation_method (configured|qp|pinv); mode unchanged";
+        return true;
+      }
+    }
+    // Changing the allocator while enabled never creates a false mode edge:
+    // task state machines keep the same unified input/unload/exit paths.
     unified_control_mode_ = req.data;
     if (req.data) {
       publishModuleModel();
     }
     // Write to rosparam for consistency (backward compat with rosparam-based tools)
-    ros::NodeHandle control_nh(nh_, "controller");
     control_nh.setParam("unified_control_mode", req.data);
     res.success = true;
-    res.message = req.data ? "unified mode enabled" : "unified mode disabled";
+    res.message = req.data ? "unified mode enabled; allocation=" + allocation_method
+                           : "unified mode disabled";
     ROS_INFO("[BeetleController] set_unified_mode service: %s", res.message.c_str());
     return true;
   }
@@ -2918,8 +2934,65 @@ namespace aerial_robot_control
 
     assemble_pid_pub_.publish(assemble_pid_msg_);
 
-    // 2. Vectoring force
-    if (alloc_ok) {
+    // All comparison curves come from this leader's one allocation snapshot.
+    // The raw request stays visible even when QP retries scale task/feedback.
+    const auto allocation = unified_controller_->getAllocationDiagnostics();
+    const auto publish_wrench = [&allocation](ros::Publisher& publisher,
+                                             const Eigen::VectorXd& wrench) {
+      geometry_msgs::WrenchStamped msg;
+      msg.header.stamp = allocation.stamp;
+      msg.header.frame_id = "assembly_cog";
+      msg.wrench.force.x = wrench(0);
+      msg.wrench.force.y = wrench(1);
+      msg.wrench.force.z = wrench(2);
+      msg.wrench.torque.x = wrench(3);
+      msg.wrench.torque.y = wrench(4);
+      msg.wrench.torque.z = wrench(5);
+      publisher.publish(msg);
+    };
+    if (allocation.requested_valid) {
+      publish_wrench(assemble_wrench_requested_pub_, allocation.requested);
+    }
+
+    diagnostic_msgs::DiagnosticArray status;
+    status.header.stamp = allocation.stamp;
+    status.header.frame_id = "assembly_cog";
+    status.status.resize(1);
+    auto& item = status.status.front();
+    item.name = "formation_allocation";
+    item.hardware_id = nh_.getNamespace();
+    item.level = !allocation.success ? diagnostic_msgs::DiagnosticStatus::ERROR :
+        (!allocation.interface_model_valid && beetle_navigator_->getAssemblyIds().size() > 1
+             ? diagnostic_msgs::DiagnosticStatus::WARN : diagnostic_msgs::DiagnosticStatus::OK);
+    item.message = allocation.reason;
+    const auto add = [&item](const std::string& key, const auto& value) {
+      diagnostic_msgs::KeyValue entry;
+      entry.key = key;
+      std::ostringstream stream;
+      stream << std::setprecision(17) << value;
+      entry.value = stream.str();
+      item.values.push_back(entry);
+    };
+    add("module_id", beetle_navigator_->getMyID());
+    add("allocation_sequence", allocation.sequence);
+    add("allocation_method", allocation.method);
+    add("requested_valid", allocation.requested_valid);
+    add("command_updated", allocation.success);
+    add("adopted_valid", allocation.success);
+    if (allocation.success) add("task_feedback_scale", allocation.task_scale);
+    add("yaw_in_allocation", yaw_in_allocation_);
+    add("interface_model_valid", allocation.interface_model_valid);
+    add("interface_constraints_enforced", allocation.interface_constraints);
+    add("interface_load_published", allocation.interface_load_published);
+    add("interface_load_topic", nh_.resolveName("unified_control/interface_load"));
+    add("interface_force_component_limit_N", allocation.interface_force_limit);
+    add("interface_torque_component_limit_Nm", allocation.interface_torque_limit);
+    add("nominal_wrench_topic", "/assemble/debug/formation_wrench");
+    add("nominal_stage", "allocator_output_before_spinal_corrections_and_limits");
+    assemble_allocation_status_pub_.publish(status);
+
+    // 2. Vectoring force and the EXISTING nominal formation wrench output.
+    if (alloc_ok && allocation.success) {
       const Eigen::VectorXd vf = unified_controller_->getTargetVectoringForce();
       std_msgs::Float32MultiArray vf_msg;
       vf_msg.data.resize(vf.size());
@@ -2927,18 +3000,8 @@ namespace aerial_robot_control
         vf_msg.data[i] = static_cast<float>(vf(i));
       assemble_vectoring_f_pub_.publish(vf_msg);
 
-      // 3. Formation allocated wrench (PC allocation model, not actuator telemetry)
-      Eigen::VectorXd rw = unified_controller_->getAllocatedWrenchCog();
-      geometry_msgs::WrenchStamped wrench_msg;
-      wrench_msg.header.stamp = ros::Time::now();
-      wrench_msg.header.frame_id = "assembly_cog";
-      wrench_msg.wrench.force.x = rw(0);
-      wrench_msg.wrench.force.y = rw(1);
-      wrench_msg.wrench.force.z = rw(2);
-      wrench_msg.wrench.torque.x = rw(3);
-      wrench_msg.wrench.torque.y = rw(4);
-      wrench_msg.wrench.torque.z = rw(5);
-      assemble_formation_wrench_pub_.publish(wrench_msg);
+      publish_wrench(assemble_wrench_adopted_pub_, allocation.adopted);
+      publish_wrench(assemble_formation_wrench_pub_, allocation.nominal);
 
       if (unified_towing_debug_log_ && formation_wrench_cmd.size() >= 6) {
         const double ff_norm = formation_wrench_cmd.head(3).norm() +

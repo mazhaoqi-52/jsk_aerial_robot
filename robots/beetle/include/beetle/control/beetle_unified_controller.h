@@ -26,6 +26,7 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -62,6 +63,29 @@ class BeetleUnifiedController
 public:
   BeetleUnifiedController();
   ~BeetleUnifiedController();  // defined in .cpp where OsqpEigen::Solver is complete
+
+  // Applied by the existing set_unified_mode service, never by parameter polling.
+  // "configured" preserves the bringup settings; "pinv" bypasses regularization.
+  bool setAllocationMethod(const std::string& method);
+
+  struct AllocationDiagnostics {
+    ros::Time stamp;
+    uint64_t sequence = 0;
+    std::string method;
+    std::string reason = "not_computed";
+    bool requested_valid = false;
+    bool success = false;
+    bool interface_model_valid = false;
+    bool interface_constraints = false;
+    bool interface_load_published = false;
+    double task_scale = 1.0;
+    double interface_force_limit = 0.0;
+    double interface_torque_limit = 0.0;
+    Eigen::VectorXd requested;
+    Eigen::VectorXd adopted;
+    Eigen::VectorXd nominal;
+  };
+  AllocationDiagnostics getAllocationDiagnostics() const;
 
   void initialize(ros::NodeHandle nh,
                   boost::shared_ptr<BeetleRobotModel> robot_model,
@@ -282,6 +306,15 @@ private:
   Eigen::MatrixXd integrated_map_inv_;    // pseudoinverse
   Eigen::MatrixXd integrated_map_inv_rot_; // last 3 cols of pseudoinverse (torque part)
   Eigen::VectorXd target_vectoring_f_;    // allocation result
+  AllocationDiagnostics allocation_diagnostics_;
+  uint64_t allocation_sequence_ = 0;
+  enum class AllocationMethod { CONFIGURED, QP, PINV };
+  AllocationMethod allocation_method_ = AllocationMethod::CONFIGURED;
+  bool usesConstrainedAllocation() const;
+  Eigen::VectorXd computeUnconstrainedAllocation(
+      const Eigen::VectorXd& target, const Eigen::VectorXd& secondary_ref) const;
+  Eigen::VectorXd accelerationToWrench(const Eigen::VectorXd& acceleration) const;
+  Eigen::VectorXd getAllocatedWrenchCogLocked() const;
 
   // Target yaw term for spinal cascade inner loop
   double candidate_yaw_term_;
@@ -513,10 +546,11 @@ private:
       Eigen::VectorXd& interface_required_wrench,
       std::vector<std::pair<int, int>>& interface_cuts) const;
 
-  void publishInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_actuation_matrix,
+  static bool buildInterfaceLoadDiagnostics(const Eigen::MatrixXd& interface_actuation_matrix,
                                        const Eigen::VectorXd& interface_required_wrench,
                                        const std::vector<std::pair<int, int>>& interface_cuts,
-                                       const Eigen::VectorXd& vectoring_f);
+                                       const Eigen::VectorXd& vectoring_f,
+                                       std_msgs::Float32MultiArray& msg);
   void publishAllocationPwmPredictions(const Eigen::VectorXd& qp_vectoring_f,
                                        const Eigen::VectorXd& pinv_vectoring_f,
                                        const std::vector<int>& assembled_ids);

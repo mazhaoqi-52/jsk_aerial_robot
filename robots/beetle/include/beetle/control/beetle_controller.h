@@ -11,6 +11,7 @@
 #include <beetle/control/beetle_unified_controller.h>
 #include <beetle/control/formation_momentum_observer.h>
 #include <diagnostic_msgs/KeyValue.h>
+#include <diagnostic_msgs/DiagnosticArray.h>
 #include <std_srvs/SetBool.h>
 #include <std_msgs/Float32MultiArray.h>
 #include <mutex>
@@ -326,6 +327,9 @@ namespace aerial_robot_control
     ros::Publisher assemble_pid_pub_;
     ros::Publisher assemble_vectoring_f_pub_;
     ros::Publisher assemble_formation_wrench_pub_;
+    ros::Publisher assemble_wrench_requested_pub_;
+    ros::Publisher assemble_wrench_adopted_pub_;
+    ros::Publisher assemble_allocation_status_pub_;
     aerial_robot_msgs::PoseControlPid assemble_pid_msg_;
     void publishAssembleDebug(const tf::Vector3& formation_pos, const tf::Vector3& formation_vel,
                               const tf::Vector3& formation_rpy,

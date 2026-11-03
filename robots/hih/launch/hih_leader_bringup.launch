@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Role label only: original PID and momentum observer remain in use. -->
+  <arg name="simulation" default="false" />
+  <arg name="real_machine" default="true" />
+  <arg name="robot_id" default="1" />
+  <arg name="battery" default="true" />
+  <arg name="headless" default="true" />
+  <arg name="estimate_mode" default="1" />
+  <arg name="hih_model" default="hih" />
+  <arg name="config_dir" default="$(find hih)/config" />
+  <include file="$(find hih)/launch/bringup.launch">
+    <arg name="simulation" value="$(arg simulation)" />
+    <arg name="real_machine" value="$(arg real_machine)" />
+    <arg name="robot_id" value="$(arg robot_id)" />
+    <arg name="battery" value="$(arg battery)" />
+    <arg name="headless" value="$(arg headless)" />
+    <arg name="estimate_mode" value="$(arg estimate_mode)" />
+    <arg name="hih_model" value="$(arg hih_model)" />
+    <arg name="config_dir" value="$(arg config_dir)" />
+  </include>
+  <param name="hih$(arg robot_id)/hih_role" value="leader" />
+</launch>

@@ -1,0 +1,7 @@
+<library path="lib/libhih_sensor_pluginlib">
+
+  <class name="sensor_plugin/hih_imu" type="sensor_plugin::HihImu" base_class_type="sensor_plugin::SensorBase">
+    <description>Hih IMU sensor plugin.</description>
+  </class>
+
+</library>

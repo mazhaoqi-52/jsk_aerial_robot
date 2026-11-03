@@ -1,0 +1,32 @@
+docking:
+  prealign_gap: 0.15           # intermediate interface gap, m
+  position_tolerance: 0.02     # prealignment gap error and Y/Z errors, m
+  prealign_angle_tolerance_deg: 3.0  # mutual interface RPY before approach
+  angle_tolerance_deg: 8.6     # final locking RPY tolerance (~original 0.15 rad)
+  approach_speed: 0.1          # axial waypoint speed upper bound, m/s
+  near_approach_speed: 0.05    # approach speed cap inside slowdown distance, m/s
+  approach_slowdown_distance: 0.15  # measured interface gap, m; speed ramps down before this
+  correction_speed: 0.02      # relative Y correction speed, m/s
+  relative_correction_gain: 0.5  # prealignment X / relative Y gain, 1/s
+  height_correction_gain: 0.2  # relative Z error -> height target velocity, 1/s
+  height_correction_speed: 0.01  # Z target velocity limit, m/s
+  height_velocity_damping: 0.4  # filtered relative vertical velocity damping
+  height_velocity_filter_time: 0.25  # relative velocity low-pass time constant, s
+  height_tracking_error_limit: 0.03  # stop integration that increases Z tracking lead, m
+  contact_height_correction_limit: 0.01  # additional Z target travel +/- after first contact zone, m
+  contact_lock_gap: 0.05      # freeze aligned Y/Z waypoint inside this actual gap, m
+  slowdown_gain: 2.0          # slow the waypoint near each fixed goal, 1/s
+  insertion_depth: 0.05       # final inward target offset, m
+  final_x_tolerance: 0.02     # lock when gap is in [-insertion_depth, final_x_tolerance)
+  final_y_tolerance: 0.02
+  final_z_tolerance: 0.015
+  reference:
+    attitude_rate_deg: 10.0   # smooth transition to the common fixed attitude
+  world_frame: world
+  baselink_frame: fc
+  # Optional root -> mating reference transforms; axes are parallel when mated.
+  # Defaults mirror automatically for attach_dir=-1.
+  # leader_connector_xyz: [0.26, 0.0, 0.0]
+  # follower_connector_xyz: [-0.26, 0.0, 0.0]
+  # leader_connector_rpy: [0.0, 0.0, 0.0]   # radians
+  # follower_connector_rpy: [0.0, 0.0, 0.0]

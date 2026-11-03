@@ -1,0 +1,2460 @@
+#!/usr/bin/env python3
+"""
+Formation Load Towing - Towing a load box using assembled Hih UAVs
+Reuses formation valve rotation infrastructure with linear trajectory generation
+"""
+
+import sys
+import os
+import math
+import threading
+import rospy
+import rosgraph
+import smach
+import numpy as np
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String, UInt8
+from tf.transformations import euler_from_quaternion
+
+# Add parent paths for imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+valve_demo_dir = os.path.join(current_dir, '../valve_rotation_demo')
+sys.path.insert(0, valve_demo_dir)
+sys.path.insert(0, os.path.join(current_dir, '../..'))
+sys.path.insert(0, os.path.join(current_dir, '..'))
+
+# Reuse components from valve rotation demo
+from valve_rotation_formation_clean import (
+    FormationSingleUAVStateBase,
+    FormationUtils,
+)
+from hih_interface import smoothstep01
+from demo_common import low_pass_update, velocity_error_adjustment
+
+
+# ============== Load Box Parameters (measured actual box) ==============
+LOAD_BOX_LENGTH = 0.88   # x dimension (m)
+LOAD_BOX_WIDTH = 0.49    # y dimension (m)
+LOAD_BOX_HEIGHT = 0.86   # z dimension (m)
+LOAD_WALL_THICKNESS = 0.02  # wall thickness (m)
+
+# ============== Towing Task Parameters ==============
+RETRACT_DISTANCE = 0.03  # 30mm retract to hook edge (wall_thickness + margin)
+HOOK_POSITION_TOLERANCE = 0.030  # 30mm tolerance for hook convergence (formation control noise)
+TOWING_DISTANCE = 0.6    # towing distance (m), overridden by ~towing_distance param
+TOWING_MAX_FORCE = 5.0   # max adaptive force (N), overridden by ~towing_force param
+# Approach height above box top for entering the load area.
+# Default is 50mm. Tune as needed; with box_top_z=0.65m:
+# - offset 0.15 -> approach 0.80m
+# - offset 0.18 -> approach 0.83m
+APPROACH_HEIGHT_OFFSET = 0.18
+# XY-transit clearance above box top - used as a SAFETY FLOOR for the
+# horizontal-transit phase and the disengage-ascent phase. Acts as a hard lower
+# bound on the transit Z target so even if takeoff_height is set low or the EE
+# drifts down during XY motion, the formation still clears the box.
+TRANSIT_CLEARANCE_OFFSET = 0.30
+
+# Feedforward wrench should be shifted from the virtual EE reference to the
+# actual hook contact point. From hih_fang.urdf.xacro:
+#   virtual EE reference: x=0.246m, z=0.074382m
+#   hook bottom center:   x=0.246-0.02404m, z=0.0113823-0.0718283-0.0025m
+# The two hooks are symmetric in Y, so the equivalent towing contact uses y=0.
+TOWING_HOOK_CONTACT_DX_FROM_EE = -0.02404
+TOWING_HOOK_CONTACT_DZ_FROM_EE = -0.137328
+# Final insertion is defined by the hook contact point, not by virtual EE descent.
+# Positive clearance keeps the hook contact above the box top; negative means
+# intentionally inserting below the box top.
+HOOK_CONTACT_INSERT_CLEARANCE = 0.015
+# Final insertion is complete only when the hook is within this clearance band
+# above the intended hook contact height.
+HOOK_INSERTION_DEPTH_TOLERANCE = 0.02
+# Soft lateral alignment guard in the load/approach frame. Exceeding this does
+# not abort the state machine, but it must not redefine the planned hook XY.
+HOOK_ALIGNMENT_LATERAL_TOLERANCE = 0.05
+# Tighter one-shot alignment before a direct insertion descent. The descent
+# itself already streams the same XY target, so do not recenter inside it.
+SINGLE_DESCENT_ALIGNMENT_LATERAL_TOLERANCE = 0.03
+HOOK_RECENTER_BEFORE_TOWING_TOLERANCE = 0.04
+HOOK_ATTEMPT_MAX_SOFT_FAIL_XY_ERROR = 0.30
+# Only split the descent when the final hook-insertion segment is long enough
+# to be meaningful. Shorter insertions are handled in one continuous descent.
+MIN_SPLIT_INSERTION_DROP = 0.10
+
+# Unified QP task weights [Fx,Fy,Fz,Tx,Ty,Tz]. Horizontal force weights are
+# rebuilt from the actual body-frame towing direction before publishing.
+TOWING_TASK_WRENCH_WEIGHTS = [1.0, 0.10, 0.0, 0.08, 0.18, 0.01]
+TOWING_PRIMARY_FORCE_TASK_WEIGHT = 1.0
+TOWING_SECONDARY_FORCE_TASK_WEIGHT = 0.10
+TOWING_TASK_PRIORITY_WEIGHT_FLOOR = 0.55
+TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR = 0.10
+TOWING_FORCE_RAMP_TIME = 25.0
+TOWING_STALL_WINDOW_TIME = 5.0
+TOWING_STALL_TIMEOUT_COUNT = 4
+TOWING_STALL_MIN_FORCE_RATIO = 1.0
+
+# Loose guards for real-machine towing. These are not precision convergence
+# checks; they only prevent obvious high-force/high-attitude transitions.
+TOWING_GOAL_TAPER_START_RATIO = 0.90
+TOWING_GOAL_FORCE_FLOOR_RATIO = 0.65
+TOWING_COMPLETE_SETTLE_TIME = 1.5
+TOWING_COMPLETE_MAX_SETTLE_TIME = 4.0
+TOWING_COMPLETE_ATTITUDE_SOFT_LIMIT = math.radians(18.0)
+TOWING_COMPLETE_ATTITUDE_HARD_LIMIT = math.radians(30.0)
+TOWING_COMPLETE_Z_ERROR_HARD_LIMIT = 0.35
+RETURN_ATTITUDE_HARD_LIMIT = math.radians(35.0)
+RETURN_LOOSE_RETRACT_TOLERANCE = 0.18
+RETURN_LOOSE_ASCENT_Z_TOLERANCE = 0.25
+
+# Force governor for real-machine towing. These limits are intentionally loose:
+# they only stop the feedforward ramp from pushing harder while attitude/Z are
+# already visibly degraded.
+TOWING_FORCE_HOLD_ATTITUDE = math.radians(12.0)
+TOWING_FORCE_RELIEF_ATTITUDE = math.radians(18.0)
+TOWING_FORCE_HOLD_Z_ERROR = 0.15
+TOWING_FORCE_RELIEF_Z_ERROR = 0.22
+TOWING_BREAKAWAY_RECOVERY_DELAY = 5.0
+TOWING_BREAKAWAY_FORCE_HOLD_TIME = 0.8
+TOWING_BREAKAWAY_CONFIRM_TIME = 0.25
+TOWING_BREAKAWAY_RELIEF_MIN_DISTANCE = 0.05
+TOWING_BREAKAWAY_FORCE_FLOOR_RATIO = 0.60
+TOWING_STABLE_ROLLING_DISTANCE = 0.25
+TOWING_STABLE_ROLLING_FORCE_FLOOR_RATIO = 0.85
+TOWING_STABLE_ROLLING_CONFIRM_TIME = 0.8
+TOWING_OVERSPEED_FORCE_RELIEF_TIME = 10.0
+TOWING_SEVERE_OVERSPEED_CONFIRM_TIME = 1.0
+TOWING_BREAKAWAY_STABLE_ATTITUDE = math.radians(5.0)
+TOWING_BREAKAWAY_STABLE_Z_ERROR = 0.05
+TOWING_TASK_COOLDOWN_SCALE = 0.60
+TOWING_TASK_STABLE_COOLDOWN_SCALE = 0.60
+TOWING_TASK_HOLD_SCALE = 0.40
+TOWING_TASK_RELIEF_SCALE = 0.15
+TOWING_TASK_SCALE_RECOVER_RATE = 0.30  # 0.15 -> 0.60 takes about 1.5s
+TOWING_UNLOAD_FORCE_RATE = 3.0  # N/s; 40N feedforward unloads in about 13s
+TOWING_UNLOAD_MAX_DURATION = 15.0
+TOWING_UNLOAD_CONTACT_LEAD = 0.03
+RETURN_RETRACT_DISTANCE = 0.13
+
+
+def build_towing_task_wrench_weights(force_body=None, task_scale=1.0):
+    weights = list(TOWING_TASK_WRENCH_WEIGHTS)
+    primary_axis = None
+    if force_body is not None:
+        force_xy = np.asarray(force_body[:2], dtype=float)
+        norm_xy = np.linalg.norm(force_xy)
+        if norm_xy > 1e-6:
+            direction_xy = force_xy / norm_xy
+            span = TOWING_PRIMARY_FORCE_TASK_WEIGHT - TOWING_SECONDARY_FORCE_TASK_WEIGHT
+            weights[0] = TOWING_SECONDARY_FORCE_TASK_WEIGHT + span * direction_xy[0] ** 2
+            weights[1] = TOWING_SECONDARY_FORCE_TASK_WEIGHT + span * direction_xy[1] ** 2
+            primary_axis = 0 if abs(direction_xy[0]) >= abs(direction_xy[1]) else 1
+    scaled_weights = [float(w) * task_scale for w in weights]
+    if primary_axis is not None and task_scale > 0.0:
+        scaled_weights[primary_axis] = max(
+            scaled_weights[primary_axis], TOWING_TASK_PRIORITY_WEIGHT_FLOOR)
+    pitch_floor = min(
+        float(TOWING_TASK_WRENCH_WEIGHTS[4]),
+        float(TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR))
+    if pitch_floor > 0.0 and task_scale > 0.0:
+        scaled_weights[4] = max(scaled_weights[4], pitch_floor)
+    return scaled_weights
+
+
+class LinearTowingTrajectoryGenerator:
+    """
+    Linear trajectory generator for load towing task.
+    Generates straight-line trajectory with force feedforward.
+    """
+
+    def __init__(self, start_pos, towing_direction, target_distance,
+                 target_velocity=0.05, control_rate=25.0, max_force=30.0):
+        """
+        Initialize linear towing trajectory generator.
+
+        Args:
+            start_pos: Starting position [x, y, z]
+            towing_direction: Unit vector of towing direction [dx, dy, 0]
+            target_distance: Total distance to tow (m)
+            target_velocity: Target towing velocity (m/s)
+            control_rate: Control frequency (Hz)
+            max_force: Maximum adaptive force in towing direction (N)
+        """
+        self.start_pos = np.array(start_pos)
+        self.towing_direction = np.array(towing_direction)
+        # Normalize direction
+        norm = np.linalg.norm(self.towing_direction[:2])
+        if norm > 0.001:
+            self.towing_direction = self.towing_direction / norm
+        self.towing_direction[2] = 0.0  # Ensure horizontal
+
+        self.target_distance = target_distance
+        self.target_velocity = target_velocity
+        self.control_rate = control_rate
+        self.dt = 1.0 / control_rate
+        self.max_force = max_force
+
+        # State variables
+        self.current_distance = 0.0
+        self.current_load_distance = 0.0
+        self.current_velocity = 0.0
+        self.target_pos = self.start_pos.copy()
+        self.load_start_pos = None
+
+        # Velocity ramp-up parameters
+        self.ramp_up_distance = 0.05  # 50mm ramp-up zone
+        self.ramp_down_distance = 0.05  # 50mm ramp-down zone
+
+        # Max lead distance: target position must not exceed actual EE position
+        # by more than this amount along towing direction, preventing PID saturation
+        # when the load is stuck or slow.
+        self.max_lead_distance = 0.17  # 170mm
+        self.max_lag_distance = 0.08   # 80mm
+        self.max_load_lead_distance = 0.12  # 120mm ahead of load progress
+        self.breakaway_load_lead_distance = 0.06  # keep target close after the load starts moving
+        self.high_force_load_lead_distance = 0.05
+        self.high_force_lead_force_ratio = 0.50
+
+        # Force adaptation: ramp to breakaway, then keep adapting to load speed.
+        self.current_force = 0.0
+        self.force_ramp_progress = 0.0
+        self.breakaway_detected = False
+        self.velocity_feedback_enabled = False
+        self.velocity_feedback_distance_reached = False
+        self.motion_measurement_was_invalid = False
+        self.breakaway_time = None
+        self.breakaway_reason = None
+        self.breakaway_force = None
+        self.breakaway_candidate_detected = False
+        self.breakaway_candidate_time = None
+        self.breakaway_candidate_force = None
+        self.breakaway_confirm_elapsed = 0.0
+        self.stable_rolling_detected = False
+        self.stable_rolling_time = None
+        self.stable_rolling_confirm_elapsed = 0.0
+        self.force_recover_rate = self.max_force / TOWING_FORCE_RAMP_TIME
+        self.instability_force_relief_rate = self.max_force / 8.0
+        # Keep the historical ROS parameter name for launch compatibility; it
+        # now gates the start of post-breakaway velocity feedback.
+        self.velocity_feedback_min_distance = max(
+            0.0, float(rospy.get_param(
+                "~breakaway_relief_min_distance",
+                TOWING_BREAKAWAY_RELIEF_MIN_DISTANCE)))
+        self.breakaway_force_floor_ratio = max(
+            0.0, min(1.0, float(rospy.get_param(
+                "~breakaway_force_floor_ratio",
+                TOWING_BREAKAWAY_FORCE_FLOOR_RATIO))))
+        self.stable_rolling_distance = max(
+            self.velocity_feedback_min_distance,
+            float(rospy.get_param(
+                "~stable_rolling_distance",
+                TOWING_STABLE_ROLLING_DISTANCE)))
+        self.stable_rolling_force_floor_ratio = max(
+            0.0, min(1.0, float(rospy.get_param(
+                "~stable_rolling_force_floor_ratio",
+                TOWING_STABLE_ROLLING_FORCE_FLOOR_RATIO))))
+        overspeed_force_relief_time = max(
+            0.5, float(rospy.get_param(
+                "~overspeed_force_relief_time",
+                TOWING_OVERSPEED_FORCE_RELIEF_TIME)))
+        self.overspeed_force_relief_rate = self.max_force / overspeed_force_relief_time
+        self.velocity_error_deadband = max(
+            0.0, float(rospy.get_param("~velocity_error_deadband", 0.005)))
+        # Choose the automatic gain so only a genuinely stopped load reaches
+        # the positive rate cap; ordinary speed errors remain proportional.
+        auto_velocity_force_gain = self.force_recover_rate / max(
+            self.target_velocity - self.velocity_error_deadband, 1e-3)
+        requested_velocity_force_gain = float(rospy.get_param(
+            "~velocity_force_gain", 0.0))
+        self.velocity_force_gain = (
+            requested_velocity_force_gain
+            if requested_velocity_force_gain > 0.0
+            else auto_velocity_force_gain)
+        requested_velocity_damping_gain = float(rospy.get_param(
+            "~velocity_force_damping_gain", 0.0))
+        # The existing velocity-error term is the integral part of the force
+        # controller. Add the proportional term in incremental form to damp
+        # the load inertia instead of waiting for the speed error to reverse.
+        self.velocity_force_damping_gain = (
+            requested_velocity_damping_gain
+            if requested_velocity_damping_gain > 0.0
+            else self.velocity_force_gain)
+        self.velocity_filter_time_constant = max(
+            0.0, float(rospy.get_param(
+                "~velocity_filter_time_constant", 0.15)))
+        self.velocity_error = self.target_velocity
+        self.previous_velocity_error_term = None
+        self.force_adjust_rate = 0.0
+        self.severe_overspeed_ratio = 2.0
+        self.severe_overspeed_elapsed = 0.0
+        self.severe_overspeed_latched = False
+        self.severe_overspeed_confirm_time = max(
+            0.1, float(rospy.get_param(
+                "~severe_overspeed_confirm_time",
+                TOWING_SEVERE_OVERSPEED_CONFIRM_TIME)))
+        self.breakaway_distance = 0.05  # 50mm load motion confirms contact release
+        self.breakaway_velocity = self.target_velocity * 0.2
+        self.early_breakaway_distance = 0.008
+        self.early_breakaway_velocity = self.target_velocity * 0.6
+        self.last_motion_distance = 0.0
+        self.raw_motion_velocity = 0.0
+        self.motion_velocity = 0.0
+        self.force_guard_state = "nominal"
+        self.task_weight_scale = 1.0
+
+        # Performance monitoring
+        self.start_time = rospy.Time.now().to_sec()
+        self.last_update_time = self.start_time
+        self.stall_counter = 0
+
+        # Sliding window for stall-based abort detection
+        self.stall_window_time = max(
+            0.5, float(rospy.get_param("~stall_window_time", TOWING_STALL_WINDOW_TIME)))
+        self.stall_timeout_count = max(
+            1, int(rospy.get_param("~stall_timeout_count", TOWING_STALL_TIMEOUT_COUNT)))
+        self.stall_min_force_ratio = max(
+            0.0, min(1.0, float(rospy.get_param(
+                "~stall_min_force_ratio", TOWING_STALL_MIN_FORCE_RATIO))))
+        self.stall_min_force = self.max_force * self.stall_min_force_ratio
+        self.stall_force_gate_active = False
+        self.stall_last_check_time = self.start_time
+        self.stall_last_check_distance = 0.0
+
+        rospy.loginfo(f"LinearTowingTrajectory: dir={self.towing_direction}, "
+                     f"dist={target_distance}m, vel={target_velocity}m/s, max_force={max_force}N, "
+                     f"stall_gate={self.stall_min_force:.1f}N "
+                     f"({self.stall_min_force_ratio:.2f}x), "
+                     f"stall={self.stall_timeout_count}x{self.stall_window_time:.1f}s, "
+                     f"feedback_dist={self.velocity_feedback_min_distance*1000:.0f}mm, "
+                     f"floor={self.breakaway_force_floor_ratio:.2f}x, "
+                     f"stable_roll={self.stable_rolling_distance*1000:.0f}mm/"
+                     f"{self.stable_rolling_force_floor_ratio:.2f}x, "
+                     f"velocity_i_gain={self.velocity_force_gain:.1f}N/m, "
+                     f"damping_gain={self.velocity_force_damping_gain:.1f}Ns/m, "
+                     f"deadband={self.velocity_error_deadband*1000:.1f}mm/s, "
+                     f"filter={self.velocity_filter_time_constant:.2f}s, "
+                     f"speed_relief_limit={self.overspeed_force_relief_rate:.1f}N/s")
+
+    def _update_force_guard(self, attitude_rp=None, z_error=0.0, current_time=None,
+                            dt=0.0):
+        max_rp = 0.0
+        if attitude_rp is not None:
+            max_rp = max(abs(float(attitude_rp[0])), abs(float(attitude_rp[1])))
+
+        z_error = float(z_error) if z_error is not None else 0.0
+        if not math.isfinite(z_error):
+            z_error = 0.0
+        abs_z = abs(z_error)
+
+        cooldown = (
+            self.breakaway_time is not None and
+            current_time is not None and
+            current_time - self.breakaway_time < TOWING_BREAKAWAY_RECOVERY_DELAY)
+
+        # Speed is handled by the velocity PI loop. Keep task-weight relief for
+        # actual flight-state instability so speed transients cannot introduce
+        # a second discontinuous control path.
+        if (max_rp > TOWING_FORCE_RELIEF_ATTITUDE or
+                abs_z > TOWING_FORCE_RELIEF_Z_ERROR):
+            guard_state = "relief"
+            target_task_scale = TOWING_TASK_RELIEF_SCALE
+        elif cooldown:
+            guard_state = "cooldown"
+            if (max_rp < TOWING_BREAKAWAY_STABLE_ATTITUDE and
+                    abs_z < TOWING_BREAKAWAY_STABLE_Z_ERROR):
+                target_task_scale = TOWING_TASK_STABLE_COOLDOWN_SCALE
+            else:
+                target_task_scale = TOWING_TASK_COOLDOWN_SCALE
+        elif max_rp > TOWING_FORCE_HOLD_ATTITUDE or abs_z > TOWING_FORCE_HOLD_Z_ERROR:
+            guard_state = "hold"
+            target_task_scale = TOWING_TASK_HOLD_SCALE
+        else:
+            guard_state = "nominal"
+            target_task_scale = 1.0
+
+        prev_task_scale = self.task_weight_scale
+        if target_task_scale > self.task_weight_scale:
+            self.task_weight_scale = min(
+                target_task_scale,
+                self.task_weight_scale + TOWING_TASK_SCALE_RECOVER_RATE * max(0.0, dt))
+        else:
+            self.task_weight_scale = target_task_scale
+
+        if guard_state != self.force_guard_state:
+            log_fn = rospy.loginfo if guard_state == "nominal" else rospy.logwarn
+            log_fn(f"[Towing Guard] {self.force_guard_state} -> {guard_state}: "
+                   f"max_rp={math.degrees(max_rp):.1f}deg, z_err={z_error*1000:.0f}mm, "
+                   f"task_scale={prev_task_scale:.2f}->{self.task_weight_scale:.2f} "
+                   f"(target={target_task_scale:.2f})")
+
+        self.force_guard_state = guard_state
+        return guard_state
+
+    def get_task_wrench_weights(self, force_body=None):
+        return build_towing_task_wrench_weights(force_body, self.task_weight_scale)
+
+    def update_state(self, current_pos, load_pos=None, attitude_rp=None,
+                     z_error=0.0, load_measurement_valid=True):
+        """
+        Update trajectory state based on current position and load position.
+
+        Args:
+            current_pos: Current end-effector position [x, y, z]
+            load_pos: Current load position (optional, for progress tracking)
+            attitude_rp: Current formation roll/pitch tuple for force guarding
+            z_error: Current towing target Z error for force guarding
+            load_measurement_valid: whether the tracked load pose is fresh.
+
+        Returns:
+            dict: Updated state info
+        """
+        current_time = rospy.Time.now().to_sec()
+        actual_dt = current_time - self.last_update_time
+        self.last_update_time = current_time
+
+        # Use the full elapsed time for velocity measurement, but cap only the
+        # control integration step so a delayed loop cannot make a large wrench
+        # jump or falsely multiply the measured speed.
+        measurement_dt = max(actual_dt, 1e-3)
+        control_dt = min(measurement_dt, 0.1)
+
+        # Calculate current end-effector distance traveled
+        displacement = np.array(current_pos) - self.start_pos
+        self.current_distance = np.dot(displacement[:2], self.towing_direction[:2])
+
+        # Track load displacement when available (primary towing success metric)
+        if load_pos is not None:
+            load_pos_arr = np.array(load_pos)
+            if self.load_start_pos is None:
+                self.load_start_pos = load_pos_arr.copy()
+                self.stall_last_check_time = current_time
+                self.stall_last_check_distance = 0.0
+                rospy.loginfo(f"[Towing] Load reference locked at {self.load_start_pos}")
+            load_displacement = load_pos_arr - self.load_start_pos
+            self.current_load_distance = np.dot(load_displacement[:2], self.towing_direction[:2])
+
+        # Prefer load displacement for progress/completion when available.
+        motion_distance = self.current_load_distance if self.load_start_pos is not None else self.current_distance
+        motion_measurement_valid = (
+            self.load_start_pos is None or bool(load_measurement_valid))
+        relocking_measurement = (
+            motion_measurement_valid and self.motion_measurement_was_invalid)
+        motion_delta = motion_distance - self.last_motion_distance
+        if motion_measurement_valid and not relocking_measurement:
+            self.raw_motion_velocity = motion_delta / measurement_dt
+            self.motion_velocity = low_pass_update(
+                self.motion_velocity, self.raw_motion_velocity, measurement_dt,
+                self.velocity_filter_time_constant)
+        elif relocking_measurement:
+            # Re-lock the position baseline after a telemetry gap; accumulated
+            # displacement has no one-cycle velocity interpretation.
+            self.raw_motion_velocity = 0.0
+        self.last_motion_distance = motion_distance
+        self.motion_measurement_was_invalid = not motion_measurement_valid
+
+        # Velocity reference shared by the trajectory and the force loop. Near
+        # the goal this intentionally slows both, avoiding a force controller
+        # that fights the trajectory's ramp-down profile.
+        remaining_distance = self.target_distance - motion_distance
+        if motion_distance < self.ramp_up_distance:
+            velocity_factor = motion_distance / self.ramp_up_distance
+            self.current_velocity = self.target_velocity * max(0.2, velocity_factor)
+        elif remaining_distance < self.ramp_down_distance:
+            velocity_factor = remaining_distance / self.ramp_down_distance
+            self.current_velocity = self.target_velocity * max(0.1, velocity_factor)
+        else:
+            self.current_velocity = self.target_velocity
+
+        low_speed = self.target_velocity * 0.6
+        high_speed = self.target_velocity * 1.3
+        velocity_sample_usable = motion_measurement_valid and not relocking_measurement
+        if not velocity_sample_usable:
+            self.breakaway_confirm_elapsed = 0.0
+            self.stable_rolling_confirm_elapsed = 0.0
+            self.severe_overspeed_elapsed = 0.0
+            self.severe_overspeed_latched = False
+            self.previous_velocity_error_term = None
+        overspeed = velocity_sample_usable and self.motion_velocity > high_speed
+        severe_overspeed = velocity_sample_usable and max(
+            self.motion_velocity,
+            self.raw_motion_velocity) > self.target_velocity * self.severe_overspeed_ratio
+        filtered_severe_overspeed = (
+            velocity_sample_usable and
+            self.motion_velocity > self.target_velocity * self.severe_overspeed_ratio)
+        if (self.severe_overspeed_latched and
+                self.motion_velocity <= high_speed):
+            self.severe_overspeed_latched = False
+            self.severe_overspeed_elapsed = 0.0
+            rospy.loginfo(
+                "[Towing] Sustained severe-overspeed relief cleared at %.0fmm/s",
+                self.motion_velocity * 1000.0)
+        elif self.breakaway_detected and filtered_severe_overspeed:
+            self.severe_overspeed_elapsed += control_dt
+            if (not self.severe_overspeed_latched and
+                    self.severe_overspeed_elapsed >=
+                    self.severe_overspeed_confirm_time):
+                self.severe_overspeed_latched = True
+                rospy.logwarn(
+                    "[Towing] Sustained severe overspeed %.0fmm/s for %.1fs; "
+                    "forcing %.1fN/s feedforward relief",
+                    self.motion_velocity * 1000.0,
+                    self.severe_overspeed_elapsed,
+                    self.overspeed_force_relief_rate)
+        else:
+            self.severe_overspeed_elapsed = 0.0
+        self.velocity_error = self.current_velocity - self.motion_velocity
+        force_adjustment = 0.0
+        if velocity_sample_usable:
+            velocity_error_term = velocity_error_adjustment(
+                self.current_velocity, self.motion_velocity,
+                1.0, 1.0, self.velocity_error_deadband)
+            force_adjustment = velocity_error_adjustment(
+                self.current_velocity, self.motion_velocity,
+                self.velocity_force_gain, control_dt,
+                self.velocity_error_deadband)
+            if (self.velocity_feedback_enabled and
+                    self.previous_velocity_error_term is not None):
+                force_adjustment += self.velocity_force_damping_gain * (
+                    velocity_error_term - self.previous_velocity_error_term)
+            self.previous_velocity_error_term = velocity_error_term
+        self.force_adjust_rate = force_adjustment / max(control_dt, 1e-3)
+        positive_force_rate_limit = (
+            self.overspeed_force_relief_rate
+            if self.velocity_feedback_enabled else self.force_recover_rate)
+        self.force_adjust_rate = min(
+            positive_force_rate_limit,
+            max(-self.overspeed_force_relief_rate, self.force_adjust_rate))
+        if self.severe_overspeed_latched:
+            self.force_adjust_rate = -self.overspeed_force_relief_rate
+        if (velocity_sample_usable and not self.breakaway_detected and
+                self.load_start_pos is not None):
+            confirmed_motion_now = (
+                motion_distance >= self.breakaway_distance and
+                self.raw_motion_velocity >= self.breakaway_velocity)
+            if confirmed_motion_now:
+                self.breakaway_confirm_elapsed += control_dt
+            else:
+                self.breakaway_confirm_elapsed = 0.0
+            confirmed_motion = (
+                confirmed_motion_now and
+                self.breakaway_confirm_elapsed >= TOWING_BREAKAWAY_CONFIRM_TIME)
+            early_motion = (
+                motion_distance >= self.early_breakaway_distance and
+                self.raw_motion_velocity >= self.early_breakaway_velocity)
+            if confirmed_motion:
+                self.breakaway_detected = True
+                self.breakaway_time = current_time
+                self.breakaway_reason = "confirmed"
+                self.breakaway_force = self.current_force
+                rospy.loginfo(f"[Towing] Load breakaway confirmed: "
+                             f"dist={motion_distance*1000:.0f}mm, "
+                             f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                             f"ff={self.current_force:.1f}N, "
+                             f"feedback_min={self.velocity_feedback_min_distance*1000:.0f}mm")
+            elif early_motion and not self.breakaway_candidate_detected:
+                self.breakaway_candidate_detected = True
+                self.breakaway_candidate_time = current_time
+                self.breakaway_candidate_force = self.current_force
+                rospy.loginfo(f"[Towing] Load motion candidate: "
+                             f"dist={motion_distance*1000:.0f}mm, "
+                             f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                             f"ff={self.current_force:.1f}N, "
+                             f"waiting for {self.breakaway_distance*1000:.0f}mm confirmed travel")
+        elif (velocity_sample_usable and self.breakaway_detected and
+              not self.stable_rolling_detected):
+            stable_rolling_now = (
+                motion_distance >= self.stable_rolling_distance and
+                self.motion_velocity >= low_speed)
+            if stable_rolling_now:
+                self.stable_rolling_confirm_elapsed += control_dt
+            else:
+                self.stable_rolling_confirm_elapsed = 0.0
+            if (stable_rolling_now and
+                    self.stable_rolling_confirm_elapsed >=
+                    TOWING_STABLE_ROLLING_CONFIRM_TIME):
+                self.stable_rolling_detected = True
+                self.stable_rolling_time = current_time
+                rospy.loginfo(f"[Towing] Stable rolling confirmed: "
+                             f"dist={motion_distance*1000:.0f}mm, "
+                             f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                             f"ff={self.current_force:.1f}N")
+
+        # Update target position
+        target_distance_increment = self.current_velocity * control_dt
+        new_target_distance = min(
+            self.target_distance,
+            np.dot(self.target_pos[:2] - self.start_pos[:2], self.towing_direction[:2]) + target_distance_increment
+        )
+
+        # Clamp target so it never leads actual EE position by more than max_lead_distance.
+        # This prevents PID saturation when the load is stuck or slow.
+        new_target_distance = min(new_target_distance,
+                                  self.current_distance + self.max_lead_distance)
+        # Also keep the target from lagging too far behind the EE after breakaway.
+        # Otherwise position PID fights the towing feedforward while the load is moving.
+        new_target_distance = max(new_target_distance,
+                                  self.current_distance - self.max_lag_distance)
+        # When load tracking is available, the commanded target should not keep
+        # walking away from a stalled load. Keep only a small lead to maintain
+        # tension while the feedforward force does the heavy work.
+        if self.load_start_pos is not None:
+            load_lead_distance = self.max_load_lead_distance
+            if (not self.breakaway_detected and
+                    self.current_force >= self.max_force * self.high_force_lead_force_ratio):
+                load_lead_distance = self.high_force_load_lead_distance
+            if self.breakaway_detected:
+                load_lead_distance = min(load_lead_distance, self.breakaway_load_lead_distance)
+            new_target_distance = min(
+                new_target_distance,
+                self.current_load_distance + load_lead_distance)
+        new_target_distance = min(self.target_distance, max(0.0, new_target_distance))
+
+        self.target_pos[:2] = self.start_pos[:2] + self.towing_direction[:2] * new_target_distance
+
+        guard_state = self._update_force_guard(
+            attitude_rp, z_error, current_time, dt=control_dt)
+
+        feedback_distance_ready = (
+            velocity_sample_usable and self.breakaway_detected and
+            motion_distance >= self.velocity_feedback_min_distance)
+        if feedback_distance_ready:
+            # Latch travel progress: elastic recoil during the hold interval
+            # must not leave the post-breakaway controller disabled forever.
+            self.velocity_feedback_distance_reached = True
+        breakaway_floor_force = 0.0
+        if self.breakaway_force is not None:
+            breakaway_floor_force = self.breakaway_force * self.breakaway_force_floor_ratio
+        rolling_floor_force = 0.0
+        if self.breakaway_force is not None and not self.stable_rolling_detected:
+            rolling_floor_force = (
+                self.breakaway_force * self.stable_rolling_force_floor_ratio)
+        initial_breakaway_phase = (
+            self.breakaway_detected and
+            motion_distance < self.velocity_feedback_min_distance + self.breakaway_distance)
+        feedback_delay_ready = (
+            self.breakaway_time is not None and
+            current_time - self.breakaway_time >= TOWING_BREAKAWAY_FORCE_HOLD_TIME)
+        if (not self.velocity_feedback_enabled and
+                velocity_sample_usable and
+                self.velocity_feedback_distance_reached and
+                feedback_delay_ready):
+            self.velocity_feedback_enabled = True
+            rospy.loginfo(
+                f"[Towing] Velocity feedback enabled ({self.breakaway_reason}): "
+                f"dist={motion_distance*1000:.0f}mm, "
+                f"vel={self.motion_velocity*1000:.0f}mm/s, "
+                f"ff={self.current_force:.1f}N, "
+                f"Ki={self.velocity_force_gain:.1f}N/m, "
+                f"Kp={self.velocity_force_damping_gain:.1f}Ns/m")
+
+        force_before_adjustment = self.current_force
+        if not self.breakaway_detected:
+            if guard_state == "relief":
+                self.current_force = max(
+                    0.0, self.current_force - self.instability_force_relief_rate * control_dt)
+            elif not velocity_sample_usable:
+                pass
+            elif guard_state == "hold":
+                self.current_force = max(
+                    0.0, self.current_force - self.force_recover_rate * control_dt)
+            elif guard_state == "nominal":
+                # A confirmed-motion sample is being accumulated. Hold the
+                # current force during that short window instead of continuing
+                # to wind up before the breakaway phase switches.
+                if self.breakaway_confirm_elapsed > 0.0:
+                    pass
+                else:
+                    ramp_time = TOWING_FORCE_RAMP_TIME
+                    self.force_ramp_progress = min(
+                        1.0, self.force_ramp_progress + 1.0 / (ramp_time * self.control_rate))
+                    ramp_force = self.max_force * smoothstep01(self.force_ramp_progress)
+                    if self.current_force < ramp_force:
+                        self.current_force = min(
+                            ramp_force, self.current_force + self.force_recover_rate * control_dt)
+                    else:
+                        self.current_force = ramp_force
+        else:
+            if guard_state == "relief":
+                # Safety relief remains independent of the object-speed loop.
+                self.current_force -= self.instability_force_relief_rate * control_dt
+            elif not velocity_sample_usable:
+                pass
+            elif not self.velocity_feedback_enabled:
+                # During the post-breakaway hold, retain the force on low
+                # speed but still permit proportional overspeed relief.
+                if self.force_adjust_rate < 0.0:
+                    self.current_force += self.force_adjust_rate * control_dt
+            elif guard_state == "hold":
+                # A hold guard may unload, but must not raise feedforward force.
+                if self.force_adjust_rate < 0.0:
+                    self.current_force += self.force_adjust_rate * control_dt
+            else:
+                self.current_force += self.force_adjust_rate * control_dt
+
+            contact_floor = 0.0
+            if initial_breakaway_phase:
+                contact_floor = max(contact_floor, breakaway_floor_force)
+            if rolling_floor_force > 0.0:
+                contact_floor = max(contact_floor, rolling_floor_force)
+            # Preserve a floor only while force was already above it. A safety
+            # guard or goal taper that unloaded below the floor must recover via
+            # the rate-limited velocity loop, never through a one-cycle jump.
+            if (guard_state != "relief" and
+                    not self.severe_overspeed_latched and
+                    contact_floor > 0.0 and
+                    force_before_adjustment >= contact_floor):
+                self.current_force = max(
+                    self.current_force,
+                    min(self.max_force, contact_floor))
+            self.current_force = min(self.max_force, max(0.0, self.current_force))
+
+        progress_ratio = motion_distance / max(self.target_distance, 1e-6)
+        if progress_ratio > TOWING_GOAL_TAPER_START_RATIO:
+            taper_span = 1.0 - TOWING_GOAL_TAPER_START_RATIO
+            remaining_ratio = max(0.0, min(1.0, (1.0 - progress_ratio) / taper_span))
+            force_cap_ratio = (TOWING_GOAL_FORCE_FLOOR_RATIO +
+                               (1.0 - TOWING_GOAL_FORCE_FLOOR_RATIO) * remaining_ratio)
+            self.current_force = min(self.current_force, self.max_force * force_cap_ratio)
+
+        # Stall detection using sliding window (for abort decision only). Before
+        # breakaway, arm this watchdog only after the configured feedforward is
+        # reached; otherwise the ramp itself can create a false stall.
+        stall_force_gate_ready = (
+            self.breakaway_detected or
+            self.current_force >= self.stall_min_force)
+        if stall_force_gate_ready and not self.stall_force_gate_active:
+            rospy.loginfo(
+                f"[Towing] Stall watchdog armed at ff={self.current_force:.1f}N "
+                f"(gate={self.stall_min_force:.1f}N)")
+        self.stall_force_gate_active = stall_force_gate_ready
+
+        window_elapsed = current_time - self.stall_last_check_time
+        if not velocity_sample_usable:
+            self.stall_last_check_time = current_time
+            self.stall_last_check_distance = motion_distance
+        elif window_elapsed >= self.stall_window_time:
+            window_distance = motion_distance - self.stall_last_check_distance
+            recent_velocity = window_distance / window_elapsed
+            self._recent_velocity = recent_velocity
+            self.stall_last_check_time = current_time
+            self.stall_last_check_distance = motion_distance
+
+            if not stall_force_gate_ready:
+                self.stall_counter = 0
+            elif recent_velocity < self.target_velocity * 0.05:  # < 5% of target
+                self.stall_counter += 1  # increments once per armed window
+            else:
+                self.stall_counter = max(0, self.stall_counter - 1)
+
+        return {
+            'current_distance': self.current_distance,
+            'current_load_distance': self.current_load_distance,
+            'target_distance': self.target_distance,
+            'current_velocity': self.current_velocity,
+            'current_force': self.current_force,
+            'raw_motion_velocity': self.raw_motion_velocity,
+            'motion_velocity': self.motion_velocity,
+            'velocity_reference': self.current_velocity,
+            'velocity_error': self.velocity_error,
+            'force_adjust_rate': self.force_adjust_rate,
+            'velocity_feedback_enabled': self.velocity_feedback_enabled,
+            'velocity_feedback_distance_reached': self.velocity_feedback_distance_reached,
+            'motion_measurement_valid': velocity_sample_usable,
+            'breakaway_detected': self.breakaway_detected,
+            'breakaway_candidate': self.breakaway_candidate_detected,
+            'stable_rolling': self.stable_rolling_detected,
+            'overspeed': overspeed,
+            'severe_overspeed': severe_overspeed,
+            'sustained_severe_overspeed': self.severe_overspeed_latched,
+            'force_guard': self.force_guard_state,
+            'task_weight_scale': self.task_weight_scale,
+            'progress': motion_distance / self.target_distance,
+            'stall_counter': self.stall_counter,
+            'stall_force_gate_ready': stall_force_gate_ready,
+            'using_load_tracking': self.load_start_pos is not None
+        }
+
+    def generate_target_state(self, current_yaw):
+        """
+        Generate target state for control.
+
+        Args:
+            current_yaw: Current assembly yaw (maintain during towing)
+
+        Returns:
+            dict: Target state with position, velocity, force
+        """
+        # Target velocity in world frame
+        target_linear_vel = self.towing_direction * self.current_velocity
+
+        # Force feedforward: world-horizontal force in towing direction.
+        # The state executor converts it to one common formation-CoG wrench
+        # before selecting the LF or unified allocation path.
+        target_force = self.towing_direction * self.current_force
+        target_force[2] = 0.0
+
+        return {
+            'position': self.target_pos.copy(),
+            'yaw': current_yaw,
+            'linear_velocity': target_linear_vel,
+            'angular_velocity': 0.0,
+            'force': target_force,
+            'torque': np.array([0.0, 0.0, 0.0])
+        }
+
+    def is_complete(self):
+        """Check if towing is complete."""
+        distance_for_completion = self.current_load_distance if self.load_start_pos is not None else self.current_distance
+        return distance_for_completion >= self.target_distance * 0.95
+
+    def get_progress(self):
+        """Get towing progress [0.0, 1.0]."""
+        distance_for_progress = self.current_load_distance if self.load_start_pos is not None else self.current_distance
+        return min(1.0, distance_for_progress / self.target_distance)
+
+
+class LoadInterface:
+    """Interface for load box position tracking (simulation and real machine)."""
+
+    def __init__(self):
+        self.load_pos = None
+        self.load_yaw = 0.0
+        self.position_received = threading.Event()
+        self.position_last_received_time = None
+        self.position_last_stamp = None
+        self.position_last_stamp_change_time = None
+        self.velocity_feedback_timeout = max(
+            0.0, float(rospy.get_param("~velocity_feedback_timeout", 0.5)))
+
+        is_simulation = rospy.get_param("~simulation", True)
+        if is_simulation:
+            rospy.Subscriber('/load/odom', Odometry, self._load_sim_cb, queue_size=1)
+        else:
+            rospy.Subscriber('/load/mocap/pose', PoseStamped, self._load_cb, queue_size=1)
+        rospy.loginfo(f"LoadInterface: mode={'simulation' if is_simulation else 'real_machine'}")
+
+    def _load_cb(self, msg):
+        """Callback for real machine (PoseStamped from mocap)."""
+        self._set_load_pose(msg.pose, msg.header)
+
+    def _load_sim_cb(self, msg):
+        """Callback for simulation (Odometry from Gazebo)."""
+        self._set_load_pose(msg.pose.pose, msg.header)
+
+    def _set_load_pose(self, pose, header=None):
+        pos = pose.position
+        ori = pose.orientation
+        self.load_pos = np.array([pos.x, pos.y, pos.z])
+        self.load_yaw = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])[2]
+        now = rospy.get_time()
+        self.position_last_received_time = now
+        stamp = header.stamp.to_sec() if header is not None else 0.0
+        if stamp <= 0.0 or stamp != self.position_last_stamp:
+            self.position_last_stamp = stamp
+            self.position_last_stamp_change_time = now
+        if not self.position_received.is_set():
+            rospy.loginfo(f"Load position received: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}), yaw={math.degrees(self.load_yaw):.1f} deg")
+            self.position_received.set()
+
+    def get_load_position(self):
+        return self.load_pos
+
+    def get_load_yaw(self):
+        return self.load_yaw
+
+    def is_load_pose_fresh(self):
+        if (self.position_last_received_time is None or
+                self.position_last_stamp_change_time is None):
+            return False
+        now = rospy.get_time()
+        ages = (now - self.position_last_received_time,
+                now - self.position_last_stamp_change_time)
+        return all(math.isfinite(age) and 0.0 <= age <= self.velocity_feedback_timeout
+                   for age in ages)
+
+    def get_load_top_z(self):
+        if self.load_pos is not None:
+            return self.load_pos[2] + LOAD_BOX_HEIGHT / 2
+        return None
+
+    def wait_for_load(self, timeout=10.0):
+        rospy.loginfo("Waiting for load position...")
+        if self.position_received.wait(timeout):
+            rospy.loginfo("Load position available")
+            return True
+        rospy.logerr(f"Load position not received after {timeout}s")
+        return False
+
+
+class TowingStateBase(FormationSingleUAVStateBase):
+    """Base class for towing states, extends FormationSingleUAVStateBase."""
+
+    # Shared load interface across states
+    _shared_load_interface = None
+    _debug_subscribers = []
+    _debug_module_ids = set()
+    _debug_lock = threading.Lock()
+    _last_four_axis_stamp = {}
+    _last_flight_state_stamp = {}
+    _last_flight_state = {}
+    _last_config_ack_stamp = {}
+    _last_config_ack = {}
+
+    def __init__(self, outcomes, input_keys=None, output_keys=None):
+        FormationSingleUAVStateBase.__init__(self, outcomes, input_keys, output_keys)
+
+        # Initialize shared load interface
+        if TowingStateBase._shared_load_interface is None:
+            TowingStateBase._shared_load_interface = LoadInterface()
+        self.load_interface = TowingStateBase._shared_load_interface
+        self.debug_monitors_enabled = rospy.get_param("~enable_command_debug_monitors", False)
+        if self.debug_monitors_enabled:
+            self._init_module_debug_monitors()
+
+    def _init_module_debug_monitors(self):
+        """Track command and force-landing heartbeat during insertion debug."""
+        with TowingStateBase._debug_lock:
+            missing_ids = [
+                module_id for module_id in self.formation_adapter.module_ids
+                if module_id not in TowingStateBase._debug_module_ids
+            ]
+            for module_id in missing_ids:
+                TowingStateBase._debug_subscribers.extend([
+                    rospy.Subscriber(f"/hih{module_id}/four_axes/command",
+                                     rospy.AnyMsg, self._four_axis_debug_cb,
+                                     callback_args=module_id, queue_size=1),
+                    rospy.Subscriber(f"/hih{module_id}/flight_state",
+                                     UInt8, self._flight_state_debug_cb,
+                                     callback_args=module_id, queue_size=1),
+                    rospy.Subscriber(f"/hih{module_id}/flight_config_ack",
+                                     UInt8, self._config_ack_debug_cb,
+                                     callback_args=module_id, queue_size=1),
+                ])
+                TowingStateBase._debug_module_ids.add(module_id)
+
+    def _four_axis_debug_cb(self, _msg, module_id):
+        with TowingStateBase._debug_lock:
+            TowingStateBase._last_four_axis_stamp[module_id] = rospy.Time.now().to_sec()
+
+    def _flight_state_debug_cb(self, msg, module_id):
+        with TowingStateBase._debug_lock:
+            TowingStateBase._last_flight_state[module_id] = msg.data
+            TowingStateBase._last_flight_state_stamp[module_id] = rospy.Time.now().to_sec()
+
+    def _config_ack_debug_cb(self, msg, module_id):
+        with TowingStateBase._debug_lock:
+            TowingStateBase._last_config_ack[module_id] = msg.data
+            TowingStateBase._last_config_ack_stamp[module_id] = rospy.Time.now().to_sec()
+
+    def format_module_debug_status(self):
+        if not getattr(self, "debug_monitors_enabled", False):
+            return ""
+
+        now = rospy.Time.now().to_sec()
+
+        def age_text(stamp, stale_limit=0.5):
+            if stamp is None:
+                return "NA"
+            age = now - stamp
+            suffix = "!" if age > stale_limit else ""
+            return f"{age:.2f}s{suffix}"
+
+        with TowingStateBase._debug_lock:
+            parts = []
+            for module_id in self.formation_adapter.module_ids:
+                cmd_stamp = TowingStateBase._last_four_axis_stamp.get(module_id)
+                state_stamp = TowingStateBase._last_flight_state_stamp.get(module_id)
+                ack_stamp = TowingStateBase._last_config_ack_stamp.get(module_id)
+                state = TowingStateBase._last_flight_state.get(module_id, "NA")
+                ack = TowingStateBase._last_config_ack.get(module_id, "NA")
+                parts.append(
+                    f"b{module_id}:cmd_age={age_text(cmd_stamp)} "
+                    f"state={state}/age={age_text(state_stamp)} "
+                    f"ack={ack}/age={age_text(ack_stamp, stale_limit=2.0)}"
+                )
+        return " module_debug=[" + "; ".join(parts) + "]"
+
+    def log_module_debug_status(self, prefix):
+        if not getattr(self, "debug_monitors_enabled", False):
+            return
+        rospy.loginfo(f"{prefix}{self.format_module_debug_status()}")
+
+    def _approach_frame_xy_error(self, current_pos, target_pos, approach_direction):
+        if current_pos is None or target_pos is None or approach_direction is None:
+            return None
+
+        approach_xy = np.array(approach_direction[:2], dtype=float)
+        norm = np.linalg.norm(approach_xy)
+        if norm < 1e-6:
+            return None
+        approach_xy = approach_xy / norm
+        lateral_axis = np.array([-approach_xy[1], approach_xy[0]])
+        delta_xy = np.array(current_pos[:2], dtype=float) - np.array(target_pos[:2], dtype=float)
+
+        longitudinal = float(np.dot(delta_xy, approach_xy))
+        lateral = float(np.dot(delta_xy, lateral_axis))
+        xy_error = float(np.linalg.norm(delta_xy))
+        return longitudinal, lateral, xy_error
+
+    def log_insertion_alignment(self, label, current_pos, target_pos, approach_direction,
+                                lateral_tolerance=HOOK_ALIGNMENT_LATERAL_TOLERANCE):
+        error = self._approach_frame_xy_error(current_pos, target_pos, approach_direction)
+        if error is None:
+            rospy.logwarn(f"[Insertion Align] {label}: cannot compute approach-frame error")
+            return True
+
+        longitudinal, lateral, xy_error = error
+        ok = abs(lateral) <= lateral_tolerance
+        log_fn = rospy.loginfo if ok else rospy.logwarn
+        log_fn(
+            f"[Insertion Align] {label}: xy_err={xy_error*1000:.1f}mm, "
+            f"along={longitudinal*1000:.1f}mm, lateral={lateral*1000:.1f}mm "
+            f"(limit={lateral_tolerance*1000:.0f}mm)"
+        )
+        return ok
+
+    def soft_recenter_insertion_alignment(
+            self, label, target_pos, target_yaw, approach_direction,
+            lateral_tolerance=HOOK_ALIGNMENT_LATERAL_TOLERANCE,
+            timeout=5.0, max_linear_vel=0.03):
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logwarn(f"[Insertion Align] {label}: position unavailable; continuing")
+            return False
+
+        if self.log_insertion_alignment(
+                label, current_pos, target_pos, approach_direction,
+                lateral_tolerance=lateral_tolerance):
+            return True
+
+        recenter_target = np.array(target_pos, dtype=float)
+        recenter_target[2] = current_pos[2]
+        rospy.logwarn(
+            f"[Insertion Align] {label}: lateral error exceeds "
+            f"{lateral_tolerance*1000:.0f}mm; trying soft XY recenter"
+        )
+        self.active_position_convergence(
+            recenter_target, target_yaw=target_yaw,
+            pos_thresh=lateral_tolerance, yaw_thresh=0.05,
+            timeout=timeout, max_linear_vel=max_linear_vel
+        )
+
+        current_pos = self.get_end_effector_position()
+        ok = self.log_insertion_alignment(
+            f"{label} after recenter", current_pos, target_pos, approach_direction,
+            lateral_tolerance=lateral_tolerance)
+        if not ok:
+            rospy.logwarn(
+                f"[Insertion Align] {label}: still outside lateral tolerance; "
+                "continuing but keeping planned hook XY"
+            )
+        return ok
+
+    def get_load_position(self):
+        """Get current load position."""
+        return self.load_interface.get_load_position()
+
+    def get_load_top_z(self):
+        """Get load box top Z coordinate."""
+        return self.load_interface.get_load_top_z()
+
+    def calculate_approach_side(self, assembly_pos, load_pos):
+        """
+        Calculate which side of the load to approach (nearest edge midpoint).
+        Accounts for load yaw: edges and approach directions are rotated accordingly.
+
+        Returns:
+            tuple: (approach_direction_vector, side_name, edge_midpoint_position)
+        """
+        if assembly_pos is None or load_pos is None:
+            return None, None, None
+
+        load_yaw = self.load_interface.get_load_yaw()
+        cos_y, sin_y = math.cos(load_yaw), math.sin(load_yaw)
+
+        def rotate_2d(v):
+            return np.array([cos_y*v[0] - sin_y*v[1], sin_y*v[0] + cos_y*v[1], v[2]])
+
+        half_length = LOAD_BOX_LENGTH / 2
+        half_width = LOAD_BOX_WIDTH / 2
+
+        # Local frame edge offsets and outward directions, rotated by load_yaw
+        local_edges = {
+            '+X': np.array([half_length, 0, 0]),
+            '-X': np.array([-half_length, 0, 0]),
+            '+Y': np.array([0, half_width, 0]),
+            '-Y': np.array([0, -half_width, 0]),
+        }
+        local_dirs = {
+            '+X': np.array([1, 0, 0]),
+            '-X': np.array([-1, 0, 0]),
+            '+Y': np.array([0, 1, 0]),
+            '-Y': np.array([0, -1, 0]),
+        }
+
+        edge_midpoints = {side: load_pos + rotate_2d(off) for side, off in local_edges.items()}
+        approach_dirs = {side: rotate_2d(d) for side, d in local_dirs.items()}
+
+        distances = {side: np.linalg.norm(np.array(assembly_pos) - midpoint)
+                     for side, midpoint in edge_midpoints.items()}
+
+        nearest_side = min(distances.keys(), key=lambda k: distances[k])
+        edge_pos = edge_midpoints[nearest_side]
+        approach_dir = approach_dirs[nearest_side]
+
+        rospy.loginfo(f"Approach side: {nearest_side}, direction: {approach_dir}, edge: {edge_pos}")
+        if abs(load_yaw) > 0.01:
+            rospy.loginfo(f"Load yaw: {math.degrees(load_yaw):.1f} deg (edges rotated)")
+        return approach_dir, nearest_side, edge_pos
+
+
+class TowingInitializeState(TowingStateBase):
+    """Initialize towing task - get positions and calculate approach strategy."""
+
+    def __init__(self):
+        TowingStateBase.__init__(self,
+            outcomes=['succeeded', 'failed'],
+            output_keys=['start_position', 'start_yaw', 'load_position',
+                        'approach_direction', 'approach_side', 'edge_position'])
+
+    def execute(self, userdata):
+        rospy.loginfo("=== Towing Initialize State ===")
+
+        # Wait for load position
+        if not self.load_interface.wait_for_load(timeout=15.0):
+            rospy.logerr("Failed to get load position")
+            return 'failed'
+
+        rospy.sleep(2.0)  # Wait for stable readings
+
+        # Get positions
+        assembly_pos = self.get_assembly_position()
+        assembly_yaw = self.get_assembly_yaw()
+        load_pos = self.get_load_position()
+
+        if assembly_pos is None:
+            rospy.logerr("Assembly position not available")
+            return 'failed'
+
+        if load_pos is None:
+            rospy.logerr("Load position not available")
+            return 'failed'
+
+        # Calculate approach side
+        approach_dir, side_name, edge_pos = self.calculate_approach_side(assembly_pos, load_pos)
+
+        if approach_dir is None:
+            rospy.logerr("Failed to calculate approach direction")
+            return 'failed'
+
+        # Store in userdata (use EE frame - all movement commands operate in EE coordinates)
+        userdata.start_position = self.get_end_effector_position()
+        userdata.start_yaw = self.get_end_effector_yaw()
+        userdata.load_position = load_pos
+        userdata.approach_direction = approach_dir
+        userdata.approach_side = side_name
+        userdata.edge_position = edge_pos
+
+        rospy.loginfo(f"Assembly position: {FormationUtils.format_vec(assembly_pos)}")
+        rospy.loginfo(f"Assembly yaw: {math.degrees(assembly_yaw):.1f} deg")
+        rospy.loginfo(f"Load position: {FormationUtils.format_vec(load_pos)}")
+        rospy.loginfo(f"Approach side: {side_name}")
+
+        return 'succeeded'
+
+
+class ApproachLoadState(TowingStateBase):
+    """Move end-effector to position above load edge, slightly over the box."""
+
+    def __init__(self):
+        TowingStateBase.__init__(self,
+            outcomes=['succeeded', 'failed'],
+            input_keys=['load_position', 'approach_direction', 'approach_side', 'edge_position'],
+            output_keys=['approach_position', 'insertion_position', 'insertion_yaw'])
+
+    def execute(self, userdata):
+        rospy.loginfo("=== Approach Load State ===")
+
+        load_pos = userdata.load_position
+        approach_dir = userdata.approach_direction
+        edge_pos = userdata.edge_position
+
+        # Calculate positions
+        # NOTE: `/load/odom` provides the load pose at the model origin (center) in this setup.
+        # Therefore: top_z = center_z + height/2.
+        load_center_z = float(load_pos[2])
+        load_top_z = load_center_z + LOAD_BOX_HEIGHT / 2
+        approach_height = load_top_z + APPROACH_HEIGHT_OFFSET
+        insertion_z = (load_top_z + HOOK_CONTACT_INSERT_CLEARANCE -
+                       TOWING_HOOK_CONTACT_DZ_FROM_EE)
+        approach_hook_clearance = approach_height + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
+
+        # Position slightly inside the box edge (overshoot by 110mm for insertion)
+        overshoot = 0.11  # 110mm inside box edge
+        approach_xy = edge_pos[:2] - approach_dir[:2] * overshoot
+
+        # Calculate target yaw: facing into the box (opposite of approach direction)
+        target_yaw = math.atan2(-approach_dir[1], -approach_dir[0])
+
+        # Get current state
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr("Cannot get current end-effector position")
+            return 'failed'
+
+        rospy.loginfo(f"Current position: {FormationUtils.format_vec(current_pos)}")
+        rospy.loginfo(f"Target XY: ({approach_xy[0]:.3f}, {approach_xy[1]:.3f})")
+        rospy.loginfo(
+            f"Load Z: center={load_center_z:.3f}m, top={load_top_z:.3f}m, "
+            f"approach_offset={APPROACH_HEIGHT_OFFSET:.3f}m"
+        )
+        rospy.loginfo(f"Target height: {approach_height:.3f}m")
+        rospy.loginfo(
+            f"Hook contact clearance: approach={approach_hook_clearance*1000:.0f}mm, "
+            f"insert={HOOK_CONTACT_INSERT_CLEARANCE*1000:.0f}mm above box top"
+        )
+        rospy.loginfo(f"Target yaw: {math.degrees(target_yaw):.1f} deg")
+
+        current_yaw = self.get_end_effector_yaw()
+        if current_yaw is None:
+            rospy.logerr("Cannot get current end-effector yaw")
+            return 'failed'
+
+        # Phase 1: XY movement with current yaw held. This keeps the EE from
+        # sweeping around the load edge while translating to the centerline.
+        transit_z = max(current_pos[2], load_top_z + TRANSIT_CLEARANCE_OFFSET)
+        rospy.loginfo(f"[Phase 1] Moving to XY position above box "
+                      f"(transit_z={transit_z:.3f}m, floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m, "
+                      f"yaw_hold={math.degrees(current_yaw):.1f} deg)")
+        phase1_target = np.array([approach_xy[0], approach_xy[1], transit_z])
+
+        trajectory_points = self.generate_polynomial_trajectory(
+            start_pos=current_pos,
+            target_pos=phase1_target,
+            target_yaw=current_yaw,
+            lock_yaw=True
+        )
+
+        if trajectory_points:
+            self.execute_polynomial_trajectory(trajectory_points)
+
+        success = self.active_position_convergence(
+            phase1_target, target_yaw=current_yaw,
+            pos_thresh=0.03, yaw_thresh=0.1, timeout=20.0
+        )
+        if not success:
+            reason = getattr(self, "last_convergence_failure_reason", "unknown")
+            rospy.logwarn(f"Phase 1 XY settling incomplete ({reason}), continuing...")
+
+        # Phase 2: rotate to load-aligned yaw while still holding the planned
+        # centerline. Do not accept an off-center Phase 1 position as the yaw
+        # target; otherwise lateral error can be carried into insertion.
+        rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(target_yaw):.1f} deg "
+                      "while holding planned XY")
+        success = self.active_position_convergence(
+            phase1_target, target_yaw=target_yaw,
+            pos_thresh=0.05, yaw_thresh=0.05, timeout=15.0,
+            max_yaw_step=0.05, max_linear_vel=0.04
+        )
+        if not success:
+            reason = getattr(self, "last_convergence_failure_reason", "unknown")
+            rospy.logwarn(f"Phase 2 XY/yaw adjustment incomplete ({reason}), continuing...")
+
+        # Phase 3: final XY/yaw settle on the load-aligned centerline.
+        rospy.loginfo("[Phase 3] Final XY/yaw settle before insertion")
+        success = self.active_position_convergence(
+            phase1_target, target_yaw=target_yaw,
+            pos_thresh=0.035, yaw_thresh=0.05, timeout=10.0,
+            max_linear_vel=0.03
+        )
+        if not success:
+            reason = getattr(self, "last_convergence_failure_reason", "unknown")
+            rospy.logwarn(f"Phase 3 XY/yaw settling incomplete ({reason}), continuing...")
+
+        # DESCEND_AND_INSERT conditionally splits at this approach height. If the
+        # final hook insertion would be too short, it descends directly instead.
+        approach_pos = np.array([approach_xy[0], approach_xy[1], approach_height])
+        insertion_pos = np.array([approach_xy[0], approach_xy[1], insertion_z])
+        userdata.insertion_position = insertion_pos
+        userdata.approach_position = approach_pos
+        userdata.insertion_yaw = target_yaw
+
+        final_insert_drop = max(0.0, approach_height - insertion_z)
+        rospy.loginfo(
+            f"Insertion plan: approach_pos={FormationUtils.format_vec(approach_pos)}, "
+            f"insert_pos={FormationUtils.format_vec(insertion_pos)}, "
+            f"final_insert_drop={final_insert_drop*1000:.1f}mm "
+            f"(split_min={MIN_SPLIT_INSERTION_DROP*1000:.0f}mm)"
+        )
+
+        rospy.loginfo("Approach complete")
+        return 'succeeded'
+
+
+class DescendAndInsertState(TowingStateBase):
+    """Descend to insert end-effector into the load box."""
+
+    def __init__(self):
+        TowingStateBase.__init__(self,
+            outcomes=['succeeded', 'failed'],
+            input_keys=['approach_position', 'insertion_position', 'insertion_yaw',
+                        'approach_direction', 'load_position'],
+            output_keys=['hook_position', 'hook_yaw'])
+
+    def execute(self, userdata):
+        rospy.loginfo("=== Descend and Insert State ===")
+
+        insertion_pos = userdata.insertion_position
+        insertion_yaw = userdata.insertion_yaw
+        approach_pos = userdata.approach_position
+        approach_dir = userdata.approach_direction
+        load_top_z = float(userdata.load_position[2]) + LOAD_BOX_HEIGHT / 2
+
+        rospy.loginfo(f"Approach-height target: {FormationUtils.format_vec(approach_pos)}")
+        rospy.loginfo(f"Insertion target: {FormationUtils.format_vec(insertion_pos)}")
+        final_insert_drop = max(0.0, approach_pos[2] - insertion_pos[2])
+        rospy.loginfo(
+            f"Final hook insertion drop: {final_insert_drop*1000:.1f}mm "
+            f"(split_min={MIN_SPLIT_INSERTION_DROP*1000:.0f}mm)"
+        )
+        rospy.loginfo(
+            f"Hook contact target clearance: {HOOK_CONTACT_INSERT_CLEARANCE*1000:.0f}mm above box top "
+            f"(box_top={load_top_z:.3f}m, hook_dz_from_ee={TOWING_HOOK_CONTACT_DZ_FROM_EE:.3f}m)"
+        )
+
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr("Cannot get current position")
+            return 'failed'
+
+        approach_descent = max(0.0, current_pos[2] - approach_pos[2])
+        total_insert_descent = max(0.0, current_pos[2] - insertion_pos[2])
+        use_split_descent = final_insert_drop >= MIN_SPLIT_INSERTION_DROP
+        rospy.loginfo(
+            f"Insertion descent request: current_to_approach={approach_descent*1000:.1f}mm, "
+            f"current_to_insert={total_insert_descent*1000:.1f}mm, "
+            f"split={use_split_descent} (final_drop_only)"
+        )
+
+        if not use_split_descent:
+            rospy.loginfo("[Insertion] Final insertion segment is short; using one continuous descent")
+            self.log_module_debug_status("[Insertion Debug] before single insertion descent")
+            self.soft_recenter_insertion_alignment(
+                "before single insertion", insertion_pos, insertion_yaw, approach_dir,
+                lateral_tolerance=SINGLE_DESCENT_ALIGNMENT_LATERAL_TOLERANCE)
+            current_pos = self.get_end_effector_position()
+            if current_pos is None:
+                rospy.logerr("Cannot get current position before single insertion")
+                return 'failed'
+            success, achieved_pos = self.streaming_z_descent(
+                current_pos,
+                insertion_pos,
+                insertion_yaw,
+                descent_speed=0.05,
+                contact_detection_remaining=HOOK_INSERTION_DEPTH_TOLERANCE
+            )
+        else:
+            self.log_module_debug_status("[Insertion Debug] before approach descent")
+
+            # Stage 1: descend from transit height to load-anchored approach height.
+            success, achieved_pos = self.streaming_z_descent(
+                current_pos,
+                approach_pos,
+                insertion_yaw,
+                descent_speed=0.05,
+                contact_detection_remaining=HOOK_INSERTION_DEPTH_TOLERANCE
+            )
+
+            if not success:
+                rospy.logerr("Approach-height descent failed (aborted). Exiting state machine.")
+                self.log_module_debug_status("[Insertion Debug] approach descent failed")
+                return 'failed'
+
+            self.log_module_debug_status("[Insertion Debug] before approach recenter")
+            recentered = self.active_position_convergence(
+                approach_pos, target_yaw=insertion_yaw,
+                pos_thresh=0.035, yaw_thresh=0.05, timeout=10.0,
+                max_linear_vel=0.04
+            )
+            if not recentered:
+                rospy.logwarn("Approach-height recenter incomplete; continuing to final insertion.")
+                self.log_module_debug_status("[Insertion Debug] approach recenter incomplete")
+
+            current_pos = self.get_end_effector_position()
+            if current_pos is None:
+                rospy.logerr("Cannot get current position before final insertion")
+                return 'failed'
+
+            self.soft_recenter_insertion_alignment(
+                "before final insertion", insertion_pos, insertion_yaw, approach_dir)
+            current_pos = self.get_end_effector_position()
+            if current_pos is None:
+                rospy.logerr("Cannot get current position before final insertion")
+                return 'failed'
+
+            # Stage 2: final insertion based on hook contact clearance.
+            self.log_module_debug_status("[Insertion Debug] before final insertion")
+            success, achieved_pos = self.streaming_z_descent(
+                current_pos,
+                insertion_pos,
+                insertion_yaw,
+                descent_speed=0.03,
+                contact_detection_remaining=HOOK_INSERTION_DEPTH_TOLERANCE
+            )
+
+        insertion_descent_soft_failed = not success
+        if insertion_descent_soft_failed:
+            if achieved_pos is None:
+                rospy.logerr("Z descent failed without a valid achieved position")
+                self.log_module_debug_status("[Insertion Debug] insertion descent failed")
+                return 'failed'
+            error = self._approach_frame_xy_error(
+                achieved_pos, insertion_pos, approach_dir)
+            if error is not None and error[2] > HOOK_ATTEMPT_MAX_SOFT_FAIL_XY_ERROR:
+                rospy.logerr(
+                    f"Z descent failed with XY error {error[2]*1000:.0f}mm "
+                    f"> {HOOK_ATTEMPT_MAX_SOFT_FAIL_XY_ERROR*1000:.0f}mm; "
+                    "refusing hook/tow attempt"
+                )
+                self.log_module_debug_status("[Insertion Debug] insertion descent failed")
+                return 'failed'
+            rospy.logwarn(
+                "Z descent soft-failed; continuing to insertion-depth check "
+                "with planned centerline"
+            )
+            self.log_module_debug_status("[Insertion Debug] insertion descent soft-failed")
+
+        # Verify achieved hook contact clearance relative to the load top.
+        if achieved_pos is None:
+            rospy.logerr("Cannot verify hook contact clearance")
+            return 'failed'
+        achieved_clearance = achieved_pos[2] + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
+        rospy.loginfo(
+            f"Achieved hook contact clearance: {achieved_clearance*1000:.1f}mm "
+            f"(target={HOOK_CONTACT_INSERT_CLEARANCE*1000:.1f}mm, positive=above box top)"
+        )
+        min_allowed_clearance = (
+            HOOK_CONTACT_INSERT_CLEARANCE - HOOK_INSERTION_DEPTH_TOLERANCE
+        )
+        max_allowed_clearance = (
+            HOOK_CONTACT_INSERT_CLEARANCE + HOOK_INSERTION_DEPTH_TOLERANCE
+        )
+        insertion_clearance_ok = (
+            min_allowed_clearance <= achieved_clearance <= max_allowed_clearance
+        )
+        final_clearance = achieved_clearance
+        if not insertion_clearance_ok:
+            depth_reason = (
+                "too deep" if achieved_clearance < min_allowed_clearance
+                else "too shallow")
+            rospy.logwarn(
+                f"Hook insertion {depth_reason}: clearance={achieved_clearance*1000:.1f}mm "
+                f"outside [{min_allowed_clearance*1000:.1f}, "
+                f"{max_allowed_clearance*1000:.1f}]mm; "
+                "holding measured insertion height"
+            )
+            self.log_module_debug_status("[Insertion Debug] hook clearance failed")
+
+        self.log_insertion_alignment(
+            "after final insertion", achieved_pos, insertion_pos, approach_dir)
+
+        contact_pos = np.array(insertion_pos, dtype=float)
+        contact_pos[2] = achieved_pos[2]
+        if not insertion_clearance_ok:
+            rospy.logwarn(
+                f"Using measured insertion Z={contact_pos[2]:.3f}m for stabilization "
+                f"instead of forcing planned_Z={insertion_pos[2]:.3f}m"
+            )
+
+        # Stabilize at the measured insertion Z once more before deciding
+        # whether the hook is inside the allowed depth band.
+        rospy.loginfo("Stabilizing at insertion contact position...")
+        self.active_stabilization_wait(contact_pos, insertion_yaw, duration=2.0)
+        settled_contact_pos = self.get_end_effector_position()
+        if settled_contact_pos is not None:
+            self.log_insertion_alignment(
+                "after contact stabilization", settled_contact_pos,
+                insertion_pos, approach_dir)
+            settled_clearance = (
+                settled_contact_pos[2] + TOWING_HOOK_CONTACT_DZ_FROM_EE - load_top_z
+            )
+            final_clearance = settled_clearance
+            rospy.loginfo(
+                f"Settled hook contact clearance: {settled_clearance*1000:.1f}mm "
+                f"(allowed=[{min_allowed_clearance*1000:.1f}, "
+                f"{max_allowed_clearance*1000:.1f}]mm)"
+            )
+            if min_allowed_clearance <= settled_clearance <= max_allowed_clearance:
+                contact_pos[2] = settled_contact_pos[2]
+                insertion_clearance_ok = True
+            else:
+                insertion_clearance_ok = False
+                contact_pos[2] = settled_contact_pos[2]
+                depth_reason = (
+                    "too deep" if settled_clearance < min_allowed_clearance
+                    else "too shallow")
+                rospy.logwarn(
+                    f"Hook insertion still {depth_reason} after stabilization; keeping measured "
+                    f"insertion Z={contact_pos[2]:.3f}m for hook/retract "
+                    f"(planned_Z={insertion_pos[2]:.3f}m)"
+                )
+            rospy.loginfo(
+                f"Insertion contact pose locked at {FormationUtils.format_vec(contact_pos)} "
+                f"(measured={FormationUtils.format_vec(settled_contact_pos)})"
+            )
+
+        if not insertion_clearance_ok:
+            depth_reason = (
+                "too deep" if final_clearance < min_allowed_clearance
+                else "too shallow")
+            rospy.logwarn(
+                f"Hook insertion remains {depth_reason} after calibration: "
+                f"clearance={final_clearance*1000:.1f}mm, "
+                f"allowed=[{min_allowed_clearance*1000:.1f}, "
+                f"{max_allowed_clearance*1000:.1f}]mm. "
+                "Proceeding to hook/tow by experiment policy; watch for EE middle-section contact."
+            )
+            self.log_module_debug_status("[Insertion Debug] hook clearance failed")
+
+        # Calculate hook position (retract to hook edge)
+        hook_pos = contact_pos.copy()
+        hook_pos[:2] = contact_pos[:2] + approach_dir[:2] * RETRACT_DISTANCE
+
+        userdata.hook_position = hook_pos
+        userdata.hook_yaw = insertion_yaw
+
+        if insertion_descent_soft_failed and not insertion_clearance_ok:
+            rospy.logwarn(
+                "Z descent soft-failed and insertion depth is outside the preferred band; "
+                "proceeding to hook/tow")
+        elif insertion_descent_soft_failed:
+            rospy.logwarn("Z descent soft-failed but hook depth is acceptable; proceeding")
+        elif not insertion_clearance_ok:
+            rospy.logwarn("Insertion depth is outside the preferred band; proceeding to hook/tow")
+        else:
+            rospy.loginfo("Insertion complete")
+        return 'succeeded'
+
+
+class RetractAndHookState(TowingStateBase):
+    """Retract horizontally to hook the box edge."""
+
+    def __init__(self):
+        TowingStateBase.__init__(self,
+            outcomes=['succeeded', 'failed'],
+            input_keys=['hook_position', 'hook_yaw', 'approach_direction'],
+            output_keys=['towing_start_position', 'towing_direction'])
+
+    def execute(self, userdata):
+        rospy.loginfo("=== Retract and Hook State ===")
+
+        hook_pos = userdata.hook_position
+        hook_yaw = userdata.hook_yaw
+        approach_dir = userdata.approach_direction
+
+        rospy.loginfo(f"Hook target: {FormationUtils.format_vec(hook_pos)}")
+        rospy.loginfo(f"Retract distance: {RETRACT_DISTANCE*1000:.0f}mm")
+
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr("Cannot get current position")
+            return 'failed'
+
+        # Slow horizontal retraction
+        success = self.active_position_convergence(
+            hook_pos, target_yaw=hook_yaw,
+            pos_thresh=HOOK_POSITION_TOLERANCE, yaw_thresh=0.05, timeout=15.0,
+            max_linear_vel=0.03  # Very slow for precise hooking
+        )
+
+        if not success:
+            rospy.logwarn(
+                "Hook convergence incomplete; continuing for real-machine "
+                "soft-threshold behavior"
+            )
+
+        # Verify hook by checking if we can sense resistance
+        rospy.loginfo("Verifying hook contact...")
+        rospy.sleep(1.0)
+
+        # Stabilize
+        self.active_stabilization_wait(hook_pos, hook_yaw, duration=2.0)
+        settled_hook_pos = self.get_end_effector_position()
+        if settled_hook_pos is None:
+            settled_hook_pos = hook_pos
+        else:
+            rospy.loginfo(f"Hook pose locked at {FormationUtils.format_vec(settled_hook_pos)}")
+
+        hook_alignment_ok = self.log_insertion_alignment(
+            "after hook stabilization", settled_hook_pos, hook_pos, approach_dir)
+        hook_error = self._approach_frame_xy_error(
+            settled_hook_pos, hook_pos, approach_dir)
+        if hook_error is not None:
+            _, hook_lateral, hook_xy_error = hook_error
+            if (abs(hook_lateral) > HOOK_RECENTER_BEFORE_TOWING_TOLERANCE or
+                    hook_xy_error > HOOK_RECENTER_BEFORE_TOWING_TOLERANCE):
+                recenter_target = np.array(hook_pos, dtype=float)
+                recenter_target[2] = settled_hook_pos[2]
+                rospy.logwarn(
+                    f"[Insertion Align] hook offset before towing: "
+                    f"xy={hook_xy_error*1000:.1f}mm, "
+                    f"lateral={hook_lateral*1000:.1f}mm; "
+                    f"recentering below "
+                    f"{HOOK_RECENTER_BEFORE_TOWING_TOLERANCE*1000:.0f}mm"
+                )
+                self.active_position_convergence(
+                    recenter_target, target_yaw=hook_yaw,
+                    pos_thresh=HOOK_POSITION_TOLERANCE, yaw_thresh=0.05,
+                    timeout=8.0, max_linear_vel=0.02)
+                self.active_stabilization_wait(
+                    recenter_target, hook_yaw, duration=2.0)
+                recentered_hook_pos = self.get_end_effector_position()
+                if recentered_hook_pos is not None:
+                    settled_hook_pos = recentered_hook_pos
+                    rospy.loginfo(
+                        f"Hook pose re-locked at "
+                        f"{FormationUtils.format_vec(settled_hook_pos)}")
+                    hook_alignment_ok = self.log_insertion_alignment(
+                        "after hook recenter stabilization",
+                        settled_hook_pos, hook_pos, approach_dir)
+        towing_start_pos = np.array(hook_pos, dtype=float)
+        towing_start_pos[2] = settled_hook_pos[2]
+        hook_xy_offset = np.linalg.norm(
+            np.array(settled_hook_pos[:2], dtype=float) - towing_start_pos[:2])
+        if hook_xy_offset > 0.01:
+            rospy.logwarn(
+                f"Measured hook XY differs from planned centerline by "
+                f"{hook_xy_offset*1000:.1f}mm; towing start keeps planned XY "
+                f"and measured Z={towing_start_pos[2]:.3f}m"
+            )
+        else:
+            rospy.loginfo(
+                f"Towing start locked at planned hook centerline "
+                f"{FormationUtils.format_vec(towing_start_pos)}"
+            )
+
+        # Towing direction is same as approach direction (pulling outward)
+        towing_direction = approach_dir.copy()
+
+        # Disable pitch compensation during towing to avoid wrench_comp Z-drift.
+        # Root cause: C++ momentum observer detects body-frame drag force during towing.
+        # At pitch -1.5 deg, body-X force (5N) couples ~131mN into world-Z through rotation.
+        # This Z component flows: wrench_comp -> I_reconfig_acc -> pid_FZ -> I_comp_Fz ->
+        # pid_Z.setICompTerm -> monotonic Z-PID I-term accumulation -> upward drift.
+        # With pitch compensation ON, the mocap-based observation amplifies this coupling.
+        # Theoretical pitch effect on EE position is only ~2mm, much less than the 7mm drift.
+        self.formation_adapter.set_pitch_compensation(False)
+
+        userdata.towing_start_position = towing_start_pos
+        userdata.towing_direction = towing_direction
+
+        if success and hook_alignment_ok:
+            rospy.loginfo(f"Hook complete. Towing direction: {towing_direction}")
+        else:
+            rospy.logwarn(
+                f"Hook complete with incomplete convergence/alignment. "
+                f"Towing direction: {towing_direction}"
+            )
+        return 'succeeded'
+
+
+class TowingWithFeedforwardState(TowingStateBase):
+    """Tow the load with force feedforward."""
+
+    def __init__(self):
+        TowingStateBase.__init__(self,
+            outcomes=['succeeded', 'failed', 'timeout'],
+            input_keys=['towing_start_position', 'towing_direction', 'hook_yaw'],
+            output_keys=['towing_end_position', 'towing_exit_reason',
+                         'towing_breakaway_detected'])
+        self.towing_alignment_diag_pub = rospy.Publisher(
+            '~towing_alignment_diag', String, queue_size=1)
+        self.last_towing_alignment_diag_time = 0.0
+
+    def _scaled_unload_duration(self, min_duration):
+        start_force = np.asarray(self.hih.current_ff_force, dtype=float)
+        force_norm = float(np.linalg.norm(start_force))
+        if not math.isfinite(force_norm):
+            force_norm = 0.0
+        unload_rate = max(
+            0.1, float(rospy.get_param("~unload_force_rate", TOWING_UNLOAD_FORCE_RATE)))
+        max_duration = max(
+            float(min_duration),
+            float(rospy.get_param("~unload_max_duration", TOWING_UNLOAD_MAX_DURATION)))
+        scaled_duration = force_norm / unload_rate
+        duration = max(float(min_duration), scaled_duration)
+        duration = min(max_duration, duration)
+        rospy.loginfo(
+            f"[Towing Unload] ff_mag={force_norm:.2f}N, "
+            f"rate={unload_rate:.1f}N/s, "
+            f"duration={duration:.1f}s, max={max_duration:.1f}s"
+        )
+        return duration
+
+    def _clear_external_wrench(self, hold_pos=None, hold_yaw=None, duration=1.0):
+        """Clear external wrench feedforward via HihInterface.
+
+        Smoothly unloads the last command, then sends a few zero-wrench
+        messages for reliability. Topic routing is handled by HihInterface.
+        """
+        duration = self._scaled_unload_duration(duration)
+        rospy.loginfo("Clearing external wrench feedforward")
+        zero = [0.0, 0.0, 0.0]
+        if hold_pos is None:
+            self.hih.clearExternalWrench(duration=duration, rate_hz=25.0)
+        else:
+            start_force = np.asarray(self.hih.current_ff_force, dtype=float)
+            start_torque = np.asarray(self.hih.current_ff_torque, dtype=float)
+            rate = rospy.Rate(25)
+            steps = max(1, int(duration * 25.0))
+            for step in range(1, steps + 1):
+                self.send_assembly_command_from_end_effector(hold_pos, hold_yaw)
+                blend = smoothstep01(float(step) / steps)
+                force = ((1.0 - blend) * start_force).tolist()
+                torque = ((1.0 - blend) * start_torque).tolist()
+                task_weights = (build_towing_task_wrench_weights(force)
+                                if self.hih.isUnifiedMode() else None)
+                self.hih.addExternalWrench(
+                    force, torque, frame_id="fc",
+                    task_weights=task_weights)
+                if rospy.is_shutdown():
+                    break
+                rate.sleep()
+        for _ in range(3):
+            if hold_pos is not None:
+                self.send_assembly_command_from_end_effector(hold_pos, hold_yaw)
+            self.hih.addExternalWrench(zero, zero, frame_id="fc")
+            rospy.sleep(0.04)
+        self.hih.clearExternalWrench()
+        # Disable legacy LF task-share auto-publish (also broadcasts a final zero).
+        self.hih.setAttachModule(None)
+
+    def _build_unload_hold_position(self, current_pos, towing_dir):
+        lead = max(0.0, float(rospy.get_param(
+            "~unload_contact_lead", TOWING_UNLOAD_CONTACT_LEAD)))
+        if current_pos is None or lead <= 1e-4:
+            return current_pos
+
+        direction = np.asarray(towing_dir, dtype=float)
+        norm_xy = np.linalg.norm(direction[:2])
+        if norm_xy < 1e-6:
+            return current_pos
+        direction = direction / norm_xy
+        direction[2] = 0.0
+
+        hold_pos = np.array(current_pos, dtype=float)
+        hold_pos[:2] += direction[:2] * lead
+        rospy.loginfo(
+            f"[Towing Unload] holding {lead*1000:.0f}mm contact lead "
+            f"along towing direction: {FormationUtils.format_vec(hold_pos)}")
+        return hold_pos
+
+    def _finish_towing_exit(self, userdata, reason, hold_pos, hold_yaw,
+                            breakaway_detected, clear_duration=1.0):
+        self._clear_external_wrench(hold_pos=hold_pos, hold_yaw=hold_yaw,
+                                    duration=clear_duration)
+        # Return/disengage needs pitch-aware EE geometry. Towing disables it to
+        # avoid wrench-comp Z drift, so every exit path must restore it.
+        self.formation_adapter.set_pitch_compensation(True)
+        final_pos = self.get_end_effector_position()
+        if final_pos is None:
+            final_pos = hold_pos
+        userdata.towing_end_position = final_pos
+        userdata.towing_exit_reason = reason
+        userdata.towing_breakaway_detected = bool(breakaway_detected)
+        pos_text = FormationUtils.format_vec(final_pos) if final_pos is not None else "None"
+        rospy.loginfo(f"Towing exit: reason={reason}, breakaway={breakaway_detected}, "
+                      f"pos={pos_text}")
+
+    def _build_towing_wrench_command(self, force_world):
+        """Build the common formation-CoG wrench used by LF and unified."""
+        contact_offset_body = np.array([
+            self.formation_adapter.base_offset_x + TOWING_HOOK_CONTACT_DX_FROM_EE,
+            self.formation_adapter.base_offset_y,
+            self.formation_adapter.total_offset_z + TOWING_HOOK_CONTACT_DZ_FROM_EE,
+        ])
+        # Keep towing feedforward horizontal in the formation-yaw frame. Current
+        # pitch/roll are tracking errors and should not create body-Z force.
+        force_body, torque_body = self.hih.buildCoGWrench(
+            force_world, application_offset_body=contact_offset_body,
+            frame_id="world_yaw")
+        return force_body, torque_body, "fc"
+
+    def _log_towing_alignment_diag(self, current_pos, target_pos, start_pos,
+                                   towing_dir, load_pos, load_start_pos,
+                                   state_info, ff_world):
+        ee_error = self._approach_frame_xy_error(current_pos, start_pos, towing_dir)
+        target_error = self._approach_frame_xy_error(current_pos, target_pos, towing_dir)
+        if ee_error is None or target_error is None:
+            return
+
+        ee_along, ee_lateral, _ = ee_error
+        target_along, target_lateral, target_xy_error = target_error
+        load_text = "load=NA"
+        if load_pos is not None and load_start_pos is not None:
+            load_error = self._approach_frame_xy_error(load_pos, load_start_pos, towing_dir)
+            if load_error is not None:
+                load_along, load_lateral, _ = load_error
+                load_text = (
+                    f"load_along={load_along*1000:.0f}mm, "
+                    f"load_lat={load_lateral*1000:.0f}mm"
+                )
+
+        now = rospy.Time.now().to_sec()
+        if now - self.last_towing_alignment_diag_time < 0.5:
+            return
+        self.last_towing_alignment_diag_time = now
+
+        diag_text = (
+            f"[Towing Align] ee_along={ee_along*1000:.0f}mm, "
+            f"ee_lat={ee_lateral*1000:.0f}mm, "
+            f"target_err_along={target_along*1000:.0f}mm, "
+            f"target_err_lat={target_lateral*1000:.0f}mm, "
+            f"target_xy_err={target_xy_error*1000:.0f}mm, "
+            f"{load_text}, ff={np.linalg.norm(ff_world):.1f}N, "
+            f"guard={state_info['force_guard']}, "
+            f"breakaway={state_info['breakaway_detected']}, "
+            f"candidate={state_info.get('breakaway_candidate', False)}"
+        )
+        rospy.loginfo(diag_text)
+        self.towing_alignment_diag_pub.publish(String(data=diag_text))
+
+    def execute(self, userdata):
+        rospy.loginfo("=== Towing With Feedforward State ===")
+
+        # Pitch compensation is DISABLED in RetractAndHookState to avoid wrench_comp Z-drift
+
+        start_pos = userdata.towing_start_position
+        towing_dir = userdata.towing_direction
+        maintain_yaw = userdata.hook_yaw
+
+        rospy.loginfo(f"Towing start: {FormationUtils.format_vec(start_pos)}")
+        rospy.loginfo(f"Towing direction: {towing_dir}")
+        rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
+
+        # ---- Wrench feedforward via HihInterface ----
+        # Both modes receive the same formation-body wrench at the formation
+        # CoG. HihInterface.addExternalWrench() then routes it to:
+        #   - formation_desired_wrench  when unified_control_mode is active
+        #   - desired_external_wrench   when leader-follower (wrench_comp) is active
+        control_mode = 'unified' if self.hih.isUnifiedMode() else 'leader-follower'
+        rospy.loginfo(f"Wrench feedforward via HihInterface (mode: {control_mode})")
+
+        # ---- Legacy LF per-module task-share setup ----
+        # HihInterface keeps these command-side shares fresh for a possible
+        # return to leader-follower mode. Unified allocation does not consume
+        # this legacy internal-wrench reconstruction input.
+        module_masses = rospy.get_param("~module_masses", None)
+        module_positions = rospy.get_param("~module_positions", None)
+        module_inertias_diag = rospy.get_param("~module_inertias_diag", None)
+        attach_ok = self.hih.setAttachModule(self.hih.module_id,
+                                                module_masses=module_masses,
+                                                module_positions=module_positions,
+                                                module_inertias_diag=module_inertias_diag)
+        if not attach_ok and control_mode == 'leader-follower':
+            rospy.logwarn("[Towing] LF task feedforward is disabled because setAttachModule failed")
+
+        trajectory_gen = LinearTowingTrajectoryGenerator(
+            start_pos=start_pos,
+            towing_direction=towing_dir,
+            target_distance=TOWING_DISTANCE,
+            target_velocity=0.05,  # 50mm/s towing speed
+            max_force=TOWING_MAX_FORCE
+        )
+
+        # Note: We rely on the low-level PID controller (HihControl.yaml)
+        # for Z-axis stabilization. The controller has d_gain=5.0 which provides
+        # damping to suppress oscillation. We only provide position targets.
+
+        # Towing control loop
+        towing_start_time = rospy.Time.now().to_sec()
+        ABSOLUTE_MAX_TIME = 180.0 # safety net: 3 minutes absolute max
+        control_rate = rospy.Rate(25)  # 25Hz
+        unified_mode_seen = False
+        completion_started_at = None
+
+        rospy.loginfo(
+            f"Starting towing loop (stall abort after "
+            f"{trajectory_gen.stall_timeout_count} consecutive "
+            f"{trajectory_gen.stall_window_time:.1f}s windows armed at "
+            f"{trajectory_gen.stall_min_force:.1f}N, "
+            f"absolute max: {ABSOLUTE_MAX_TIME:.0f}s)...")
+
+        # PI compensator REMOVED: testing showed it was counterproductive.
+        # When EE is below target (z_err>0), integral saturates negative, pushes Z target UP,
+        # UAV spends control effort climbing instead of pushing horizontally -> can't tow.
+        # Z-axis stabilization is handled by C++ Z-PID (p=8, d=5) alone.
+
+        while not rospy.is_shutdown():
+            elapsed = rospy.Time.now().to_sec() - towing_start_time
+
+            # Get current state
+            current_pos = self.get_end_effector_position()
+            current_yaw = self.get_end_effector_yaw()
+            load_pos = self.get_load_position()
+            load_measurement_valid = self.load_interface.is_load_pose_fresh()
+            if not load_measurement_valid:
+                rospy.logwarn_throttle(
+                    1.0, "[Towing] Load pose stale; holding adaptive force")
+
+            if current_pos is None:
+                rospy.logwarn("Lost position, waiting...")
+                control_rate.sleep()
+                continue
+
+            rpy_result = self.hih.getAssemblyRPY()
+            z_err_for_guard = trajectory_gen.target_pos[2] - current_pos[2]
+
+            # Update trajectory
+            state_info = trajectory_gen.update_state(
+                current_pos, load_pos, rpy_result, z_err_for_guard,
+                load_measurement_valid=load_measurement_valid)
+
+            rospy.logdebug_throttle(2.0, f"[Towing Pos] actual={current_pos}, start={start_pos}")
+
+            if trajectory_gen.is_complete() and completion_started_at is None:
+                done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+                done_source = 'load' if state_info['using_load_tracking'] else 'ee'
+                completion_started_at = rospy.Time.now().to_sec()
+                rospy.loginfo(f"Towing distance reached: {done_dist*1000:.0f}mm ({done_source}); "
+                              "settling briefly before unload")
+
+            # Timeout: stall-based (consecutive stall windows) + absolute safety net
+            if state_info['stall_counter'] >= trajectory_gen.stall_timeout_count:
+                rospy.logwarn(f"Towing aborted: stalled for {state_info['stall_counter']} "
+                             f"consecutive armed windows "
+                             f"({state_info['stall_counter']*trajectory_gen.stall_window_time:.0f}s no progress)")
+                reason = ('stalled_after_breakaway' if state_info['breakaway_detected']
+                          else 'stalled_no_breakaway')
+                unload_hold_pos = self._build_unload_hold_position(current_pos, towing_dir)
+                self._finish_towing_exit(
+                    userdata, reason, unload_hold_pos, current_yaw,
+                    state_info['breakaway_detected'])
+                return 'timeout'
+            if elapsed > ABSOLUTE_MAX_TIME:
+                rospy.logwarn(f"Towing absolute timeout after {elapsed:.1f}s")
+                reason = ('absolute_timeout_after_breakaway' if state_info['breakaway_detected']
+                          else 'absolute_timeout_no_breakaway')
+                unload_hold_pos = self._build_unload_hold_position(current_pos, towing_dir)
+                self._finish_towing_exit(
+                    userdata, reason, unload_hold_pos, current_yaw,
+                    state_info['breakaway_detected'])
+                return 'timeout'
+
+            # Stall warning (throttled to avoid log spam)
+            if state_info['stall_counter'] > 0:
+                rospy.logwarn_throttle(
+                    5.0,
+                    f"Towing stalled (window {state_info['stall_counter']}/"
+                    f"{trajectory_gen.stall_timeout_count})")
+            elif (not state_info['breakaway_detected'] and
+                    not state_info['stall_force_gate_ready']):
+                rospy.loginfo_throttle(
+                    5.0,
+                    f"[Towing] stall watchdog waiting for ff "
+                    f"{trajectory_gen.stall_min_force:.1f}N "
+                    f"(current={state_info['current_force']:.1f}N)")
+
+            # Generate and execute target
+            target_state = trajectory_gen.generate_target_state(maintain_yaw)
+            unified_mode = self.hih.isUnifiedMode()
+            if unified_mode:
+                unified_mode_seen = True
+
+            pitch_deg = np.degrees(rpy_result[1]) if rpy_result is not None else 0.0
+            raw_z_err = target_state['position'][2] - current_pos[2]
+
+            if unified_mode_seen and not unified_mode:
+                rospy.logwarn("Towing safety abort: unified mode exited during towing")
+                reason = ('unified_exit_after_breakaway' if state_info['breakaway_detected']
+                          else 'unified_exit_no_breakaway')
+                self._finish_towing_exit(
+                    userdata, reason, current_pos, current_yaw,
+                    state_info['breakaway_detected'])
+                return 'timeout'
+
+            if completion_started_at is not None:
+                settle_elapsed = rospy.Time.now().to_sec() - completion_started_at
+                if rpy_result is not None:
+                    max_rp = max(abs(rpy_result[0]), abs(rpy_result[1]))
+                else:
+                    max_rp = 0.0
+                attitude_soft_ok = max_rp < TOWING_COMPLETE_ATTITUDE_SOFT_LIMIT
+                hard_bad = (max_rp > TOWING_COMPLETE_ATTITUDE_HARD_LIMIT or
+                            abs(raw_z_err) > TOWING_COMPLETE_Z_ERROR_HARD_LIMIT)
+
+                if settle_elapsed >= TOWING_COMPLETE_SETTLE_TIME and attitude_soft_ok:
+                    done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+                    done_source = 'load' if state_info['using_load_tracking'] else 'ee'
+                    rospy.loginfo(f"Towing complete! Distance: {done_dist*1000:.0f}mm ({done_source}), "
+                                  f"settle={settle_elapsed:.1f}s, "
+                                  f"max_rp={math.degrees(max_rp):.1f}deg")
+                    break
+                if settle_elapsed >= TOWING_COMPLETE_MAX_SETTLE_TIME and not hard_bad:
+                    done_dist = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+                    done_source = 'load' if state_info['using_load_tracking'] else 'ee'
+                    rospy.logwarn(f"Towing complete with loose settle: distance={done_dist*1000:.0f}mm "
+                                  f"({done_source}), settle={settle_elapsed:.1f}s, "
+                                  f"max_rp={math.degrees(max_rp):.1f}deg, "
+                                  f"z_err={raw_z_err*1000:.0f}mm")
+                    break
+                rospy.logwarn_throttle(
+                    1.0,
+                    f"[Towing] completion settling: t={settle_elapsed:.1f}s, "
+                    f"max_rp={math.degrees(max_rp):.1f}deg, z_err={raw_z_err*1000:.0f}mm")
+
+            rospy.logdebug_throttle(2.0, f"[Towing Debug] target_pos={target_state['position']}, "
+                                    f"z_err={raw_z_err*1000:.1f}mm, pitch={pitch_deg:.2f} deg")
+
+            self.send_assembly_command_from_end_effector(
+                target_state['position'],
+                target_state['yaw'],
+                linear_vel=target_state['linear_velocity']
+            )
+
+            # ---- Publish desired external wrench via HihInterface ----
+            ff_world = target_state['force']
+            ff_force, ff_torque, ff_frame = (
+                self._build_towing_wrench_command(ff_world))
+            task_weights = (trajectory_gen.get_task_wrench_weights(ff_force)
+                            if unified_mode else None)
+            self.hih.addExternalWrench(force=ff_force, torque=ff_torque,
+                                          frame_id=ff_frame,
+                                          task_weights=task_weights)
+            self._log_towing_alignment_diag(
+                current_pos=current_pos,
+                target_pos=target_state['position'],
+                start_pos=start_pos,
+                towing_dir=towing_dir,
+                load_pos=load_pos,
+                load_start_pos=trajectory_gen.load_start_pos,
+                state_info=state_info,
+                ff_world=ff_world
+            )
+
+            task_weight_text = ""
+            if task_weights is not None:
+                task_weight_text = (
+                    f"task_w_xy=({task_weights[0]:.2f},{task_weights[1]:.2f}), "
+                    f"task_w_ty={task_weights[4]:.2f}, ")
+            rospy.loginfo_throttle(
+                2.0,
+                f"[Towing FF] ff_world=({ff_world[0]:.2f},{ff_world[1]:.2f},{ff_world[2]:.2f})N, "
+                f"mag={np.linalg.norm(ff_world):.2f}N, progress={state_info['progress']*100:.1f}%, "
+                f"guard={state_info['force_guard']}, task_scale={state_info['task_weight_scale']:.2f}, "
+                f"{task_weight_text}"
+                f"vref={state_info['velocity_reference']*1000:.0f}mm/s, "
+                f"vel={state_info['motion_velocity']*1000:.0f}mm/s, "
+                f"dff_cmd_dt={state_info['force_adjust_rate']:.2f}N/s, "
+                f"vel_fb={state_info['velocity_feedback_enabled']}, "
+                f"vel_valid={state_info['motion_measurement_valid']}, "
+                f"breakaway={state_info['breakaway_detected']}, "
+                f"stable_roll={state_info['stable_rolling']}, overspeed={state_info['overspeed']}, "
+                f"severe={state_info['severe_overspeed']}, "
+                f"severe_hold={state_info['sustained_severe_overspeed']}, "
+                f"mode={'unified' if unified_mode else 'LF'}, "
+                f"cmd_frame={ff_frame}, tau=({ff_torque[0]:.2f},{ff_torque[1]:.2f},{ff_torque[2]:.2f})Nm")
+
+            dist_source = 'load' if state_info['using_load_tracking'] else 'ee'
+            dist_value = state_info['current_load_distance'] if state_info['using_load_tracking'] else state_info['current_distance']
+            rospy.loginfo_throttle(
+                5.0,
+                f"Towing: {state_info['progress']*100:.1f}%, "
+                f"dist={dist_value*1000:.0f}mm({dist_source}), "
+                f"ff={state_info['current_force']:.1f}N, "
+                f"vel={state_info['motion_velocity']*1000:.0f}mm/s, "
+                f"guard={state_info['force_guard']}, time={elapsed:.1f}s")
+
+            control_rate.sleep()
+
+        # If loop ends due to ROS shutdown/Ctrl-C, this is not a successful towing completion.
+        if rospy.is_shutdown():
+            hold_pos = self.get_end_effector_position()
+            self._finish_towing_exit(
+                userdata, 'ros_shutdown', hold_pos, maintain_yaw,
+                trajectory_gen.breakaway_detected)
+            return 'timeout'
+
+        # ---- Clear feedforward after towing completes while holding pose ----
+        unload_hold_pos = self.get_end_effector_position()
+        unload_hold_pos = self._build_unload_hold_position(unload_hold_pos, towing_dir)
+        self._finish_towing_exit(
+            userdata, 'succeeded', unload_hold_pos, maintain_yaw,
+            trajectory_gen.breakaway_detected, clear_duration=2.0)
+        final_pos = userdata.towing_end_position
+
+        pos_text = FormationUtils.format_vec(final_pos) if final_pos is not None else "None"
+        rospy.loginfo(f"Towing phase complete at {pos_text}")
+        return 'succeeded'
+
+
+class DisengageAndReturnState(TowingStateBase):
+    """Disengage from load and return to start position."""
+
+    def __init__(self):
+        TowingStateBase.__init__(self,
+            outcomes=['succeeded', 'failed'],
+            input_keys=['start_position', 'start_yaw', 'towing_end_position',
+                        'towing_direction', 'load_position',
+                        'towing_exit_reason', 'towing_breakaway_detected'])
+
+    def _return_attitude_safe(self, context):
+        rpy = self.hih.getAssemblyRPY()
+        if rpy is None:
+            return True
+        max_rp = max(abs(rpy[0]), abs(rpy[1]))
+        if max_rp > RETURN_ATTITUDE_HARD_LIMIT:
+            rospy.logerr(f"{context}: attitude too large for return "
+                         f"(roll={math.degrees(rpy[0]):.1f} deg, "
+                         f"pitch={math.degrees(rpy[1]):.1f} deg)")
+            return False
+        return True
+
+    def _loose_position_reached(self, target_pos, tolerance, context):
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable")
+            return False
+        pos_error = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+        if pos_error <= tolerance:
+            rospy.logwarn(f"{context}: convergence incomplete but close enough "
+                          f"({pos_error*1000:.0f}mm <= {tolerance*1000:.0f}mm)")
+            return True
+        rospy.logerr(f"{context}: convergence failed with large error "
+                     f"({pos_error*1000:.0f}mm > {tolerance*1000:.0f}mm)")
+        return False
+
+    def _return_target_height(self, start_pos, load_position):
+        load_top_z = float(load_position[2]) + LOAD_BOX_HEIGHT / 2
+        return max(start_pos[2], load_top_z + TRANSIT_CLEARANCE_OFFSET), load_top_z
+
+    def _ascend_to_return_height(self, userdata, start_pos, current_yaw, context,
+                                 max_linear_vel=0.05):
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable before ascent")
+            return False
+
+        target_height, load_top_z = self._return_target_height(start_pos, userdata.load_position)
+        z_gap = target_height - current_pos[2]
+        rospy.loginfo(f"{context}: returning to height {target_height:.3f}m "
+                      f"(start_pos[2]={start_pos[2]:.3f}m, "
+                      f"floor=box_top+{TRANSIT_CLEARANCE_OFFSET:.2f}m={load_top_z+TRANSIT_CLEARANCE_OFFSET:.3f}m, "
+                      f"current {current_pos[2]:.3f}m, delta {z_gap*1000:.0f}mm)")
+        if z_gap <= 0.03:
+            return self._return_attitude_safe(context)
+
+        ascent_target = (current_pos[0], current_pos[1], target_height)
+        success = self.active_position_convergence(
+            ascent_target, target_yaw=current_yaw,
+            pos_thresh=0.05, yaw_thresh=0.1, timeout=20.0,
+            max_linear_vel=max_linear_vel
+        )
+        if success:
+            return True
+
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable after ascent")
+            return False
+        z_gap = target_height - current_pos[2]
+        if z_gap > RETURN_LOOSE_ASCENT_Z_TOLERANCE or not self._return_attitude_safe(context):
+            rospy.logerr(f"{context}: ascent failed with large Z gap ({z_gap*1000:.0f}mm)")
+            return False
+        rospy.logwarn(f"{context}: ascent incomplete but close enough "
+                      f"(z_gap={z_gap*1000:.0f}mm)")
+        return True
+
+    def _retract_to_disengage(self, userdata, current_yaw, context):
+        towing_dir = np.array(userdata.towing_direction, dtype=float)
+        retract_dir = -towing_dir
+        retract_dir[2] = 0.0
+        norm_xy = np.linalg.norm(retract_dir[:2])
+        if norm_xy < 1e-6:
+            rospy.logerr(f"{context}: invalid towing direction for disengage")
+            return False
+        retract_dir = retract_dir / norm_xy
+
+        current_pos = self.get_end_effector_position()
+        if current_pos is None:
+            rospy.logerr(f"{context}: current position unavailable before retract")
+            return False
+        retract_target = np.array(current_pos) + retract_dir * RETURN_RETRACT_DISTANCE
+        rospy.loginfo(f"{context}: retracting {RETURN_RETRACT_DISTANCE*1000:.0f}mm along "
+                      f"{retract_dir} to disengage hook")
+
+        success = self.active_position_convergence(
+            retract_target, target_yaw=current_yaw,
+            pos_thresh=0.03, yaw_thresh=0.1, timeout=10.0,
+            max_linear_vel=0.03
+        )
+        if (not success and
+                (not self._loose_position_reached(retract_target,
+                                                  RETURN_LOOSE_RETRACT_TOLERANCE,
+                                                  context) or
+                 not self._return_attitude_safe(context))):
+            return False
+        rospy.sleep(0.5)
+        return True
+
+    def execute(self, userdata):
+        rospy.loginfo("=== Disengage and Return State ===")
+
+        start_pos = userdata.start_position
+        start_yaw = userdata.start_yaw
+        exit_reason = getattr(userdata, 'towing_exit_reason', 'unknown')
+        breakaway_detected = bool(getattr(userdata, 'towing_breakaway_detected', False))
+        no_breakaway_timeout = (
+            exit_reason != 'succeeded' and not breakaway_detected)
+        rospy.loginfo(f"[Return] towing_exit_reason={exit_reason}, "
+                      f"breakaway={breakaway_detected}")
+
+        current_pos = self.get_end_effector_position()
+        current_yaw = self.get_end_effector_yaw()
+
+        if current_pos is None:
+            rospy.logerr("Cannot get current position")
+            return 'failed'
+
+        # Phase 0: disengage before any long hold. Holding at the contact pose
+        # after a no-breakaway exit can let the load reaction roll the formation.
+        if no_breakaway_timeout:
+            rospy.logwarn("[Phase 0] No load breakaway detected; "
+                          "horizontal disengage before return hold/ascent")
+
+        if not self._retract_to_disengage(userdata, current_yaw, "[Phase 0]"):
+            return 'failed'
+        updated_yaw = self.get_end_effector_yaw()
+        if updated_yaw is not None:
+            current_yaw = updated_yaw
+
+        # Phase 1: Return to start height (hook is already disengaged in Phase 0).
+        if not self._ascend_to_return_height(
+                userdata, start_pos, current_yaw, "[Phase 1]",
+                max_linear_vel=0.05):
+            return 'failed'
+
+        rospy.sleep(1.0)
+
+        # Phase 2: Adjust yaw to start yaw
+        rospy.loginfo(f"[Phase 2] Adjusting yaw to {math.degrees(start_yaw):.1f} deg")
+        current_pos = self.get_end_effector_position()
+
+        success = self.active_position_convergence(
+            current_pos, target_yaw=start_yaw,
+            pos_thresh=0.1, yaw_thresh=0.05, timeout=30.0,
+            max_yaw_step=0.05, yaw_only=True
+        )
+
+        rospy.sleep(1.0)
+
+        # Phase 3: Return to start position (XY + original Z)
+        rospy.loginfo("[Phase 3] Returning to start position")
+        current_pos = self.get_end_effector_position()
+        return_target = (start_pos[0], start_pos[1], start_pos[2])
+
+        # Use streaming polynomial trajectory for smooth return
+        traj_desc = self.generate_polynomial_trajectory(
+            start_pos=current_pos,
+            target_pos=return_target,
+            target_yaw=start_yaw,
+            lock_yaw=True
+        )
+
+        if traj_desc:
+            self.execute_polynomial_trajectory(traj_desc)
+
+        success = self.active_position_convergence(
+            return_target, target_yaw=start_yaw,
+            pos_thresh=0.05, yaw_thresh=0.1, timeout=30.0
+        )
+        if (not success and
+                (not self._loose_position_reached(return_target, 0.35, "[Phase 3]") or
+                 not self._return_attitude_safe("[Phase 3]"))):
+            return 'failed'
+
+        rospy.loginfo("=== Towing Task Complete ===")
+        return 'succeeded'
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _parse_module_ids(module_ids_str):
+    try:
+        return [int(x.strip()) for x in str(module_ids_str).split(',') if x.strip()]
+    except ValueError:
+        rospy.logerr("[TowingPreflight] Invalid module_ids: %s", module_ids_str)
+        return []
+
+
+def _names_for_topic(system_state_entries, topic_name):
+    for name, nodes in system_state_entries:
+        if name == topic_name:
+            return nodes
+    return []
+
+
+def log_towing_preflight(module_ids, real_machine, simulation):
+    """Log master/module readiness without changing task behavior."""
+    master_uri = os.environ.get('ROS_MASTER_URI', '<unset>')
+    ros_ip = os.environ.get('ROS_IP', '<unset>')
+    ros_hostname = os.environ.get('ROS_HOSTNAME', '<unset>')
+    rospy.loginfo("[TowingPreflight] ROS_MASTER_URI=%s ROS_IP=%s ROS_HOSTNAME=%s",
+                  master_uri, ros_ip, ros_hostname)
+    rospy.loginfo("[TowingPreflight] module_ids=%s real_machine=%s simulation=%s",
+                  module_ids, real_machine, simulation)
+    if real_machine and ('localhost' in master_uri or '127.0.0.1' in master_uri):
+        rospy.logwarn("[TowingPreflight] real_machine with local ROS_MASTER_URI; "
+                      "this is only valid on the machine running the shared ROS master")
+    if ros_ip != '<unset>' and ros_hostname != '<unset>':
+        rospy.logwarn("[TowingPreflight] Both ROS_IP and ROS_HOSTNAME are set; "
+                      "prefer setting only one to avoid advertised-address ambiguity")
+
+    try:
+        master = rosgraph.Master('/formation_load_towing_preflight')
+        pubs, subs, srvs = master.getSystemState()
+    except Exception as e:
+        rospy.logerr("[TowingPreflight] Cannot query ROS master: %s", e)
+        return
+
+    published_topics = {name for name, _ in pubs}
+    service_names = {name for name, _ in srvs}
+
+    missing_mocap = [
+        f"/hih{module_id}/mocap/pose"
+        for module_id in module_ids
+        if f"/hih{module_id}/mocap/pose" not in published_topics
+    ]
+    if missing_mocap:
+        rospy.logwarn("[TowingPreflight] Missing module mocap topics: %s", missing_mocap)
+
+    load_topic = '/load/odom' if simulation else '/load/mocap/pose'
+    if load_topic not in published_topics:
+        rospy.logwarn("[TowingPreflight] Missing load pose topic: %s", load_topic)
+
+    nav_subscribers = _names_for_topic(subs, '/assembly/uav/nav')
+    if nav_subscribers:
+        rospy.loginfo("[TowingPreflight] /assembly/uav/nav subscribers: %s", nav_subscribers)
+    else:
+        rospy.logwarn("[TowingPreflight] No subscriber on /assembly/uav/nav; towing commands would be ignored")
+
+    missing_unified_services = [
+        f"/hih{module_id}/controller/set_unified_mode"
+        for module_id in module_ids
+        if f"/hih{module_id}/controller/set_unified_mode" not in service_names
+    ]
+    if missing_unified_services:
+        rospy.logwarn("[TowingPreflight] Missing set_unified_mode services: %s", missing_unified_services)
+
+    cpp_leaders = {}
+    for module_id in module_ids:
+        param_name = f"/hih{module_id}/assembly_leader_id"
+        if rospy.has_param(param_name):
+            cpp_leaders[module_id] = rospy.get_param(param_name)
+    if cpp_leaders:
+        python_ee_leader = module_ids[-1] if module_ids else None
+        rospy.loginfo("[TowingPreflight] C++ assembly_leader_id params: %s; Python EE leader=%s",
+                      cpp_leaders, python_ee_leader)
+        unique_cpp_leaders = set(cpp_leaders.values())
+        if len(unique_cpp_leaders) == 1 and python_ee_leader not in unique_cpp_leaders:
+            rospy.logwarn("[TowingPreflight] Python EE leader differs from C++ control leader; "
+                          "this is OK only if the EE is on the last module and wrench routing uses assembly_leader_id")
+    else:
+        rospy.logwarn("[TowingPreflight] assembly_leader_id params are not available yet; "
+                      "launch after assembly/unified navigation has published them")
+
+
+def main():
+    rospy.init_node('formation_load_towing')
+
+    global TOWING_DISTANCE, TOWING_MAX_FORCE, HOOK_CONTACT_INSERT_CLEARANCE
+    global TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR
+    TOWING_DISTANCE = rospy.get_param("~towing_distance", 0.6)
+    TOWING_MAX_FORCE = rospy.get_param("~towing_force", 5.0)
+    HOOK_CONTACT_INSERT_CLEARANCE = float(rospy.get_param(
+        "~hook_contact_insert_clearance", HOOK_CONTACT_INSERT_CLEARANCE))
+    TOWING_TASK_WRENCH_WEIGHTS[4] = max(0.0, float(rospy.get_param(
+        "~towing_pitch_torque_task_weight", TOWING_TASK_WRENCH_WEIGHTS[4])))
+    requested_pitch_floor = float(rospy.get_param(
+        "~towing_pitch_torque_task_weight_floor",
+        TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR))
+    TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR = max(
+        0.0, min(TOWING_TASK_WRENCH_WEIGHTS[4], requested_pitch_floor))
+    module_ids = _parse_module_ids(rospy.get_param("~module_ids", ""))
+    real_machine = _as_bool(rospy.get_param("~real_machine", False))
+    simulation = _as_bool(rospy.get_param("~simulation", True))
+
+    rospy.loginfo("=" * 60)
+    rospy.loginfo("Formation Load Towing Task")
+    rospy.loginfo("=" * 60)
+    rospy.loginfo(f"Load box: {LOAD_BOX_LENGTH}m x {LOAD_BOX_WIDTH}m x {LOAD_BOX_HEIGHT}m")
+    rospy.loginfo(f"Hook contact insert clearance: {HOOK_CONTACT_INSERT_CLEARANCE*1000:.0f}mm above box top")
+    rospy.loginfo(f"Hook insertion depth tolerance: {HOOK_INSERTION_DEPTH_TOLERANCE*1000:.0f}mm")
+    rospy.loginfo(f"Retract distance: {RETRACT_DISTANCE*1000:.0f}mm")
+    rospy.loginfo(f"Towing distance: {TOWING_DISTANCE}m")
+    rospy.loginfo(f"Max towing force: {TOWING_MAX_FORCE}N (adaptive from 0N)")
+    rospy.loginfo(
+        f"Towing pitch torque task weight: {TOWING_TASK_WRENCH_WEIGHTS[4]:.2f} "
+        f"(floor={TOWING_PITCH_TORQUE_TASK_WEIGHT_FLOOR:.2f})")
+    rospy.loginfo("=" * 60)
+    log_towing_preflight(module_ids, real_machine, simulation)
+
+    try:
+        # Create SMACH state machine
+        sm = smach.StateMachine(outcomes=['success', 'failure'])
+
+        with sm:
+            # Step 1: Initialize towing task
+            # (Assembly and mode switching done manually before launching this script)
+            smach.StateMachine.add('TOWING_INITIALIZE',
+                                   TowingInitializeState(),
+                                   transitions={'succeeded': 'APPROACH_LOAD',
+                                               'failed': 'failure'})
+
+            # Step 3: Approach load box
+            smach.StateMachine.add('APPROACH_LOAD',
+                                   ApproachLoadState(),
+                                   transitions={'succeeded': 'DESCEND_AND_INSERT',
+                                               'failed': 'failure'})
+
+            # Step 4: Descend and insert
+            smach.StateMachine.add('DESCEND_AND_INSERT',
+                                   DescendAndInsertState(),
+                                   transitions={'succeeded': 'RETRACT_AND_HOOK',
+                                               'failed': 'failure'})
+
+            # Step 5: Retract and hook
+            smach.StateMachine.add('RETRACT_AND_HOOK',
+                                   RetractAndHookState(),
+                                   transitions={'succeeded': 'TOWING_WITH_FEEDFORWARD',
+                                               'failed': 'failure'})
+
+            # Step 6: Tow with feedforward
+            smach.StateMachine.add('TOWING_WITH_FEEDFORWARD',
+                                   TowingWithFeedforwardState(),
+                                   transitions={'succeeded': 'DISENGAGE_AND_RETURN',
+                                               'failed': 'failure',
+                                               'timeout': 'DISENGAGE_AND_RETURN'})
+
+            # Step 7: Disengage and return
+            smach.StateMachine.add('DISENGAGE_AND_RETURN',
+                                   DisengageAndReturnState(),
+                                   transitions={'succeeded': 'success',
+                                               'failed': 'failure'})
+
+        # Execute state machine
+        rospy.loginfo("Starting Formation Load Towing state machine...")
+        outcome = sm.execute()
+        rospy.loginfo(f"Formation Load Towing completed with outcome: {outcome}")
+
+    except Exception as e:
+        rospy.logerr(f"Error during state machine execution: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()

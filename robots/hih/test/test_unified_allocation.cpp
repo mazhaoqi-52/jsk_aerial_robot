@@ -1,0 +1,783 @@
+// Offline unit test for the unified-mode allocation QP (solveFullVectorQP).
+//
+// Runs without ROS node / hardware: it builds a synthetic allocation matrix,
+// drives the private QP solver through a friend fixture, and checks the
+// *properties* the solver must guarantee (wrench tracking, actuator bounds,
+// gimbal-angle limit, module-balance shaping). This is the regression guard
+// that makes deeper refactoring of solveFullVectorQP safe.
+//
+// Note: friendship is granted to this fixture only, and is not inherited by the
+// TEST_F subclasses, so every access to private members of the controller goes
+// through fixture methods (configure / solve) defined here.
+
+#include <gtest/gtest.h>
+#include <ros/ros.h>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <vector>
+#include <hih/control/hih_unified_controller.h>
+
+namespace aerial_robot_control
+{
+
+class HihUnifiedAllocTest : public ::testing::Test
+{
+protected:
+  HihUnifiedController ctrl_;
+  static constexpr int kModules = 2;
+  static constexpr int kRotorsPerModule = 4;
+  static constexpr int kRotorCoef = 2;
+  static constexpr int kCols = kModules * kRotorsPerModule * kRotorCoef;  // 16
+
+  // Tunables the tests may change before calling configure(); also read back in
+  // assertions so the tests never touch the controller's private members.
+  double t_max_ = 20.0;
+  // A realistic finite limit. Avoid exactly pi/2: tan(pi/2) ~ 1.6e16 produces a
+  // pathologically scaled gimbal-constraint row that wrecks QP conditioning.
+  double gimbal_limit_ = 1.0;  // ~57 deg
+  double lambda_ = 1e-4;
+  double balance_weight_ = 0.0;
+  double wrench_weight_ = 10.0;
+  double interface_force_limit_ = 0.0;
+  double interface_torque_limit_ = 0.0;
+
+  void SetUp() override
+  {
+    if (!ros::Time::isValid()) ros::Time::init();  // logQpDiagnostics uses ros::Time::now()
+    configure();
+  }
+
+  // Push the fixture tunables into the controller and reset the QP solver state.
+  void configure()
+  {
+    ctrl_.rotor_coef_ = kRotorCoef;
+    ctrl_.motor_num_per_module_ = kRotorsPerModule;
+    ctrl_.alloc_t_max_ = t_max_;
+    ctrl_.alloc_gimbal_limit_rad_ = gimbal_limit_;
+    ctrl_.alloc_lambda_ = lambda_;
+    ctrl_.alloc_effort_weight_ = 0.0;
+    ctrl_.alloc_module_balance_weight_ = balance_weight_;
+    ctrl_.alloc_interface_force_limit_ = interface_force_limit_;
+    ctrl_.alloc_interface_torque_limit_ = interface_torque_limit_;
+    ctrl_.alloc_wrench_weights_ = Eigen::VectorXd::Ones(6) * wrench_weight_;
+    ctrl_.prev_vectoring_f_.resize(0);
+    ctrl_.resetQPState();
+    // Push the throttled QP diagnostic far into the future so logQpDiagnostics
+    // returns before emitting any ROS log (which would try to start a node and
+    // contact a master). Keeps the test purely offline.
+    ctrl_.last_qp_diag_log_time_ = std::numeric_limits<double>::max();
+  }
+
+  // Synthetic allocation matrix: rotor i at position p_i contributes force
+  // (fx along body-x, fz along body-z) and torque p_i x force. Two modules
+  // offset along body-y; four rotors each at +/-(0.15) corners.
+  Eigen::MatrixXd buildA() const
+  {
+    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6, kCols);
+    const double mod_y[kModules] = {-0.3, 0.3};
+    const double lx[kRotorsPerModule] = {0.15, 0.15, -0.15, -0.15};
+    const double ly[kRotorsPerModule] = {0.15, -0.15, 0.15, -0.15};
+    for (int m = 0; m < kModules; ++m) {
+      for (int r = 0; r < kRotorsPerModule; ++r) {
+        const double px = lx[r];
+        const double py = mod_y[m] + ly[r];
+        const int base = (m * kRotorsPerModule + r) * kRotorCoef;
+        const int fx = base, fz = base + 1;
+        A(0, fx) = 1.0;   // Fx
+        A(5, fx) = -py;   // Tz
+        A(2, fz) = 1.0;   // Fz
+        A(3, fz) = py;    // Tx
+        A(4, fz) = -px;   // Ty
+      }
+    }
+    return A;
+  }
+
+  bool solve(const Eigen::MatrixXd& A, const Eigen::VectorXd& w_control,
+             const Eigen::VectorXd& secondary_ref, Eigen::VectorXd& f_out)
+  {
+    const std::vector<int> ids = {1, 2};
+    const Eigen::VectorXd empty;
+    const Eigen::MatrixXd empty_matrix;
+    return ctrl_.solveFullVectorQP(A, w_control, empty, empty, empty, empty, empty,
+                                   secondary_ref, ids, empty_matrix, empty, f_out);
+  }
+
+  // Solve with an explicit task wrench whose active rows are promoted to hard
+  // priority bands (tolerances > 0, weight >= min task weight).
+  bool solveWithTaskBand(const Eigen::MatrixXd& A, const Eigen::VectorXd& w_control,
+                         const Eigen::VectorXd& w_task, const Eigen::VectorXd& task_weights,
+                         const Eigen::VectorXd& tolerances, Eigen::VectorXd& f_out)
+  {
+    ctrl_.alloc_task_priority_enabled_ = true;
+    ctrl_.alloc_priority_tolerances_ = tolerances;
+    const std::vector<int> ids = {1, 2};
+    const Eigen::VectorXd empty;
+    const Eigen::MatrixXd empty_matrix;
+    return ctrl_.solveFullVectorQP(A, w_control, w_task, task_weights,
+                                   empty, empty, empty,
+                                   Eigen::VectorXd::Zero(kCols), ids,
+                                   empty_matrix, empty,
+                                   f_out);
+  }
+
+  bool solveWithInterfaceModel(const Eigen::MatrixXd& A,
+                               const Eigen::VectorXd& w_control,
+                               const Eigen::MatrixXd& D,
+                               const Eigen::VectorXd& d,
+                               Eigen::VectorXd& f_out)
+  {
+    const std::vector<int> ids = {1, 2};
+    const Eigen::VectorXd empty;
+    return ctrl_.solveFullVectorQP(A, w_control, empty, empty, empty, empty, empty,
+                                   Eigen::VectorXd::Zero(kCols), ids, D, d, f_out);
+  }
+
+  bool solveWithTaskAndInterfaceModel(const Eigen::MatrixXd& A,
+                                      const Eigen::VectorXd& w_control,
+                                      const Eigen::VectorXd& w_task,
+                                      const Eigen::VectorXd& task_weights,
+                                      const Eigen::VectorXd& tolerances,
+                                      const Eigen::MatrixXd& D,
+                                      const Eigen::VectorXd& d,
+                                      Eigen::VectorXd& f_out)
+  {
+    ctrl_.alloc_task_priority_enabled_ = true;
+    ctrl_.alloc_priority_tolerances_ = tolerances;
+    const std::vector<int> ids = {1, 2};
+    const Eigen::VectorXd empty;
+    return ctrl_.solveFullVectorQP(
+        A, w_control, w_task, task_weights, empty, empty, empty,
+        Eigen::VectorXd::Zero(kCols), ids, D, d, f_out);
+  }
+
+  Eigen::VectorXd unconstrained(const Eigen::MatrixXd& A,
+                                const Eigen::VectorXd& target,
+                                const Eigen::VectorXd& reference)
+  {
+    ctrl_.integrated_map_ = A;
+    ctrl_.integrated_map_inv_ = aerial_robot_model::pseudoinverse(A);
+    return ctrl_.computeUnconstrainedAllocation(target, reference);
+  }
+
+  bool usesQp() const { return ctrl_.usesConstrainedAllocation(); }
+
+  void configureSelectionCheck()
+  {
+    ctrl_.use_constrained_alloc_ = true;
+    ctrl_.yaw_in_allocation_ = false;
+    ctrl_.alloc_interface_force_limit_ = 70.0;
+    ctrl_.alloc_interface_torque_limit_ = 15.0;
+    ctrl_.target_vectoring_f_ = Eigen::VectorXd::Ones(kCols);
+  }
+
+  void expectSelectionSettingsUnchanged() const
+  {
+    EXPECT_TRUE(ctrl_.use_constrained_alloc_);
+    EXPECT_FALSE(ctrl_.yaw_in_allocation_);
+    EXPECT_DOUBLE_EQ(ctrl_.alloc_lambda_, lambda_);
+    EXPECT_DOUBLE_EQ(ctrl_.alloc_interface_force_limit_, 70.0);
+    EXPECT_DOUBLE_EQ(ctrl_.alloc_interface_torque_limit_, 15.0);
+    EXPECT_TRUE(ctrl_.target_vectoring_f_.isOnes());
+  }
+
+  static bool predict(const Eigen::MatrixXd& D, const Eigen::VectorXd& d,
+                      const std::vector<std::pair<int, int>>& cuts,
+                      const Eigen::VectorXd& forces, std_msgs::Float32MultiArray& msg)
+  {
+    return HihUnifiedController::buildInterfaceLoadDiagnostics(D, d, cuts, forces, msg);
+  }
+
+  Eigen::VectorXd physicalWrench(const Eigen::VectorXd& acceleration,
+                                 double mass, const Eigen::Matrix3d& inertia,
+                                 const Eigen::Matrix3d& cog_from_body)
+  {
+    ctrl_.formation_mass_ = mass;
+    ctrl_.formation_inertia_ = inertia;
+    ctrl_.allocation_cog_from_body_ = cog_from_body;
+    return ctrl_.accelerationToWrench(acceleration);
+  }
+
+  bool physicalChainOrder(const std::vector<int>& allocation_ids,
+                          const std::map<int, Eigen::Vector3d>& offsets,
+                          std::vector<int>& chain_ids,
+                          std::map<int, int>& allocation_indices)
+  {
+    ctrl_.cached_module_offsets_from_leader_ = offsets;
+    return ctrl_.getPhysicalChainOrder(allocation_ids, chain_ids, allocation_indices);
+  }
+
+  bool buildThreeModuleInterfaceModel(const Eigen::VectorXd& control_wrench_acc,
+                                      Eigen::MatrixXd& D,
+                                      Eigen::VectorXd& d,
+                                      std::vector<std::pair<int, int>>& cuts)
+  {
+    const std::vector<int> allocation_ids = {1, 2, 3};
+    ctrl_.formation_cog_offset_.setZero();
+    ctrl_.cached_module_offsets_from_leader_ = {
+        {1, Eigen::Vector3d(1.0, 0.0, 0.0)},
+        {2, Eigen::Vector3d(-1.0, 0.0, 0.0)},
+        {3, Eigen::Vector3d(0.0, 0.0, 0.0)}};
+
+    HihUnifiedController::ModuleModelDescriptor model;
+    model.mass = 1.0;
+    model.inertia = 0.1 * Eigen::Matrix3d::Identity();
+    model.rotor_origins_from_cog.assign(kRotorsPerModule, Eigen::Vector3d::Zero());
+    model.mf_rate = 0.0;
+    for (int r = 0; r < kRotorsPerModule; r++) model.rotor_direction[r + 1] = 1;
+    for (int id : allocation_ids) ctrl_.setModuleModelDescriptor(id, model);
+
+    Eigen::MatrixXd mask(3, 2);
+    mask << 1.0, 0.0,
+            0.0, 0.0,
+            0.0, 1.0;
+    const std::vector<Eigen::MatrixXd> masks(kRotorsPerModule, mask);
+    return ctrl_.buildInterfaceLoadModelWithMasks(
+        allocation_ids, control_wrench_acc, masks, D, d, cuts);
+  }
+
+  Eigen::MatrixXd buildSingleModuleAllocation(
+      const HihUnifiedController::ModuleModelDescriptor& model,
+      const std::vector<Eigen::MatrixXd>& masks_body,
+      const Eigen::Matrix3d& cog_from_body)
+  {
+    ctrl_.cached_module_offsets_from_leader_ = {
+        {1, Eigen::Vector3d::Zero()}};
+    ctrl_.setModuleModelDescriptor(1, model);
+    std::vector<Eigen::MatrixXd> masks_cog;
+    masks_cog.reserve(masks_body.size());
+    for (const auto& mask_body : masks_body) {
+      masks_cog.push_back(cog_from_body * mask_body);
+    }
+    return ctrl_.buildFormationAllocationMatrix(
+        {1}, model.mass, model.inertia, Eigen::Vector3d::Zero(),
+        cog_from_body, masks_cog);
+  }
+
+  Eigen::VectorXd buildSingleModuleSecondaryReference(
+      const HihUnifiedController::ModuleModelDescriptor& model,
+      const std::vector<Eigen::MatrixXd>& masks_body,
+      const Eigen::Matrix3d& cog_from_body,
+      const Eigen::VectorXd& desired_wrench_acc,
+      Eigen::MatrixXd& allocation)
+  {
+    allocation = buildSingleModuleAllocation(model, masks_body, cog_from_body);
+    ctrl_.formation_mass_ = model.mass;
+    ctrl_.integrated_map_ = allocation;
+    ctrl_.integrated_map_inv_ =
+        aerial_robot_model::pseudoinverse(allocation);
+    return ctrl_.buildSecondaryAllocationReference(
+        {1}, desired_wrench_acc);
+  }
+
+  static Eigen::Matrix<double, 6, 6> spatialRotation(
+      const Eigen::Matrix3d& rotation)
+  {
+    Eigen::Matrix<double, 6, 6> result =
+        Eigen::Matrix<double, 6, 6>::Zero();
+    result.topLeftCorner<3, 3>() = rotation;
+    result.bottomRightCorner<3, 3>() = rotation;
+    return result;
+  }
+
+  static double moduleFzSum(const Eigen::VectorXd& f, int m)
+  {
+    double s = 0.0;
+    for (int r = 0; r < kRotorsPerModule; ++r)
+      s += f((m * kRotorsPerModule + r) * kRotorCoef + 1);
+    return s;
+  }
+};
+
+TEST_F(HihUnifiedAllocTest, SelectionChangesOnlyAllocatorAndRejectsUnknownMethod)
+{
+  configureSelectionCheck();
+  EXPECT_TRUE(usesQp());
+  ASSERT_TRUE(ctrl_.setAllocationMethod("pinv"));
+  EXPECT_FALSE(usesQp());
+  expectSelectionSettingsUnchanged();
+  ASSERT_TRUE(ctrl_.setAllocationMethod("qp"));
+  EXPECT_TRUE(usesQp());
+  EXPECT_FALSE(ctrl_.setAllocationMethod("lf"));
+  EXPECT_TRUE(usesQp());
+  ASSERT_TRUE(ctrl_.setAllocationMethod("configured"));
+  EXPECT_TRUE(usesQp());
+  expectSelectionSettingsUnchanged();
+}
+
+TEST_F(HihUnifiedAllocTest, ExplicitPinvUsesFullTargetWithoutDampingOrSecondaryBias)
+{
+  lambda_ = 100.0;
+  configure();
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6, 8);
+  A.leftCols(6).setIdentity();
+  A(0, 6) = 1.0;
+  A(2, 7) = 1.0;
+  Eigen::VectorXd control(6), task(6), feedback(6);
+  control << 0.2, -0.3, 9.8, 0.04, -0.05, 0.0;
+  task << 2.0, 1.0, -0.1, 0.4, 0.2, -0.5;
+  feedback << 0.1, 0.2, 0.3, -0.01, 0.02, 0.03;
+  const Eigen::VectorXd target = control + task + feedback;
+  const Eigen::VectorXd reference = Eigen::VectorXd::Constant(8, 12.0);
+  ASSERT_TRUE(ctrl_.setAllocationMethod("pinv"));
+  const Eigen::VectorXd result = unconstrained(A, target, reference);
+  EXPECT_LT((A * result - target).norm(), 1e-10);
+  EXPECT_NEAR(result(0), result(6), 1e-10);
+  EXPECT_NEAR(result(2), result(7), 1e-10);
+  EXPECT_LT((result - aerial_robot_model::pseudoinverse(A) * target).norm(), 1e-10);
+
+  ASSERT_TRUE(ctrl_.setAllocationMethod("configured"));
+  const Eigen::VectorXd legacy = unconstrained(A, target, reference);
+  EXPECT_GT((A * legacy - target).norm(), 1.0);
+}
+
+TEST_F(HihUnifiedAllocTest, InterfacePredictionUsesEachResultAndPreservesFieldOrder)
+{
+  Eigen::VectorXd control = Eigen::VectorXd::Zero(6);
+  control(2) = 9.8;
+  Eigen::MatrixXd D;
+  Eigen::VectorXd d;
+  std::vector<std::pair<int, int>> cuts;
+  ASSERT_TRUE(buildThreeModuleInterfaceModel(control, D, d, cuts));
+  const Eigen::VectorXd first = Eigen::VectorXd::Ones(D.cols());
+  const Eigen::VectorXd second = 3.0 * first;
+  std_msgs::Float32MultiArray one, two;
+  ASSERT_TRUE(predict(D, d, cuts, first, one));
+  ASSERT_TRUE(predict(D, d, cuts, second, two));
+  ASSERT_EQ(one.data.size(), 20u);
+  EXPECT_EQ(one.data[0], 2.0f);
+  EXPECT_EQ(one.data[1], 3.0f);
+  EXPECT_EQ(one.data[10], 3.0f);
+  EXPECT_EQ(one.data[11], 1.0f);
+  EXPECT_NE(one.layout.dim[0].label.find("predicted"), std::string::npos);
+  const Eigen::VectorXd expected = d - D * second;
+  for (size_t k = 0; k < cuts.size(); ++k) {
+    for (int j = 0; j < 6; ++j) EXPECT_NEAR(two.data[k * 10 + 2 + j], expected(6 * k + j), 1e-5);
+  }
+  EXPECT_NE(one.data[2], two.data[2]);
+  d(0) = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(predict(D, d, cuts, second, two));
+  EXPECT_TRUE(two.data.empty());
+}
+
+TEST_F(HihUnifiedAllocTest, PinvReportsInterfaceOverloadWithoutChangingRating)
+{
+  configureSelectionCheck();
+  ASSERT_TRUE(ctrl_.setAllocationMethod("pinv"));
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd target = Eigen::VectorXd::Zero(6);
+  target(0) = 160.0;
+  target(2) = 16.0;
+  const Eigen::VectorXd result = unconstrained(A, target, Eigen::VectorXd::Ones(kCols));
+  ASSERT_LT((A * result - target).norm(), 1e-9);
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  for (int rotor = 0; rotor < kRotorsPerModule; ++rotor) D(0, rotor * kRotorCoef) = 1.0;
+  std_msgs::Float32MultiArray msg;
+  ASSERT_TRUE(predict(D, Eigen::VectorXd::Zero(6), {{2, 1}}, result, msg));
+  EXPECT_NEAR(msg.data[2], -80.0, 1e-4);
+  EXPECT_GT(std::abs(msg.data[2]), 70.0);
+  expectSelectionSettingsUnchanged();
+}
+
+TEST_F(HihUnifiedAllocTest, WrenchConversionUsesMassAndRotatedFullInertia)
+{
+  const Eigen::Matrix3d R = Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  Eigen::Matrix3d inertia;
+  inertia << 2.0, 0.1, 0.2, 0.1, 3.0, 0.3, 0.2, 0.3, 4.0;
+  Eigen::VectorXd acceleration(6);
+  acceleration << 1.0, 2.0, 9.8, -0.2, 0.3, 0.4;
+  const Eigen::VectorXd wrench = physicalWrench(acceleration, 7.0, inertia, R);
+  EXPECT_LT((wrench.head<3>() - 7.0 * acceleration.head<3>()).norm(), 1e-12);
+  const Eigen::Vector3d torque_body = inertia * R.transpose() * acceleration.tail<3>();
+  EXPECT_LT((R.transpose() * wrench.tail<3>() - torque_body).norm(), 1e-12);
+}
+
+// (1) The solver tracks a feasible desired wrench and respects actuator bounds.
+TEST_F(HihUnifiedAllocTest, TracksFeasibleWrench)
+{
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.5, 0.5, 0.2;
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solve(A, w, Eigen::VectorXd::Zero(kCols), f));
+  ASSERT_EQ(f.size(), kCols);
+
+  const Eigen::VectorXd realized = A * f;
+  // Fy (row 1) is unactuated in this synthetic model; its target is 0.
+  for (int row : {0, 2, 3, 4, 5}) {
+    EXPECT_NEAR(realized(row), w(row), 0.3) << "wrench row " << row;
+  }
+  for (int i = 0; i < kCols / kRotorCoef; ++i) {
+    const double fx = f(2 * i), fz = f(2 * i + 1);
+    EXPECT_GE(fz, -1e-6) << "rotor " << i;
+    EXPECT_LE(std::sqrt(fx * fx + fz * fz), t_max_ + 1e-3) << "rotor " << i;
+    EXPECT_LE(std::abs(std::atan2(-fx, fz)), gimbal_limit_ + 1e-3) << "rotor " << i;
+  }
+}
+
+// (2) The per-rotor gimbal-angle limit is enforced.
+TEST_F(HihUnifiedAllocTest, RespectsGimbalLimit)
+{
+  gimbal_limit_ = 0.3;  // ~17 deg
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.0, 0.0, 0.0;  // modest lateral demand, stays feasible
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solve(A, w, Eigen::VectorXd::Zero(kCols), f));
+  for (int i = 0; i < kCols / kRotorCoef; ++i) {
+    const double fx = f(2 * i), fz = f(2 * i + 1);
+    EXPECT_LE(std::abs(std::atan2(-fx, fz)), gimbal_limit_ + 1e-3) << "rotor " << i;
+  }
+}
+
+// (3) The module-balance penalty reduces inter-module thrust spread that an
+//     asymmetric secondary reference would otherwise induce.
+TEST_F(HihUnifiedAllocTest, ModuleBalanceReducesSpread)
+{
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 0.0, 0.0, 16.0, 0.0, 0.0, 0.0;  // symmetric lift, no torque demand
+
+  Eigen::VectorXd fref = Eigen::VectorXd::Zero(kCols);
+  for (int r = 0; r < kRotorsPerModule; ++r) {
+    fref((0 * kRotorsPerModule + r) * kRotorCoef + 1) = 4.0;  // module 1 biased high
+    fref((1 * kRotorsPerModule + r) * kRotorCoef + 1) = 0.5;  // module 2 biased low
+  }
+  wrench_weight_ = 0.1;  // weak tracking so the reference bias is visible
+  lambda_ = 0.5;         // strong pull toward the asymmetric reference
+
+  balance_weight_ = 0.0;
+  configure();
+  Eigen::VectorXd f_off;
+  ASSERT_TRUE(solve(A, w, fref, f_off));
+  const double spread_off = std::abs(moduleFzSum(f_off, 0) - moduleFzSum(f_off, 1));
+
+  balance_weight_ = 10.0;
+  configure();
+  Eigen::VectorXd f_on;
+  ASSERT_TRUE(solve(A, w, fref, f_on));
+  const double spread_on = std::abs(moduleFzSum(f_on, 0) - moduleFzSum(f_on, 1));
+
+  EXPECT_LT(spread_on, spread_off) << "spread off=" << spread_off << " on=" << spread_on;
+}
+
+// (4) Hard-banded task rows keep their soft tracking: the solution must sit
+//     near the band CENTER (w_control + w_task), not be dragged to the band's
+//     lower edge by the effort cost. Regression guard for the 2026-07-03
+//     pushing log where task_prio_res was pinned at the tolerance for the
+//     whole force ramp (contact force under-delivered by exactly tol).
+TEST_F(HihUnifiedAllocTest, TaskBandTracksCenterNotEdge)
+{
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w_control(6), w_task(6), task_weights(6), tolerances(6);
+  w_control << 0.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+  w_task << 2.0, 0.0, 0.0, 0.0, 0.0, 0.0;   // active task row: Fx
+  task_weights << 1.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+  tolerances << 0.5, 0.0, 0.0, 0.0, 0.0, 0.0;
+
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solveWithTaskBand(A, w_control, w_task, task_weights, tolerances, f));
+  const double realized_fx = (A * f)(0);
+  // Must stay inside the hard band ...
+  EXPECT_GE(realized_fx, 2.0 - 0.5 - 1e-3);
+  EXPECT_LE(realized_fx, 2.0 + 0.5 + 1e-3);
+  // ... and near its center, not at the lower edge (1.5).
+  EXPECT_NEAR(realized_fx, 2.0, 0.15);
+}
+
+// (5) A vertical gimbal limit (pi/2) must not break QP conditioning. Before the
+//     cos/sin reformulation of the gimbal-angle constraint, tan(pi/2) ~ 1.6e16
+//     produced a pathologically scaled row and the solver failed here.
+TEST_F(HihUnifiedAllocTest, HandlesVerticalGimbalLimit)
+{
+  gimbal_limit_ = M_PI / 2.0;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.5, 0.5, 0.2;
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solve(A, w, Eigen::VectorXd::Zero(kCols), f));
+  for (int i = 0; i < kCols / kRotorCoef; ++i) {
+    const double fx = f(2 * i), fz = f(2 * i + 1);
+    EXPECT_GE(fz, -1e-6) << "rotor " << i;
+    EXPECT_LE(std::sqrt(fx * fx + fz * fz), t_max_ + 1e-3) << "rotor " << i;
+  }
+}
+
+// (6) The affine interface constraint is centered on the model demand d, not
+//     on raw actuator wrench D*f. This is the discrete QP form of
+//     -F_bar <= d - D*f <= F_bar.
+TEST_F(HihUnifiedAllocTest, InterfaceForceBoundUsesAffineDemand)
+{
+  interface_force_limit_ = 0.02;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  D(0, 0) = 1.0;
+  Eigen::VectorXd d = Eigen::VectorXd::Zero(6);
+  d(0) = 0.4;
+
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solveWithInterfaceModel(A, w, D, d, f));
+  EXPECT_LE(std::abs(d(0) - (D * f)(0)), interface_force_limit_ + 1e-4);
+}
+
+// (7) Force and torque limits gate different rows of each 6D interface block.
+TEST_F(HihUnifiedAllocTest, InterfaceTorqueBoundUsesTorqueRowsOnly)
+{
+  interface_torque_limit_ = 0.015;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w(6);
+  w << 1.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  D(3, 0) = 1.0;
+  Eigen::VectorXd d = Eigen::VectorXd::Zero(6);
+  d(3) = 0.3;
+
+  Eigen::VectorXd f;
+  ASSERT_TRUE(solveWithInterfaceModel(A, w, D, d, f));
+  EXPECT_LE(std::abs(d(3) - (D * f)(3)), interface_torque_limit_ + 1e-4);
+}
+
+// (8) A task hard band must not bypass an incompatible structural hard bound.
+TEST_F(HihUnifiedAllocTest, InfeasibleTaskAndInterfaceBoundsReturnFalse)
+{
+  interface_force_limit_ = 0.05;
+  configure();
+  const Eigen::MatrixXd A = buildA();
+  Eigen::VectorXd w_control(6), w_task(6), task_weights(6);
+  w_control << 0.0, 0.0, 16.0, 0.0, 0.0, 0.0;
+  w_task << 2.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+  task_weights << 1.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+  Eigen::VectorXd tolerances = Eigen::VectorXd::Zero(6);
+  tolerances(0) = 0.1;
+
+  Eigen::MatrixXd D = Eigen::MatrixXd::Zero(6, kCols);
+  D.row(0) = A.row(0);
+  const Eigen::VectorXd d = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd f;
+  EXPECT_FALSE(solveWithTaskAndInterfaceModel(
+      A, w_control, w_task, task_weights, tolerances, D, d, f));
+}
+
+// (9) Navigator assembly IDs are numerically sorted, but the physical chain is
+//     defined by increasing body-X position (e.g. the real formation 2-3-1).
+TEST_F(HihUnifiedAllocTest, PhysicalChainOrderDoesNotFollowNumericIds)
+{
+  const std::map<int, Eigen::Vector3d> offsets = {
+      {1, Eigen::Vector3d(1.0, 0.0, 0.0)},
+      {2, Eigen::Vector3d(-1.0, 0.0, 0.0)},
+      {3, Eigen::Vector3d(0.0, 0.0, 0.0)}};
+  std::vector<int> chain_ids;
+  std::map<int, int> allocation_indices;
+  ASSERT_TRUE(physicalChainOrder({1, 2, 3}, offsets,
+                                 chain_ids, allocation_indices));
+  ASSERT_EQ(chain_ids.size(), 3u);
+  EXPECT_EQ(chain_ids[0], 2);
+  EXPECT_EQ(chain_ids[1], 3);
+  EXPECT_EQ(chain_ids[2], 1);
+  EXPECT_EQ(allocation_indices.at(1), 0);
+  EXPECT_EQ(allocation_indices.at(2), 1);
+  EXPECT_EQ(allocation_indices.at(3), 2);
+}
+
+// (10) The actual cut model must use the contact-free negative-X subtree. For
+//      allocation columns [id1,id2,id3] and physical chain 2-3-1, the two cuts
+//      contain {2} and {2,3}; hover cancels d-Df, while equal task shares create
+//      one and two units of transmitted interface load respectively.
+TEST_F(HihUnifiedAllocTest, InterfaceModelUsesContactFreePhysicalSubtree)
+{
+  Eigen::VectorXd control = Eigen::VectorXd::Zero(6);
+  control(2) = aerial_robot_estimation::G;
+  Eigen::MatrixXd D;
+  Eigen::VectorXd d;
+  std::vector<std::pair<int, int>> cuts;
+  ASSERT_TRUE(buildThreeModuleInterfaceModel(control, D, d, cuts));
+  ASSERT_EQ(D.rows(), 12);
+  ASSERT_EQ(D.cols(), 24);
+  ASSERT_EQ(cuts.size(), 2u);
+  EXPECT_EQ(cuts[0], std::make_pair(2, 3));
+  EXPECT_EQ(cuts[1], std::make_pair(3, 1));
+
+  // Allocation block order remains numeric [1,2,3]. Cut 2-3 contains only id2;
+  // cut 3-1 contains id2 and id3, never the +X contact module id1.
+  EXPECT_NEAR(D.block(0, 0, 6, 8).norm(), 0.0, 1e-12);
+  EXPECT_GT(D.block(0, 8, 6, 8).norm(), 0.0);
+  EXPECT_NEAR(D.block(0, 16, 6, 8).norm(), 0.0, 1e-12);
+  EXPECT_NEAR(D.block(6, 0, 6, 8).norm(), 0.0, 1e-12);
+  EXPECT_GT(D.block(6, 8, 6, 16).norm(), 0.0);
+
+  Eigen::VectorXd f_hover = Eigen::VectorXd::Zero(24);
+  for (int module = 0; module < 3; module++) {
+    for (int rotor = 0; rotor < kRotorsPerModule; rotor++) {
+      f_hover((module * kRotorsPerModule + rotor) * kRotorCoef + 1) =
+          aerial_robot_estimation::G / kRotorsPerModule;
+    }
+  }
+  EXPECT_NEAR((d - D * f_hover).norm(), 0.0, 1e-10);
+
+  Eigen::VectorXd f_push = f_hover;
+  for (int module = 0; module < 3; module++) {
+    for (int rotor = 0; rotor < kRotorsPerModule; rotor++) {
+      f_push((module * kRotorsPerModule + rotor) * kRotorCoef) =
+          1.0 / kRotorsPerModule;
+    }
+  }
+  const Eigen::VectorXd interface_wrench = d - D * f_push;
+  EXPECT_NEAR(interface_wrench(0), -1.0, 1e-10);
+  EXPECT_NEAR(interface_wrench(6), -2.0, 1e-10);
+}
+
+// (11) A physical roll/pitch command rotates the virtual CoG axes but must not
+//      change the body wrench represented by a fixed actuator vector. This
+//      guards against mixing body-fixed lever arms/inertia with CoG-frame
+//      thrust masks in the formation allocation matrix.
+TEST_F(HihUnifiedAllocTest, BodyWrenchIsInvariantUnderVirtualCogRotation)
+{
+  HihUnifiedController::ModuleModelDescriptor model;
+  model.mass = 2.7;
+  model.inertia <<
+      0.31,  0.02, -0.01,
+      0.02,  0.47,  0.03,
+     -0.01,  0.03,  0.62;
+  model.rotor_origins_from_cog = {
+      Eigen::Vector3d( 0.23, -0.17,  0.04),
+      Eigen::Vector3d(-0.19, -0.21, -0.03),
+      Eigen::Vector3d(-0.24,  0.16,  0.02),
+      Eigen::Vector3d( 0.18,  0.22, -0.05)};
+  model.rotor_direction = {{1, 1}, {2, -1}, {3, 1}, {4, -1}};
+  model.mf_rate = 0.015;
+
+  std::vector<Eigen::MatrixXd> masks_body;
+  for (double angle : {0.0, 0.35, -0.42, 0.21}) {
+    const Eigen::Matrix3d rotor_from_nominal =
+        Eigen::AngleAxisd(angle, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    Eigen::MatrixXd nominal_mask(3, 2);
+    nominal_mask << 1.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 1.0;
+    masks_body.push_back(rotor_from_nominal * nominal_mask);
+  }
+
+  Eigen::VectorXd actuator(8);
+  actuator << 0.8, 2.7, -0.5, 3.1, 1.2, 2.2, -0.9, 3.7;
+
+  Eigen::VectorXd expected_wrench = Eigen::VectorXd::Zero(6);
+  for (int r = 0; r < kRotorsPerModule; r++) {
+    const Eigen::Vector3d force_body =
+        masks_body[r] * actuator.segment<2>(2 * r);
+    expected_wrench.head<3>() += force_body;
+    expected_wrench.tail<3>() +=
+        model.rotor_origins_from_cog[r].cross(force_body) +
+        model.rotor_direction.at(r + 1) * model.mf_rate * force_body;
+  }
+
+  const Eigen::MatrixXd allocation_body =
+      buildSingleModuleAllocation(model, masks_body, Eigen::Matrix3d::Identity());
+  const std::vector<Eigen::Matrix3d> rotations = {
+      Eigen::Matrix3d::Identity(),
+      (Eigen::AngleAxisd(0.41, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(-0.27, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(0.19, Eigen::Vector3d::UnitX())).toRotationMatrix(),
+      (Eigen::AngleAxisd(-0.33, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(0.24, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(-0.37, Eigen::Vector3d::UnitX())).toRotationMatrix()};
+
+  for (const auto& cog_from_body : rotations) {
+    const Eigen::MatrixXd allocation_cog =
+        buildSingleModuleAllocation(model, masks_body, cog_from_body);
+    const Eigen::Matrix<double, 6, 6> spatial_rot =
+        spatialRotation(cog_from_body);
+    EXPECT_LT((allocation_cog - spatial_rot * allocation_body).norm(), 1e-11);
+
+    const Eigen::VectorXd acceleration_body =
+        spatial_rot.transpose() * (allocation_cog * actuator);
+    Eigen::VectorXd realized_wrench = Eigen::VectorXd::Zero(6);
+    realized_wrench.head<3>() = model.mass * acceleration_body.head<3>();
+    realized_wrench.tail<3>() = model.inertia * acceleration_body.tail<3>();
+    EXPECT_LT((realized_wrench - expected_wrench).norm(), 1e-10);
+  }
+}
+
+// (12) The secondary hover/load-sharing reference must not compete with the
+//      commanded wrench. A raw body-fixed hover vector produces horizontal
+//      acceleration when the virtual CoG frame is tilted; only its null-space
+//      component may be retained in f_ref.
+TEST_F(HihUnifiedAllocTest, SecondaryReferencePreservesDesiredWrenchWhenCogIsTilted)
+{
+  HihUnifiedController::ModuleModelDescriptor model;
+  model.mass = 2.7;
+  model.inertia <<
+      0.31,  0.02, -0.01,
+      0.02,  0.47,  0.03,
+     -0.01,  0.03,  0.62;
+  model.rotor_origins_from_cog = {
+      Eigen::Vector3d( 0.23, -0.17,  0.04),
+      Eigen::Vector3d(-0.19, -0.21, -0.03),
+      Eigen::Vector3d(-0.24,  0.16,  0.02),
+      Eigen::Vector3d( 0.18,  0.22, -0.05)};
+  model.rotor_direction = {{1, 1}, {2, -1}, {3, 1}, {4, -1}};
+  model.mf_rate = 0.015;
+
+  std::vector<Eigen::MatrixXd> masks_body;
+  for (double angle : {0.0, 0.35, -0.42, 0.21}) {
+    const Eigen::Matrix3d rotor_from_nominal =
+        Eigen::AngleAxisd(angle, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    Eigen::MatrixXd nominal_mask(3, 2);
+    nominal_mask << 1.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 1.0;
+    masks_body.push_back(rotor_from_nominal * nominal_mask);
+  }
+
+  const Eigen::Matrix3d cog_from_body =
+      (Eigen::AngleAxisd(-0.25, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(0.20, Eigen::Vector3d::UnitX())).toRotationMatrix();
+  Eigen::VectorXd desired_wrench_acc = Eigen::VectorXd::Zero(6);
+  desired_wrench_acc(2) = aerial_robot_estimation::G;
+
+  Eigen::MatrixXd allocation;
+  const Eigen::VectorXd reference = buildSingleModuleSecondaryReference(
+      model, masks_body, cog_from_body, desired_wrench_acc, allocation);
+  ASSERT_EQ(allocation.fullPivLu().rank(), 6);
+  ASSERT_EQ(reference.size(), kRotorsPerModule * kRotorCoef);
+  ASSERT_TRUE(reference.allFinite());
+
+  Eigen::VectorXd raw_balanced_hover =
+      Eigen::VectorXd::Zero(kRotorsPerModule * kRotorCoef);
+  const double hover_per_rotor =
+      model.mass * aerial_robot_estimation::G / kRotorsPerModule;
+  for (int r = 0; r < kRotorsPerModule; r++) {
+    raw_balanced_hover(r * kRotorCoef + kRotorCoef - 1) = hover_per_rotor;
+  }
+
+  // This is the old failure mode: the physical-body hover reference itself
+  // asks the tilted virtual frame for a large horizontal acceleration.
+  EXPECT_GT((allocation * raw_balanced_hover).head<2>().norm(), 1.0);
+
+  // The corrected reference keeps the load-sharing preference only in null(A),
+  // so every soft regularizer is centered on the same requested 6D wrench.
+  EXPECT_LT((allocation * reference - desired_wrench_acc).norm(), 1e-9);
+  const Eigen::VectorXd minimum_norm =
+      aerial_robot_model::pseudoinverse(allocation) * desired_wrench_acc;
+  EXPECT_LT((allocation * (reference - minimum_norm)).norm(), 1e-9);
+}
+
+}  // namespace aerial_robot_control
+
+int main(int argc, char** argv)
+{
+  testing::InitGoogleTest(&argc, argv);
+  ros::init(argc, argv, "test_unified_allocation");
+  return RUN_ALL_TESTS();
+}

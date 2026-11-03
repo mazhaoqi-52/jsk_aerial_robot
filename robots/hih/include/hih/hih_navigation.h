@@ -1,0 +1,227 @@
+// -*- mode: c++ -*-
+
+#pragma once
+
+#include <gimbalrotor/gimbalrotor_navigation.h>
+#include <hih/model/hih_robot_model.h>
+#include <hih/ModuleModel.h>
+#include <diagnostic_msgs/KeyValue.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/Point.h>
+#include <nav_msgs/Odometry.h>
+#include <Eigen/Dense>
+#include <algorithm>
+#include <cctype>
+#include <mutex>
+
+namespace aerial_robot_navigation
+{
+  /* target frmae*/
+  enum target_framea
+    {
+     COG,
+     BASE_LINK,
+     CONTACT_POINT,
+     CENTER_OF_MOVING
+    };
+  class HihNavigator : public GimbalrotorNavigator
+  {
+  public:
+    HihNavigator();
+    ~HihNavigator(){}
+
+    void initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
+                    boost::shared_ptr<aerial_robot_model::RobotModel> robot_model,
+                    boost::shared_ptr<aerial_robot_estimation::StateEstimator> estimator,
+                    double loop_du) override;
+
+    void update() override;
+
+    inline void setTargetPosCandX( float value){  target_pos_candidate_.setX(value);}
+    inline void setTargetPosCandY( float value){  target_pos_candidate_.setY(value);}
+    inline void setTargetPosCandZ( float value){  target_pos_candidate_.setZ(value);}
+    inline void setTargetPosCand( tf::Vector3 value){  target_pos_candidate_ = value ;}
+    inline tf::Vector3 getTargetPosCand() {return target_pos_candidate_;}
+    template<class T> T getCog2CoM();
+
+    // Unified control mode flag — set by HihController, read by navigation
+    // to skip leader-follower specific logic (e.g. CoG→CoM conversion).
+    void setUnifiedControlMode(bool mode) {
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      unified_control_mode_ = mode;
+    }
+    bool getUnifiedControlMode() {
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return unified_control_mode_;
+    }
+
+    // Synchronize pre_target_pos_ tracking state with current target position.
+    // Must be called when transitioning back from unified → leader-follower mode
+    // to prevent convertTargetPosFromCoG2CoM()'s "changed by something other than
+    // uav nav" check from detecting a false mismatch and corrupting target_pos_candidate_.
+    void syncPreTargetPos() {
+      tf::Vector3 cur_target = getTargetPos();
+      pre_target_pos_.setX(cur_target.x());
+      pre_target_pos_.setY(cur_target.y());
+      pre_target_pos_.setZ(cur_target.z());
+    }
+
+    bool getCurrentAssembled(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return current_assembled_;
+    }
+    int getModuleState(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return module_state_;
+    }
+    int getReconfigFlag(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return reconfig_flag_;
+    }
+    int getMyID(){return my_id_;}
+    int getMyIndex(){return my_index_;}
+    std::string getMyName(){return my_name_;}
+    int getLeaderID(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return leader_id_;
+    }
+    std::vector<int> getModuleIDs(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return assembled_modules_ids_;
+    }
+    bool getControlFlag(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return control_flag_;
+    }
+    int getModuleNum(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return module_num_;
+    }
+
+    void setCog2CoM(const KDL::Frame Cog2CoM){
+      std::lock_guard<std::mutex> lock(mutex_cog2com_);
+      Cog2CoM_ = Cog2CoM;
+    }
+    void setModuleNum(const int module_num){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      module_num_ = module_num;
+    }
+    void setAssemblyFlag(const int key, const bool value){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      assembly_flags_[key] = value;
+    }
+    void setControlFlag(const bool control_flag){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      control_flag_ = control_flag;
+    }
+    void setLeaderID(const int leader_id){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      leader_id_ = leader_id;
+      leader_fix_flag_ = true;
+    }
+
+    void setLeaderFixFlag(const bool leader_fix_flag){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      leader_fix_flag_ = leader_fix_flag;
+    }
+
+    std::map<int, bool> getAssemblyFlags(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return assembly_flags_;
+    }
+    std::vector<int> getAssemblyIds(){
+      std::lock_guard<std::mutex> lock(mutex_assembly_state_);
+      return assembled_modules_ids_;
+    }
+    int getMaxModuleNum(){return max_modules_num_;}
+    tf2_ros::Buffer& getTfBuffer(){return tfBuffer_;}
+
+    virtual void calcCenterOfMoving();  
+
+    bool pseudo_assembly_mode_;
+  protected:
+    ros::Publisher cog_com_dist_pub_;
+    std::mutex mutex_cog2com_;
+    std::mutex mutex_assembly_state_;
+    KDL::Frame Cog2CoM_;
+    tf2_ros::TransformListener tfListener_;
+    tf2_ros::Buffer tfBuffer_;
+    tf2_ros::TransformBroadcaster br_;
+    int max_modules_num_;
+    int pre_assembled_modules_;
+    int my_id_;
+    std::string my_name_;
+    int my_index_;
+    int leader_id_;
+    int left_id_;
+    int right_id_;
+    std::map<int, bool> assembly_flags_;
+    bool reconfig_flag_;
+    bool current_assembled_;
+    bool control_flag_;
+    bool leader_fix_flag_;
+    std::vector<int> assembled_modules_ids_;
+    int module_state_;
+    int module_num_;
+    tf::Vector3 target_pos_candidate_;
+    tf::Vector3 pre_target_pos_;
+    tf::Vector3 pre_target_rot_;
+    ros::NodeHandle nh_;
+    ros::NodeHandle nhp_;
+    ros::Subscriber assembly_nav_sub_;
+    ros::Subscriber assembly_target_rot_sub_;
+
+    // Assembly CoG odom publishing
+    ros::Publisher assembly_cog_odom_pub_;
+    nav_msgs::Odometry assembly_cog_odom_;
+    bool publish_assembly_odom_;
+
+    double max_target_roll_pitch_rate_;
+    bool joy_roll_positive_flag_;
+    bool joy_roll_negative_flag_;
+    bool joy_pitch_positive_flag_;
+    bool joy_pitch_negative_flag_;
+
+    bool roll_pitch_control_flag_;
+    bool pre_assembled_ ; 
+    bool unified_control_mode_ = false;  // set by controller
+
+    // [EXIT_DIAG] per-instance diagnostic counters for CoG→CoM tracing
+    int cog2com_diag_count_ = -1;
+    bool was_unified_for_diag_ = false;
+
+    void rosParamInit() override;
+    
+    // Assembly CoG calculation and publishing
+    virtual void calculateAndPublishAssemblyCoGOdom();
+    virtual Eigen::Vector3d calculateAssemblyCoGPosition();
+    virtual Eigen::Quaterniond calculateAssemblyCoGOrientation();
+    virtual void convertTargetPosFromCoG2CoM();
+    virtual void assemblyNavCallback(const aerial_robot_msgs::FlightNavConstPtr & msg);
+    virtual void joyStickControl(const sensor_msgs::JoyConstPtr & joy_msg) override;
+    virtual void naviCallback(const aerial_robot_msgs::FlightNavConstPtr & msg) override;
+
+  private:
+    void setAssemblyFinalTargetBaselinkRotCallback(const spinal::DesireCoordConstPtr & msg);
+    void rotateContactPointFrame();
+    boost::shared_ptr<HihRobotModel> hih_robot_model_;
+    map<string, ros::Subscriber> assembly_flag_subs_;
+    void assemblyFlagCallback(const diagnostic_msgs::KeyValue & msg);
+
+    // Per-module mass cache for mass-weighted center of moving in calcCenterOfMoving().
+    // Mirrors the controller's per-module mass usage in
+    // HihUnifiedController::updateFormationGeometry(); keeps the Cog2CoM_
+    // definition consistent with formation_cog_offset_ on the control side.
+    map<string, ros::Subscriber> module_model_subs_;
+    std::map<int, double> module_masses_;
+    std::mutex mutex_module_masses_;
+    void moduleModelCallback(const hih::ModuleModel& msg);
+  };
+
+  template<> inline KDL::Frame HihNavigator::getCog2CoM()
+  {
+    std::lock_guard<std::mutex> lock(mutex_cog2com_);
+    return Cog2CoM_;
+  }
+};

@@ -1,0 +1,5 @@
+<library path="lib/libhih_navigation">
+  <class name="aerial_robot_navigation/hih_navigation" type="aerial_robot_navigation::HihNavigator" base_class_type="aerial_robot_navigation::BaseNavigator">
+    <description>plugin for hih navigation </description>
+  </class>
+</library>

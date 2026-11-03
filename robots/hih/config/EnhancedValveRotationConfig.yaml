@@ -1,0 +1,66 @@
+# Enhanced Valve Rotation Configuration
+# Strict alignment control parameters for valve rotation
+# Ensures COG, end-effector center, and valve center are collinear during rotation
+# 
+# CODE ORGANIZATION:
+# - Alignment control logic is now in EnhancedMotionController
+# - ModernRotateValveState provides clean interface
+# - Improved code readability and reusability
+
+# === STRICT ALIGNMENT CONTROL ===
+# Enable strict alignment monitoring and correction during valve rotation
+strict_alignment_enabled: true
+
+# Enable real-time alignment corrections during rotation
+alignment_correction_enabled: true
+
+# === END-EFFECTOR PARAMETERS ===
+# End-effector offset from UAV center of gravity (COG) in body frame [x, y, z] meters
+# Default: [0.0, 0.0, -0.246] means 24.6cm directly below COG
+end_effector_offset: [0.0, 0.0, -0.246]
+
+# === ALIGNMENT TOLERANCES ===
+# Maximum allowed distance between end-effector and valve center (meters)
+alignment_position_tolerance: 0.01  # 1cm
+
+# Maximum allowed yaw error for proper alignment (radians)
+alignment_yaw_tolerance: 0.05  # ~2.9 degrees
+
+# === ROTATION TRAJECTORY STABILITY ===
+# Maximum allowed deviation from ideal rotation radius (meters)
+rotation_radius_tolerance: 0.005  # 0.5cm
+
+# Maximum allowed height deviation during rotation (meters)
+rotation_height_tolerance: 0.01  # 1cm
+
+# === CONTROL PARAMETERS ===
+# Control gain for alignment corrections (0.0 to 1.0)
+# Higher values = more aggressive corrections
+alignment_control_gain: 0.8
+
+# Frequency of alignment checks and corrections (Hz)
+alignment_check_frequency: 25
+
+# === EMERGENCY DETECTION (EXISTING) ===
+# Time threshold for stuck detection (seconds)
+stuck_threshold: 25.0
+
+# Movement threshold for stuck detection (meters)
+movement_threshold: 0.02
+
+# Yaw threshold for stuck detection (radians)
+yaw_threshold: 0.1
+
+# === ROTATION PARAMETERS ===
+# Rotation angle in radians (default: π/2 = 90 degrees)
+rotation_angle: 1.5708  # π/2
+
+# Rotation duration in seconds
+rotation_duration: 8.0
+
+# === LOGGING AND MONITORING ===
+# Enable detailed alignment logging
+debug_alignment: false
+
+# Enable trajectory deviation logging
+debug_trajectory: false

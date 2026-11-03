@@ -1,0 +1,86 @@
+<?xml version="1.0"?>
+<launch>
+  ###########  launch config  ###########
+  <arg name="real_machine" default="False"/>
+  <arg name="simulation"   default="True"/>
+
+  ###########  Formation modules  ###########
+  <arg name="module_ids" default="1,2"
+       doc="Comma-separated hih module IDs, e.g. 2,3 or 2,3,1"/>
+
+  ###########  Valve  ###########
+  <arg name="valve_ns"  default="valve"/>
+  <arg name="valve_id"  default="85"/>
+  <arg name="valve_x"   default="3"/>
+  <arg name="valve_y"   default="0"/>
+  <arg name="valve_z"   default="0"/>
+  <arg name="valve_yaw" default="0"/>
+  <arg name="valve_model" default="valve"
+       doc="valve keeps the legacy upward demo; valve_downward selects the new model"/>
+  <arg name="valve_support_height" default="1.5"/>
+
+  <include file="$(find hih)/launch/valve_rotation_tasks/valve_pos.launch">
+    <arg name="real_machine" value="$(arg real_machine)"/>
+    <arg name="simulation"   value="$(arg simulation)"/>
+    <arg name="robot_ns"     value="$(arg valve_ns)"/>
+    <arg name="robot_id"     value="$(arg valve_id)"/>
+    <arg name="valve_x"      value="$(arg valve_x)"/>
+    <arg name="valve_y"      value="$(arg valve_y)"/>
+    <arg name="valve_z"      value="$(arg valve_z)"/>
+    <arg name="valve_yaw"    value="$(arg valve_yaw)"/>
+    <arg name="valve_model" value="$(arg valve_model)"/>
+    <arg name="valve_support_height" value="$(arg valve_support_height)"/>
+  </include>
+
+  ###########  Parameters  ###########
+  <arg name="rotation_angle_deg" default="360"
+       doc="Total rotation target in degrees"/>
+  <arg name="valve_rotation_direction" default="cw"
+       doc="Valve rotation direction: cw/ccw"/>
+  <arg name="rotation_torque" default="3.0"
+       doc="Maximum valve-axis feedforward torque (N*m)"/>
+  <arg name="torque_ramp_time" default="60.0"
+       doc="Nominal time to reach rotation_torque while the valve remains below target speed (s)"/>
+  <arg name="contact_search_speed_deg_s" default="3.0"
+       doc="Wrench-free contact-search yaw speed (deg/s)"/>
+  <arg name="contact_search_max_angle_deg" default="90.0"
+       doc="Maximum wrench-free contact-search angle (deg)"/>
+  <arg name="wrench_ramp_hold_position_tolerance" default="0.030"
+       doc="Allowed 3D EE settling during wrench ramp (m)"/>
+  <arg name="wrench_ramp_hold_yaw_tolerance_deg" default="5.0"
+       doc="Allowed EE yaw settling during wrench ramp (deg)"/>
+  <arg name="yaw_rate_guard" default="0.15"
+       doc="Immediate formation yaw-rate limit during contact search/hold (rad/s)"/>
+  <arg name="approach_height" default="0.48"
+       doc="Valve approach height (m), adjusted for EE offset"/>
+  <arg name="debug" default="false"/>
+
+  <param name="controller/valve_rotation_feedforward/enabled"  value="true"/>
+  <param name="controller/valve_rotation_feedforward/force_z"  value="-2.0"/>
+  <param name="controller/valve_rotation_feedforward/force_ramp_time" value="3.0"/>
+  <param name="controller/valve_rotation_feedforward/rp_guard" value="0.174532925"/>
+  <param name="controller/valve_rotation_feedforward/contact_init_torque" value="0.1"/>
+  <param name="controller/valve_rotation_feedforward/torque_limit" value="$(arg rotation_torque)"/>
+  <param name="controller/valve_rotation_feedforward/torque_ramp_time" value="$(arg torque_ramp_time)"/>
+  <param name="controller/valve_rotation_feedforward/valve_feedback_timeout" value="0.5"/>
+  <param name="controller/valve_rotation_feedforward/yaw_velocity_timeout" value="0.2"/>
+  <param name="controller/valve_rotation_feedforward/yaw_rate_guard" value="$(arg yaw_rate_guard)"/>
+
+  ###########  Demo  ###########
+  <node name="formation_valve_rotation" pkg="hih" type="valve_rotation_formation_clean.py"
+        output="screen">
+    <param name="module_ids"      value="$(arg module_ids)"/>
+     <param name="rotation_angle_deg" value="$(arg rotation_angle_deg)"/>
+    <param name="valve_rotation_direction" value="$(arg valve_rotation_direction)"/>
+    <param name="approach_height" value="$(arg approach_height)"/>
+    <param name="contact_search_speed_deg_s" value="$(arg contact_search_speed_deg_s)"/>
+    <param name="contact_search_max_angle_deg" value="$(arg contact_search_max_angle_deg)"/>
+    <param name="wrench_ramp_hold_position_tolerance"
+           value="$(arg wrench_ramp_hold_position_tolerance)"/>
+    <param name="wrench_ramp_hold_yaw_tolerance_deg"
+           value="$(arg wrench_ramp_hold_yaw_tolerance_deg)"/>
+    <param name="simulation"      value="$(arg simulation)"/>
+    <param name="real_machine"    value="$(arg real_machine)"/>
+    <param name="debug"           value="$(arg debug)"/>
+  </node>
+</launch>

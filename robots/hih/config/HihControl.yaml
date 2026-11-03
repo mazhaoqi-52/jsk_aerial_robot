@@ -1,0 +1,220 @@
+aerial_robot_control_name: aerial_robot_control/hih_controller
+
+controller:
+  torque_allocation_matrix_inv_pub_interval: 0.05
+  wrench_allocation_matrix_pub_interval: 0.1
+  gimbal_calc_in_fc : true
+  i_term_rp_calc_in_pc: false  # 2026-09-15: test FC-side RP I; keep XY D LPF off
+  wrench_estimate_update_rate: 100
+  module_observer_spatial_sum_timeout: 0.35  # [s], diagnostic sum requires fresh output from every assembled module
+  momentum_observer_force_weight: 3
+  momentum_observer_torque_weight: 2.5
+  wrench_estimate_flag: true
+  # wrench_estimate_flag: false
+  comp_term_update_freq: 40
+  unified_control_mode: false
+  unified_reference_warmup_frames: 20  # leader-side local warmup after mode switch [frames @40Hz]
+  unified_reference_timeout: 0.8       # follower force-lands if leader reference is stale in flight [s]
+  unified_peer_stall_guard: true       # leader force-lands if an assembled peer heartbeat is stale
+  unified_peer_heartbeat_timeout: 0.8
+  unified_external_wrench_feedback: true
+  unified_external_wrench_feedback_gain: 0.2
+  unified_external_wrench_feedback_task_weight: 0.05  # LF-style soft task-space disturbance rejection
+  unified_external_wrench_feedback_settle_pos: 0.08   # [m/rad], learn observer bias only near hover equilibrium
+  unified_external_wrench_feedback_settle_vel: 0.12   # [m/s, rad/s], learn observer bias only when slow
+  unified_torque_allocation_matrix_inv_pub_interval: 0.05  # keep spinal P/D allocation mapping fresh
+  unified_command_stall_warn_gap: 0.30   # warn only when command gap is close to FC 500ms watchdog
+  unified_command_stall_trace_gap: 0.20  # keep DEBUG stage trace for smaller gaps
+  unified_command_stall_trace_duration: 0.25
+  unified_heartbeat_pub_interval: 0.2    # rosbag-visible unified stage heartbeat [s], <=0 disables
+
+  # v4: seed_bucket / z_ki_boost machinery removed — bumpless transfer (de-gravity)
+  # handles LF↔unified switching directly in initUnifiedMode().
+
+  # ========== Formation Momentum Observer ==========
+  # Formation-level external wrench estimation using the existing PC-side
+  # allocation-model wrench (A * f) about assembly_cog.
+  # Feedback is bias-corrected, hover-settled, and injected only as a low-weight
+  # task-space disturbance-rejection objective.
+  formation_observer:
+    force_observer_gain: 3.0
+    torque_observer_gain: 2.5
+    enable_force_observer: true
+    enable_torque_observer: true
+    # Output LPF cutoff. Feedback is bias-corrected, settled-gated, and ramped.
+    est_force_lpf_cutoff_freq: 0.5
+    est_torque_lpf_cutoff_freq: 0.5
+    # Short gate ramp: close to LF's quick observer engagement, without a hard step.
+    ff_ramp_seconds: 1.0
+
+  yaw_in_allocation: true  # false: single-channel yaw (spinal-only), true: include yaw in QP
+
+  # Leader-only compact log for aerial towing validation. Prints only while a
+  # nonzero formation_desired_wrench is active.
+  unified_towing_debug_log: true
+  unified_towing_debug_log_period: 1.0
+  # Spinal owns roll/pitch P+D. The formation QP receives only the slow PC
+  # I-term in its control target; task wrench is tracked by a separate soft objective.
+
+  # Full-vector constrained QP allocation
+  # Decision variables: all force components [f_x, f_z] per rotor (not just scalar thrust).
+  # Constraints: gimbal angle limits (linearized), component bounds.
+  use_constrained_alloc: true
+  alloc_lambda: 1.0e-2          # secondary weight toward the balanced/task-consistent reference
+  alloc_t_max: 17.5             # conservative per-rotor thrust upper bound [N]
+  alloc_gimbal_limit_deg: 75.0  # gimbal angle hard limit [deg] (< 90° to avoid singularity)
+  # Spidar-style secondary costs: regularize around the balanced/task-consistent
+  # reference before using actuator margin.
+  alloc_rate_weight: 2.0e-2     # soft penalty on |f[k] - f[k-1]|
+  alloc_rate_limit: 0.0         # hard per-cycle component delta limit [N]; 0 disables
+  alloc_direction_rate_limit_deg: 0.0  # hard per-cycle gimbal direction band [deg]; soft fx-rate is preferred
+  alloc_lateral_rate_weight: 1.0e-1    # soft penalty on 1-DOF rotor fx[k]-fx[k-1]
+  # Weighted control/stabilization residual [Fx,Fy,Fz,Tx,Ty,Tz].
+  alloc_wrench_weights: [0.50, 0.50, 1.20, 0.25, 0.40, 0.50]
+  # Fallback weighted task residual [Fx,Fy,Fz,Tx,Ty,Tz]. Demo layers may publish
+  # task-specific weights with each wrench command.
+  alloc_task_wrench_weights: [1.00, 1.00, 0.40, 0.40, 0.40, 0.40]
+  alloc_effort_weight: 3.0e-3   # secondary cost on ||f - f_ref||^2
+  alloc_module_weights: []      # module-id indexed multiplier for alloc_lambda; lower => easier to deviate/output more
+  alloc_module_balance_weight: 1.0e-3  # soft penalty on per-module vertical-thrust spread
+  # Component-wise hard box on the model interface wrench w_I=d-Df for the
+  # standard positive-X terminal tool/contact topology.
+  # N / Nm; <=0 disables that half of the 6D bound. These experiment limits
+  # must remain below the verified docking-interface rating with safety margin.
+  alloc_interface_force_limit: 70.0
+  alloc_interface_torque_limit: 15.0
+  alloc_priority_enabled: false
+  # Spidar-style task tracking: axes with nonzero desired wrench and task weight
+  # >= min_weight are narrow hard bands; effort/rate/balance stay secondary.
+  alloc_task_priority_enabled: true
+  alloc_task_priority_min_weight: 0.5
+  # Hard 6D wrench tracking bands [Fx,Fy,Fz,Tx,Ty,Tz] in acceleration space.
+  # Reused by task-priority rows; hover priority currently fills only Fx/Fy/Tx/Ty.
+  # <=0 disables that row.
+  alloc_priority_wrench_tolerances: [0.35, 0.35, 0.30, 0.40, 0.35, 0.40]
+
+  pd_wrench_comp_mode: true
+  # pd_wrench_comp_mode: false
+  desired_wrench_timeout: 0.5
+
+  external_force_upper_limit: 0.0
+  external_force_lower_limit: 0.0
+  external_torque_upper_limit: 0.0
+  external_torque_lower_limit: 0.0
+
+  cutoff_freq: 1.0
+  sample_freq: 40.0
+
+  wrench_comp:
+    p_gain: 0.1
+    d_gain: 0.07
+    i_gain: 0.0
+  xy:
+    p_gain: 10.0
+    i_gain: 0.2
+    d_gain: 5.0       # 2026-09-09: XY D-only comparison for side-dependent takeoff oscillation
+    err_d_lpf_cutoff_freq: 0.0  # 2026-09-15: B trial, disable XY D LPF only (baseline: 3.5 Hz)
+    limit_sum: 8.0
+    limit_p: 12.0
+    limit_i: 5.0
+    limit_d: 12.0
+
+  z:
+    p_gain: 8.0
+    i_gain: 1.5
+    d_gain: 4.0       # F-5a: 5.0→4.0  Z D-term dominates bt0 oscillation (100% of pid_body_z variance)
+    err_d_lpf_cutoff_freq: 3.0  # F-5b: NEW  3Hz LPF on Z velocity error to reject sensor noise
+    limit_err_p: 1.0
+    limit_sum: 25.0 # N for clamping thrust force
+    limit_p: 25.0
+    limit_i: 20.0
+    limit_d: 25.0
+    force_landing_descending_rate: -0.5
+
+  roll:
+    p_gain: 17.0 #8~25
+    i_gain: 5.0
+    d_gain: 15.0 #4~11
+    limit_sum: 0.0
+    limit_p: 20.0
+    limit_i: 10.0
+    limit_d: 20.0
+
+    start_rp_integration_height: 0.01
+
+  pitch:
+    p_gain: 17.0 #8~25
+    i_gain: 5.0
+    d_gain: 12.0 #4~11
+    limit_sum: 20.0
+    limit_p: 20.0
+    limit_i: 10.0
+    limit_d: 20.0
+
+    start_rp_integration_height: 0.01
+
+  yaw:
+    p_gain: 15.0
+    i_gain: 1.0
+    d_gain: 5.0
+    limit_err_p: 0.4
+    limit_sum: 20.0
+    limit_p: 20.0
+    limit_i: 5.0
+    limit_d: 20.0
+
+    need_d_control: true
+
+  # Unified-mode PID gains for roll/pitch.
+  # Applied when entering unified control mode; restored on exit.
+  # P+D are sent to each module's spinal for 1000Hz inner-loop tracking.
+  # I-term is retained on PC for slow formation-level bias correction.
+  unified_roll:
+    p_gain: 17.0
+    i_gain: 1.0
+    d_gain: 15.0
+    limit_sum: 50.0
+    limit_p: 20.0
+    limit_i: 10.0
+    limit_d: 20.0
+
+  unified_pitch:
+    p_gain: 17.0
+    i_gain: 3.0
+    d_gain: 12.0
+    limit_sum: 50.0
+    limit_p: 20.0
+    limit_i: 20.0
+    limit_d: 20.0
+
+  unified_xy:
+    p_gain: 10.0
+    i_gain: 0.15
+    d_gain: 5.0      # B: 4→5, add damping for low-frequency assembly XY hover oscillation
+    err_d_lpf_cutoff_freq: 1.5  # A: 3.5→1.5 Hz, 抑制 1-3Hz 速度估计噪声放大成 target_pitch 抖动
+    limit_sum: 8.0
+    limit_p: 12.0
+    limit_i: 5.0
+    limit_d: 12.0
+
+  unified_z:
+    p_gain: 8.0
+    i_gain: 1.5
+    d_gain: 4.0
+    limit_sum: 25.0
+    limit_p: 25.0
+    limit_i: 20.0
+    limit_d: 25.0
+
+  # Unified-mode yaw PID gains.
+  # Full P+I+D on PC side. D-gain also sent to spinal for high-freq damping.
+  # When yaw_in_allocation=true, yaw PID output participates in 6-DOF QP allocation.
+  unified_yaw:
+    p_gain: 15.0
+    i_gain: 1.0
+    d_gain: 10.0
+    limit_err_p: 0.4
+    limit_sum: 20.0
+    limit_p: 20.0
+    limit_i: 5.0
+    limit_d: 20.0

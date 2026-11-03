@@ -1,0 +1,5 @@
+<library path="lib/libhih_controller">
+  <class name="aerial_robot_control/hih_controller" type="aerial_robot_control::HihController" base_class_type="aerial_robot_control::ControlBase">
+    <description>plugin for hih control </description>
+  </class>
+</library>

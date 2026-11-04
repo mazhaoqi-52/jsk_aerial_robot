@@ -1,0 +1,10 @@
+<library path="lib/libhih_role_controllers">
+  <class name="aerial_robot_control/hih_leader_controller"
+    type="aerial_robot_control::HihLeaderController" base_class_type="aerial_robot_control::ControlBase">
+    <description>HiH Leader: inherited PID and momentum observer.</description>
+  </class>
+  <class name="aerial_robot_control/hih_follower_controller"
+    type="aerial_robot_control::HihFollowerController" base_class_type="aerial_robot_control::ControlBase">
+    <description>HiH Follower: inherited PID/MOB plus optional XYZ+yaw contact-force admittance.</description>
+  </class>
+</library>

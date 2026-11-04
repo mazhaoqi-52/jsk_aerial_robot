@@ -33,6 +33,7 @@
   <run_depend>cfs_sensor</run_depend>
   <run_depend>roscpp</run_depend>
   <run_depend>rospy</run_depend>
+  <run_depend>python3-yaml</run_depend>
   <run_depend>rospkg</run_depend>
   <run_depend>pluginlib</run_depend>
   <run_depend>diagnostic_msgs</run_depend>
@@ -48,6 +49,7 @@
   <run_depend>message_runtime</run_depend>
 
   <export>
+    <aerial_robot_control plugin="${prefix}/plugins/hih_role_control_plugins.xml" />
     <aerial_robot_model plugin="${prefix}/plugins/robot_model_plugins.xml" />
     <aerial_robot_control plugin="${prefix}/plugins/control_plugins.xml" />
     <aerial_robot_control plugin="${prefix}/plugins/navigation_plugin.xml" />

@@ -35,6 +35,7 @@
 
 
 #include <aerial_robot_control/control/base/pose_linear_controller.h>
+#include <aerial_robot_control/control/base/target_reference_modifier.h>
 
 namespace aerial_robot_control
 {
@@ -229,7 +230,10 @@ namespace aerial_robot_control
   {
     pos_ = estimator_->getPos(Frame::COG, estimate_mode_);
     vel_ = estimator_->getVel(Frame::COG, estimate_mode_);
-    const auto target_snapshot = navigator_->getTargetSnapshot();
+    auto target_snapshot = navigator_->getTargetSnapshot();
+    // Optional reference shaping; existing controllers keep the exact old path.
+    if (auto* modifier = dynamic_cast<TargetReferenceModifier*>(this))
+      modifier->modifyTargetSnapshot(target_snapshot);
     target_pos_ = target_snapshot.pos;
     target_vel_ = target_snapshot.vel;
     target_acc_ = target_snapshot.acc;

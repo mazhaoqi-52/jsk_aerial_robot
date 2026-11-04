@@ -1,3 +1,5 @@
+> 이 문서는 초기 패키지 이름 분리 단계의 기록입니다. 이후 추가한 역할 제어기와 Admittance의 현재 상태는 [CONTROLLERS.md](CONTROLLERS.md)를 참고하세요.
+
 # HiH 패키지 분리 작업 결과
 
 ## 적용 위치

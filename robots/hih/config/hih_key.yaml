@@ -1,0 +1,49 @@
+# hih_key.py loads this file automatically. All speeds are positive SI values.
+# Frame: world = global X/Y directions, local = each robot's current yaw axes.
+frame: world
+publish_rate: 20.0
+# Terminals report key characters, not key-up events. Last key repeat expires here.
+key_timeout: 0.35
+command_repeat_gap: 0.7
+stop_repeats: 3
+common_targets: [leader, follower]
+
+robots:
+  leader:
+    namespace: /hih1
+    xy_speed: 0.10       # m/s
+    z_speed: 0.10        # m/s
+    yaw_speed: 0.10      # rad/s
+  follower:
+    namespace: /hih2
+    xy_speed: 0.10
+    z_speed: 0.10
+    yaw_speed: 0.10
+
+keys:
+  common:
+    arm: v
+    takeoff: b
+    land: n
+    force_landing: m
+    halt: '/'
+    stop_motion: SPACE  # zero keyboard velocity; does NOT stop motors
+    help: '?'
+  follower:
+    '+X': w
+    '-X': s
+    '+Y': a
+    '-Y': d
+    '+Z': r
+    '-Z': f
+    '+yaw': q
+    '-yaw': e
+  leader:
+    '+X': i
+    '-X': k
+    '+Y': j
+    '-Y': l
+    '+Z': p
+    '-Z': ';'
+    '+yaw': u
+    '-yaw': o

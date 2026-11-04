@@ -9,8 +9,8 @@ Ubuntu 22.04 / ROS-O (`ROS_DISTRO=one`)에서 사용합니다.
 - 패키지, C++ 클래스, 라이브러리, 플러그인, 메시지, Python 모듈과 리소스 참조를 분리했습니다.
 - PID, 모멘텀 기반 외력 추정, QP 계산, 하드웨어 캘리브레이션과 수치 게인은 복사본의 기존 내용을 유지했습니다.
 - `HihFormationMomentumObserver`도 원래 계산 그대로이며, 동일 프로세스에서 Beetle 라이브러리와 심볼이 충돌하지 않도록 이름만 분리했습니다.
-- Leader/Follower bringup은 기본 ID와 역할 표지만 다릅니다. 두 기체 모두 현재는 같은 기존 제어기를 사용합니다.
-- 새 Leader/Follower 제어기, Admittance, `hih_control.yaml`, `hih_key.yaml`, 요청한 새 키 매핑의 `hih_key.py`는 다음 단계입니다. 이 버전에 구현된 것으로 간주하지 마세요.
+- Leader/Follower bringup은 이제 역할별 제어기 플러그인을 선택합니다. Leader는 기존 제어를 유지하고 Follower는 선택적으로 XYZ+yaw 접촉력 Admittance를 적용합니다.
+- 역할 제어기·Admittance·`hih_control.yaml`이 추가됐습니다. 자세한 수식·활성 조건·배포 방법은 [CONTROLLERS.md](CONTROLLERS.md)를 참고하세요. 새 `hih_key.yaml`/`hih_key.py` 키 매핑과 dry-run이 추가됐습니다. 실행법은 [KEYBOARD.md](KEYBOARD.md)를 참고하세요.
 
 ## 주요 이름과 경로
 
@@ -30,6 +30,8 @@ Ubuntu 22.04 / ROS-O (`ROS_DISTRO=one`)에서 사용합니다.
 메시지 타입은 `hih/TaggedWrench` 등으로 분리했습니다. 따라서 두 기체 PC와 ground station 모두 같은 버전의 `hih`를 빌드해야 합니다. 원래 `beetle/…` 메시지를 구독하는 분석/외부 노드는 `hih/…`로 맞춰야 합니다. 모델의 기존 물리 link/joint 이름(예: `beetle_fang_link`)은 하드웨어 인터페이스 호환을 위해 유지했습니다.
 
 ## 배치 및 빌드
+
+**역할 제어기 업데이트에는 공통 `aerial_robot_control`의 선택 참조 인터페이스도 포함됩니다. 새 업데이트 ZIP은 저장소 상대 경로를 포함하므로 `jsk_aerial_robot/` 아래 내용을 같은 브랜치의 저장소 루트에 적용하세요. `hih/`만 복사하면 Follower의 보정이 PID에 전달되지 않습니다.**
 
 ZIP에는 최상위 `hih/` 폴더가 있습니다. 작업 공간에 아래처럼 배치합니다.
 
@@ -51,6 +53,15 @@ rospack find beetle
 ```
 
 빌드 결과와 `__pycache__`는 ZIP에 포함하지 않습니다. 코드 수정 후에는 다시 빌드하고 각 터미널에서 작업 공간 환경을 적용합니다.
+
+## 새 HiH 키보드
+
+```bash
+rosrun hih hih_key.py --dry-run
+rosrun hih hih_key.py
+```
+
+요청된 좌우 분리 매핑이며 `m`=force landing, `/`=halt입니다. 기본 설정은 자동 로드합니다. [KEYBOARD.md](KEYBOARD.md)에 timeout·다중 PC 실행법을 정리했습니다. 아래의 `keyboard_command_multi.py`는 이전 방식의 참고용입니다.
 
 ## 두 기체 PC + ground station
 

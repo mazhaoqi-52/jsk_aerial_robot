@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <launch>
-  <!-- Role label only: original PID and momentum observer remain in use. -->
+  <!-- Per-role plugin; inherited PID/MOB values are configured in hih_control.yaml. -->
   <arg name="simulation" default="false" />
   <arg name="real_machine" default="true" />
   <arg name="robot_id" default="2" />
@@ -8,6 +8,7 @@
   <arg name="headless" default="true" />
   <arg name="estimate_mode" default="1" />
   <arg name="hih_model" default="hih" />
+  <arg name="hih_control_file" default="$(find hih)/config/hih_control.yaml" />
   <arg name="config_dir" default="$(find hih)/config" />
   <include file="$(find hih)/launch/bringup.launch">
     <arg name="simulation" value="$(arg simulation)" />
@@ -20,4 +21,6 @@
     <arg name="config_dir" value="$(arg config_dir)" />
   </include>
   <param name="hih$(arg robot_id)/hih_role" value="follower" />
+  <rosparam file="$(arg hih_control_file)" command="load" ns="hih$(arg robot_id)/hih" />
+  <param name="hih$(arg robot_id)/aerial_robot_control_name" value="aerial_robot_control/hih_follower_controller" />
 </launch>

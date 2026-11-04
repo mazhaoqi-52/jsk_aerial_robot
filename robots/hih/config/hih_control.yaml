@@ -1,0 +1,184 @@
+# Hand in Hand: role-specific overrides, read BEFORE inherited PID/MOB initialization.
+# PID/MOB values below are copied from the working HihControl.yaml, not retuned.
+# Admittance vectors use [world X, world Y, world Z, world yaw]. SI units: m/rad.
+# Virtual masses: kg/kg*m^2; damping: N*s/m or Nm*s/rad; stiffness: N/m or Nm/rad.
+# normal_contact points from the robot toward the payload in the MODEL contact_point axes.
+# 10 N and virtual dynamics are simulation-derived starting values, NOT validated flight gains.
+# Limits are deliberately smaller than the simulation; enabled=false by default.
+# K=0 permits steady nonzero contact force without spring pullback toward the old task pose.
+# No automatic approach or lifting sequence is implemented here.
+# Configure before bringup; restart the role controller to reload these settings.
+leader:
+  controller:
+    wrench_estimate_flag: true
+    wrench_estimate_update_rate: 100
+    momentum_observer_force_weight: 3
+    momentum_observer_torque_weight: 2.5
+    xy:
+      p_gain: 10.0
+      i_gain: 0.2
+      d_gain: 5.0
+      err_d_lpf_cutoff_freq: 0.0
+      limit_sum: 8.0
+      limit_p: 12.0
+      limit_i: 5.0
+      limit_d: 12.0
+    z:
+      p_gain: 8.0
+      i_gain: 1.5
+      d_gain: 4.0
+      err_d_lpf_cutoff_freq: 3.0
+      limit_err_p: 1.0
+      limit_sum: 25.0
+      limit_p: 25.0
+      limit_i: 20.0
+      limit_d: 25.0
+      force_landing_descending_rate: -0.5
+    roll:
+      p_gain: 17.0
+      i_gain: 5.0
+      d_gain: 15.0
+      limit_sum: 0.0
+      limit_p: 20.0
+      limit_i: 10.0
+      limit_d: 20.0
+      start_rp_integration_height: 0.01
+    pitch:
+      p_gain: 17.0
+      i_gain: 5.0
+      d_gain: 12.0
+      limit_sum: 20.0
+      limit_p: 20.0
+      limit_i: 10.0
+      limit_d: 20.0
+      start_rp_integration_height: 0.01
+    yaw:
+      p_gain: 15.0
+      i_gain: 1.0
+      d_gain: 5.0
+      limit_err_p: 0.4
+      limit_sum: 20.0
+      limit_p: 20.0
+      limit_i: 5.0
+      limit_d: 20.0
+      need_d_control: true
+follower:
+  controller:
+    wrench_estimate_flag: true
+    wrench_estimate_update_rate: 100
+    momentum_observer_force_weight: 3
+    momentum_observer_torque_weight: 2.5
+    xy:
+      p_gain: 10.0
+      i_gain: 0.2
+      d_gain: 5.0
+      err_d_lpf_cutoff_freq: 0.0
+      limit_sum: 8.0
+      limit_p: 12.0
+      limit_i: 5.0
+      limit_d: 12.0
+    z:
+      p_gain: 8.0
+      i_gain: 1.5
+      d_gain: 4.0
+      err_d_lpf_cutoff_freq: 3.0
+      limit_err_p: 1.0
+      limit_sum: 25.0
+      limit_p: 25.0
+      limit_i: 20.0
+      limit_d: 25.0
+      force_landing_descending_rate: -0.5
+    roll:
+      p_gain: 17.0
+      i_gain: 5.0
+      d_gain: 15.0
+      limit_sum: 0.0
+      limit_p: 20.0
+      limit_i: 10.0
+      limit_d: 20.0
+      start_rp_integration_height: 0.01
+    pitch:
+      p_gain: 17.0
+      i_gain: 5.0
+      d_gain: 12.0
+      limit_sum: 20.0
+      limit_p: 20.0
+      limit_i: 10.0
+      limit_d: 20.0
+      start_rp_integration_height: 0.01
+    yaw:
+      p_gain: 15.0
+      i_gain: 1.0
+      d_gain: 5.0
+      limit_err_p: 0.4
+      limit_sum: 20.0
+      limit_p: 20.0
+      limit_i: 5.0
+      limit_d: 20.0
+      need_d_control: true
+    admittance:
+      enabled: false
+      apply_velocity: true
+      world_frame: world
+      sample_timeout: 0.15
+      debug_period: 0.05
+      max_dt: 0.1
+      normal_contact:
+      - 1.0
+      - 0.0
+      - 0.0
+      normal_force_desired: 10.0
+      normal_force_max: 20.0
+      normal_force_rate: 1.0
+      contact_threshold: 0.8
+      mass:
+      - 1.5
+      - 1.5
+      - 1.0
+      - 1.0
+      damping:
+      - 20.0
+      - 20.0
+      - 5.0
+      - 2.0
+      stiffness:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      max_offset:
+      - 0.15
+      - 0.15
+      - 0.1
+      - 0.15
+      max_velocity:
+      - 0.1
+      - 0.1
+      - 0.08
+      - 0.15
+      max_acceleration:
+      - 0.3
+      - 0.3
+      - 0.2
+      - 0.4
+      max_wrench:
+      - 2.0
+      - 2.0
+      - 2.0
+      - 0.5
+      deadband:
+      - 0.05
+      - 0.05
+      - 0.05
+      - 0.01
+      bias:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      gain:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      filter_cutoff_hz: 10.0

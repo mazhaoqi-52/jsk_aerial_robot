@@ -34,7 +34,7 @@ generate_messages(DEPENDENCIES std_msgs geometry_msgs)
 
 catkin_package(
   INCLUDE_DIRS include
-  LIBRARIES hih_robot_model hih_controller hih_navigation
+  LIBRARIES hih_robot_model hih_controller hih_navigation hih_role_controllers
   CATKIN_DEPENDS aerial_robot_control aerial_robot_model aerial_robot_msgs pluginlib roscpp gimbalrotor diagnostic_msgs std_msgs std_srvs geometry_msgs message_runtime
 )
 
@@ -134,5 +134,24 @@ install(DIRECTORY include/${PROJECT_NAME}/
 catkin_install_python(PROGRAMS
   script/keyboard_command.py
   script/keyboard_command_multi.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# HiH roles reuse HihController and only shape the follower reference.
+add_library(hih_role_controllers
+  src/control/hih_leader_controller.cpp
+  src/control/hih_follower_controller.cpp)
+target_link_libraries(hih_role_controllers hih_controller hih_robot_model hih_navigation ${catkin_LIBRARIES})
+add_dependencies(hih_role_controllers ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+install(TARGETS hih_role_controllers DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(hih_test_admittance test/test_hih_admittance.cpp)
+  if(TARGET hih_test_admittance)
+    target_link_libraries(hih_test_admittance ${catkin_LIBRARIES})
+  endif()
+endif()
+
+catkin_install_python(PROGRAMS script/hih_key.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

@@ -411,3 +411,15 @@ int main(int argc, char** argv)
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+TEST_F(Cop, RearPlateRecoversCopAndReversesOnlyYawGeometry)
+{
+  model.configure(p,tf::Vector3(-1,0,0));
+  const tf::Vector3 force(10,2,-1), cop(0,.08,.09);
+  const auto s=model.step(force,cop.cross(force),10,true,10,.01,true,true);
+  EXPECT_TRUE(s.valid); EXPECT_DOUBLE_EQ(s.normal_force,10);
+  EXPECT_NEAR(s.raw.y(),.08,1e-12); EXPECT_NEAR(s.raw.z(),.09,1e-12);
+  EXPECT_LT(s.yaw_offset,0); EXPECT_GT(s.z_offset,0);
+  const auto wrong=model.step(tf::Vector3(-10,0,0),tf::Vector3(0,0,0),10.01,true,10.01,.01,true,true);
+  EXPECT_FALSE(wrong.valid);
+}

@@ -80,11 +80,11 @@ The keyboard works with **either robot alone or both robots connected**. It does
 
 v:  arming motor (please do before takeoff)
 b:  takeoff
+g:  approach ON/OFF
 n:  land
 m:  force landing
 /:  halt (force stop motor)
 Space:  hold in current position
-approach:  approach ON/OFF
 
 1:  Leader trajectory: +X -> +Z -> -X -> -Z
 2:  Leader trajectory: +yaw -> -Y -> -yaw -> -X

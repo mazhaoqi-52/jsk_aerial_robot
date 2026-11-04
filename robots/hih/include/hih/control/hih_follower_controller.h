@@ -1,6 +1,7 @@
 #pragma once
 #include <hih/control/hih_controller.h>
 #include <hih/control/hih_admittance.h>
+#include <hih/control/hih_contact_guard.h>
 #include <hih/control/hih_cop_adjustment.h>
 #include <aerial_robot_control/control/base/target_reference_modifier.h>
 #include <geometry_msgs/PointStamped.h>
@@ -29,12 +30,17 @@ protected:
   void reset() override;
 
 private:
+  friend class HihFollowerControlTest;
   bool copFlightAllowed() const;
   void modifyAdmittanceTarget(aerial_robot_navigation::BaseNavigator::TargetSnapshot& target);
+  void holdAdmittanceTarget(aerial_robot_navigation::BaseNavigator::TargetSnapshot& target);
   void publishDebug(const aerial_robot_navigation::BaseNavigator::TargetSnapshot& nominal,
                     const aerial_robot_navigation::BaseNavigator::TargetSnapshot& command,
                     const std::string& status, bool applying, const ros::Time& now);
   hih_control::Admittance4D admittance_;
+  hih_control::ContactGuard contact_guard_;
+  aerial_robot_navigation::BaseNavigator::TargetSnapshot held_target_;
+  bool have_held_target_ = false;
   hih_control::HihCopAdjustment cop_adjustment_;
   bool admittance_applying_ = false;
   bool cop_flight_allowed_last_ = false;
@@ -50,7 +56,7 @@ private:
   double contact_threshold_ = 0.8;
   double normal_force_reference_ = 0.0;
   bool contact_acquired_ = false;
-  tf::Vector3 normal_contact_{1, 0, 0};
+  tf::Vector3 normal_contact_{-1, 0, 0};
   tf::Vector3 contact_offset_cog_{0, 0, 0};
   tf::Matrix3x3 contact_to_world_;
   std::string world_frame_ = "world";
@@ -66,5 +72,6 @@ private:
   ros::Publisher nominal_pub_, command_pub_, offset_pub_, velocity_pub_;
   ros::Publisher wrench_pub_, yaw_pub_, active_pub_, status_pub_;
   ros::Publisher force_reference_pub_, measured_normal_pub_;
+  ros::Publisher fault_pub_, reference_offset_pub_;
 };
 }

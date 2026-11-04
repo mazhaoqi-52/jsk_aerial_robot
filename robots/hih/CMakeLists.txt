@@ -147,6 +147,15 @@ add_dependencies(hih_role_controllers ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catk
 install(TARGETS hih_role_controllers DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
 
 if(CATKIN_ENABLE_TESTING)
+  add_rostest_gtest(hih_test_follower_control test/test_hih_follower_control.test
+    test/test_hih_follower_control.cpp)
+  if(TARGET hih_test_follower_control)
+    add_dependencies(hih_test_follower_control ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+    target_link_libraries(hih_test_follower_control -Wl,--no-as-needed hih_role_controllers ${catkin_LIBRARIES})
+  endif()
+endif()
+
+if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(hih_test_admittance test/test_hih_admittance.cpp)
   if(TARGET hih_test_admittance)
     target_link_libraries(hih_test_admittance ${catkin_LIBRARIES})

@@ -15,7 +15,7 @@ import rospkg
 import rospy
 import yaml
 from aerial_robot_msgs.msg import FlightNav
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, Bool
 
 ROBOTS = ("follower", "leader")
 VELOCITY_FIELDS = ("target_vel_x", "target_vel_y", "target_vel_z", "target_omega_z")
@@ -50,7 +50,7 @@ def load_config(path):
         config = yaml.safe_load(stream)
     if config["frame"] not in ("world", "local"):
         raise ValueError("frame must be world or local")
-    for name in ("publish_rate", "key_timeout", "command_repeat_gap", "approach_speed"):
+    for name in ("publish_rate", "key_timeout", "command_repeat_gap", "approach_speed", "trajectory_max_speed", "trajectory_max_yaw_rate"):
         if not math.isfinite(config[name]) or config[name] <= 0:
             raise ValueError(f"{name} must be positive and finite")
     if not 1 <= config["publish_rate"] <= 100 or config["key_timeout"] < 1 / config["publish_rate"]:
@@ -70,6 +70,11 @@ def load_config(path):
         for name in names:
             if not math.isfinite(trajectory[name]) or trajectory[name] <= 0:
                 raise ValueError(f"Invalid trajectory {number}/{name}")
+        # Quintic segment peak is 1.875 * displacement / (period/4).
+        if 7.5 * trajectory["displacement"] / trajectory["period"] > config["trajectory_max_speed"]:
+            raise ValueError(f"Trajectory {number} exceeds trajectory_max_speed; increase period")
+        if number == "2" and 7.5 * math.radians(trajectory["yaw_displacement_deg"]) / trajectory["period"] > config["trajectory_max_yaw_rate"]:
+            raise ValueError("Trajectory 2 exceeds trajectory_max_yaw_rate; increase period")
         if trajectory["period"] < 40 / config["publish_rate"]:
             raise ValueError("A trajectory needs at least 10 publish ticks per segment")
     all_keys = ["1", "2"]  # Reserved trajectory trigger keys.
@@ -109,10 +114,10 @@ def print_help(config):
 {common['force_landing']}:  force landing
 {common['halt']}:  halt (force stop motor)
 {stop_key}:  hold in current position
-{common['approach']}:  approach ON/OFF (both robots: local +X, {config['approach_speed']:g} m/s)
+{common['approach']}:  approach ON/OFF (both robots: local -X, {config['approach_speed']:g} m/s)
 
-1:  Leader trajectory: +X -> +Z -> -X -> -Z
-2:  Leader trajectory: +yaw -> -Y -> -yaw -> -X
+1:  Leader trajectory: -X -> +Z -> +X -> -Z
+2:  Leader trajectory: +yaw -> +Y -> -yaw -> +X
 
 ======= Follower =======|======== Leader ========
 {follower['+yaw']:^6}{follower['+X']:^6}{follower['-yaw']:^6}{follower['+Z']:^6}|{leader['+yaw']:^6}{leader['+X']:^6}{leader['-yaw']:^6}{leader['+Z']:^6}
@@ -152,6 +157,7 @@ def get_key(fd, timeout, input_state):
 def trajectory_velocity(number, elapsed, settings):
     """Smooth velocity for one four-segment path; None means finished.
 
+    Rear-contact paths: rotate the original path 180 degrees about world Z.
     Each segment moves by displacement (m), or yaw_displacement_deg (deg).
     Position follows 10*s^3 - 15*s^4 + 6*s^5: zero endpoint velocity/acceleration.
     """
@@ -163,16 +169,16 @@ def trajectory_velocity(number, elapsed, settings):
     rate = 30 * phase**2 * (1 - phase)**2 / duration
     velocity = settings["displacement"] * rate
     if number == "1":
-        if segment == 0: return (velocity, 0.0, 0.0, 0.0)
+        if segment == 0: return (-velocity, 0.0, 0.0, 0.0)
         if segment == 1: return (0.0, 0.0, velocity, 0.0)
-        if segment == 2: return (-velocity, 0.0, 0.0, 0.0)
+        if segment == 2: return (velocity, 0.0, 0.0, 0.0)
         if segment == 3: return (0.0, 0.0, -velocity, 0.0)
     if number == "2":
         yaw_rate = math.radians(settings["yaw_displacement_deg"]) * rate
         if segment == 0: return (0.0, 0.0, 0.0, yaw_rate)
-        if segment == 1: return (0.0, -velocity, 0.0, 0.0)
+        if segment == 1: return (0.0, velocity, 0.0, 0.0)
         if segment == 2: return (0.0, 0.0, 0.0, -yaw_rate)
-        if segment == 3: return (-velocity, 0.0, 0.0, 0.0)
+        if segment == 3: return (velocity, 0.0, 0.0, 0.0)
     raise ValueError("Unknown trajectory number")
 
 
@@ -249,6 +255,11 @@ def main():
     follower_nav_pub = None if args.dry_run else rospy.Publisher(follower_ns + "/uav/nav", FlightNav, queue_size=1)
     leader_nav_pub = None if args.dry_run else rospy.Publisher(leader_ns + "/uav/nav", FlightNav, queue_size=1)
     nav_pubs = {"follower": follower_nav_pub, "leader": leader_nav_pub}
+    fault = {"follower": False}
+    fault_sub = None
+    if not args.dry_run:
+        fault_sub = rospy.Subscriber(follower_ns + "/hih/admittance/fault", Bool,
+            lambda msg: fault.update(follower=msg.data), queue_size=1)
     common = config["keys"]["common"]
     follower = config["keys"]["follower"]
     leader = config["keys"]["leader"]
@@ -266,6 +277,7 @@ def main():
     stops = dict.fromkeys(ROBOTS, 0)
     trajectory = None
     approach = False
+    fault_seen = False
     trajectory_start = 0.0
     last_command, last_printed = {}, {}
     input_state = {"escape": "", "paste": False}
@@ -283,8 +295,18 @@ def main():
             now = time.monotonic()
             if key == "\x03":
                 break
-            # g toggles slow local +X motion for both robots.
+            # g toggles slow local -X motion for both robots.
             flight_keys = [common[action] for action in COMMANDS]
+            if fault["follower"]:
+                if not fault_seen:
+                    approach=False; trajectory=None
+                    stop_motion(ROBOTS, motion, expires, stops, config)
+                    rospy.logerr("Follower contact fault: motion stopped; land/reset before retry")
+                fault_seen=True
+                if key in (common["approach"], "1", "2") or key in leader.values() or key in follower.values():
+                    key=None  # Flight/landing commands remain available.
+            else:
+                fault_seen=False
             if key == common["approach"]:
                 gap = now - last_command.get(key, -math.inf)
                 last_command[key] = now
@@ -405,7 +427,7 @@ def main():
                 if approach:
                     for role in ROBOTS:
                         motion[role].control_frame = FlightNav.LOCAL_FRAME
-                        motion[role].target_vel_x = config["approach_speed"]
+                        motion[role].target_vel_x = -config["approach_speed"]
                         expires[role][0] = now + config["key_timeout"]
                 if trajectory is not None:
                     velocity = trajectory_velocity(trajectory, now - trajectory_start,

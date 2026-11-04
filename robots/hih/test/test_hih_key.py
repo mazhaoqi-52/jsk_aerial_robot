@@ -21,11 +21,12 @@ class KeyboardTest(unittest.TestCase):
     def setUp(self):
         self.config = key.load_config(ROOT / "config/hih_key.yaml")
 
-    def run_keys(self, steps, connected=("/hih1", "/hih2"), config=None):
+    def run_keys(self, steps, connected=("/hih1", "/hih2"), config=None, fault_at=None):
         import copy
         import io
         from contextlib import ExitStack, redirect_stdout
         clock = [10.0]
+        fault_callback = [None]
         steps = iter(list(steps) + [("\x03", .05)])
         received = {}
         connections = {}
@@ -35,6 +36,8 @@ class KeyboardTest(unittest.TestCase):
         def read_key(*_args):
             character, duration = next(steps)
             clock[0] += duration
+            if fault_at is not None and clock[0] >= fault_at and fault_callback[0]:
+                fault_callback[0](key.Bool(data=True))
             return character
 
         def publisher(topic, *_args, **_kwargs):
@@ -64,8 +67,10 @@ class KeyboardTest(unittest.TestCase):
             stack.enter_context(patch.object(key.rospy, "is_shutdown", return_value=False))
             stack.enter_context(patch.object(key.rospy, "signal_shutdown"))
             stack.enter_context(patch.object(key.rospy, "logwarn"))
+            stack.enter_context(patch.object(key.rospy, "logerr", side_effect=lambda text, *args: print(text % args if args else text)))
             stack.enter_context(patch.object(key.rospy, "loginfo", side_effect=lambda text, *args: print(text % args if args else text)))
             stack.enter_context(patch.object(key.rospy, "Publisher", side_effect=publisher))
+            stack.enter_context(patch.object(key.rospy, "Subscriber", side_effect=lambda topic, kind, callback, **kw: fault_callback.__setitem__(0, callback) or Mock()))
             stack.enter_context(patch.object(key.rospy.Time, "now", return_value=rospy.Time.from_sec(42)))
             key.main()
             restore.assert_called_once()
@@ -169,8 +174,8 @@ class KeyboardTest(unittest.TestCase):
         second = self.config["trajectories"]["2"]["displacement"]
         yaw = math.radians(self.config["trajectories"]["2"]["yaw_displacement_deg"])
         expected = {
-            "1": [(0, first), (2, first), (0, -first), (2, -first)],
-            "2": [(3, yaw), (1, -second), (3, -yaw), (0, -second)]}
+            "1": [(0, -first), (2, first), (0, first), (2, -first)],
+            "2": [(3, yaw), (1, second), (3, -yaw), (0, second)]}
         for number, segments in expected.items():
             params = self.config["trajectories"][number]
             duration = params["period"] / 4
@@ -213,7 +218,7 @@ class KeyboardTest(unittest.TestCase):
 
     def test_follower_input_does_not_cancel_leader_trajectory(self):
         received, _ = self.run_keys([("1", .05), ("w", .25), (None, .1)])
-        self.assertTrue(any(msg.target_vel_x > 0 for msg in received["/hih1/uav/nav"]))
+        self.assertTrue(any(msg.target_vel_x < 0 for msg in received["/hih1/uav/nav"]))
         self.assertTrue(any(msg.target_vel_x == .1 for msg in received["/hih2/uav/nav"]))
         self.assertNotIn("cancelled", self.output)
 
@@ -222,7 +227,7 @@ class KeyboardTest(unittest.TestCase):
             with self.subTest(character=character):
                 received, _ = self.run_keys([("1", .05), (None, .25), (character, .1), (None, .2)])
                 messages = received["/hih1/uav/nav"]
-                self.assertTrue(any(msg.target_vel_x > 0 for msg in messages))
+                self.assertTrue(any(msg.target_vel_x < 0 for msg in messages))
                 self.assertTrue(all(not any(getattr(msg, f) for f in key.VELOCITY_FIELDS)
                                     for msg, stamp in zip(messages, self.received_times["/hih1/uav/nav"]) if stamp >= 10.4 - 1e-8))
                 self.assertIn("cancelled", self.output)
@@ -280,7 +285,7 @@ class KeyboardTest(unittest.TestCase):
             topic = ns + "/uav/nav"
             moving = [msg for msg in received[topic] if msg.target_vel_x]
             self.assertTrue(moving)
-            self.assertTrue(all(msg.target_vel_x == .02 and msg.control_frame == FlightNav.LOCAL_FRAME
+            self.assertTrue(all(msg.target_vel_x == -.02 and msg.control_frame == FlightNav.LOCAL_FRAME
                                 and msg.target_vel_y == msg.target_vel_z == msg.target_omega_z == 0 for msg in moving))
             self.assertTrue(any(stamp > 10.8 for msg, stamp in zip(received[topic], self.received_times[topic])
                                 if msg.target_vel_x))
@@ -296,7 +301,7 @@ class KeyboardTest(unittest.TestCase):
         received, _ = self.run_keys([("g", .05), (None, .2)], config=config)
         for ns in ("/hih1", "/hih2"):
             messages = received[ns + "/uav/nav"]
-            self.assertTrue(any(msg.target_vel_x == .015 for msg in messages))
+            self.assertTrue(any(msg.target_vel_x == -.015 for msg in messages))
             self.assertFalse(any(getattr(messages[-1], f) for f in key.VELOCITY_FIELDS))
 
     def test_space_and_common_flight_commands_cancel_approach(self):
@@ -305,7 +310,7 @@ class KeyboardTest(unittest.TestCase):
                 received, _ = self.run_keys([("g", .05), (None, .2), (character, .1), (None, .2)])
                 for ns in ("/hih1", "/hih2"):
                     topic = ns + "/uav/nav"
-                    self.assertTrue(any(msg.target_vel_x == .02 for msg in received[topic]))
+                    self.assertTrue(any(msg.target_vel_x == -.02 for msg in received[topic]))
                     self.assertTrue(all(not any(getattr(msg, f) for f in key.VELOCITY_FIELDS)
                                         for msg, stamp in zip(received[topic], self.received_times[topic]) if stamp >= 10.35 - 1e-8))
 
@@ -317,10 +322,10 @@ class KeyboardTest(unittest.TestCase):
 
     def test_approach_and_trajectory_replace_each_other(self):
         received, _ = self.run_keys([("1", .05), (None, .2), ("g", .1), (None, .2)])
-        self.assertTrue(any(msg.target_vel_x == .02 and msg.control_frame == FlightNav.LOCAL_FRAME
+        self.assertTrue(any(msg.target_vel_x == -.02 and msg.control_frame == FlightNav.LOCAL_FRAME
                             for msg in received["/hih1/uav/nav"]))
         received, _ = self.run_keys([("g", .05), (None, .2), ("1", .1), (None, .2)])
-        self.assertTrue(any(msg.target_vel_x > 0 and msg.control_frame == FlightNav.WORLD_FRAME
+        self.assertTrue(any(msg.target_vel_x < 0 and msg.control_frame == FlightNav.WORLD_FRAME
                             for msg in received["/hih1/uav/nav"]))
         self.assertTrue(all(msg.target_vel_x == 0 for msg, stamp in zip(received["/hih2/uav/nav"],
                              self.received_times["/hih2/uav/nav"]) if stamp >= 10.35 - 1e-8))
@@ -333,7 +338,39 @@ class KeyboardTest(unittest.TestCase):
     def test_approach_does_not_wait_for_second_robot(self):
         for connected in (("/hih1",), ("/hih2",)):
             received, _ = self.run_keys([("g", .05), (None, .2)], connected=connected)
-            self.assertTrue(any(msg.target_vel_x == .02 for msg in received[connected[0] + "/uav/nav"]))
+            self.assertTrue(any(msg.target_vel_x == -.02 for msg in received[connected[0] + "/uav/nav"]))
+
+    def test_follower_fault_stops_approach_and_blocks_retry_but_allows_land(self):
+        received, _ = self.run_keys([("g", .05), (None, .1), (None, .1), ("g", .8), ("n", .1)], fault_at=10.2)
+        self.assertEqual(self.output.count("Approach ON"),1)
+        for ns in ("/hih1","/hih2"):
+            topic=ns+"/uav/nav"
+            self.assertTrue(all(not any(getattr(msg,f) for f in key.VELOCITY_FIELDS)
+                for msg,stamp in zip(received[topic],self.received_times[topic]) if stamp>=10.2))
+            self.assertEqual(len(received[ns+"/teleop_command/land"]),1)
+
+    def test_follower_fault_stops_trajectory_and_blocks_motion_but_allows_halt(self):
+        received,_=self.run_keys([("1",.05),(None,.1),(None,.1),("2",.8),("i",.1),("/",.1)],fault_at=10.2)
+        self.assertEqual(self.output.count("started"),1)
+        for ns in ("/hih1","/hih2"):
+            topic=ns+"/uav/nav"
+            self.assertTrue(all(not any(getattr(msg,f) for f in key.VELOCITY_FIELDS)
+                for msg,stamp in zip(received[topic],self.received_times[topic]) if stamp>=10.2))
+            self.assertEqual(len(received[ns+"/teleop_command/halt"]),1)
+
+    def test_follower_fault_immediately_cancels_existing_manual_velocity(self):
+        received,_=self.run_keys([("i",.05),(None,.1),(None,.1)],fault_at=10.2)
+        topic="/hih1/uav/nav"
+        self.assertTrue(any(msg.target_vel_x==.1 for msg in received[topic]))
+        self.assertTrue(all(not msg.target_vel_x for msg,stamp in zip(received[topic],self.received_times[topic]) if stamp>=10.2))
+
+    def test_rejects_trajectory_peak_speed_above_experiment_limits(self):
+        import copy
+        for number in ("1","2"):
+            config=copy.deepcopy(self.config); config["trajectories"][number]["period"]=20
+            with tempfile.NamedTemporaryFile(mode="w",suffix=".yaml") as stream:
+                yaml.safe_dump(config,stream);stream.flush()
+                with self.assertRaises(ValueError): key.load_config(stream.name)
 
     def test_rejects_duplicate_mapping_and_bad_speed(self):
         for change in ("duplicate", "speed", "namespace", "approach_speed"):

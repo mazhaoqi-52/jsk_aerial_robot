@@ -66,6 +66,8 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   readVector(settings, "deadband", p.deadband);
   readVector(settings, "bias", p.bias);
   readVector(settings, "gain", p.gain);
+  settings.param("moving_reference", p.moving_reference, false);
+  if (p.moving_reference) readVector(settings, "max_travel", p.max_travel);
   settings.param("filter_cutoff_hz", p.filter_cutoff_hz, 2.0);
   settings.param("max_dt", p.max_dt, 0.1);
   admittance_.configure(p);
@@ -78,6 +80,12 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
       normal_force_desired_ < 0 || normal_force_desired_ > normal_force_max_ ||
       normal_force_max_ <= 0 || normal_force_rate_ <= 0 || contact_threshold_ <= 0)
     throw std::invalid_argument("Invalid normal-force target/ramp/contact threshold");
+  hih_control::ContactGuardParameters guard;
+  guard.acquire_force=contact_threshold_; guard.max_force=normal_force_max_;
+  settings.param("contact_release", guard.release_force, 0.4);
+  settings.param("contact_loss_timeout", guard.loss_timeout, 0.2);
+  settings.param("stale_fault_timeout", guard.stale_timeout, 0.5);
+  contact_guard_.configure(guard);
   bool observer_enabled = false;
   nh.param("controller/wrench_estimate_flag", observer_enabled, false);
   if (enabled_ && !observer_enabled)
@@ -101,6 +109,8 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   status_pub_ = debug.advertise<std_msgs::String>("status", 1);
   force_reference_pub_ = debug.advertise<std_msgs::Float64>("normal_force_reference", 1);
   measured_normal_pub_ = debug.advertise<std_msgs::Float64>("normal_force_measured", 1);
+  fault_pub_ = debug.advertise<std_msgs::Bool>("fault", 1);
+  reference_offset_pub_ = debug.advertise<geometry_msgs::Vector3Stamped>("reference_offset", 1);
   ready_.store(true);
   ROS_INFO("[HiH Follower] PID/MOB retained; world XYZ+yaw Admittance %s", enabled_ ? "ENABLED" : "DISABLED");
 }
@@ -153,6 +163,7 @@ void HihFollowerController::reset()
 {
   HihController::reset();
   admittance_.reset();
+  contact_guard_.reset(); have_held_target_=false;
   cop_adjustment_.reset();
   admittance_applying_ = false;
   cop_flight_allowed_last_ = false;
@@ -176,7 +187,11 @@ bool HihFollowerController::update()
   // Unified control can bypass the reference modifier entirely. Clear stored
   // trim on mode exit even then, so it cannot reappear on later independent flight.
   const bool allowed = copFlightAllowed();
-  if (!allowed && cop_flight_allowed_last_) cop_adjustment_.reset();
+  if (!allowed && cop_flight_allowed_last_)
+  {
+    cop_adjustment_.reset(); admittance_.reset(); contact_guard_.reset();
+    have_held_target_=false; contact_acquired_=false; normal_force_reference_=0;
+  }
   cop_flight_allowed_last_ = allowed;
   return HihController::update();
 }
@@ -186,6 +201,7 @@ void HihFollowerController::modifyTargetSnapshot(aerial_robot_navigation::BaseNa
   if (!ready_.load()) return;
   admittance_applying_ = false;
   modifyAdmittanceTarget(target);  // Existing outer-loop calculation is unchanged.
+  if (admittance_applying_) { held_target_=target; have_held_target_=true; }
 
   tf::Vector3 force, torque;
   ros::Time stamp;
@@ -215,10 +231,10 @@ void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::Base
   else if (navigator_->getNaviState() != aerial_robot_navigation::HOVER_STATE) reason = "not_hovering";
   else if (hih_nav_->getCurrentAssembled() || hih_nav_->getUnifiedControlMode()) reason = "assembled_mode";
   else if (navigator_->getXyControlMode() != aerial_robot_navigation::POS_CONTROL_MODE) reason = "not_position_mode";
-  else if (!std::isfinite(dt) || dt <= 0 || dt > max_dt_) reason = "time_reset";
   if (!reason.empty())
   {
     admittance_.reset();
+    contact_guard_.reset(); have_held_target_=false;
     contact_acquired_ = false;
     normal_force_reference_ = 0.0;
     publishDebug(nominal, target, reason, false, now);
@@ -238,36 +254,32 @@ void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::Base
   }
   const double age = (now - sample_stamp).toSec();
   fresh = fresh && std::isfinite(age) && age >= 0 && age <= sample_timeout_;
-  if (!contact_acquired_)
+  const bool acquired_before=contact_guard_.acquired();
+  const auto guard_state=contact_guard_.step(now.toSec(),
+    std::isfinite(dt) && dt>0 && dt<=max_dt_, fresh, -normal_contact_.dot(force_contact));
+  if (guard_state!=hih_control::ContactGuard::ACTIVE)
   {
-    const double normal_force = -normal_contact_.dot(force_contact);
-    if (!fresh || normal_force < contact_threshold_)
-    {
-      admittance_.reset();
-      publishDebug(nominal, target, "waiting_for_contact", false, now);
-      return;
-    }
-    contact_acquired_ = true;
-    normal_force_reference_ = std::clamp(normal_force, 0.0, normal_force_desired_);
-  }
-  if (fresh)
-  {
-    normal_force_reference_ += std::clamp(normal_force_desired_ - normal_force_reference_,
-                                        -normal_force_rate_ * dt, normal_force_rate_ * dt);
-    // Desired environmental reaction is -F_normal*n. Tangential force and
-    // contact moment targets are zero, matching the simulation's basic law.
-    wrench = hih_control::contactWrenchErrorWorld(
-      {force_contact, torque_contact}, contact_to_world, normal_contact_, normal_force_reference_);
-  }
-  // Missing force is not zero contact force. Freeze displacement and force ramp.
-  if (!fresh) admittance_.hold();
-  else if (!admittance_.step(wrench, dt))
-  {
-    admittance_.reset();
-    publishDebug(nominal, target, "invalid_input", false, now);
+    admittance_.hold();
+    if (guard_state!=hih_control::ContactGuard::WAITING) holdAdmittanceTarget(target);
+    publishDebug(nominal,target,contact_guard_.status(),false,now);
     return;
   }
-  const auto& x = admittance_.offset();
+  if (!acquired_before)
+    normal_force_reference_=std::clamp(-normal_contact_.dot(force_contact),0.0,normal_force_desired_);
+  contact_acquired_=true;
+  normal_force_reference_ += std::clamp(normal_force_desired_ - normal_force_reference_,
+                                      -normal_force_rate_ * dt, normal_force_rate_ * dt);
+  // Desired environmental reaction is -F_normal*n; tangential targets are zero.
+  wrench = hih_control::contactWrenchErrorWorld(
+    {force_contact, torque_contact}, contact_to_world, normal_contact_, normal_force_reference_);
+  if (!admittance_.step(wrench, dt))
+  {
+    contact_guard_.fault("admittance_travel_or_input_limit_hold");
+    admittance_.hold(); holdAdmittanceTarget(target);
+    publishDebug(nominal, target, contact_guard_.status(), false, now);
+    return;
+  }
+  const auto x = admittance_.totalOffset();
   const auto& v = admittance_.velocity();
   target.rpy.setZ(angles::normalize_angle(nominal.rpy.z() + x[3]));
   tf::Matrix3x3 nominal_rot, command_rot;
@@ -287,9 +299,17 @@ void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::Base
       nominal_omega_world.cross(nominal_rot * contact_offset) -
       command_omega_world.cross(command_rot * contact_offset);
   }
-  // Do not write to the navigator: each cycle starts from the unchanged nominal reference.
+  // Moving reference is internal; keyboard/navigation targets remain independent.
   admittance_applying_ = true;
   publishDebug(nominal, target, fresh ? "active" : "stale_input_frozen", true, now);
+}
+
+void HihFollowerController::holdAdmittanceTarget(
+  aerial_robot_navigation::BaseNavigator::TargetSnapshot& target)
+{
+  if (!have_held_target_) { held_target_=target; have_held_target_=true; }
+  target=held_target_;
+  target.vel.setZero(); target.acc.setZero(); target.omega.setZero(); target.ang_acc.setZero();
 }
 
 void HihFollowerController::publishDebug(
@@ -310,13 +330,17 @@ void HihFollowerController::publishDebug(
   const auto& x = admittance_.offset(); const auto& v = admittance_.velocity();
   vector.vector.x = x[0]; vector.vector.y = x[1]; vector.vector.z = x[2]; offset_pub_.publish(vector);
   vector.vector.x = v[0]; vector.vector.y = v[1]; vector.vector.z = v[2]; velocity_pub_.publish(vector);
-  vector.vector.x = nominal.rpy.z(); vector.vector.y = command.rpy.z(); vector.vector.z = x[3]; yaw_pub_.publish(vector);
+  const auto& baseline=admittance_.referenceOffset();
+  vector.vector.x=baseline[0]; vector.vector.y=baseline[1]; vector.vector.z=baseline[2]; reference_offset_pub_.publish(vector);
+  vector.vector.x = nominal.rpy.z()+baseline[3]; vector.vector.y = command.rpy.z();
+  vector.vector.z = admittance_.totalOffset()[3]; yaw_pub_.publish(vector);
   geometry_msgs::WrenchStamped force;
   force.header = point.header;
   const auto& f = admittance_.filteredWrench();
   force.wrench.force.x = f[0]; force.wrench.force.y = f[1]; force.wrench.force.z = f[2];
   force.wrench.torque.z = f[3]; wrench_pub_.publish(force);
   std_msgs::Bool active; active.data = applying; active_pub_.publish(active);
+  active.data=contact_guard_.state()==hih_control::ContactGuard::FAULT; fault_pub_.publish(active);
   std_msgs::String text; text.data = status; status_pub_.publish(text);
   std_msgs::Float64 normal;
   normal.data = normal_force_reference_; force_reference_pub_.publish(normal);

@@ -101,11 +101,13 @@ void HihCopAdjustment::configure(const CopAdjustmentParameters& parameters,
 {
   parameters.validate();
   const bool supported = finite(normal_contact) &&
-    (normal_contact - tf::Vector3(1, 0, 0)).length() < 1e-6;
+    std::abs(std::abs(normal_contact.x()) - 1) < 1e-6 &&
+    std::abs(normal_contact.y()) < 1e-6 && std::abs(normal_contact.z()) < 1e-6;
   if (parameters.enabled && !supported)
-    throw std::invalid_argument("HiH CoP adjustment requires contact-frame normal_contact=[1,0,0]");
+    throw std::invalid_argument("HiH CoP adjustment requires contact-frame normal_contact=[+/-1,0,0]");
   p_ = parameters;
   supported_normal_ = supported;
+  normal_sign_ = supported ? normal_contact.x() : 1;
   reset();
 }
 
@@ -191,7 +193,7 @@ const CopAdjustmentState& HihCopAdjustment::step(const tf::Vector3& force_contac
   state_.error.setZero();
   state_.force_contact = force_contact - p_.force_bias_contact;
   state_.torque_contact = torque_contact - p_.torque_bias_contact;
-  state_.normal_force = -state_.force_contact.x();  // Environment pushes toward -X_C.
+  state_.normal_force = -normal_sign_ * state_.force_contact.x();  // Positive compression for either X-facing plate.
   const double nan = std::numeric_limits<double>::quiet_NaN();
   state_.raw.setValue(0, nan, nan);
   const bool valid_dt = std::isfinite(now) && std::isfinite(dt) && dt > 0 && dt <= p_.max_dt;
@@ -255,7 +257,8 @@ const CopAdjustmentState& HihCopAdjustment::step(const tf::Vector3& force_contac
     const bool track = state_.valid && admittance_applying;
     if (valid_dt)
     {
-      advanceAxis(state_.error.y(), p_.yaw, p_.enabled && p_.yaw.enabled, track,
+      // Moving the plate from +X to -X reverses its lateral sweep under yaw.
+      advanceAxis(normal_sign_ * state_.error.y(), p_.yaw, p_.enabled && p_.yaw.enabled, track,
                   dt, state_.yaw_offset, state_.yaw_rate);
       advanceAxis(state_.error.z(), p_.z, p_.enabled && p_.z.enabled, track,
                   dt, state_.z_offset, state_.z_velocity);

@@ -80,6 +80,7 @@ private:
   CopAdjustmentParameters p_;
   CopAdjustmentState state_;
   bool supported_normal_ = true, filter_initialized_ = false;
+  double normal_sign_ = 1;  // contact outward normal: +X or -X
   double filter_stamp_ = 0, newest_sample_stamp_ = 0, last_control_time_ = 0;
   std::unique_ptr<ros::NodeHandle> settings_;
   std::string world_frame_ = "world", contact_frame_;

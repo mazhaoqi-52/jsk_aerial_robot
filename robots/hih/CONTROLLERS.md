@@ -81,6 +81,36 @@ CoG_position_command = nominal_position + contact_translation_offset
 
 ## 파라미터와 실행
 
+### 单机 Gazebo 起飞验证
+
+无需生成或加载 `/tmp` 配置文件。普通 `bringup.launch` 增加了启动参数
+`admittance:=true`，自动选择 Follower 控制器并启用 XYZ+yaw 导纳：
+
+```bash
+source /opt/ros/one/setup.bash
+source ~/ros/jsk_aerial_robot_ws/devel/setup.bash
+roslaunch hih bringup.launch simulation:=true real_machine:=false \
+  robot_id:=2 headless:=false admittance:=true
+```
+
+该入口读取包内 `config/hih_control.yaml` 的导纳设置；仿真时用
+`HihControl_sim.yaml` 覆盖角色的 PID/MOB 等已有控制参数，避免角色初始化
+将仿真增益覆盖为真机增益。`admittance` 默认为 `false`，普通启动保持原有
+控制器。该开关仅在启动时生效，不是飞行中的切换服务。
+
+另一终端加载工作空间后运行 `rosrun hih hih_key.py`，按 `v` 解锁、`b` 起飞，
+悬停后按 `n` 降落。仅启动一台 `/hih2` 即可，不需要 Leader。
+
+```bash
+rostopic echo /hih2/hih/admittance/status
+```
+
+正常无接触悬停时应为 `waiting_for_contact`，补偿量为零；检测到超过阈值的
+压缩力后才进入 `active`。因此本步骤验证开启导纳后的起飞/悬停兼容性，
+接触力跟踪还需随后在 Gazebo 中施加接触或外力验证。
+
+### 기존 역할별 실행
+
 `hih_control.yaml`에서 `leader/controller` 및 `follower/controller`의 PID/MOB 값은 기존 실기 `HihControl.yaml`과 동일합니다. bringup이 설정을 namespace 아래에 로드하고, 제어기가 자기 역할의 값을 부모 초기화 전에 적용합니다. `HihControl.yaml`에는 QP와 기존 하드웨어 관련 나머지 기본 설정이 유지됩니다.
 
 Admittance 벡터 순서는 모두 `[X,Y,Z,yaw]`입니다. 병진은 m·N, 회전은 rad·Nm를 사용합니다. M/D/K의 초기값은 제공된 시뮬레이션의 해당 축 값을 참고했지만, 변위·속도 제한은 더 작게 두었습니다. **10 N 목표와 수치들은 실기 검증된 게인이 아닙니다.** 실제 기체에서 확인한 값으로 설정하고 실험 전 활성 여부를 결정해야 합니다.

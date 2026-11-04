@@ -243,7 +243,7 @@ def main():
                     if key == common["halt"]:
                         halt_pub.publish(Empty())
 
-            # Follower: w/s = X, a/d = Y, r/f = Z, q/e = yaw.
+            # Follower defaults: w/s = X, a/d = Y, [/] = Z, q/e = yaw.
             deadline = now + config["key_timeout"]
             if key == follower["+X"]:
                 follower_nav.target_vel_x = follower_xy_vel
@@ -270,7 +270,7 @@ def main():
                 follower_nav.target_omega_z = -follower_yaw_vel
                 expires["follower"][3] = deadline
 
-            # Leader: i/k = X, j/l = Y, p/; = Z, u/o = yaw.
+            # Leader defaults: i/k = X, j/, = Y, p/; = Z, u/o = yaw.
             if key == leader["+X"]:
                 leader_nav.target_vel_x = leader_xy_vel
                 expires["leader"][0] = deadline

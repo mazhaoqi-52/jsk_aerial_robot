@@ -67,10 +67,10 @@ class KeyboardTest(unittest.TestCase):
     def test_all_requested_motion_keys(self):
         expected = {"w": ("hih2", 0, .1), "s": ("hih2", 0, -.1),
                     "a": ("hih2", 1, .1), "d": ("hih2", 1, -.1),
-                    "r": ("hih2", 2, .1), "f": ("hih2", 2, -.1),
+                    "[": ("hih2", 2, .1), "]": ("hih2", 2, -.1),
                     "q": ("hih2", 3, .1), "e": ("hih2", 3, -.1),
                     "i": ("hih1", 0, .1), "k": ("hih1", 0, -.1),
-                    "j": ("hih1", 1, .1), "l": ("hih1", 1, -.1),
+                    "j": ("hih1", 1, .1), ",": ("hih1", 1, -.1),
                     "p": ("hih1", 2, .1), ";": ("hih1", 2, -.1),
                     "u": ("hih1", 3, .1), "o": ("hih1", 3, -.1)}
         for character, (namespace, axis, value) in expected.items():
@@ -86,7 +86,7 @@ class KeyboardTest(unittest.TestCase):
     def test_one_robot_connected_still_receives_every_common_command(self):
         for ns in ("/hih1", "/hih2"):
             with self.subTest(connected=ns):
-                received, pubs = self.run_keys([(char, .1) for char in "vbnm/"], connected=(ns,))
+                received, pubs = self.run_keys([(char, .1) for char in "rtlfh"], connected=(ns,))
                 for topic in ("start", "takeoff", "land", "force_landing", "halt"):
                     name = ns + "/teleop_command/" + topic
                     self.assertEqual(pubs[name].get_num_connections.return_value, 1)
@@ -116,7 +116,7 @@ class KeyboardTest(unittest.TestCase):
         self.assertEqual(received["/hih2/uav/nav"][1].target_vel_x, -.1)
 
     def test_common_command_debounce(self):
-        received, _ = self.run_keys([("v", .05), ("v", .1), ("v", 1)])
+        received, _ = self.run_keys([("r", .05), ("r", .1), ("r", 1)])
         self.assertEqual(len(received["/hih1/teleop_command/start"]), 2)
 
     def test_space_stops_both_robots(self):
@@ -127,7 +127,7 @@ class KeyboardTest(unittest.TestCase):
             self.assertEqual(msgs[-4].target_vel_x, 0)
 
     def test_unknown_keys_and_startup_do_not_send_motion_or_flight_commands(self):
-        received, _ = self.run_keys([(None, .1), ("W", .1), ("h", .1)])
+        received, _ = self.run_keys([(None, .1), ("W", .1)] + [(char, .1) for char in "vbnm/"])
         for topic, messages in received.items():
             if topic.endswith("/uav/nav"):
                 self.assertEqual(len(messages), 3)  # Exit zeros only.
@@ -152,13 +152,27 @@ class KeyboardTest(unittest.TestCase):
     def test_common_mapping(self):
         common = self.config["keys"]["common"]
         self.assertEqual({a: common[a] for a in key.COMMANDS},
-                         {"arm": "v", "takeoff": "b", "land": "n", "force_landing": "m", "halt": "/"})
+                         {"arm": "r", "takeoff": "t", "land": "l", "force_landing": "f", "halt": "h"})
         self.assertNotEqual(key.COMMANDS["force_landing"], key.COMMANDS["halt"])
+
+    def test_flight_keys_do_not_also_command_robot_movement(self):
+        commands = {"r": "start", "t": "takeoff", "l": "land",
+                    "f": "force_landing", "h": "halt"}
+        for character, command in commands.items():
+            with self.subTest(character=character):
+                received, _ = self.run_keys([(character, .1)])
+                for ns in ("/hih1", "/hih2"):
+                    self.assertEqual(len(received[f"{ns}/teleop_command/{command}"]), 1)
+                    self.assertTrue(all(not any(getattr(msg, field) for field in key.VELOCITY_FIELDS)
+                                        for msg in received[f"{ns}/uav/nav"]))
+                    for other in commands.values():
+                        if other != command:
+                            self.assertEqual(received[f"{ns}/teleop_command/{other}"], [])
 
     def test_rejects_duplicate_mapping_and_bad_speed(self):
         for change in ("duplicate", "speed", "namespace"):
             data = yaml.safe_load((ROOT / "config/hih_key.yaml").read_text())
-            if change == "duplicate": data["keys"]["leader"]["+X"] = "v"
+            if change == "duplicate": data["keys"]["leader"]["+X"] = "r"
             if change == "speed": data["robots"]["leader"]["xy_speed"] = float("nan")
             if change == "namespace": data["robots"]["leader"]["namespace"] = "/hih2"
             with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as stream:

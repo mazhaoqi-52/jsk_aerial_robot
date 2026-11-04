@@ -1,6 +1,7 @@
 #pragma once
 #include <hih/control/hih_controller.h>
 #include <hih/control/hih_admittance.h>
+#include <hih/control/hih_cop_adjustment.h>
 #include <aerial_robot_control/control/base/target_reference_modifier.h>
 #include <geometry_msgs/PointStamped.h>
 #include <geometry_msgs/Vector3Stamped.h>
@@ -15,6 +16,7 @@ class HihFollowerController : public HihController, public TargetReferenceModifi
 public:
   HihFollowerController();
   ~HihFollowerController() override;
+  bool update() override;
   void initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
     boost::shared_ptr<aerial_robot_model::RobotModel> robot_model,
     boost::shared_ptr<aerial_robot_estimation::StateEstimator> estimator,
@@ -27,10 +29,15 @@ protected:
   void reset() override;
 
 private:
+  bool copFlightAllowed() const;
+  void modifyAdmittanceTarget(aerial_robot_navigation::BaseNavigator::TargetSnapshot& target);
   void publishDebug(const aerial_robot_navigation::BaseNavigator::TargetSnapshot& nominal,
                     const aerial_robot_navigation::BaseNavigator::TargetSnapshot& command,
                     const std::string& status, bool applying, const ros::Time& now);
   hih_control::Admittance4D admittance_;
+  hih_control::HihCopAdjustment cop_adjustment_;
+  bool admittance_applying_ = false;
+  bool cop_flight_allowed_last_ = false;
   std::atomic<bool> ready_{false};
   bool enabled_ = false;
   bool apply_velocity_ = true;

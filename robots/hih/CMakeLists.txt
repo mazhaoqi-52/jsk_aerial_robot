@@ -140,7 +140,8 @@ catkin_install_python(PROGRAMS
 # HiH roles reuse HihController and only shape the follower reference.
 add_library(hih_role_controllers
   src/control/hih_leader_controller.cpp
-  src/control/hih_follower_controller.cpp)
+  src/control/hih_follower_controller.cpp
+  src/control/hih_cop_adjustment.cpp)
 target_link_libraries(hih_role_controllers hih_controller hih_robot_model hih_navigation ${catkin_LIBRARIES})
 add_dependencies(hih_role_controllers ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 install(TARGETS hih_role_controllers DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
@@ -155,3 +156,22 @@ endif()
 catkin_install_python(PROGRAMS script/hih_key.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+# Numerical CoP tests run without a ROS master or an aircraft.
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(hih_test_cop_adjustment
+    test/test_hih_cop_adjustment.cpp src/control/hih_cop_adjustment.cpp)
+  if(TARGET hih_test_cop_adjustment)
+    add_dependencies(hih_test_cop_adjustment ${catkin_EXPORTED_TARGETS})
+    target_link_libraries(hih_test_cop_adjustment ${catkin_LIBRARIES})
+  endif()
+endif()
+
+if(CATKIN_ENABLE_TESTING)
+  add_rostest_gtest(hih_test_cop_ros test/test_hih_cop_adjustment.test
+    test/test_hih_cop_ros.cpp src/control/hih_cop_adjustment.cpp)
+  if(TARGET hih_test_cop_ros)
+    add_dependencies(hih_test_cop_ros ${catkin_EXPORTED_TARGETS})
+    target_link_libraries(hih_test_cop_ros ${catkin_LIBRARIES})
+  endif()
+endif()

@@ -87,6 +87,7 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   hih_model_ = boost::dynamic_pointer_cast<HihRobotModel>(robot_model);
   if (!hih_model_) throw std::invalid_argument("HiH Follower requires HihRobotModel");
 
+  cop_adjustment_.initialize(nh, normal_contact_, world_frame_);
   HihController::initialize(nh, nhp, robot_model, estimator, navigator, ctrl_loop_rate);
   ros::NodeHandle debug(nh_, "hih/admittance");
   nominal_pub_ = debug.advertise<geometry_msgs::PointStamped>("nominal_position", 1);
@@ -152,6 +153,9 @@ void HihFollowerController::reset()
 {
   HihController::reset();
   admittance_.reset();
+  cop_adjustment_.reset();
+  admittance_applying_ = false;
+  cop_flight_allowed_last_ = false;
   last_update_ = ros::Time(0);
   contact_acquired_ = false;
   normal_force_reference_ = 0.0;
@@ -159,7 +163,46 @@ void HihFollowerController::reset()
   sample_valid_ = false;
 }
 
+bool HihFollowerController::copFlightAllowed() const
+{
+  return ready_.load() && navigator_->getNaviState() == aerial_robot_navigation::HOVER_STATE &&
+    !navigator_->getForceLandingFlag() &&
+    navigator_->getXyControlMode() == aerial_robot_navigation::POS_CONTROL_MODE &&
+    !hih_nav_->getCurrentAssembled() && !hih_nav_->getUnifiedControlMode();
+}
+
+bool HihFollowerController::update()
+{
+  // Unified control can bypass the reference modifier entirely. Clear stored
+  // trim on mode exit even then, so it cannot reappear on later independent flight.
+  const bool allowed = copFlightAllowed();
+  if (!allowed && cop_flight_allowed_last_) cop_adjustment_.reset();
+  cop_flight_allowed_last_ = allowed;
+  return HihController::update();
+}
+
 void HihFollowerController::modifyTargetSnapshot(aerial_robot_navigation::BaseNavigator::TargetSnapshot& target)
+{
+  if (!ready_.load()) return;
+  admittance_applying_ = false;
+  modifyAdmittanceTarget(target);  // Existing outer-loop calculation is unchanged.
+
+  tf::Vector3 force, torque;
+  ros::Time stamp;
+  bool valid;
+  {
+    std::lock_guard<std::mutex> lock(sample_mutex_);
+    force = sample_force_contact_; torque = sample_torque_contact_;
+    stamp = sample_stamp_; valid = sample_valid_;
+  }
+  const bool flight_allowed = copFlightAllowed();
+  // Add only CoP yaw/world-Z trim to the completed Admittance reference.
+  // The inherited PID consumes this local snapshot; the navigator is never overwritten.
+  cop_adjustment_.update(target, force, torque, stamp, valid,
+                         flight_allowed, admittance_applying_, ros::Time::now());
+}
+
+void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::BaseNavigator::TargetSnapshot& target)
 {
   if (!ready_.load()) return;
   const auto nominal = target;
@@ -245,6 +288,7 @@ void HihFollowerController::modifyTargetSnapshot(aerial_robot_navigation::BaseNa
       command_omega_world.cross(command_rot * contact_offset);
   }
   // Do not write to the navigator: each cycle starts from the unchanged nominal reference.
+  admittance_applying_ = true;
   publishDebug(nominal, target, fresh ? "active" : "stale_input_frozen", true, now);
 }
 

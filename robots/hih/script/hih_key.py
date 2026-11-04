@@ -50,7 +50,7 @@ def load_config(path):
         config = yaml.safe_load(stream)
     if config["frame"] not in ("world", "local"):
         raise ValueError("frame must be world or local")
-    for name in ("publish_rate", "key_timeout", "command_repeat_gap"):
+    for name in ("publish_rate", "key_timeout", "command_repeat_gap", "approach_speed"):
         if not math.isfinite(config[name]) or config[name] <= 0:
             raise ValueError(f"{name} must be positive and finite")
     if not 1 <= config["publish_rate"] <= 100 or config["key_timeout"] < 1 / config["publish_rate"]:
@@ -59,11 +59,20 @@ def load_config(path):
         raise ValueError("stop_repeats must be 1..10")
     if not config["common_targets"] or any(r not in ROBOTS for r in config["common_targets"]):
         raise ValueError("common_targets must contain leader and/or follower")
-    if set(config["keys"]["common"]) != set(COMMANDS) | {"stop_motion"}:
+    if set(config["keys"]["common"]) != set(COMMANDS) | {"stop_motion", "approach"}:
         raise ValueError("Check common command names in keys/common")
     if any(set(config["keys"][role]) != set(MOVEMENTS) for role in ROBOTS):
         raise ValueError("Check movement names in keys/leader and keys/follower")
-    all_keys = []
+    # Four equal-duration segments, executed once in WORLD_FRAME.
+    for number in ("1", "2"):
+        trajectory = config["trajectories"][number]
+        names = ("period", "displacement") + (("yaw_displacement_deg",) if number == "2" else ())
+        for name in names:
+            if not math.isfinite(trajectory[name]) or trajectory[name] <= 0:
+                raise ValueError(f"Invalid trajectory {number}/{name}")
+        if trajectory["period"] < 40 / config["publish_rate"]:
+            raise ValueError("A trajectory needs at least 10 publish ticks per segment")
+    all_keys = ["1", "2"]  # Reserved trajectory trigger keys.
     for group in ("common",) + ROBOTS:
         for action, key in config["keys"][group].items():
             key = " " if key == "SPACE" else key
@@ -100,6 +109,10 @@ def print_help(config):
 {common['force_landing']}:  force landing
 {common['halt']}:  halt (force stop motor)
 {stop_key}:  hold in current position
+{common['approach']}:  approach ON/OFF (both robots: local +X, {config['approach_speed']:g} m/s)
+
+1:  Leader trajectory: +X -> +Z -> -X -> -Z
+2:  Leader trajectory: +yaw -> -Y -> -yaw -> -X
 
 ======= Follower =======|======== Leader ========
 {follower['+yaw']:^6}{follower['+X']:^6}{follower['-yaw']:^6}{follower['+Z']:^6}|{leader['+yaw']:^6}{leader['+X']:^6}{leader['-yaw']:^6}{leader['+Z']:^6}
@@ -109,7 +122,7 @@ def print_help(config):
 {'(+Y)':^6}{'(-X)':^6}{'(-Y)':^6}{'(-Z)':^6}|{'(+Y)':^6}{'(-X)':^6}{'(-Y)':^6}{'(-Z)':^6}
 
 Please don't have caps lock on.
-CTRL+c to send zero keyboard velocities and exit
+CTRL+c to send zero keyboard velocities and exit.
 
 ---------------------------
 """, flush=True)
@@ -136,8 +149,37 @@ def get_key(fd, timeout, input_state):
     return None if input_state["paste"] else key
 
 
+def trajectory_velocity(number, elapsed, settings):
+    """Smooth velocity for one four-segment path; None means finished.
+
+    Each segment moves by displacement (m), or yaw_displacement_deg (deg).
+    Position follows 10*s^3 - 15*s^4 + 6*s^5: zero endpoint velocity/acceleration.
+    """
+    if elapsed < 0 or elapsed >= settings["period"]:
+        return None
+    duration = settings["period"] / 4
+    segment = min(int(elapsed / duration), 3)
+    phase = (elapsed - segment * duration) / duration
+    rate = 30 * phase**2 * (1 - phase)**2 / duration
+    velocity = settings["displacement"] * rate
+    if number == "1":
+        if segment == 0: return (velocity, 0.0, 0.0, 0.0)
+        if segment == 1: return (0.0, 0.0, velocity, 0.0)
+        if segment == 2: return (-velocity, 0.0, 0.0, 0.0)
+        if segment == 3: return (0.0, 0.0, -velocity, 0.0)
+    if number == "2":
+        yaw_rate = math.radians(settings["yaw_displacement_deg"]) * rate
+        if segment == 0: return (0.0, 0.0, 0.0, yaw_rate)
+        if segment == 1: return (0.0, -velocity, 0.0, 0.0)
+        if segment == 2: return (0.0, 0.0, 0.0, -yaw_rate)
+        if segment == 3: return (-velocity, 0.0, 0.0, 0.0)
+    raise ValueError("Unknown trajectory number")
+
+
 def stop_motion(roles, motion, expires, stops, config):
     for role in roles:
+        motion[role].control_frame = (FlightNav.WORLD_FRAME if config["frame"] == "world"
+                                      else FlightNav.LOCAL_FRAME)
         for field in VELOCITY_FIELDS:
             setattr(motion[role], field, 0.0)
         expires[role] = [0.0] * 4
@@ -222,6 +264,9 @@ def main():
     motion = {"follower": follower_nav, "leader": leader_nav}
     expires = {role: [0.0] * 4 for role in ROBOTS}
     stops = dict.fromkeys(ROBOTS, 0)
+    trajectory = None
+    approach = False
+    trajectory_start = 0.0
     last_command, last_printed = {}, {}
     input_state = {"escape": "", "paste": False}
     fd = sys.stdin.fileno()
@@ -238,6 +283,51 @@ def main():
             now = time.monotonic()
             if key == "\x03":
                 break
+            # g toggles slow local +X motion for both robots.
+            flight_keys = [common[action] for action in COMMANDS]
+            if key == common["approach"]:
+                gap = now - last_command.get(key, -math.inf)
+                last_command[key] = now
+                if gap >= config["command_repeat_gap"]:
+                    approach = not approach
+                    trajectory = None
+                    stop_motion(ROBOTS, motion, expires, stops, config)
+                    text = "Approach ON" if approach else "Approach OFF"
+                    if args.dry_run:
+                        print(f"[DRY RUN] {text}", flush=True)
+                    else:
+                        rospy.loginfo(text)
+            elif approach and (key == common["stop_motion"] or key in flight_keys or
+                               key in leader.values() or key in follower.values() or key in ("1", "2")):
+                approach = False
+                stop_motion(ROBOTS, motion, expires, stops, config)
+
+            # Stop automated Leader motion before processing manual commands.
+            if trajectory is not None and (key == common["stop_motion"] or
+                                           key in flight_keys or key in leader.values()):
+                trajectory = None
+                stop_motion(("leader",), motion, expires, stops, config)
+                if args.dry_run:
+                    print("[DRY RUN] Leader trajectory cancelled", flush=True)
+                else:
+                    rospy.loginfo("Leader trajectory cancelled")
+
+            if key in ("1", "2"):
+                gap = now - last_command.get(key, -math.inf)
+                last_command[key] = now
+                if key != trajectory and gap >= config["command_repeat_gap"]:
+                    if not args.dry_run and leader_nav_pub.get_num_connections() == 0:
+                        rospy.logwarn("No Leader nav subscriber; trajectory not started")
+                    else:
+                        stop_motion(("leader",), motion, expires, stops, config)
+                        trajectory, trajectory_start = key, now
+                        leader_nav.control_frame = FlightNav.WORLD_FRAME
+                        period = config["trajectories"][key]["period"]
+                        if args.dry_run:
+                            print(f"[DRY RUN] Leader trajectory {key} started: {period:g} s, WORLD frame", flush=True)
+                        else:
+                            rospy.loginfo("Leader trajectory %s started: %g s, WORLD frame", key, period)
+
             # Flight commands: same direct key -> publisher flow as Beetle.
             if key == common["stop_motion"]:
                 stop_motion(ROBOTS, motion, expires, stops, config)
@@ -312,6 +402,26 @@ def main():
                 expires["leader"][3] = deadline
 
             if now >= next_tick:
+                if approach:
+                    for role in ROBOTS:
+                        motion[role].control_frame = FlightNav.LOCAL_FRAME
+                        motion[role].target_vel_x = config["approach_speed"]
+                        expires[role][0] = now + config["key_timeout"]
+                if trajectory is not None:
+                    velocity = trajectory_velocity(trajectory, now - trajectory_start,
+                                                   config["trajectories"][trajectory])
+                    if velocity is None:
+                        trajectory = None
+                        stop_motion(("leader",), motion, expires, stops, config)
+                        if args.dry_run:
+                            print("[DRY RUN] Leader trajectory finished", flush=True)
+                        else:
+                            rospy.loginfo("Leader trajectory finished")
+                    else:
+                        (leader_nav.target_vel_x, leader_nav.target_vel_y,
+                         leader_nav.target_vel_z, leader_nav.target_omega_z) = velocity
+                        expires["leader"] = [now + config["key_timeout"]] * 4
+                        stops["leader"] = config["stop_repeats"]
                 send_motion(config, nav_pubs, motion, expires, stops, now, args.dry_run, last_printed)
                 next_tick = now + 1.0 / config["publish_rate"]
     except (KeyboardInterrupt, EOFError):

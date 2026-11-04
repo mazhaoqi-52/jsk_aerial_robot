@@ -1,0 +1,4 @@
+<launch>
+  <!-- Isolated ROS diagnostic/configuration test. No bringup, FC, or motor node. -->
+  <test test-name="hih_cop_ros" pkg="hih" type="hih_test_cop_ros" time-limit="30.0" />
+</launch>

@@ -28,7 +28,6 @@ keys:
     force_landing: m
     halt: '/'
     stop_motion: SPACE  # zero keyboard velocity; does NOT stop motors
-    help: '?'
   follower:
     '+X': w
     '-X': s

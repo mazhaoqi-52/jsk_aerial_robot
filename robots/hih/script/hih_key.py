@@ -59,7 +59,7 @@ def load_config(path):
         raise ValueError("stop_repeats must be 1..10")
     if not config["common_targets"] or any(r not in ROBOTS for r in config["common_targets"]):
         raise ValueError("common_targets must contain leader and/or follower")
-    if set(config["keys"]["common"]) != set(COMMANDS) | {"help", "stop_motion"}:
+    if set(config["keys"]["common"]) != set(COMMANDS) | {"stop_motion"}:
         raise ValueError("Check common command names in keys/common")
     if any(set(config["keys"][role]) != set(MOVEMENTS) for role in ROBOTS):
         raise ValueError("Check movement names in keys/leader and keys/follower")
@@ -87,15 +87,32 @@ def load_config(path):
 
 
 def print_help(config):
-    keys = config["keys"]
-    print("\nHiH keyboard — " + config["frame"].upper() + " frame")
-    print(" | ".join(f"{keys['common'][action]}: {action}" for action in COMMANDS))
-    print("                 Follower    Leader")
-    for action in MOVEMENTS:
-        print(f"{action:16} {keys['follower'][action]:8}    {keys['leader'][action]}")
-    print(f"{keys['common']['stop_motion']!r}: zero keyboard motion | {keys['common']['help']}: help")
-    print("Please disable Caps Lock. Ctrl+C: zero keyboard velocities and quit.\n", flush=True)
+    common = config["keys"]["common"]
+    follower = config["keys"]["follower"]
+    leader = config["keys"]["leader"]
+    stop_key = "Space" if common["stop_motion"] == " " else common["stop_motion"]
+    print(f"""
+---------------------------
 
+{common['arm']}:  arming motor (please do before takeoff)
+{common['takeoff']}:  takeoff
+{common['land']}:  land
+{common['force_landing']}:  force landing
+{common['halt']}:  halt (force stop motor)
+{stop_key}:  hold in current position
+
+======= Follower =======|======== Leader ========
+{follower['+yaw']:^6}{follower['+X']:^6}{follower['-yaw']:^6}{follower['+Z']:^6}|{leader['+yaw']:^6}{leader['+X']:^6}{leader['-yaw']:^6}{leader['+Z']:^6}
+{'(+yaw)':^6}{'(+X)':^6}{'(-yaw)':^6}{'(+Z)':^6}|{'(+yaw)':^6}{'(+X)':^6}{'(-yaw)':^6}{'(+Z)':^6}
+                        |
+{follower['+Y']:^6}{follower['-X']:^6}{follower['-Y']:^6}{follower['-Z']:^6}|{leader['+Y']:^6}{leader['-X']:^6}{leader['-Y']:^6}{leader['-Z']:^6}
+{'(+Y)':^6}{'(-X)':^6}{'(-Y)':^6}{'(-Z)':^6}|{'(+Y)':^6}{'(-X)':^6}{'(-Y)':^6}{'(-Z)':^6}
+
+Please don't have caps lock on.
+CTRL+c to send zero keyboard velocities and exit
+
+---------------------------
+""", flush=True)
 
 def get_key(fd, timeout, input_state):
     """Read one key; skip arrow/escape sequences and bracketed pasted text."""
@@ -222,8 +239,6 @@ def main():
             if key == "\x03":
                 break
             # Flight commands: same direct key -> publisher flow as Beetle.
-            if key == common["help"]:
-                print_help(config)
             if key == common["stop_motion"]:
                 stop_motion(ROBOTS, motion, expires, stops, config)
             if key in (common["arm"], common["takeoff"], common["land"],

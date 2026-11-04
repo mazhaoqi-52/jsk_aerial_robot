@@ -132,15 +132,15 @@ follower:
       normal_force_rate: 1.0
       contact_threshold: 0.8
       mass:
-      - 1.5
-      - 1.5
-      - 1.0
-      - 1.0
+      - 1.2
+      - 1.6
+      - 3.2
+      - 0.2
       damping:
       - 20.0
       - 20.0
-      - 5.0
-      - 2.0
+      - 30.0
+      - 1.0
       stiffness:
       - 0.0
       - 0.0

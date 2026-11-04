@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <hih/control/hih_admittance.h>
 #include <hih/control/hih_contact_wrench.h>
+#include <hih/control/hih_contact_guard.h>
 #include <limits>
 
 using namespace hih_control;
@@ -149,4 +150,113 @@ TEST(ContactWrench, YawCompensationPreservesContactCenterPosition)
   const auto compensation = contactCenterCompensation(nominal, command, lever);
   const auto after = compensation + command * lever;
   EXPECT_NEAR((after - nominal * lever).length(), 0, 1e-12);
+}
+
+TEST(ContactWrench, RearPlateForceAndMomentSigns)
+{
+  tf::Matrix3x3 identity; identity.setIdentity();
+  const tf::Vector3 n(-1,0,0), lever(-0.26,0,0), force(10,2,-1);
+  const auto measured = wrenchAtContact(force, lever.cross(force), identity, tf::Transform(identity,lever));
+  EXPECT_NEAR(measured.torque.length(),0,1e-12);
+  for (double fn : {5.,10.,15.}) {
+    auto e=contactWrenchErrorWorld({tf::Vector3(fn,0,0),tf::Vector3(0,0,0)},identity,n,10);
+    EXPECT_DOUBLE_EQ(e[0],fn-10); // Low compression advances -X; high retreats +X.
+  }
+  tf::Matrix3x3 turned; turned.setRPY(0,0,1.5707963267948966);
+  auto e=contactWrenchErrorWorld({tf::Vector3(5,0,0),tf::Vector3(0,0,0)},turned,n,10);
+  EXPECT_NEAR(e[0],0,1e-12); EXPECT_NEAR(e[1],-5,1e-12);
+  auto compensation=contactCenterCompensation(identity,turned,lever);
+  EXPECT_NEAR((compensation+turned*lever-lever).length(),0,1e-12);
+}
+
+TEST(Admittance, MovingReferenceCarriesTranslationAndNinetyDegreeYawWithoutLocalSaturation)
+{
+  for (int axis=0; axis<4; ++axis) {
+    AdmittanceParameters p; p.moving_reference=true; p.filter_cutoff_hz=0; p.deadband.fill(0);
+    p.max_travel.fill(3); Admittance4D model(p);
+    Vector4 force{{0,0,0,0}}; force[axis]=axis==3 ? .3 : 2;
+    const double goal=axis==3 ? 1.5707963267948966 : .25;
+    double previous=0;
+    for (int i=0; i<40000 && model.totalOffset()[axis]<goal; ++i) {
+      ASSERT_TRUE(model.step(force,.005));
+      const double total=model.totalOffset()[axis];
+      EXPECT_GE(total,previous); EXPECT_LE(total-previous,p.max_velocity[axis]*.005+1e-12);
+      EXPECT_LT(std::abs(model.offset()[axis]),p.max_offset[axis]); previous=total;
+    }
+    EXPECT_GE(model.totalOffset()[axis],goal);
+    EXPECT_GT(model.referenceOffset()[axis],0);
+    const auto before=model.totalOffset(); model.hold(); EXPECT_EQ(model.totalOffset(),before);
+  }
+}
+TEST(Admittance, TravelLimitRejectsStepWithoutReferenceJump)
+{
+  AdmittanceParameters p; p.moving_reference=true; p.max_travel.fill(.2);
+  p.max_offset.fill(.1); p.filter_cutoff_hz=0; p.deadband.fill(0); Admittance4D model(p);
+  bool rejected=false;
+  for(int i=0;i<10000;++i) {
+    const auto before=model.totalOffset();
+    if(!model.step({{2,0,0,0}},.01)) { EXPECT_EQ(model.totalOffset(),before); rejected=true; break; }
+  }
+  EXPECT_TRUE(rejected); EXPECT_LT(model.totalOffset()[0],.2);
+}
+TEST(Admittance, MovingReferenceRequiresZeroSpringAndFiniteTravel)
+{
+  AdmittanceParameters p; p.moving_reference=true; p.stiffness[0]=1;
+  EXPECT_THROW(Admittance4D model(p),std::invalid_argument);
+  p.stiffness[0]=0; p.max_travel[0]=.01;
+  EXPECT_THROW(Admittance4D model(p),std::invalid_argument);
+}
+TEST(ContactGuard, RequiresCompressiveNormalBeforeAnyForceRamp)
+{
+  ContactGuard g; EXPECT_EQ(g.step(1,true,true,0),ContactGuard::WAITING);
+  EXPECT_EQ(g.step(2,true,true,-5),ContactGuard::WAITING);
+  EXPECT_EQ(g.step(3,true,true,1),ContactGuard::ACTIVE);
+}
+TEST(ContactGuard, LostContactPausesImmediatelyThenLatchesUntilReset)
+{
+  ContactGuard g; g.step(1,true,true,1);
+  EXPECT_EQ(g.step(2,true,true,0),ContactGuard::HOLD);
+  EXPECT_EQ(g.step(2.25,true,true,0),ContactGuard::FAULT);
+  EXPECT_EQ(g.step(3,true,true,10),ContactGuard::FAULT);
+  EXPECT_EQ(g.status(),"contact_lost_hold"); g.reset();
+  EXPECT_EQ(g.step(4,true,true,10),ContactGuard::ACTIVE);
+}
+TEST(ContactGuard, BriefLossCanResumeWithoutLosingAcquisition)
+{
+  ContactGuard g; g.step(1,true,true,1); g.step(2,true,true,0);
+  EXPECT_EQ(g.step(2.1,true,true,1),ContactGuard::ACTIVE); EXPECT_TRUE(g.acquired());
+  EXPECT_EQ(g.step(3,true,true,0),ContactGuard::HOLD);
+}
+TEST(ContactGuard, ControlGapPreservesContactAndOverloadStillWins)
+{
+  ContactGuard g; g.step(1,true,true,1);
+  EXPECT_EQ(g.step(2,false,true,10),ContactGuard::HOLD); EXPECT_TRUE(g.acquired());
+  EXPECT_EQ(g.step(2.01,true,true,10),ContactGuard::ACTIVE);
+  EXPECT_EQ(g.step(3,false,true,20),ContactGuard::FAULT);
+  EXPECT_EQ(g.status(),"normal_force_limit_hold");
+}
+TEST(ContactGuard, OverloadIsCheckedEvenBeforeFirstContact)
+{
+  for(double f : {-21.,20.,21.}) {
+    ContactGuard g; EXPECT_EQ(g.step(1,true,true,f),ContactGuard::FAULT);
+  }
+}
+TEST(ContactGuard, StaleMobHoldsThenLatchesAndRejectsNonfiniteForce)
+{
+  ContactGuard g; g.step(1,true,true,1);
+  EXPECT_EQ(g.step(2,true,false,10),ContactGuard::HOLD);
+  EXPECT_EQ(g.step(2.6,true,false,10),ContactGuard::FAULT);
+  EXPECT_EQ(g.status(),"mob_timeout_hold");
+  g.reset(); EXPECT_EQ(g.step(3,true,true,std::numeric_limits<double>::quiet_NaN()),ContactGuard::WAITING);
+}
+TEST(ContactGuard, ThresholdHysteresisRetainsEstablishedContact)
+{
+  ContactGuard g; g.step(1,true,true,1);
+  EXPECT_EQ(g.step(2,true,true,.6),ContactGuard::ACTIVE);
+  EXPECT_EQ(g.step(3,true,true,.3),ContactGuard::HOLD);
+}
+TEST(ContactGuard, RejectsInvalidProtectionSettings)
+{
+  ContactGuardParameters p; p.release_force=2; ContactGuard g;
+  EXPECT_THROW(g.configure(p),std::invalid_argument);
 }

@@ -2,9 +2,10 @@
 # PID/MOB values below are copied from the working HihControl.yaml, not retuned.
 # Admittance vectors use [world X, world Y, world Z, world yaw]. SI units: m/rad.
 # Virtual masses: kg/kg*m^2; damping: N*s/m or Nm*s/rad; stiffness: N/m or Nm/rad.
+# Contact center: base_link (-0.26,0,0), axes unrotated; compressive reaction is +X.
 # normal_contact points from the robot toward the payload in the MODEL contact_point axes.
 # 10 N and virtual dynamics are simulation-derived starting values, NOT validated flight gains.
-# Limits are deliberately smaller than the simulation; enabled=false by default.
+# Local corrections stay small; moving_reference transfers accumulated motion into an internal baseline.
 # K=0 permits steady nonzero contact force without spring pullback toward the old task pose.
 # No automatic approach or lifting sequence is implemented here.
 # Configure before bringup; restart the role controller to reload these settings.
@@ -117,30 +118,35 @@ follower:
       limit_d: 20.0
       need_d_control: true
     admittance:
-      enabled: false
+      enabled: true
       apply_velocity: true
       world_frame: world
       sample_timeout: 0.15
       debug_period: 0.05
       max_dt: 0.1
+      moving_reference: true
+      max_travel: [1.0, 1.0, 0.5, 2.0] # contact-reference travel [m,m,m,rad]; fault HOLD at limit
+      contact_release: 0.4           # N; immediately pause below this force
+      contact_loss_timeout: 0.2      # s; latch contact-loss HOLD
+      stale_fault_timeout: 0.5       # s after first stale sample; latch MOB-timeout HOLD
       normal_contact:
-      - 1.0
+      - -1.0
       - 0.0
       - 0.0
       normal_force_desired: 10.0
-      normal_force_max: 20.0
+      normal_force_max: 20.0          # N; measured |Fn| >= limit latches HOLD
       normal_force_rate: 1.0
       contact_threshold: 0.8
       mass:
-      - 1.5
-      - 1.5
-      - 1.0
-      - 1.0
+      - 1.2
+      - 1.6
+      - 3.2
+      - 0.2
       damping:
       - 20.0
       - 20.0
-      - 5.0
-      - 2.0
+      - 30.0
+      - 1.0
       stiffness:
       - 0.0
       - 0.0
@@ -182,3 +188,35 @@ follower:
       - 1.0
       - 1.0
       filter_cutoff_hz: 10.0
+
+    # Supplementary CoP trim AFTER Admittance, BEFORE inherited PID.
+    # Requires Admittance to be applying; CoP is still estimated while OFF.
+    # All parameters load at bringup. Only the three enabled flags also support
+    # runtime changes at /hih2/controller/cop_adjustment/... (not the role copy).
+    cop_adjustment:
+      enabled: false
+      safe_y: 0.05                   # [m] CoP safety half-width, user-selected
+      safe_z: 0.05                   # [m] -> safe area is +/-0.05 in each axis
+      hysteresis_y: 0.005            # [m] boundary latch release margin
+      hysteresis_z: 0.005
+      min_normal_force: 1.0          # [N] compressive Fn=+Fx_C; reject before division
+      max_abs_cop_y: 0.25            # [m] numerical outlier limit, NOT plate size
+      max_abs_cop_z: 0.25
+      filter_cutoff_hz: 5.0          # CoP LPF; 0 bypasses filtering
+      sample_timeout: 0.15           # [s] use original IMU/MOB sample stamp
+      max_dt: 0.1                    # [s] hold across invalid control intervals
+      debug_period: 0.05             # [s]
+      force_bias_contact: [0.0, 0.0, 0.0]   # [N], subtracted only in CoP estimator
+      torque_bias_contact: [0.0, 0.0, 0.0]  # [Nm], about contact center, contact axes
+      yaw:                          # contact CoP-Y -> Euler/world-Z yaw offset
+        enabled: true
+        gain: 0.17453292519943295 # [rad/(m*s)] = 10 deg/(m*s)
+        direction: 1.0              # +1 or -1; yaw geometry sign follows normal_contact automatically
+        max_offset: 0.05235987755982989 # [rad] = 3 deg
+        max_rate: 0.008726646259971648 # [rad/s] = 0.5 deg/s
+      z:                            # contact CoP-Z -> WORLD Z position offset
+        enabled: true
+        gain: 0.2                   # [1/s], weak supplementary trim
+        direction: 1.0
+        max_offset: 0.02            # [m] = 20 mm
+        max_rate: 0.005             # [m/s] = 5 mm/s

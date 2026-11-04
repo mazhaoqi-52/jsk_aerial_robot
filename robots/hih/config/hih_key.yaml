@@ -7,6 +7,7 @@ key_timeout: 0.35
 command_repeat_gap: 0.7
 stop_repeats: 3
 common_targets: [leader, follower]
+approach_speed: 0.02    # m/s, g toggles BOTH robots' LOCAL -X motion
 
 robots:
   leader:
@@ -29,7 +30,7 @@ keys:
     force_landing: f
     halt: h
     stop_motion: SPACE  # zero keyboard velocity; does NOT stop motors
-    help: '?'
+    approach: g
   follower:
     '+X': w
     '-X': s
@@ -48,3 +49,18 @@ keys:
     '-Z': ';'
     '+yaw': u
     '-yaw': o
+
+# Rear-contact paths: original XY displacements rotated 180 deg about world Z.
+# Leader-only, WORLD frame, one execution per trigger (no automatic repetition).
+# period is the total time for all four segments; each segment takes period/4.
+# displacement is the distance of EACH translation segment, not the whole path.
+trajectory_max_speed: 0.05       # m/s, validate peak speed before running
+trajectory_max_yaw_rate: 0.12    # rad/s, below Follower Admittance max_velocity[yaw]
+trajectories:
+  "1":  # -X -> +Z -> +X -> -Z (returns the nominal reference to its start)
+    period: 40.0                 # s, total four-segment duration
+    displacement: 0.20           # m per translation segment
+  "2":  # +yaw -> +Y -> -yaw -> +X (ends at +displacement in both X and Y)
+    period: 120.0
+    displacement: 0.20           # m per translation segment
+    yaw_displacement_deg: 90.0   # degrees per yaw segment; net yaw change is zero

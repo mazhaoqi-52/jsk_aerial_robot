@@ -1,0 +1,3 @@
+<launch>
+  <test test-name="hih_follower_control" pkg="hih" type="hih_test_follower_control" time-limit="45" />
+</launch>

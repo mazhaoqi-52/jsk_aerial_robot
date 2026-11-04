@@ -24,18 +24,22 @@ struct AdmittanceParameters
   Vector4 gain{{1.0, 1.0, 1.0, 1.0}};
   double filter_cutoff_hz = 2.0;
   double max_dt = 0.1;
+  bool moving_reference = false;
+  Vector4 max_travel{{1.0, 1.0, 0.5, 2.0}}; // Total displacement from contact acquisition.
 
   void validate() const
   {
     for (int i = 0; i < 4; ++i)
     {
       const double values[] = {mass[i], damping[i], stiffness[i], max_offset[i],
-        max_velocity[i], max_acceleration[i], max_wrench[i], deadband[i], bias[i], gain[i]};
+        max_velocity[i], max_acceleration[i], max_wrench[i], deadband[i], bias[i], gain[i], max_travel[i]};
       for (double v : values)
         if (!std::isfinite(v)) throw std::invalid_argument("Admittance parameters must be finite");
       if (mass[i] <= 0 || damping[i] < 0 || stiffness[i] < 0 || max_offset[i] < 0 ||
           max_velocity[i] <= 0 || max_acceleration[i] <= 0 || max_wrench[i] <= 0 || deadband[i] < 0)
         throw std::invalid_argument("Invalid Admittance mass/damping/stiffness/limit");
+      if (moving_reference && (stiffness[i] != 0 || max_travel[i] < max_offset[i] || max_travel[i] <= 0))
+        throw std::invalid_argument("Moving reference requires K=0 and max_travel >= max_offset > limit");
     }
     if (!std::isfinite(filter_cutoff_hz) || filter_cutoff_hz < 0 ||
         !std::isfinite(max_dt) || max_dt <= 0)
@@ -50,11 +54,14 @@ public:
   explicit Admittance4D(const AdmittanceParameters& p = AdmittanceParameters()) : p_(p)
   { p_.validate(); reset(); }
   void configure(const AdmittanceParameters& p) { p.validate(); p_ = p; reset(); }
-  void reset() { offset_.fill(0); velocity_.fill(0); filtered_.fill(0); }
+  void reset() { offset_.fill(0); reference_.fill(0); velocity_.fill(0); filtered_.fill(0); }
   void hold() { velocity_.fill(0); }
   const Vector4& offset() const { return offset_; }
   const Vector4& velocity() const { return velocity_; }
   const Vector4& filteredWrench() const { return filtered_; }
+  const Vector4& referenceOffset() const { return reference_; }
+  Vector4 totalOffset() const
+  { Vector4 total; for (int i=0; i<4; ++i) total[i]=reference_[i]+offset_[i]; return total; }
 
   // M*xdd + D*xd + K*x = deadband(gain * contact-wrench-error).
   // Backward Euler with small substeps; bounds prevent integrator windup.
@@ -62,6 +69,7 @@ public:
   {
     if (!std::isfinite(dt) || dt <= 0 || dt > p_.max_dt) return false;
     for (double f : wrench) if (!std::isfinite(f)) return false;
+    const auto old_offset=offset_, old_velocity=velocity_, old_filter=filtered_;
     const int steps = std::max(1, static_cast<int>(std::ceil(dt / 0.005)));
     const double h = dt / steps;
     for (int s = 0; s < steps; ++s)
@@ -84,11 +92,21 @@ public:
         // An outward velocity at the displacement bound must not keep integrating.
         velocity_[i] = ((x >= p_.max_offset[i] && v > 0) || (x <= -p_.max_offset[i] && v < 0)) ? 0.0 : v;
       }
+    if (p_.moving_reference)
+    {
+      const auto total = totalOffset();
+      for (int i=0; i<4; ++i)
+        if (std::abs(total[i]) >= p_.max_travel[i])
+        { offset_=old_offset; velocity_=old_velocity; filtered_=old_filter; return false; }
+      for (int i=0; i<4; ++i)
+        if (p_.max_offset[i] > 0 && std::abs(offset_[i]) >= 0.5*p_.max_offset[i])
+        { reference_[i] += offset_[i]; offset_[i]=0; }
+    }
     return true;
   }
 
 private:
   AdmittanceParameters p_;
-  Vector4 offset_, velocity_, filtered_;
+  Vector4 offset_, reference_, velocity_, filtered_;
 };
 }  // namespace hih_control

@@ -80,10 +80,10 @@ class KeyboardTest(unittest.TestCase):
     def test_all_requested_motion_keys(self):
         expected = {"w": ("hih2", 0, .1), "s": ("hih2", 0, -.1),
                     "a": ("hih2", 1, .1), "d": ("hih2", 1, -.1),
-                    "r": ("hih2", 2, .1), "f": ("hih2", 2, -.1),
+                    "[": ("hih2", 2, .1), "]": ("hih2", 2, -.1),
                     "q": ("hih2", 3, .1), "e": ("hih2", 3, -.1),
                     "i": ("hih1", 0, .1), "k": ("hih1", 0, -.1),
-                    "j": ("hih1", 1, .1), "l": ("hih1", 1, -.1),
+                    "j": ("hih1", 1, .1), ",": ("hih1", 1, -.1),
                     "p": ("hih1", 2, .1), ";": ("hih1", 2, -.1),
                     "u": ("hih1", 3, .1), "o": ("hih1", 3, -.1)}
         for character, (namespace, axis, value) in expected.items():
@@ -99,7 +99,7 @@ class KeyboardTest(unittest.TestCase):
     def test_one_robot_connected_still_receives_every_common_command(self):
         for ns in ("/hih1", "/hih2"):
             with self.subTest(connected=ns):
-                received, pubs = self.run_keys([(char, .1) for char in "vbnm/"], connected=(ns,))
+                received, pubs = self.run_keys([(char, .1) for char in "rtlfh"], connected=(ns,))
                 for topic in ("start", "takeoff", "land", "force_landing", "halt"):
                     name = ns + "/teleop_command/" + topic
                     self.assertEqual(pubs[name].get_num_connections.return_value, 1)
@@ -129,7 +129,7 @@ class KeyboardTest(unittest.TestCase):
         self.assertEqual(received["/hih2/uav/nav"][1].target_vel_x, -.1)
 
     def test_common_command_debounce(self):
-        received, _ = self.run_keys([("v", .05), ("v", .1), ("v", 1)])
+        received, _ = self.run_keys([("r", .05), ("r", .1), ("r", 1)])
         self.assertEqual(len(received["/hih1/teleop_command/start"]), 2)
 
     def test_space_stops_both_robots(self):
@@ -140,7 +140,7 @@ class KeyboardTest(unittest.TestCase):
             self.assertEqual(msgs[-4].target_vel_x, 0)
 
     def test_unknown_keys_and_startup_do_not_send_motion_or_flight_commands(self):
-        received, _ = self.run_keys([(None, .1), ("W", .1), ("h", .1)])
+        received, _ = self.run_keys([(None, .1), ("W", .1)] + [(char, .1) for char in "vbnm/"])
         for topic, messages in received.items():
             if topic.endswith("/uav/nav"):
                 self.assertEqual(len(messages), 3)  # Exit zeros only.
@@ -165,7 +165,7 @@ class KeyboardTest(unittest.TestCase):
     def test_common_mapping(self):
         common = self.config["keys"]["common"]
         self.assertEqual({a: common[a] for a in key.COMMANDS},
-                         {"arm": "v", "takeoff": "b", "land": "n", "force_landing": "m", "halt": "/"})
+                         {"arm": "r", "takeoff": "t", "land": "l", "force_landing": "f", "halt": "h"})
         self.assertNotEqual(key.COMMANDS["force_landing"], key.COMMANDS["halt"])
 
     def test_trajectory_segment_integrals_and_order(self):
@@ -223,7 +223,7 @@ class KeyboardTest(unittest.TestCase):
         self.assertNotIn("cancelled", self.output)
 
     def test_space_and_flight_commands_cancel_trajectory(self):
-        for character in " vbnm/":
+        for character in [" "] + [self.config["keys"]["common"][action] for action in key.COMMANDS]:
             with self.subTest(character=character):
                 received, _ = self.run_keys([("1", .05), (None, .25), (character, .1), (None, .2)])
                 messages = received["/hih1/uav/nav"]
@@ -305,7 +305,7 @@ class KeyboardTest(unittest.TestCase):
             self.assertFalse(any(getattr(messages[-1], f) for f in key.VELOCITY_FIELDS))
 
     def test_space_and_common_flight_commands_cancel_approach(self):
-        for character in " vbnm/":
+        for character in [" "] + [self.config["keys"]["common"][action] for action in key.COMMANDS]:
             with self.subTest(character=character):
                 received, _ = self.run_keys([("g", .05), (None, .2), (character, .1), (None, .2)])
                 for ns in ("/hih1", "/hih2"):
@@ -315,7 +315,7 @@ class KeyboardTest(unittest.TestCase):
                                         for msg, stamp in zip(received[topic], self.received_times[topic]) if stamp >= 10.35 - 1e-8))
 
     def test_manual_input_cancels_approach_before_applying_the_key(self):
-        received, _ = self.run_keys([("g", .05), (None, .2), ("r", .1), (None, .2)])
+        received, _ = self.run_keys([("g", .05), (None, .2), (self.config["keys"]["follower"]["+Z"], .1), (None, .2)])
         self.assertTrue(any(msg.target_vel_z == .1 and msg.target_vel_x == 0 for msg in received["/hih2/uav/nav"]))
         self.assertTrue(all(msg.target_vel_x == 0 for msg, stamp in zip(received["/hih1/uav/nav"],
                              self.received_times["/hih1/uav/nav"]) if stamp >= 10.35 - 1e-8))
@@ -341,7 +341,7 @@ class KeyboardTest(unittest.TestCase):
             self.assertTrue(any(msg.target_vel_x == -.02 for msg in received[connected[0] + "/uav/nav"]))
 
     def test_follower_fault_stops_approach_and_blocks_retry_but_allows_land(self):
-        received, _ = self.run_keys([("g", .05), (None, .1), (None, .1), ("g", .8), ("n", .1)], fault_at=10.2)
+        received, _ = self.run_keys([("g", .05), (None, .1), (None, .1), ("g", .8), (self.config["keys"]["common"]["land"], .1)], fault_at=10.2)
         self.assertEqual(self.output.count("Approach ON"),1)
         for ns in ("/hih1","/hih2"):
             topic=ns+"/uav/nav"
@@ -350,7 +350,7 @@ class KeyboardTest(unittest.TestCase):
             self.assertEqual(len(received[ns+"/teleop_command/land"]),1)
 
     def test_follower_fault_stops_trajectory_and_blocks_motion_but_allows_halt(self):
-        received,_=self.run_keys([("1",.05),(None,.1),(None,.1),("2",.8),("i",.1),("/",.1)],fault_at=10.2)
+        received,_=self.run_keys([("1",.05),(None,.1),(None,.1),("2",.8),("i",.1),(self.config["keys"]["common"]["halt"],.1)],fault_at=10.2)
         self.assertEqual(self.output.count("started"),1)
         for ns in ("/hih1","/hih2"):
             topic=ns+"/uav/nav"
@@ -372,10 +372,24 @@ class KeyboardTest(unittest.TestCase):
                 yaml.safe_dump(config,stream);stream.flush()
                 with self.assertRaises(ValueError): key.load_config(stream.name)
 
+    def test_flight_keys_do_not_also_command_robot_movement(self):
+        commands = {"r": "start", "t": "takeoff", "l": "land",
+                    "f": "force_landing", "h": "halt"}
+        for character, command in commands.items():
+            with self.subTest(character=character):
+                received, _ = self.run_keys([(character, .1)])
+                for ns in ("/hih1", "/hih2"):
+                    self.assertEqual(len(received[f"{ns}/teleop_command/{command}"]), 1)
+                    self.assertTrue(all(not any(getattr(msg, field) for field in key.VELOCITY_FIELDS)
+                                        for msg in received[f"{ns}/uav/nav"]))
+                    for other in commands.values():
+                        if other != command:
+                            self.assertEqual(received[f"{ns}/teleop_command/{other}"], [])
+
     def test_rejects_duplicate_mapping_and_bad_speed(self):
         for change in ("duplicate", "speed", "namespace", "approach_speed"):
             data = yaml.safe_load((ROOT / "config/hih_key.yaml").read_text())
-            if change == "duplicate": data["keys"]["leader"]["+X"] = "v"
+            if change == "duplicate": data["keys"]["leader"]["+X"] = "r"
             if change == "speed": data["robots"]["leader"]["xy_speed"] = float("nan")
             if change == "namespace": data["robots"]["leader"]["namespace"] = "/hih2"
             if change == "approach_speed": data["approach_speed"] = float("nan")

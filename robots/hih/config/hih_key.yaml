@@ -23,11 +23,12 @@ robots:
 
 keys:
   common:
-    arm: v
-    takeoff: b
-    land: n
-    force_landing: m
-    halt: '/'
+    # Match Beetle keyboard_command_multi.py flight commands.
+    arm: r
+    takeoff: t
+    land: l
+    force_landing: f
+    halt: h
     stop_motion: SPACE  # zero keyboard velocity; does NOT stop motors
     approach: g
   follower:
@@ -35,15 +36,15 @@ keys:
     '-X': s
     '+Y': a
     '-Y': d
-    '+Z': r
-    '-Z': f
+    '+Z': '['
+    '-Z': ']'
     '+yaw': q
     '-yaw': e
   leader:
     '+X': i
     '-X': k
     '+Y': j
-    '-Y': l
+    '-Y': ','  # l is the common land command.
     '+Z': p
     '-Z': ';'
     '+yaw': u

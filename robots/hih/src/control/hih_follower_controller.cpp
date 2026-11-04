@@ -120,7 +120,11 @@ void HihFollowerController::externalWrenchEstimate()
   // The inherited initialize starts this thread before all HiH pointers exist.
   if (!ready_.load()) return;
   HihController::externalWrenchEstimate();
-  const double stamp = estimator_->getImuLatestTimeStamp();
+  // Before the observer starts (e.g. on the ground during Gazebo startup),
+  // the estimator's IMU timestamp queue may still be empty. Its getter calls
+  // back() unconditionally, so only read it after an estimate was produced.
+  const double stamp = prev_est_wrench_timestamp_ > 0
+    ? estimator_->getImuLatestTimeStamp() : 0.0;
   const int state = navigator_->getNaviState();
   bool valid = prev_est_wrench_timestamp_ > 0 && est_external_wrench_.size() == 6 &&
     est_external_wrench_.allFinite() && std::isfinite(stamp) && stamp > 0 &&

@@ -55,7 +55,7 @@ public:
   { p_.validate(); reset(); }
   void configure(const AdmittanceParameters& p) { p.validate(); p_ = p; reset(); }
   void reset() { offset_.fill(0); reference_.fill(0); velocity_.fill(0); filtered_.fill(0); }
-  void hold() { velocity_.fill(0); }
+  void hold(bool clear_input=false) { velocity_.fill(0); if (clear_input) filtered_.fill(0); }
   const Vector4& offset() const { return offset_; }
   const Vector4& velocity() const { return velocity_; }
   const Vector4& filteredWrench() const { return filtered_; }

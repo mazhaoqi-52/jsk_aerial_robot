@@ -61,6 +61,36 @@ protected:
     EXPECT_DOUBLE_EQ(after.vel.length(),0); EXPECT_DOUBLE_EQ(after.omega.length(),0);
     EXPECT_DOUBLE_EQ(after.acc.length(),0); EXPECT_DOUBLE_EQ(after.ang_acc.length(),0);
   }
+  void requestRelease() { controller.release_requested_.store(true); }
+  void configureRelease()
+  {
+    hih_control::ForceReleaseParameters p; p.settle_time=.03; controller.force_release_.configure(p);
+    controller.release_motion_valid_=true; controller.release_speed_=controller.release_omega_=0;
+    controller.pid_controllers_.resize(6);
+    for(int i=0;i<6;++i) controller.pid_controllers_[i].setErrI(i+.5);
+  }
+  hih_control::ForceRelease::Phase releasePhase() { return controller.force_release_.phase(); }
+  double integral(int i) { return controller.pid_controllers_[i].getErrI(); }
+  double cop_yaw_=0,cop_z_=0;
+  Snapshot finalPreHandoffReference()
+  {
+    auto t=controller.held_target_; t.pos.setZ(t.pos.z()+cop_z_);
+    t.rpy.setZ(angles::normalize_angle(t.rpy.z()+cop_yaw_)); return t;
+  }
+  void seedCop()
+  {
+    hih_control::CopAdjustmentParameters p; p.enabled=true;
+    controller.cop_adjustment_.configure(p,tf::Vector3(-1,0,0));
+    controller.cop_adjustment_.step(tf::Vector3(10,0,0),tf::Vector3(0,1,-1),10,true,10,.025,true,true);
+    cop_yaw_=controller.cop_adjustment_.state().yaw_offset; cop_z_=controller.cop_adjustment_.state().z_offset;
+  }
+  void observerBeforeFirstTimestamp()
+  {
+    nav->setNaviState(aerial_robot_navigation::ARM_OFF_STATE);
+    controller.prev_est_wrench_timestamp_=0;
+    controller.externalWrenchEstimate(); // No estimator/IMU queue exists in this fixture.
+    EXPECT_FALSE(controller.sample_valid_);
+  }
   bool fault() { return controller.contact_guard_.state()==hih_control::ContactGuard::FAULT; }
   double reference() { return controller.normal_force_reference_; }
   double baseline() { return controller.admittance_.referenceOffset()[0]; }
@@ -68,6 +98,10 @@ protected:
   double total() { return controller.admittance_.totalOffset()[0]; }
 };
 
+TEST_F(HihFollowerControlTest, ObserverStartupDoesNotReadUnavailableImuTimestamp)
+{
+  EXPECT_NO_THROW(observerBeforeFirstTimestamp());
+}
 TEST_F(HihFollowerControlTest, InternalBaselineMovesWithoutWritingNavigator)
 {
   const auto target=load(); EXPECT_FALSE(fault());
@@ -110,6 +144,50 @@ TEST_F(HihFollowerControlTest, LandingClearsFaultAndStoredDisplacement)
   EXPECT_DOUBLE_EQ(target.pos.x(),.4); EXPECT_FALSE(fault());
   EXPECT_DOUBLE_EQ(total(),0);
 }
+TEST_F(HihFollowerControlTest, ReleaseTransfersReferenceWithoutPoseJumpOrPidReset)
+{
+  load(); configureRelease(); seedCop(); requestRelease();
+  tick(.025,1);
+  const auto before=tick(.025,0); // Intentional contact loss must not latch a normal contact-loss fault.
+  ros::WallDuration(.05).sleep(); const auto after=tick(.025,0);
+  ASSERT_EQ(releasePhase(),hih_control::ForceRelease::HOVER); EXPECT_FALSE(fault());
+  EXPECT_LE((after.pos-before.pos).length(),.005*.025+1e-9); // Ordinary bounded motion between ticks.
+  const auto handoff=finalPreHandoffReference();
+  EXPECT_NEAR((after.pos-handoff.pos).length(),0,1e-10);
+  EXPECT_NEAR((after.rpy-handoff.rpy).length(),0,1e-10);
+  EXPECT_NEAR((nav->getTargetPos()-after.pos).length(),0,1e-8);
+  EXPECT_NEAR((nav->getTargetRPY()-after.rpy).length(),0,1e-8);
+  for(int i=0;i<6;++i) EXPECT_DOUBLE_EQ(integral(i),i+.5);
+  EXPECT_DOUBLE_EQ(reference(),0); EXPECT_DOUBLE_EQ(total(),0);
+  const auto manual=tick(.025,10,true,.7); // No automatic force reacquisition; manual hover remains usable.
+  EXPECT_DOUBLE_EQ(manual.pos.x(),.7); EXPECT_EQ(releasePhase(),hih_control::ForceRelease::HOVER);
+}
+TEST_F(HihFollowerControlTest, ReleaseCannotReportSuccessWithPressureOrMissingState)
+{
+  load(); configureRelease(); requestRelease();
+  for(int i=0;i<10;++i) tick(.025,1);
+  EXPECT_EQ(releasePhase(),hih_control::ForceRelease::RELEASING);
+  EXPECT_GT(reference(),0);
+}
+TEST_F(HihFollowerControlTest, ReleaseStaleDataPreservesLastReferenceAndNeverAnnouncesHover)
+{
+  load(); configureRelease(); requestRelease(); const auto before=tick(.025,1); const double force=reference();
+  expectHold(before,tick(.025,0,false,99)); EXPECT_DOUBLE_EQ(reference(),force);
+  EXPECT_NE(releasePhase(),hih_control::ForceRelease::HOVER);
+}
+TEST_F(HihFollowerControlTest, ReleaseKeepsOverloadProtectionAndCannotClearExistingFault)
+{
+  load(); configureRelease(); requestRelease(); tick(.025,21);
+  EXPECT_TRUE(fault()); EXPECT_EQ(releasePhase(),hih_control::ForceRelease::FAILED);
+  requestRelease(); tick(.025,0); EXPECT_TRUE(fault());
+}
+TEST_F(HihFollowerControlTest, LandingCancelsReleaseAndResetsTheNextFlight)
+{
+  load(); configureRelease(); requestRelease(); tick(.025,1);
+  nav->setNaviState(aerial_robot_navigation::LAND_STATE); tick(.025,0);
+  EXPECT_EQ(releasePhase(),hih_control::ForceRelease::OFF);
+}
+
 }
 
 int main(int argc,char** argv)

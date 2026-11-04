@@ -31,6 +31,15 @@ namespace aerial_robot_navigation
     HihNavigator();
     ~HihNavigator(){}
 
+    // Adopt the completed shaped pose atomically; keep the independent PID state.
+    void adoptHoverReference(const TargetSnapshot& target)
+    {
+      std::lock_guard<std::recursive_mutex> lock(target_mutex_);
+      setTargetPos(target.pos); setTargetRPY(target.rpy);
+      setTargetZeroVel(); setTargetZeroAcc(); setTargetZeroOmega(); setTargetZeroAngAcc();
+      target_pos_candidate_=target.pos; pre_target_pos_=target.pos;
+    }
+
     void initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
                     boost::shared_ptr<aerial_robot_model::RobotModel> robot_model,
                     boost::shared_ptr<aerial_robot_estimation::StateEstimator> estimator,

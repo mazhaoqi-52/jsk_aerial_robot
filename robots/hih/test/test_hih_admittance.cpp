@@ -2,6 +2,7 @@
 #include <hih/control/hih_admittance.h>
 #include <hih/control/hih_contact_wrench.h>
 #include <hih/control/hih_contact_guard.h>
+#include <hih/control/hih_force_release.h>
 #include <limits>
 
 using namespace hih_control;
@@ -259,4 +260,64 @@ TEST(ContactGuard, RejectsInvalidProtectionSettings)
 {
   ContactGuardParameters p; p.release_force=2; ContactGuard g;
   EXPECT_THROW(g.configure(p),std::invalid_argument);
+}
+
+TEST(ForceRelease, ReferenceRampsDownAndNeverRestartsOnRepeatedRequest)
+{
+  ForceRelease r; ASSERT_TRUE(r.request(1,10,10));
+  ASSERT_TRUE(r.advance(1.1,.1,true,10,20,.1)); EXPECT_NEAR(r.reference(),9.9,1e-12);
+  EXPECT_FALSE(r.request(1.2,10,10));
+  ASSERT_TRUE(r.advance(1.2,.1,true,2,20,.1)); EXPECT_NEAR(r.reference(),1.9,1e-12);
+  ASSERT_TRUE(r.advance(1.3,.1,true,0,20,.1)); EXPECT_DOUBLE_EQ(r.reference(),0);
+  EXPECT_EQ(r.phase(),ForceRelease::RELEASING);
+}
+TEST(ForceRelease, RequestCannotIncreaseExistingForceReference)
+{
+  ForceRelease a,b; a.request(1,10,2); EXPECT_DOUBLE_EQ(a.reference(),2);
+  b.request(1,0,10); EXPECT_DOUBLE_EQ(b.reference(),0);
+}
+TEST(ForceRelease, ZeroReferenceRequiresMeasuredUnloadingAndMotionDwell)
+{
+  ForceReleaseParameters p; p.settle_time=.1; ForceRelease r; r.configure(p); r.request(1,0,0);
+  ASSERT_TRUE(r.advance(1.1,.025,true,0,20,.1));
+  r.observe(1.1,0,2,0,true,0,0,0,0,0,0); EXPECT_EQ(r.phase(),ForceRelease::RELEASING);
+  r.observe(1.2,0,0,0,false,0,0,0,0,0,0); EXPECT_EQ(r.phase(),ForceRelease::RELEASING);
+  r.observe(1.3,0,0,0,true,.2,0,0,0,0,0); EXPECT_EQ(r.phase(),ForceRelease::RELEASING);
+  r.observe(1.4,0,0,0,true,0,0,0,0,0,0);
+  r.observe(1.55,0,0,0,true,0,0,0,0,0,0); EXPECT_EQ(r.phase(),ForceRelease::READY);
+  r.complete(); EXPECT_EQ(r.phase(),ForceRelease::HOVER); EXPECT_EQ(r.status(),"released_hover");
+  EXPECT_FALSE(r.request(2,10,10));
+}
+TEST(ForceRelease, StaleAndControlGapPauseThenFailWithoutForceReduction)
+{
+  ForceRelease r; r.request(1,10,10);
+  EXPECT_FALSE(r.advance(2,.2,true,10,20,.1)); EXPECT_DOUBLE_EQ(r.reference(),10);
+  EXPECT_FALSE(r.advance(2.6,.025,false,0,20,.1)); EXPECT_EQ(r.phase(),ForceRelease::FAILED);
+  EXPECT_EQ(r.status(),"release_data_timeout_hold");
+}
+TEST(ForceRelease, OverloadAndTimeoutNeverProduceSuccess)
+{
+  ForceRelease r; r.request(1,10,10); r.advance(2,.025,true,21,20,.1);
+  EXPECT_EQ(r.status(),"release_force_limit_hold"); r.complete(); EXPECT_EQ(r.phase(),ForceRelease::FAILED);
+  r.reset(); r.request(1,0,0); r.advance(32,.025,true,0,20,.1);
+  EXPECT_EQ(r.status(),"release_timeout_hold");
+}
+TEST(ForceRelease, MotionBoundFailsInsteadOfUnlimitedWithdrawal)
+{
+  ForceRelease r; r.request(1,10,10);r.advance(2,.025,true,10,20,.1);
+  r.observe(2,10,10,0,true,0,0,0,0,.16,0); EXPECT_EQ(r.status(),"release_motion_limit_hold");
+}
+TEST(ForceRelease, InvalidParametersAreRejected)
+{
+  ForceReleaseParameters p; p.rate=0; ForceRelease r;
+  EXPECT_THROW(r.configure(p),std::invalid_argument);
+}
+
+TEST(ForceRelease, ClearingOldInputPreservesAccumulatedReference)
+{
+  Admittance4D model; for(int i=0;i<20;++i) ASSERT_TRUE(model.step({{-2,0,0,0}},.025));
+  const auto before=model.totalOffset(); model.hold(true);
+  EXPECT_EQ(model.totalOffset(),before);
+  for(double value:model.filteredWrench()) EXPECT_DOUBLE_EQ(value,0);
+  for(double value:model.velocity()) EXPECT_DOUBLE_EQ(value,0);
 }

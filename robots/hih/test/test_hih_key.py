@@ -21,12 +21,15 @@ class KeyboardTest(unittest.TestCase):
     def setUp(self):
         self.config = key.load_config(ROOT / "config/hih_key.yaml")
 
-    def run_keys(self, steps, connected=("/hih1", "/hih2"), config=None, fault_at=None):
+    def run_keys(self, steps, connected=("/hih1", "/hih2"), config=None, fault_at=None, statuses=()):
         import copy
         import io
         from contextlib import ExitStack, redirect_stdout
         clock = [10.0]
         fault_callback = [None]
+        status_callback = [None]
+        statuses = iter(statuses)
+        next_status = [next(statuses, None)]
         steps = iter(list(steps) + [("\x03", .05)])
         received = {}
         connections = {}
@@ -38,7 +41,14 @@ class KeyboardTest(unittest.TestCase):
             clock[0] += duration
             if fault_at is not None and clock[0] >= fault_at and fault_callback[0]:
                 fault_callback[0](key.Bool(data=True))
+            while next_status[0] and clock[0] >= next_status[0][0]:
+                if status_callback[0]: status_callback[0](key.String(data=next_status[0][1]))
+                next_status[0] = next(statuses, None)
             return character
+
+        def subscriber(topic, kind, callback, **kw):
+            (fault_callback if topic.endswith("/fault") else status_callback)[0]=callback
+            return Mock()
 
         def publisher(topic, *_args, **_kwargs):
             pub = Mock()
@@ -70,7 +80,7 @@ class KeyboardTest(unittest.TestCase):
             stack.enter_context(patch.object(key.rospy, "logerr", side_effect=lambda text, *args: print(text % args if args else text)))
             stack.enter_context(patch.object(key.rospy, "loginfo", side_effect=lambda text, *args: print(text % args if args else text)))
             stack.enter_context(patch.object(key.rospy, "Publisher", side_effect=publisher))
-            stack.enter_context(patch.object(key.rospy, "Subscriber", side_effect=lambda topic, kind, callback, **kw: fault_callback.__setitem__(0, callback) or Mock()))
+            stack.enter_context(patch.object(key.rospy, "Subscriber", side_effect=subscriber))
             stack.enter_context(patch.object(key.rospy.Time, "now", return_value=rospy.Time.from_sec(42)))
             key.main()
             restore.assert_called_once()
@@ -380,11 +390,44 @@ class KeyboardTest(unittest.TestCase):
                 received, _ = self.run_keys([(character, .1)])
                 for ns in ("/hih1", "/hih2"):
                     self.assertEqual(len(received[f"{ns}/teleop_command/{command}"]), 1)
+                    self.assertEqual(received["/hih2/hih/admittance/release"], [])
                     self.assertTrue(all(not any(getattr(msg, field) for field in key.VELOCITY_FIELDS)
                                         for msg in received[f"{ns}/uav/nav"]))
                     for other in commands.values():
                         if other != command:
                             self.assertEqual(received[f"{ns}/teleop_command/{other}"], [])
+
+    def test_z_requests_follower_only_and_debounces_without_claiming_completion(self):
+        received,_=self.run_keys([("z",.05),("z",.1),("z",.8)],connected=("/hih2",))
+        self.assertEqual(len(received["/hih2/hih/admittance/release"]),1)
+        self.assertNotIn("/hih1/hih/admittance/release",received)
+        self.assertNotIn("unloading completed",self.output)
+        self.assertTrue(all(not messages for topic,messages in received.items() if "/teleop_command/" in topic))
+
+    def test_z_cancels_approach_and_blocks_motion_until_acknowledged_completion(self):
+        received,_=self.run_keys([("g",.05),(None,.1),("z",.1),("w",.1),("1",.1),
+            (None,.1),("w",.1)],statuses=[(10.4,"releasing"),(10.6,"released_hover")])
+        topic="/hih2/uav/nav"
+        self.assertTrue(all(not msg.target_vel_x for msg,stamp in zip(received[topic],self.received_times[topic]) if 10.25-1e-8<=stamp<10.6))
+        self.assertTrue(any(msg.target_vel_x==.1 for msg,stamp in zip(received[topic],self.received_times[topic]) if stamp>=10.6))
+        self.assertNotIn("trajectory 1 started",self.output)
+        self.assertIn("unloading completed",self.output)
+
+    def test_old_released_status_without_release_ack_does_not_unlock_motion(self):
+        received,_=self.run_keys([("z",.05),("w",.1),(None,.1)],statuses=[(10.1,"released_hover")])
+        self.assertFalse(any(msg.target_vel_x for msg in received["/hih2/uav/nav"]))
+        self.assertNotIn("unloading completed",self.output)
+
+    def test_z_missing_receiver_does_not_report_release_or_block_manual_keys(self):
+        received,_=self.run_keys([("z",.05),("i",.1)],connected=("/hih1",))
+        self.assertFalse(received["/hih2/hih/admittance/release"])
+        self.assertTrue(any(msg.target_vel_x==.1 for msg in received["/hih1/uav/nav"]))
+
+    def test_z_cancels_trajectory_and_preserves_land_command(self):
+        received,_=self.run_keys([("1",.05),(None,.1),("z",.1),(self.config["keys"]["common"]["land"],.1)])
+        self.assertEqual(len(received["/hih2/hih/admittance/release"]),1)
+        self.assertEqual(len(received["/hih2/teleop_command/land"]),1)
+        self.assertEqual(len(received["/hih1/teleop_command/land"]),1)
 
     def test_rejects_duplicate_mapping_and_bad_speed(self):
         for change in ("duplicate", "speed", "namespace", "approach_speed"):

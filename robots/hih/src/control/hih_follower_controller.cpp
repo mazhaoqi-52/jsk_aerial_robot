@@ -26,6 +26,7 @@ HihFollowerController::HihFollowerController()
 
 HihFollowerController::~HihFollowerController()
 {
+  release_sub_.shutdown();
   ready_.store(false);
   if (wrench_estimate_thread_.joinable())
   { wrench_estimate_thread_.interrupt(); wrench_estimate_thread_.join(); }
@@ -86,6 +87,22 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   settings.param("contact_loss_timeout", guard.loss_timeout, 0.2);
   settings.param("stale_fault_timeout", guard.stale_timeout, 0.5);
   contact_guard_.configure(guard);
+  hih_control::ForceReleaseParameters release;
+  ros::NodeHandle release_settings(settings,"release");
+  release_settings.param("force_rate",release.rate,release.rate);
+  release_settings.param("normal_tolerance",release.normal_tolerance,release.normal_tolerance);
+  release_settings.param("force_tolerance",release.force_tolerance,release.force_tolerance);
+  release_settings.param("torque_tolerance",release.torque_tolerance,release.torque_tolerance);
+  release_settings.param("speed_tolerance",release.speed_tolerance,release.speed_tolerance);
+  release_settings.param("omega_tolerance",release.omega_tolerance,release.omega_tolerance);
+  release_settings.param("command_speed_tolerance",release.command_speed_tolerance,release.command_speed_tolerance);
+  release_settings.param("command_omega_tolerance",release.command_omega_tolerance,release.command_omega_tolerance);
+  release_settings.param("settle_time",release.settle_time,release.settle_time);
+  release_settings.param("timeout",release.timeout,release.timeout);
+  release_settings.param("data_timeout",release.data_timeout,release.data_timeout);
+  release_settings.param("max_distance",release.max_distance,release.max_distance);
+  release_settings.param("max_yaw",release.max_yaw,release.max_yaw);
+  force_release_.configure(release);
   bool observer_enabled = false;
   nh.param("controller/wrench_estimate_flag", observer_enabled, false);
   if (enabled_ && !observer_enabled)
@@ -111,6 +128,8 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   measured_normal_pub_ = debug.advertise<std_msgs::Float64>("normal_force_measured", 1);
   fault_pub_ = debug.advertise<std_msgs::Bool>("fault", 1);
   reference_offset_pub_ = debug.advertise<geometry_msgs::Vector3Stamped>("reference_offset", 1);
+  release_sub_=debug.subscribe<std_msgs::Empty>("release",1,
+    [this](const std_msgs::EmptyConstPtr&) { release_requested_.store(true); });
   ready_.store(true);
   ROS_INFO("[HiH Follower] PID/MOB retained; world XYZ+yaw Admittance %s", enabled_ ? "ENABLED" : "DISABLED");
 }
@@ -168,6 +187,7 @@ void HihFollowerController::reset()
   HihController::reset();
   admittance_.reset();
   contact_guard_.reset(); have_held_target_=false;
+  force_release_.reset(); release_requested_.store(false); release_motion_valid_=false;
   cop_adjustment_.reset();
   admittance_applying_ = false;
   cop_flight_allowed_last_ = false;
@@ -191,6 +211,17 @@ bool HihFollowerController::update()
   // Unified control can bypass the reference modifier entirely. Clear stored
   // trim on mode exit even then, so it cannot reappear on later independent flight.
   const bool allowed = copFlightAllowed();
+  if (ready_.load())
+  {
+    const auto velocity=estimator_->getVel(Frame::COG,estimate_mode_);
+    const auto omega=estimator_->getAngularVel(Frame::COG,estimate_mode_);
+    release_motion_valid_=finiteVector(velocity) && finiteVector(omega);
+    release_speed_=velocity.length(); release_omega_=omega.length();
+  }
+  const int flight_state=navigator_->getNaviState();
+  if (flight_state==aerial_robot_navigation::LAND_STATE ||
+      flight_state==aerial_robot_navigation::STOP_STATE || flight_state==aerial_robot_navigation::ARM_OFF_STATE)
+  { force_release_.reset(); release_requested_.store(false); }
   if (!allowed && cop_flight_allowed_last_)
   {
     cop_adjustment_.reset(); admittance_.reset(); contact_guard_.reset();
@@ -205,6 +236,7 @@ void HihFollowerController::modifyTargetSnapshot(aerial_robot_navigation::BaseNa
   if (!ready_.load()) return;
   admittance_applying_ = false;
   modifyAdmittanceTarget(target);  // Existing outer-loop calculation is unchanged.
+  if (force_release_.phase()==hih_control::ForceRelease::HOVER) return;
   if (admittance_applying_) { held_target_=target; have_held_target_=true; }
 
   tf::Vector3 force, torque;
@@ -219,13 +251,25 @@ void HihFollowerController::modifyTargetSnapshot(aerial_robot_navigation::BaseNa
   // Add only CoP yaw/world-Z trim to the completed Admittance reference.
   // The inherited PID consumes this local snapshot; the navigator is never overwritten.
   cop_adjustment_.update(target, force, torque, stamp, valid,
-                         flight_allowed, admittance_applying_, ros::Time::now());
+                         flight_allowed, admittance_applying_ && !force_release_.pending() &&
+                           force_release_.phase()!=hih_control::ForceRelease::FAILED, ros::Time::now());
+  if (force_release_.phase()==hih_control::ForceRelease::READY)
+  {
+    // Transfer the FULL reference, including retained CoP trim. Preserve PID I:
+    // clearing it would change the actuator command despite an unchanged pose.
+    hih_nav_->adoptHoverReference(target);
+    target=hih_nav_->getTargetSnapshot();
+    admittance_.reset(); cop_adjustment_.reset(); contact_guard_.reset();
+    normal_force_reference_=0; contact_acquired_=false; have_held_target_=false;
+    force_release_.complete(); admittance_applying_=false;
+    ROS_INFO("[HiH Follower] released_hover: force and motion settled; force control stays off until reset");
+  }
 }
 
 void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::BaseNavigator::TargetSnapshot& target)
 {
   if (!ready_.load()) return;
-  const auto nominal = target;
+  auto nominal = target;
   const ros::Time now = ros::Time::now();
   const double dt = last_update_.isZero() ? 0.0 : (now - last_update_).toSec();
   last_update_ = now;
@@ -237,12 +281,22 @@ void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::Base
   else if (navigator_->getXyControlMode() != aerial_robot_navigation::POS_CONTROL_MODE) reason = "not_position_mode";
   if (!reason.empty())
   {
+    release_requested_.store(false);
+    if (navigator_->getNaviState()==aerial_robot_navigation::LAND_STATE ||
+        navigator_->getNaviState()==aerial_robot_navigation::STOP_STATE ||
+        navigator_->getNaviState()==aerial_robot_navigation::ARM_OFF_STATE) force_release_.reset();
+    else if (force_release_.pending()) force_release_.fail("release_flight_mode_changed_hold");
     admittance_.reset();
     contact_guard_.reset(); have_held_target_=false;
     contact_acquired_ = false;
     normal_force_reference_ = 0.0;
     publishDebug(nominal, target, reason, false, now);
     return;
+  }
+  if (force_release_.phase()==hih_control::ForceRelease::HOVER)
+  {
+    release_requested_.store(false);
+    publishDebug(nominal,target,"released_hover",false,now); return;
   }
 
   hih_control::Vector4 wrench{{0, 0, 0, 0}};
@@ -258,27 +312,68 @@ void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::Base
   }
   const double age = (now - sample_stamp).toSec();
   fresh = fresh && std::isfinite(age) && age >= 0 && age <= sample_timeout_;
-  const bool acquired_before=contact_guard_.acquired();
-  const auto guard_state=contact_guard_.step(now.toSec(),
-    std::isfinite(dt) && dt>0 && dt<=max_dt_, fresh, -normal_contact_.dot(force_contact));
-  if (guard_state!=hih_control::ContactGuard::ACTIVE)
+  const double normal_force=-normal_contact_.dot(force_contact);
+  if (release_requested_.exchange(false) && force_release_.phase()==hih_control::ForceRelease::OFF)
   {
-    admittance_.hold();
-    if (guard_state!=hih_control::ContactGuard::WAITING) holdAdmittanceTarget(target);
-    publishDebug(nominal,target,contact_guard_.status(),false,now);
-    return;
+    if (contact_guard_.state()==hih_control::ContactGuard::FAULT)
+      force_release_.fail("release_blocked_by_fault_hold");
+    else if (!fresh || !std::isfinite(normal_force)) force_release_.fail("release_invalid_data_hold");
+    else
+    {
+      force_release_.request(now.toSec(),normal_force_reference_,normal_force);
+      release_nominal_=target;
+      release_start_=have_held_target_ ? held_target_ : target;
+      cop_adjustment_.applyReference(release_start_);
+      admittance_.hold(true); // Clear old inward input while preserving the reference.
+      ROS_INFO("[HiH Follower] releasing: keep contact until released_hover");
+    }
   }
-  if (!acquired_before)
-    normal_force_reference_=std::clamp(-normal_contact_.dot(force_contact),0.0,normal_force_desired_);
-  contact_acquired_=true;
-  normal_force_reference_ += std::clamp(normal_force_desired_ - normal_force_reference_,
-                                      -normal_force_rate_ * dt, normal_force_rate_ * dt);
+  const bool releasing=force_release_.pending();
+  if (releasing)
+  {
+    nominal=release_nominal_; // Freeze the task pose; only force unloading may move the reference.
+    navigator_->setTargetZeroVel(); navigator_->setTargetZeroAcc();
+    navigator_->setTargetZeroOmega(); navigator_->setTargetZeroAngAcc();
+    nominal.vel.setZero(); nominal.acc.setZero(); nominal.omega.setZero(); nominal.ang_acc.setZero();
+    target=nominal;
+    if (!force_release_.advance(now.toSec(),dt,fresh,normal_force,normal_force_max_,max_dt_))
+    {
+      admittance_.hold(); holdAdmittanceTarget(target);
+      if (force_release_.phase()==hih_control::ForceRelease::FAILED) contact_guard_.fault(force_release_.status());
+      publishDebug(nominal,target,force_release_.status(),false,now); return;
+    }
+    normal_force_reference_=force_release_.reference();
+  }
+  if (force_release_.phase()==hih_control::ForceRelease::FAILED)
+  {
+    contact_guard_.fault(force_release_.status()); admittance_.hold(); holdAdmittanceTarget(target);
+    publishDebug(nominal,target,force_release_.status(),false,now); return;
+  }
+  if (!releasing)
+  {
+    const bool acquired_before=contact_guard_.acquired();
+    const auto guard_state=contact_guard_.step(now.toSec(),
+      std::isfinite(dt) && dt>0 && dt<=max_dt_, fresh, -normal_contact_.dot(force_contact));
+    if (guard_state!=hih_control::ContactGuard::ACTIVE)
+    {
+      admittance_.hold();
+      if (guard_state!=hih_control::ContactGuard::WAITING) holdAdmittanceTarget(target);
+      publishDebug(nominal,target,contact_guard_.status(),false,now);
+      return;
+    }
+    if (!acquired_before)
+      normal_force_reference_=std::clamp(-normal_contact_.dot(force_contact),0.0,normal_force_desired_);
+    contact_acquired_=true;
+    normal_force_reference_ += std::clamp(normal_force_desired_ - normal_force_reference_,
+                                        -normal_force_rate_ * dt, normal_force_rate_ * dt);
+  }
   // Desired environmental reaction is -F_normal*n; tangential targets are zero.
   wrench = hih_control::contactWrenchErrorWorld(
     {force_contact, torque_contact}, contact_to_world, normal_contact_, normal_force_reference_);
   if (!admittance_.step(wrench, dt))
   {
     contact_guard_.fault("admittance_travel_or_input_limit_hold");
+    if (releasing) force_release_.fail("release_admittance_limit_hold");
     admittance_.hold(); holdAdmittanceTarget(target);
     publishDebug(nominal, target, contact_guard_.status(), false, now);
     return;
@@ -304,8 +399,21 @@ void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::Base
       command_omega_world.cross(command_rot * contact_offset);
   }
   // Moving reference is internal; keyboard/navigation targets remain independent.
+  if (releasing)
+  {
+    auto full_target=target; cop_adjustment_.applyReference(full_target);
+    force_release_.observe(now.toSec(),normal_force,force_contact.length(),torque_contact.length(),
+      release_motion_valid_,release_speed_,release_omega_,full_target.vel.length(),full_target.omega.length(),
+      (full_target.pos-release_start_.pos).length(),
+      angles::shortest_angular_distance(release_start_.rpy.z(),full_target.rpy.z()));
+    if (force_release_.phase()==hih_control::ForceRelease::FAILED)
+    {
+      contact_guard_.fault(force_release_.status()); admittance_.hold(); holdAdmittanceTarget(target);
+      publishDebug(nominal,target,force_release_.status(),false,now); return;
+    }
+  }
   admittance_applying_ = true;
-  publishDebug(nominal, target, fresh ? "active" : "stale_input_frozen", true, now);
+  publishDebug(nominal,target,releasing ? force_release_.status() : "active",true,now);
 }
 
 void HihFollowerController::holdAdmittanceTarget(

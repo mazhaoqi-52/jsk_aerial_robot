@@ -2,6 +2,8 @@
 #include <hih/control/hih_controller.h>
 #include <hih/control/hih_admittance.h>
 #include <hih/control/hih_contact_guard.h>
+#include <hih/control/hih_force_release.h>
+#include <std_msgs/Empty.h>
 #include <hih/control/hih_cop_adjustment.h>
 #include <aerial_robot_control/control/base/target_reference_modifier.h>
 #include <geometry_msgs/PointStamped.h>
@@ -39,6 +41,13 @@ private:
                     const std::string& status, bool applying, const ros::Time& now);
   hih_control::Admittance4D admittance_;
   hih_control::ContactGuard contact_guard_;
+  hih_control::ForceRelease force_release_;
+  std::atomic<bool> release_requested_{false};
+  ros::Subscriber release_sub_;
+  aerial_robot_navigation::BaseNavigator::TargetSnapshot release_start_;
+  aerial_robot_navigation::BaseNavigator::TargetSnapshot release_nominal_;
+  double release_speed_=0, release_omega_=0;
+  bool release_motion_valid_=false;
   aerial_robot_navigation::BaseNavigator::TargetSnapshot held_target_;
   bool have_held_target_ = false;
   hih_control::HihCopAdjustment cop_adjustment_;

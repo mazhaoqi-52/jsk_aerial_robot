@@ -126,8 +126,8 @@ follower:
       max_dt: 0.1
       moving_reference: true
       max_travel: [1.0, 1.0, 0.5, 2.0] # contact-reference travel [m,m,m,rad]; fault HOLD at limit
-      contact_release: 0.4           # N; immediately pause below this force
-      contact_loss_timeout: 0.2      # s; latch contact-loss HOLD
+      contact_release: 0.1           # N; immediately pause below this force
+      contact_loss_timeout: 1.0      # s; latch contact-loss HOLD
       stale_fault_timeout: 0.5       # s after first stale sample; latch MOB-timeout HOLD
       normal_contact:
       - -1.0
@@ -136,7 +136,21 @@ follower:
       normal_force_desired: 10.0
       normal_force_max: 20.0          # N; measured |Fn| >= limit latches HOLD
       normal_force_rate: 1.0
-      contact_threshold: 0.8
+      contact_threshold: 0.2
+      release:                      # z key: decrease force, verify unloading, adopt hover reference
+        force_rate: 1.0             # N/s; reference never exceeds measured compression during release
+        normal_tolerance: 0.3        # N
+        force_tolerance: 0.5         # N, full contact force norm
+        torque_tolerance: 0.1        # Nm, full contact torque norm
+        speed_tolerance: 0.05        # m/s, estimated flight speed
+        omega_tolerance: 0.05        # rad/s, estimated body angular speed
+        command_speed_tolerance: 0.005 # m/s, shaped command speed
+        command_omega_tolerance: 0.01  # rad/s, shaped command angular speed
+        settle_time: 1.0            # s continuously meeting all completion conditions
+        timeout: 30.0               # s; failure HOLD, never report success on timeout
+        data_timeout: 0.5           # s of stale/invalid data or control interval
+        max_distance: 0.15          # m, max command displacement from z request
+        max_yaw: 0.15               # rad, max yaw change during release
       mass:
       - 1.2
       - 1.6

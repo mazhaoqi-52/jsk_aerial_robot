@@ -15,7 +15,7 @@ import rospkg
 import rospy
 import yaml
 from aerial_robot_msgs.msg import FlightNav
-from std_msgs.msg import Empty, Bool
+from std_msgs.msg import Empty, Bool, String
 
 ROBOTS = ("follower", "leader")
 VELOCITY_FIELDS = ("target_vel_x", "target_vel_y", "target_vel_z", "target_omega_z")
@@ -59,7 +59,7 @@ def load_config(path):
         raise ValueError("stop_repeats must be 1..10")
     if not config["common_targets"] or any(r not in ROBOTS for r in config["common_targets"]):
         raise ValueError("common_targets must contain leader and/or follower")
-    if set(config["keys"]["common"]) != set(COMMANDS) | {"stop_motion", "approach"}:
+    if set(config["keys"]["common"]) != set(COMMANDS) | {"stop_motion", "approach", "release_force"}:
         raise ValueError("Check common command names in keys/common")
     if any(set(config["keys"][role]) != set(MOVEMENTS) for role in ROBOTS):
         raise ValueError("Check movement names in keys/leader and keys/follower")
@@ -115,6 +115,7 @@ def print_help(config):
 {common['halt']}:  halt (force stop motor)
 {stop_key}:  hold in current position
 {common['approach']}:  approach ON/OFF (both robots: local -X, {config['approach_speed']:g} m/s)
+{common['release_force']}:  release Follower force; keep contact until released_hover
 
 1:  Leader trajectory: -X -> +Z -> +X -> -Z
 2:  Leader trajectory: +yaw -> +Y -> -yaw -> +X
@@ -255,11 +256,15 @@ def main():
     follower_nav_pub = None if args.dry_run else rospy.Publisher(follower_ns + "/uav/nav", FlightNav, queue_size=1)
     leader_nav_pub = None if args.dry_run else rospy.Publisher(leader_ns + "/uav/nav", FlightNav, queue_size=1)
     nav_pubs = {"follower": follower_nav_pub, "leader": leader_nav_pub}
-    fault = {"follower": False}
+    release_pub = MultiPublisher([follower_ns + "/hih/admittance/release"], args.dry_run)
+    fault = {"follower": False, "status": ""}
     fault_sub = None
+    status_sub = None
     if not args.dry_run:
         fault_sub = rospy.Subscriber(follower_ns + "/hih/admittance/fault", Bool,
             lambda msg: fault.update(follower=msg.data), queue_size=1)
+        status_sub = rospy.Subscriber(follower_ns + "/hih/admittance/status", String,
+            lambda msg: fault.update(status=msg.data), queue_size=1)
     common = config["keys"]["common"]
     follower = config["keys"]["follower"]
     leader = config["keys"]["leader"]
@@ -278,6 +283,8 @@ def main():
     trajectory = None
     approach = False
     fault_seen = False
+    release_pending = False
+    release_acknowledged = False
     trajectory_start = 0.0
     last_command, last_printed = {}, {}
     input_state = {"escape": "", "paste": False}
@@ -297,6 +304,11 @@ def main():
                 break
             # g toggles slow local -X motion for both robots.
             flight_keys = [common[action] for action in COMMANDS]
+            if release_pending and fault["status"] in ("releasing","release_handoff_pending"):
+                release_acknowledged=True
+            if release_pending and release_acknowledged and fault["status"] == "released_hover":
+                release_pending=False
+                rospy.loginfo("Follower released_hover: unloading completed; force control remains off")
             if fault["follower"]:
                 if not fault_seen:
                     approach=False; trajectory=None
@@ -307,6 +319,23 @@ def main():
                     key=None  # Flight/landing commands remain available.
             else:
                 fault_seen=False
+            if release_pending and (key in (common["approach"], "1", "2") or
+                                    key in leader.values() or key in follower.values()):
+                key=None
+            if key == common["release_force"]:
+                gap=now-last_command.get(key,-math.inf)
+                last_command[key]=now
+                if gap >= config["command_repeat_gap"] and not release_pending:
+                    approach=False; trajectory=None
+                    stop_motion(ROBOTS,motion,expires,stops,config)
+                    if not args.dry_run and fault["status"]=="released_hover":
+                        rospy.loginfo("Follower force control is already released")
+                    elif args.dry_run or release_pub.publishers[0].get_num_connections()>0:
+                        release_pub.publish(Empty()); release_pending=True; release_acknowledged=False
+                        if not args.dry_run:
+                            rospy.loginfo("Follower release requested; KEEP CONTACT until released_hover")
+                    else:
+                        rospy.logwarn("No Follower release receiver; check that the updated controller is running")
             if key == common["approach"]:
                 gap = now - last_command.get(key, -math.inf)
                 last_command[key] = now
@@ -358,6 +387,7 @@ def main():
                 gap = now - last_command.get(key, -math.inf)
                 last_command[key] = now
                 if gap >= config["command_repeat_gap"]:
+                    if key in (common["land"],common["force_landing"],common["halt"]): release_pending=False
                     stop_motion(config["common_targets"], motion, expires, stops, config)
                     if key == common["arm"]:
                         start_pub.publish(Empty())

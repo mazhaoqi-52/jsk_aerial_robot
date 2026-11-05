@@ -51,7 +51,8 @@ keys:
     '+yaw': u
     '-yaw': o
 
-# Rear-contact paths: original XY displacements rotated 180 deg about world Z.
+# Paths 1/2: original XY displacements rotated 180 deg about world Z.
+# Path 3: WORLD XY rectangle, holding the existing Z and yaw references.
 # Leader-only, WORLD frame, one execution per trigger (no automatic repetition).
 # period is the total time for all four segments; each segment takes period/4.
 # displacement is the distance of EACH translation segment, not the whole path.
@@ -65,3 +66,6 @@ trajectories:
     period: 120.0
     displacement: 0.20           # m per translation segment
     yaw_displacement_deg: 90.0   # degrees per yaw segment; net yaw change is zero
+  "3":  # +X -> +Y -> -X -> -Y (closed 0.20 m x 0.20 m rectangle)
+    period: 40.0                 # s, total four-segment duration
+    displacement: 0.20           # m per translation segment

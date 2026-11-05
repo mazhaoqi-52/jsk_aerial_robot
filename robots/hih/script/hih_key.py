@@ -18,6 +18,7 @@ from aerial_robot_msgs.msg import FlightNav
 from std_msgs.msg import Empty, Bool, String
 
 ROBOTS = ("follower", "leader")
+TRAJECTORY_KEYS = ("1", "2", "3")
 VELOCITY_FIELDS = ("target_vel_x", "target_vel_y", "target_vel_z", "target_omega_z")
 COMMANDS = {"arm": "start", "takeoff": "takeoff", "land": "land",
             "force_landing": "force_landing", "halt": "halt"}
@@ -64,7 +65,7 @@ def load_config(path):
     if any(set(config["keys"][role]) != set(MOVEMENTS) for role in ROBOTS):
         raise ValueError("Check movement names in keys/leader and keys/follower")
     # Four equal-duration segments, executed once in WORLD_FRAME.
-    for number in ("1", "2"):
+    for number in TRAJECTORY_KEYS:
         trajectory = config["trajectories"][number]
         names = ("period", "displacement") + (("yaw_displacement_deg",) if number == "2" else ())
         for name in names:
@@ -77,7 +78,7 @@ def load_config(path):
             raise ValueError("Trajectory 2 exceeds trajectory_max_yaw_rate; increase period")
         if trajectory["period"] < 40 / config["publish_rate"]:
             raise ValueError("A trajectory needs at least 10 publish ticks per segment")
-    all_keys = ["1", "2"]  # Reserved trajectory trigger keys.
+    all_keys = list(TRAJECTORY_KEYS)  # Reserved trajectory trigger keys.
     for group in ("common",) + ROBOTS:
         for action, key in config["keys"][group].items():
             key = " " if key == "SPACE" else key
@@ -119,6 +120,7 @@ def print_help(config):
 
 1:  Leader trajectory: -X -> +Z -> +X -> -Z
 2:  Leader trajectory: +yaw -> +Y -> -yaw -> +X
+3:  Leader trajectory: +X -> +Y -> -X -> -Y (XY rectangle; Z/yaw held)
 
 ======= Follower =======|======== Leader ========
 {follower['+yaw']:^6}{follower['+X']:^6}{follower['-yaw']:^6}{follower['+Z']:^6}|{leader['+yaw']:^6}{leader['+X']:^6}{leader['-yaw']:^6}{leader['+Z']:^6}
@@ -158,7 +160,8 @@ def get_key(fd, timeout, input_state):
 def trajectory_velocity(number, elapsed, settings):
     """Smooth velocity for one four-segment path; None means finished.
 
-    Rear-contact paths: rotate the original path 180 degrees about world Z.
+    Paths 1/2 rotate the original path 180 degrees about world Z; path 3 is XY-only.
+    Velocities extend the navigator's existing reference; no absolute origin is commanded.
     Each segment moves by displacement (m), or yaw_displacement_deg (deg).
     Position follows 10*s^3 - 15*s^4 + 6*s^5: zero endpoint velocity/acceleration.
     """
@@ -180,6 +183,11 @@ def trajectory_velocity(number, elapsed, settings):
         if segment == 1: return (0.0, velocity, 0.0, 0.0)
         if segment == 2: return (0.0, 0.0, 0.0, -yaw_rate)
         if segment == 3: return (velocity, 0.0, 0.0, 0.0)
+    if number == "3":
+        if segment == 0: return (velocity, 0.0, 0.0, 0.0)
+        if segment == 1: return (0.0, velocity, 0.0, 0.0)
+        if segment == 2: return (-velocity, 0.0, 0.0, 0.0)
+        if segment == 3: return (0.0, -velocity, 0.0, 0.0)
     raise ValueError("Unknown trajectory number")
 
 
@@ -315,11 +323,11 @@ def main():
                     stop_motion(ROBOTS, motion, expires, stops, config)
                     rospy.logerr("Follower contact fault: motion stopped; land/reset before retry")
                 fault_seen=True
-                if key in (common["approach"], "1", "2") or key in leader.values() or key in follower.values():
+                if key == common["approach"] or key in TRAJECTORY_KEYS or key in leader.values() or key in follower.values():
                     key=None  # Flight/landing commands remain available.
             else:
                 fault_seen=False
-            if release_pending and (key in (common["approach"], "1", "2") or
+            if release_pending and (key == common["approach"] or key in TRAJECTORY_KEYS or
                                     key in leader.values() or key in follower.values()):
                 key=None
             if key == common["release_force"]:
@@ -349,7 +357,7 @@ def main():
                     else:
                         rospy.loginfo(text)
             elif approach and (key == common["stop_motion"] or key in flight_keys or
-                               key in leader.values() or key in follower.values() or key in ("1", "2")):
+                               key in leader.values() or key in follower.values() or key in TRAJECTORY_KEYS):
                 approach = False
                 stop_motion(ROBOTS, motion, expires, stops, config)
 
@@ -363,7 +371,7 @@ def main():
                 else:
                     rospy.loginfo("Leader trajectory cancelled")
 
-            if key in ("1", "2"):
+            if key in TRAJECTORY_KEYS:
                 gap = now - last_command.get(key, -math.inf)
                 last_command[key] = now
                 if key != trajectory and gap >= config["command_repeat_gap"]:

@@ -182,10 +182,12 @@ class KeyboardTest(unittest.TestCase):
         import math
         first = self.config["trajectories"]["1"]["displacement"]
         second = self.config["trajectories"]["2"]["displacement"]
+        third = self.config["trajectories"]["3"]["displacement"]
         yaw = math.radians(self.config["trajectories"]["2"]["yaw_displacement_deg"])
         expected = {
             "1": [(0, -first), (2, first), (0, first), (2, -first)],
-            "2": [(3, yaw), (1, second), (3, -yaw), (0, second)]}
+            "2": [(3, yaw), (1, second), (3, -yaw), (0, second)],
+            "3": [(0, third), (1, third), (0, -third), (1, -third)]}
         for number, segments in expected.items():
             params = self.config["trajectories"][number]
             duration = params["period"] / 4
@@ -218,13 +220,48 @@ class KeyboardTest(unittest.TestCase):
     def test_trajectory_world_frame_and_leader_only(self):
         config = __import__("copy").deepcopy(self.config)
         config["frame"] = "local"
-        received, _ = self.run_keys([("1", .05), (None, .25), (None, .25)], config=config)
-        moving = [msg for msg in received["/hih1/uav/nav"] if msg.target_vel_x]
-        self.assertTrue(moving)
-        self.assertTrue(all(msg.control_frame == FlightNav.WORLD_FRAME for msg in moving))
+        for number in ("1", "3"):
+            with self.subTest(number=number):
+                received, _ = self.run_keys([(number, .05), (None, .25), (None, .25)], config=config)
+                moving = [msg for msg in received["/hih1/uav/nav"] if msg.target_vel_x]
+                self.assertTrue(moving)
+                self.assertTrue(all(msg.control_frame == FlightNav.WORLD_FRAME for msg in moving))
+                self.assertTrue(all(not any(getattr(msg, f) for f in key.VELOCITY_FIELDS)
+                                    for msg in received["/hih2/uav/nav"]))
+                self.assertEqual(received["/hih1/uav/nav"][-1].control_frame, FlightNav.LOCAL_FRAME)
+
+    def test_xy_rectangle_executes_once_without_z_yaw_or_absolute_position_commands(self):
+        config = __import__("copy").deepcopy(self.config)
+        config["trajectories"]["3"]["period"] = 4.0
+        received, _ = self.run_keys([("3", .05)] + [(None, .05)] * 100, config=config)
+        messages = received["/hih1/uav/nav"]
+        for field in ("target_vel_x", "target_vel_y"):
+            self.assertTrue(any(getattr(msg, field) > 0 for msg in messages))
+            self.assertTrue(any(getattr(msg, field) < 0 for msg in messages))
+        for msg in messages:
+            self.assertEqual((msg.target_vel_z, msg.target_omega_z), (0, 0))
+            self.assertEqual((msg.pos_xy_nav_mode, msg.pos_z_nav_mode, msg.yaw_nav_mode),
+                             (FlightNav.VEL_MODE,) * 3)
+        self.assertEqual(self.output.count("Leader trajectory 3 started"), 1)
+        self.assertEqual(self.output.count("Leader trajectory finished"), 1)
+        for msg, stamp in zip(messages, self.received_times["/hih1/uav/nav"]):
+            if stamp >= 14.1:
+                self.assertFalse(any(getattr(msg, f) for f in key.VELOCITY_FIELDS))
         self.assertTrue(all(not any(getattr(msg, f) for f in key.VELOCITY_FIELDS)
                             for msg in received["/hih2/uav/nav"]))
-        self.assertEqual(received["/hih1/uav/nav"][-1].control_frame, FlightNav.LOCAL_FRAME)
+
+    def test_space_cancels_xy_rectangle_and_three_replaces_approach(self):
+        received, _ = self.run_keys([("g", .05), (None, .1), ("3", .1), (None, .1),
+                                     (" ", .1), (None, .1)])
+        messages = received["/hih1/uav/nav"]
+        self.assertTrue(any(msg.target_vel_x > 0 and msg.control_frame == FlightNav.WORLD_FRAME
+                            for msg in messages))
+        for ns in ("/hih1", "/hih2"):
+            topic = ns + "/uav/nav"
+            self.assertTrue(all(not any(getattr(msg, f) for f in key.VELOCITY_FIELDS)
+                                for msg, stamp in zip(received[topic], self.received_times[topic])
+                                if stamp >= 10.45 - 1e-8))
+        self.assertIn("cancelled", self.output)
 
     def test_follower_input_does_not_cancel_leader_trajectory(self):
         received, _ = self.run_keys([("1", .05), ("w", .25), (None, .1)])
@@ -278,13 +315,14 @@ class KeyboardTest(unittest.TestCase):
 
     def test_rejects_invalid_trajectory_config_and_reserved_keys(self):
         import copy
-        for change in ("zero_period", "nan_displacement", "bad_yaw", "too_fast", "reserved_key"):
+        for change in ("zero_period", "nan_displacement", "bad_yaw", "too_fast", "reserved_key", "reserved_three"):
             config = yaml.safe_load((ROOT / "config/hih_key.yaml").read_text())
             if change == "zero_period": config["trajectories"]["1"]["period"] = 0
             if change == "nan_displacement": config["trajectories"]["1"]["displacement"] = float("nan")
             if change == "bad_yaw": config["trajectories"]["2"]["yaw_displacement_deg"] = -1
             if change == "too_fast": config["trajectories"]["1"]["period"] = .01
             if change == "reserved_key": config["keys"]["leader"]["+X"] = "1"
+            if change == "reserved_three": config["keys"]["leader"]["+X"] = "3"
             with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as stream:
                 yaml.safe_dump(config, stream); stream.flush()
                 with self.subTest(change=change), self.assertRaises(ValueError): key.load_config(stream.name)
@@ -360,7 +398,7 @@ class KeyboardTest(unittest.TestCase):
             self.assertEqual(len(received[ns+"/teleop_command/land"]),1)
 
     def test_follower_fault_stops_trajectory_and_blocks_motion_but_allows_halt(self):
-        received,_=self.run_keys([("1",.05),(None,.1),(None,.1),("2",.8),("i",.1),(self.config["keys"]["common"]["halt"],.1)],fault_at=10.2)
+        received,_=self.run_keys([("3",.05),(None,.1),(None,.1),("3",.8),("i",.1),(self.config["keys"]["common"]["halt"],.1)],fault_at=10.2)
         self.assertEqual(self.output.count("started"),1)
         for ns in ("/hih1","/hih2"):
             topic=ns+"/uav/nav"
@@ -376,7 +414,7 @@ class KeyboardTest(unittest.TestCase):
 
     def test_rejects_trajectory_peak_speed_above_experiment_limits(self):
         import copy
-        for number in ("1","2"):
+        for number in key.TRAJECTORY_KEYS:
             config=copy.deepcopy(self.config); config["trajectories"][number]["period"]=20
             with tempfile.NamedTemporaryFile(mode="w",suffix=".yaml") as stream:
                 yaml.safe_dump(config,stream);stream.flush()
@@ -405,12 +443,12 @@ class KeyboardTest(unittest.TestCase):
         self.assertTrue(all(not messages for topic,messages in received.items() if "/teleop_command/" in topic))
 
     def test_z_cancels_approach_and_blocks_motion_until_acknowledged_completion(self):
-        received,_=self.run_keys([("g",.05),(None,.1),("z",.1),("w",.1),("1",.1),
+        received,_=self.run_keys([("g",.05),(None,.1),("z",.1),("w",.1),("3",.1),
             (None,.1),("w",.1)],statuses=[(10.4,"releasing"),(10.6,"released_hover")])
         topic="/hih2/uav/nav"
         self.assertTrue(all(not msg.target_vel_x for msg,stamp in zip(received[topic],self.received_times[topic]) if 10.25-1e-8<=stamp<10.6))
         self.assertTrue(any(msg.target_vel_x==.1 for msg,stamp in zip(received[topic],self.received_times[topic]) if stamp>=10.6))
-        self.assertNotIn("trajectory 1 started",self.output)
+        self.assertNotIn("trajectory 3 started",self.output)
         self.assertIn("unloading completed",self.output)
 
     def test_old_released_status_without_release_ack_does_not_unlock_motion(self):

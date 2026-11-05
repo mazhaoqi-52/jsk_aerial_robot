@@ -136,7 +136,7 @@ follower:
       normal_force_desired: 10.0
       normal_force_max: 20.0          # N; measured |Fn| >= limit latches HOLD
       normal_force_rate: 1.0
-      contact_threshold: 0.2
+      contact_threshold: 3.0
       release:                      # z key: decrease force, verify unloading, adopt hover reference
         force_rate: 1.0             # N/s; reference never exceeds measured compression during release
         normal_tolerance: 0.3        # N

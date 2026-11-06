@@ -266,7 +266,7 @@ void HihNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & msg
             }
           case LOCAL_FRAME:
             {
-              double yaw_angle = estimator_->getState(Frame::COG, estimate_mode_).z();
+              double yaw_angle = estimator_->getEuler(Frame::COG, estimate_mode_).z();
               tf::Vector3 target_vel = frameConversion(tf::Vector3(msg->target_vel_x, msg->target_vel_y, 0), yaw_angle);
               setTargetVelX(target_vel.x());
               setTargetVelY(target_vel.y());
@@ -327,7 +327,7 @@ void HihNavigator::naviCallback(const aerial_robot_msgs::FlightNavConstPtr & msg
             }
           case LOCAL_FRAME:
             {
-              double yaw_angle = estimator_->getState(Frame::COG, estimate_mode_).z();
+              double yaw_angle = estimator_->getEuler(Frame::COG, estimate_mode_).z();
               tf::Vector3 target_acc = frameConversion(tf::Vector3(msg->target_acc_x, msg->target_acc_y, 0), yaw_angle);
               setTargetAccX(target_acc.x());
               setTargetAccY(target_acc.y());
@@ -543,7 +543,7 @@ void HihNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavConstPt
           break;
         case LOCAL_FRAME:
           {
-            double yaw_angle = estimator_->getState(Frame::COG, estimate_mode_).z();
+            double yaw_angle = estimator_->getEuler(Frame::COG, estimate_mode_).z();
             tf::Vector3 target_vel = frameConversion(
                 tf::Vector3(msg->target_vel_x, msg->target_vel_y, 0), yaw_angle);
             setTargetVelX(target_vel.x());
@@ -719,7 +719,7 @@ void HihNavigator::assemblyNavCallback(const aerial_robot_msgs::FlightNavConstPt
             }
           case LOCAL_FRAME:
             {
-              double yaw_angle = estimator_->getState(Frame::COG, estimate_mode_).z();
+              double yaw_angle = estimator_->getEuler(Frame::COG, estimate_mode_).z();
               tf::Vector3 target_vel = frameConversion(tf::Vector3(msg->target_vel_x, msg->target_vel_y, 0), yaw_angle);
               setTargetVelX(target_vel.x());
               setTargetVelY(target_vel.y());
@@ -1077,6 +1077,18 @@ void HihNavigator::convertTargetPosFromCoG2CoM()
   // the formation-level position reference.
   const bool unified_control_mode = getUnifiedControlMode();
   if (unified_control_mode) return;
+
+  // Independent HiH robots have identical CoG/CoM task frames. Keep the
+  // navigator's integrated reference exactly: the legacy millimetre comparison
+  // below otherwise discards slow velocity steps (0.02 m/s at 40 Hz = 0.5 mm).
+  if (!getCurrentAssembled())
+  {
+    std::lock_guard<std::recursive_mutex> target_lock(target_mutex_);
+    target_pos_candidate_ = getTargetPos();
+    pre_target_pos_ = target_pos_candidate_;
+    pre_assembled_ = false;
+    return;
+  }
 
   //TODO: considering correct rotaion axis
 

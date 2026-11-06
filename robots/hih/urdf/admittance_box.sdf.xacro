@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<sdf version="1.6" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="size_x" default="0.2" />
+  <xacro:arg name="size_y" default="0.5" />
+  <xacro:arg name="size_z" default="1.0" />
+  <xacro:arg name="mass" default="0.5" />
+  <xacro:arg name="static" default="false" />
+  <xacro:arg name="contact_friction" default="1.0" />
+  <xacro:arg name="ground_friction" default="0.1" />
+  <xacro:property name="sx" value="$(arg size_x)" />
+  <xacro:property name="sy" value="$(arg size_y)" />
+  <xacro:property name="sz" value="$(arg size_z)" />
+  <xacro:property name="m" value="$(arg mass)" />
+  <xacro:property name="sole" value="0.01" />
+  <xacro:macro name="surface" params="mu">
+    <surface>
+      <friction><ode><mu>${mu}</mu><mu2>${mu}</mu2></ode></friction>
+      <contact><ode><kp>100000</kp><kd>100</kd><max_vel>0.05</max_vel><min_depth>0.0005</min_depth></ode></contact>
+    </surface>
+  </xacro:macro>
+  <model name="hih_box">
+    <static>$(arg static)</static>
+    <link name="box_link">
+      <inertial>
+        <mass>${m}</mass>
+        <inertia><ixx>${m*(sy*sy+sz*sz)/12}</ixx><iyy>${m*(sx*sx+sz*sz)/12}</iyy>
+          <izz>${m*(sx*sx+sy*sy)/12}</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+      </inertial>
+      <visual name="box_visual">
+        <geometry><box><size>${sx} ${sy} ${sz}</size></box></geometry>
+        <material><ambient>0.95 0.5 0.12 1</ambient><diffuse>0.95 0.5 0.12 1</diffuse></material>
+      </visual>
+      <!-- Low-friction sole slides on the floor; gripping faces have independent friction. -->
+      <collision name="body_collision">
+        <pose>0 0 ${sole/2} 0 0 0</pose>
+        <geometry><box><size>${sx} ${sy} ${sz-sole}</size></box></geometry>
+        <xacro:surface mu="$(arg contact_friction)" />
+      </collision>
+      <collision name="sole_collision">
+        <pose>0 0 ${-sz/2+sole/2} 0 0 0</pose>
+        <geometry><box><size>${sx} ${sy} ${sole}</size></box></geometry>
+        <xacro:surface mu="$(arg ground_friction)" />
+      </collision>
+      <sensor name="box_contacts" type="contact">
+        <always_on>true</always_on><update_rate>100</update_rate>
+        <contact><collision>body_collision</collision></contact>
+        <plugin name="box_bumper" filename="libgazebo_ros_bumper.so">
+          <robotNamespace>/hih_box</robotNamespace>
+          <bumperTopicName>/hih_box/contacts</bumperTopicName><frameName>world</frameName>
+        </plugin>
+      </sensor>
+    </link>
+  </model>
+</sdf>

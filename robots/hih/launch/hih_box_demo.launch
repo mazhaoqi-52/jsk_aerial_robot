@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Scene only by default: keyboard must explicitly request flight. -->
+  <arg name="headless" default="false" />
+  <arg name="robot_spacing" default="1.0" />
+  <arg name="takeoff_height" default="0.8" />
+  <arg name="box_size_x" default="0.2" />
+  <arg name="box_size_y" default="0.5" />
+  <arg name="box_size_z" default="1.0" />
+  <arg name="box_mass" default="0.5" />
+  <arg name="box_spawn_z" value="$(eval float(arg('box_size_z'))/2+0.001)" />
+  <arg name="box_static" default="false" />
+  <arg name="box_contact_friction" default="1.0" />
+  <arg name="box_ground_friction" default="0.1" />
+  <!-- Scene-specific starting values for the free 0.5 kg box; real YAML is unchanged. -->
+  <arg name="normal_force_desired" default="3.0" />
+  <arg name="contact_threshold" default="1.0" />
+  <arg name="release_max_distance" default="0.15" />
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find aerial_robot_simulation)/gazebo_model/world/empty_swarm.world" />
+    <arg name="gui" value="$(eval not arg('headless'))" />
+    <arg name="use_sim_time" value="true" />
+    <arg name="paused" value="false" />
+  </include>
+
+  <!-- Rear contact plate is at body -X. These two plates face the box. -->
+  <include file="$(find hih)/launch/bringup.launch">
+    <arg name="simulation" value="true" /><arg name="real_machine" value="false" />
+    <arg name="robot_id" value="1" /><arg name="battery" value="false" />
+    <arg name="hih_model" value="hih" /><arg name="headless" value="true" />
+    <arg name="launch_gazebo" value="false" />
+    <arg name="spawn_x" value="$(eval float(arg('robot_spacing'))/2)" />
+    <arg name="spawn_yaw" value="0" />
+  </include>
+  <!-- Select the Leader plugin while retaining the simulation gains. -->
+  <rosparam file="$(find hih)/config/hih_control.yaml" command="load" ns="hih1/hih" />
+  <rosparam file="$(find hih)/config/HihControl_sim.yaml" command="load" ns="hih1/hih/leader" />
+  <param name="hih1/aerial_robot_control_name" value="aerial_robot_control/hih_leader_controller" />
+  <param name="hih1/navigation/takeoff_height" value="$(arg takeoff_height)" type="double" />
+
+  <include file="$(find hih)/launch/bringup.launch">
+    <arg name="simulation" value="true" /><arg name="real_machine" value="false" />
+    <arg name="robot_id" value="2" /><arg name="battery" value="false" />
+    <arg name="hih_model" value="hih" /><arg name="headless" value="true" />
+    <arg name="launch_gazebo" value="false" />
+    <arg name="spawn_x" value="$(eval -float(arg('robot_spacing'))/2)" />
+    <arg name="spawn_yaw" value="3.141592653589793" />
+    <arg name="admittance" value="true" />
+    <arg name="admittance_free_hover" value="false" />
+  </include>
+  <param name="hih2/navigation/takeoff_height" value="$(arg takeoff_height)" type="double" />
+  <param name="hih2/hih/follower/controller/admittance/normal_force_desired"
+         value="$(arg normal_force_desired)" type="double" />
+  <param name="hih2/hih/follower/controller/admittance/contact_threshold"
+         value="$(arg contact_threshold)" type="double" />
+  <param name="hih2/hih/follower/controller/admittance/release/max_distance"
+         value="$(arg release_max_distance)" type="double" />
+
+  <param name="hih_box/robot_description"
+         command="$(find xacro)/xacro '$(find hih)/urdf/admittance_box.sdf.xacro' size_x:=$(arg box_size_x) size_y:=$(arg box_size_y) size_z:=$(arg box_size_z) mass:=$(arg box_mass) static:=$(arg box_static) contact_friction:=$(arg box_contact_friction) ground_friction:=$(arg box_ground_friction)" />
+  <node pkg="gazebo_ros" type="spawn_model" name="spawn_hih_box" output="screen"
+        args="-sdf -model hih_box -x 0 -y 0 -z $(arg box_spawn_z) -param /hih_box/robot_description" />
+</launch>

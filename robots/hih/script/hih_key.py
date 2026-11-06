@@ -115,7 +115,7 @@ def print_help(config):
 {common['force_landing']}:  force landing
 {common['halt']}:  halt (force stop motor)
 {stop_key}:  hold in current position
-{common['approach']}:  approach ON/OFF (both robots: local -X, {config['approach_speed']:g} m/s)
+{common['approach']}:  approach ON/OFF (Leader local -X, Follower local +X, {config['approach_speed']:g} m/s)
 {common['release_force']}:  release Follower force; keep contact until released_hover
 
 1:  Leader trajectory: -X -> +Z -> +X -> -Z
@@ -465,7 +465,7 @@ def main():
                 if approach:
                     for role in ROBOTS:
                         motion[role].control_frame = FlightNav.LOCAL_FRAME
-                        motion[role].target_vel_x = -config["approach_speed"]
+                        motion[role].target_vel_x = config["approach_speed"] * (1 if role == "follower" else -1)
                         expires[role][0] = now + config["key_timeout"]
                 if trajectory is not None:
                     velocity = trajectory_velocity(trajectory, now - trajectory_start,

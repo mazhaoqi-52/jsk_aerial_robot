@@ -119,6 +119,7 @@ follower:
       need_d_control: true
     admittance:
       enabled: true
+      free_hover: false             # zero-force admittance on hover, without contact acquisition/preload
       apply_velocity: true
       world_frame: world
       sample_timeout: 0.15

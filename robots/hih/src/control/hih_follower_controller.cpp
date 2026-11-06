@@ -41,10 +41,13 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
   hih_control::applyRoleParameters(nh, "follower");
   ros::NodeHandle settings(nh, "controller/admittance");
   settings.param("enabled", enabled_, false);
+  settings.param("free_hover", free_hover_, false);
   settings.param("apply_velocity", apply_velocity_, true);
   settings.param("sample_timeout", sample_timeout_, 0.15);
   settings.param("debug_period", debug_period_, 0.05);
   settings.param("normal_force_desired", normal_force_desired_, 10.0);
+  // Free hover regulates external wrench toward zero, with no inward preload ramp.
+  if (free_hover_) normal_force_desired_ = 0.0;
   settings.param("normal_force_max", normal_force_max_, 20.0);
   settings.param("normal_force_rate", normal_force_rate_, 1.0);
   settings.param("contact_threshold", contact_threshold_, 0.8);
@@ -82,6 +85,7 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
       normal_force_max_ <= 0 || normal_force_rate_ <= 0 || contact_threshold_ <= 0)
     throw std::invalid_argument("Invalid normal-force target/ramp/contact threshold");
   hih_control::ContactGuardParameters guard;
+  guard.require_contact = !free_hover_;
   guard.acquire_force=contact_threshold_; guard.max_force=normal_force_max_;
   settings.param("contact_release", guard.release_force, 0.4);
   settings.param("contact_loss_timeout", guard.loss_timeout, 0.2);
@@ -132,6 +136,8 @@ void HihFollowerController::initialize(ros::NodeHandle nh, ros::NodeHandle nhp,
     [this](const std_msgs::EmptyConstPtr&) { release_requested_.store(true); });
   ready_.store(true);
   ROS_INFO("[HiH Follower] PID/MOB retained; world XYZ+yaw Admittance %s", enabled_ ? "ENABLED" : "DISABLED");
+  if (enabled_ && free_hover_)
+    ROS_INFO("[HiH Follower] Free-hover Admittance: zero force target, no contact acquisition or CoP trim");
 }
 
 void HihFollowerController::externalWrenchEstimate()
@@ -251,7 +257,7 @@ void HihFollowerController::modifyTargetSnapshot(aerial_robot_navigation::BaseNa
   // Add only CoP yaw/world-Z trim to the completed Admittance reference.
   // The inherited PID consumes this local snapshot; the navigator is never overwritten.
   cop_adjustment_.update(target, force, torque, stamp, valid,
-                         flight_allowed, admittance_applying_ && !force_release_.pending() &&
+                         flight_allowed && !free_hover_, admittance_applying_ && !force_release_.pending() &&
                            force_release_.phase()!=hih_control::ForceRelease::FAILED, ros::Time::now());
   if (force_release_.phase()==hih_control::ForceRelease::READY)
   {
@@ -413,7 +419,8 @@ void HihFollowerController::modifyAdmittanceTarget(aerial_robot_navigation::Base
     }
   }
   admittance_applying_ = true;
-  publishDebug(nominal,target,releasing ? force_release_.status() : "active",true,now);
+  publishDebug(nominal,target,releasing ? force_release_.status() :
+    (free_hover_ ? "free_hover_active" : "active"),true,now);
 }
 
 void HihFollowerController::holdAdmittanceTarget(

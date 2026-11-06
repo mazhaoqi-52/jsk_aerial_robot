@@ -55,6 +55,7 @@ private:
   bool cop_flight_allowed_last_ = false;
   std::atomic<bool> ready_{false};
   bool enabled_ = false;
+  bool free_hover_ = false;
   bool apply_velocity_ = true;
   double sample_timeout_ = 0.15;
   double max_dt_ = 0.1;

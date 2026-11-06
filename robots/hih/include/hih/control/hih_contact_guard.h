@@ -8,6 +8,7 @@ namespace hih_control
 // Local contact protection only. It never arms, lands or commands the peer.
 struct ContactGuardParameters
 {
+  bool require_contact=true; // Free-hover mode retains data/overload guards without contact acquisition/loss.
   double acquire_force=0.8, release_force=0.4, max_force=20;
   double loss_timeout=0.2, stale_timeout=0.5;
   void validate() const
@@ -39,11 +40,11 @@ public:
     fresh = fresh && std::isfinite(normal_force);
     if (!acquired_)
     {
-      if (!fresh || normal_force<p_.acquire_force)
-      { status_="waiting_for_contact"; return state_=WAITING; }
+      if (!fresh || (p_.require_contact && normal_force<p_.acquire_force))
+      { status_=p_.require_contact ? "waiting_for_contact" : "waiting_for_input"; return state_=WAITING; }
       acquired_=true;
     }
-    if (!fresh || normal_force<p_.release_force)
+    if (!fresh || (p_.require_contact && normal_force<p_.release_force))
     {
       if (bad_since_<0 || now<bad_since_) bad_since_=now;
       state_=HOLD; status_=fresh ? "contact_loss_held" : "stale_input_held";
